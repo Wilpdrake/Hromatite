@@ -1,0 +1,24 @@
+[project]
+name = "furrylovebot"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "aiocryptopay>=0.4.8",
+    "aiogram>=3.27.0",
+    "aiosqlite>=0.22.1",
+    "alembic>=1.18.4",
+    "asyncssh>=2.22.0",
+    "dishka>=1.10.0",
+    "fastapi>=0.124.0",
+    "imageio[ffmpeg]>=2.37.0",
+    "passlib>=1.7.4",
+    "pillow>=12.2.0",
+    "python-dotenv>=1.1.0",
+    "python-jose>=3.3.0",
+    "python-multipart>=0.0.27",
+    "qrcode>=8.2",
+    "sqlalchemy>=2.0.49",
+    "uvicorn>=0.38.0",
+    "watchfiles>=1.1.1",
+]
