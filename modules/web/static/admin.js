@@ -5,9 +5,10 @@ const api = async (url, options = {}) => {
   const response = await fetch(url, { ...options, headers });
   if (response.status === 401) {
     localStorage.removeItem('adminToken');
-    window.location.href = '/login';
+    document.cookie = 'adminToken=; Path=/; Max-Age=0; SameSite=Lax';
+    window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
   }
-  if (response.status === 403) window.location.href = '/login';
+  if (response.status === 403) window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 };

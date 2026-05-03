@@ -1,11 +1,9 @@
 from pathlib import Path
-from time import monotonic
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Config
@@ -13,6 +11,7 @@ from core.database import create_session_maker
 from modules.web.repositories.admin_repo import AdminUserRepo
 from modules.web.models.schemas import AdminCreate, ClientCreate, ConfigCreate, ConfigUpdate, LoginRequest, RegisterRequest, ServerCreate, ServerUpdate
 from modules.web.services.admin_service import AdminService
+from modules.web.services.auth_service import AuthManager
 from modules.web.services.client_service import ClientService
 from modules.web.services.log_service import LogService
 from modules.web.services.process_service import ProcessService
@@ -27,8 +26,7 @@ def create_app(config: Config) -> FastAPI:
     static_dir = Path(__file__).parent / "static"
     security = HTTPBearer(auto_error=False)
     auth_secret = config.web.admin_token or "change-me"
-    request_log: dict[str, list[float]] = {}
-    login_failures: dict[str, tuple[int, float]] = {}
+    auth = AuthManager(config, auth_secret)
 
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -37,39 +35,8 @@ def create_app(config: Config) -> FastAPI:
         async with session_maker() as session:
             yield session
 
-    def client_key(request: Request) -> str:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
-
-    def enforce_rate_limit(request: Request):
-        if config.web.rate_limit_requests <= 0:
-            return
-        now = monotonic()
-        window = config.web.rate_limit_window_seconds
-        key = client_key(request)
-        timestamps = [item for item in request_log.get(key, []) if now - item < window]
-        if len(timestamps) >= config.web.rate_limit_requests:
-            raise HTTPException(status_code=429, detail="Слишком много запросов")
-        timestamps.append(now)
-        request_log[key] = timestamps
-
     async def authenticate_admin(request: Request, credentials: HTTPAuthorizationCredentials | None, session: AsyncSession):
-        enforce_rate_limit(request)
-        if not credentials:
-            raise HTTPException(status_code=401, detail="Требуется авторизация")
-        try:
-            payload = jwt.decode(credentials.credentials, auth_secret, algorithms=["HS256"])
-            user_id = int(payload.get("sub", "0"))
-        except (JWTError, ValueError):
-            raise HTTPException(status_code=401, detail="Недействительный токен")
-        user = await AdminUserRepo(session).find_by_id(user_id)
-        if not user or not user.is_active:
-            raise HTTPException(status_code=401, detail="Аккаунт заблокирован")
-        if (user.role or "user") not in {"admin", "superadmin", "owner"}:
-            raise HTTPException(status_code=403, detail="Недостаточно прав")
-        return user
+        return await auth.authenticate_roles(request, session, credentials=credentials)
 
     async def require_admin(
         request: Request,
@@ -79,7 +46,10 @@ def create_app(config: Config) -> FastAPI:
         return await authenticate_admin(request, credentials, session)
 
     @app.get("/admin", response_class=HTMLResponse)
-    async def admin_page():
+    async def admin_page(request: Request, session: AsyncSession = Depends(get_session)):
+        html_auth = await auth.require_html_roles(request, session)
+        if isinstance(html_auth, RedirectResponse):
+            return html_auth
         page = Path(__file__).parent / "template" / "admin.html"
         return page.read_text(encoding="utf-8")
 
@@ -94,7 +64,10 @@ def create_app(config: Config) -> FastAPI:
         return page.read_text(encoding="utf-8")
 
     @app.get("/admin/partials/{partial_name}", response_class=HTMLResponse)
-    async def admin_partial(partial_name: str):
+    async def admin_partial(partial_name: str, request: Request, session: AsyncSession = Depends(get_session)):
+        html_auth = await auth.require_html_roles(request, session)
+        if isinstance(html_auth, RedirectResponse):
+            return html_auth
         allowed_partials = {"overview", "vpn", "access", "system"}
         if partial_name not in allowed_partials:
             raise HTTPException(status_code=404, detail="Раздел админки не найден")
@@ -115,27 +88,19 @@ def create_app(config: Config) -> FastAPI:
 
     @app.post("/api/auth/login")
     async def login(payload: LoginRequest, request: Request, session: AsyncSession = Depends(get_session)):
-        enforce_rate_limit(request)
-        key = client_key(request)
-        attempts, banned_until = login_failures.get(key, (0, 0.0))
-        now = monotonic()
-        if banned_until > now:
-            raise HTTPException(status_code=429, detail="Слишком много неудачных попыток входа")
+        auth.enforce_rate_limit(request)
+        auth.ensure_login_allowed(request)
         try:
             result = await AdminService(session, auth_secret).login(payload.username, payload.password)
-            login_failures.pop(key, None)
+            auth.clear_login_failures(request)
             return result
         except ValueError as error:
-            attempts += 1
-            if attempts >= config.web.login_max_attempts:
-                login_failures[key] = (attempts, now + config.web.login_ban_seconds)
-                raise HTTPException(status_code=429, detail="Слишком много неудачных попыток входа") from error
-            login_failures[key] = (attempts, 0.0)
+            auth.register_login_failure(request)
             raise HTTPException(status_code=401, detail=str(error)) from error
 
     @app.post("/api/auth/register")
     async def register(payload: RegisterRequest, request: Request, session: AsyncSession = Depends(get_session)):
-        enforce_rate_limit(request)
+        auth.enforce_rate_limit(request)
         try:
             created = await AdminService(session, auth_secret).register_user(payload.username, payload.password)
             return {"id": created["id"], "username": created["username"], "role": created["role"]}
@@ -164,7 +129,7 @@ def create_app(config: Config) -> FastAPI:
         if total:
             await authenticate_admin(request, credentials, session)
         else:
-            enforce_rate_limit(request)
+            auth.enforce_rate_limit(request)
         try:
             return await AdminService(session, auth_secret).create_user(payload.username, payload.password, role=payload.role)
         except ValueError as error:

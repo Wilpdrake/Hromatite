@@ -133,6 +133,14 @@ from web.models.base import VPNConfig
 
 Проект использует Alembic. Не полагайся на `Base.metadata.create_all()` в runtime.
 
+ИИ-ассистент должен использовать Alembic автоматически при любых изменениях схемы БД:
+
+- Если меняются SQLAlchemy-модели, Pydantic-схемы с persistable-полями, репозитории или сервисы, влияющие на структуру таблиц, обязательно создай или обнови Alembic-миграцию.
+- Не ограничивайся изменением ORM-модели без миграции.
+- Перед созданием новой миграции проверь последнюю ревизию в `migrations/versions/` и укажи корректный `down_revision`.
+- После миграции проверь, что `upgrade()` и `downgrade()` соответствуют изменению схемы.
+- Если доступна локальная среда, проверь миграции командами Alembic через текущий способ запуска проекта, например `uv run alembic upgrade head`.
+
 Если добавляешь или меняешь SQLAlchemy-модель:
 
 1. Проверь `modules/web/models/base.py`.
@@ -238,6 +246,8 @@ except ValueError as error:
 - Вкладки админки загружаются частями через `GET /admin/partials/{partial_name}`. Новые partial endpoints добавляй только через whitelist в `modules/web/app.py`.
 - Отдельные страницы авторизации пользователей доступны на `GET /login` и `GET /register`; они используют `auth.html`, `auth.css` и `auth.js`, не встраивай форму логина в `admin.html`.
 - Auth API: `POST /api/auth/login` выдаёт JWT с `role`, `POST /api/auth/register` создаёт обычного пользователя с ролью `user`.
+- Общая логика авторизации, rate limit, login-ban, JWT-проверок и HTML-редиректов находится в `modules/web/services/auth_service.py`.
+- HTML-ресурсы админки (`/admin`, `/admin/partials/{partial_name}`) требуют cookie `adminToken`; при отсутствии/ошибке токена или недостаточной роли они редиректят на `/login?next=<path>`. JS-авторизация после логина сохраняет токен в `localStorage` для API и в cookie для серверной проверки HTML-ресурсов.
 - Админские API защищены `Authorization: Bearer <token>` и доступны только ролям `admin`, `superadmin`, `owner`; обычная роль `user` не должна получать доступ к `/api/stats`, `/api/configs`, `/api/servers`, `/api/clients`, `/api/logs`, `/api/process`, `/api/admins`.
 - В web-модуле есть in-memory rate limit по IP и временный ban для частых неудачных логинов. Настройки находятся в `core.config.WebConfig`: `rate_limit_requests`, `rate_limit_window_seconds`, `login_max_attempts`, `login_ban_seconds`, env-переменные — `WEB_RATE_LIMIT_REQUESTS`, `WEB_RATE_LIMIT_WINDOW_SECONDS`, `WEB_LOGIN_MAX_ATTEMPTS`, `WEB_LOGIN_BAN_SECONDS`.
 - При любых изменениях структуры админки, partial-шаблонов, JS/CSS панели или связанных web endpoints обновляй этот раздел `README_AI.md`.
@@ -315,6 +325,18 @@ GET /api/clients
 GET /api/logs
 GET /metrics
 ```
+
+## Работа с Git
+
+ИИ-ассистент должен использовать Git как обязательную часть рабочего процесса:
+
+- Перед изменениями проверь текущее состояние репозитория через `git status`.
+- Не перезаписывай и не форматируй чужие несвязанные изменения.
+- После изменений проверь `git diff`, чтобы убедиться, что изменены только нужные файлы.
+- Если пользователь просит завершить задачу полностью, подготовь коммит с понятным сообщением.
+- Если пользователь просит отправить изменения, используй `git push` только после успешных проверок и подтверждения, что коммит готов.
+- Не выполняй destructive-команды вроде `git reset --hard`, `git clean`, force-push или удаления веток без явного отдельного подтверждения пользователя.
+- Для миграций Alembic всегда включай в коммит и изменения моделей/сервисов, и соответствующий файл из `migrations/versions/`.
 
 ## Типовые ошибки и решения
 

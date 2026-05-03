@@ -10,13 +10,25 @@ async def test_admin_page_and_health(client):
     unknown_partial = await client.get("/admin/partials/unknown")
     health = await client.get("/api/health")
 
+    assert admin.status_code == 303
+    assert admin.headers["location"] == "/login?next=/admin"
+    assert overview.status_code == 303
+    assert overview.headers["location"] == "/login?next=/admin/partials/overview"
+    assert unknown_partial.status_code == 303
+    assert health.status_code == 200
+    assert health.json()["module"] == "web"
+
+
+async def test_admin_html_accepts_auth_cookie(client):
+    headers = await auth_headers(client)
+    token = headers["Authorization"].removeprefix("Bearer ")
+    admin = await client.get("/admin", cookies={"adminToken": token})
+    overview = await client.get("/admin/partials/overview", cookies={"adminToken": token})
+
     assert admin.status_code == 200
     assert "Hromatite" in admin.text
     assert overview.status_code == 200
     assert "dashboard" in overview.text
-    assert unknown_partial.status_code == 404
-    assert health.status_code == 200
-    assert health.json()["module"] == "web"
 
 
 async def test_config_client_admin_and_log_api(client):

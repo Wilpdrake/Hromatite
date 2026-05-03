@@ -1,4 +1,21 @@
 const isRegister = window.location.pathname === '/register';
+const params = new URLSearchParams(window.location.search);
+const nextUrl = params.get('next') || '/admin';
+const authModes = {
+  login: {
+    endpoint: '/api/auth/login',
+    title: 'Вход в аккаунт',
+    subtitle: 'Авторизуйтесь, чтобы продолжить работу с Hromatite.',
+    submitText: 'Войти',
+  },
+  register: {
+    endpoint: '/api/auth/register',
+    title: 'Создание аккаунта',
+    subtitle: 'Создайте пользовательский аккаунт Hromatite.',
+    submitText: 'Зарегистрироваться',
+  },
+};
+const mode = isRegister ? authModes.register : authModes.login;
 const title = document.querySelector('#pageTitle');
 const subtitle = document.querySelector('#pageSubtitle');
 const submitBtn = document.querySelector('#submitBtn');
@@ -7,18 +24,17 @@ const message = document.querySelector('#authMessage');
 document.querySelector('#loginLink').classList.toggle('active', !isRegister);
 document.querySelector('#registerLink').classList.toggle('active', isRegister);
 
-title.textContent = isRegister ? 'Создание аккаунта' : 'Вход в аккаунт';
-subtitle.textContent = isRegister ? 'Создайте пользовательский аккаунт Hromatite.' : 'Авторизуйтесь, чтобы продолжить работу с Hromatite.';
-submitBtn.textContent = isRegister ? 'Зарегистрироваться' : 'Войти';
+title.textContent = mode.title;
+subtitle.textContent = mode.subtitle;
+submitBtn.textContent = mode.submitText;
 
 document.querySelector('#authForm').addEventListener('submit', async event => {
   event.preventDefault();
   message.textContent = '';
   message.classList.remove('ok');
   const data = Object.fromEntries(new FormData(event.target));
-  const endpoint = isRegister ? '/api/auth/register' : '/api/auth/login';
   try {
-    const response = await fetch(endpoint, {
+    const response = await fetch(mode.endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -32,7 +48,8 @@ document.querySelector('#authForm').addEventListener('submit', async event => {
       return;
     }
     localStorage.setItem('adminToken', result.token);
-    if (['admin', 'superadmin', 'owner'].includes(result.role)) window.location.href = '/admin';
+    document.cookie = `adminToken=${encodeURIComponent(result.token)}; Path=/; SameSite=Lax`;
+    if (['admin', 'superadmin', 'owner'].includes(result.role)) window.location.href = nextUrl;
     else {
       message.classList.add('ok');
       message.textContent = 'Вход выполнен. Пользовательская панель пока не подключена.';
