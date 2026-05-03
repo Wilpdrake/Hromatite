@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hromatite Admin</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">H</span>
+        <div>
+          <strong>Hromatite</strong>
+          <small>VPN Control Center</small>
+        </div>
+      </div>
+      <nav>
+        <button class="tab-link active" data-tab="overview" data-url="/admin/partials/overview">Обзор</button>
+        <button class="tab-link" data-tab="vpn" data-url="/admin/partials/vpn">VPN</button>
+        <button class="tab-link" data-tab="access" data-url="/admin/partials/access">Доступ</button>
+        <button class="tab-link" data-tab="system" data-url="/admin/partials/system">Система</button>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Админ-панель</p>
+          <h1>Управление Hromatite</h1>
+        </div>
+        <div class="actions">
+          <button id="refreshBtn">Обновить</button>
+          <button id="logoutBtn">Выйти</button>
+        </div>
+      </header>
+
+      <section id="partialRoot"></section>
+    </main>
+  </div>
+  <script src="/static/admin.js"></script>
+</body>
+</html>

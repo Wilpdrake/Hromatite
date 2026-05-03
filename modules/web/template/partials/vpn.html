@@ -1,0 +1,40 @@
+<section class="tab-panel" data-panel="vpn">
+  <section class="panel" id="configs">
+    <div class="panel-head">
+      <div><h2>VPN конфиги</h2><p>Создание, переключение и удаление серверных конфигураций.</p></div>
+      <form id="configForm" class="inline-form">
+        <input name="name" placeholder="Название" required>
+        <input name="host" placeholder="Хост" required>
+        <input name="port" type="number" placeholder="Порт" value="51820" required>
+        <button>Добавить</button>
+      </form>
+    </div>
+    <div id="configsTable" class="table"></div>
+  </section>
+
+  <section class="panel" id="servers">
+    <div class="panel-head">
+      <div><h2>Серверы</h2><p>Управление VPN-нодами, primary-сервером и проверкой доступности SSH.</p></div>
+      <form id="serverForm" class="inline-form">
+        <input name="name" placeholder="Название" required>
+        <input name="host" placeholder="Host/IP" required>
+        <input name="ssh_user" placeholder="SSH user" required>
+        <input name="ssh_port" type="number" placeholder="SSH port" value="22" required>
+        <button>Добавить</button>
+      </form>
+    </div>
+    <div id="serversTable" class="table"></div>
+  </section>
+
+  <section class="panel" id="clients">
+    <div class="panel-head">
+      <div><h2>Клиенты</h2><p>WireGuard/AmnesiaWG устройства и трафик.</p></div>
+      <form id="clientForm" class="inline-form">
+        <input name="device_name" placeholder="Устройство" required>
+        <input name="allowed_ips" placeholder="Allowed IPs" value="0.0.0.0/0">
+        <button>Создать</button>
+      </form>
+    </div>
+    <div id="clientsTable" class="table"></div>
+  </section>
+</section>

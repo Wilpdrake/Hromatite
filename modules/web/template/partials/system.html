@@ -1,0 +1,17 @@
+<section class="tab-panel" data-panel="system">
+  <section class="panel" id="process">
+    <div class="panel-head">
+      <div><h2>Процессы</h2><p>Статус сервисов и быстрые действия.</p></div>
+      <div class="actions">
+        <button data-action="/api/process/reload/wg">Reload WG</button>
+        <button data-action="/api/process/reload/xray">Reload Xray</button>
+      </div>
+    </div>
+    <pre id="processBox"></pre>
+  </section>
+
+  <section class="panel" id="logs">
+    <div class="panel-head"><div><h2>Логи</h2><p>Последние действия и события панели.</p></div></div>
+    <div id="logsTable" class="table"></div>
+  </section>
+</section>

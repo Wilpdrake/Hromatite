@@ -30,6 +30,10 @@ class WebConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     admin_token: str = ""
+    rate_limit_requests: int = 120
+    rate_limit_window_seconds: int = 60
+    login_max_attempts: int = 5
+    login_ban_seconds: int = 900
 
 
 @dataclass
@@ -76,6 +80,10 @@ def load_config() -> Config:
             host=os.getenv("WEB_HOST", "0.0.0.0"),
             port=int(os.getenv("WEB_PORT", "8000")),
             admin_token=os.getenv("WEB_ADMIN_TOKEN", ""),
+            rate_limit_requests=int(os.getenv("WEB_RATE_LIMIT_REQUESTS", "120")),
+            rate_limit_window_seconds=int(os.getenv("WEB_RATE_LIMIT_WINDOW_SECONDS", "60")),
+            login_max_attempts=int(os.getenv("WEB_LOGIN_MAX_ATTEMPTS", "5")),
+            login_ban_seconds=int(os.getenv("WEB_LOGIN_BAN_SECONDS", "900")),
         ),
         pterodactyl=PterodactylConfig(
             panel_url=os.getenv("PTERODACTYL_PANEL_URL", ""),
