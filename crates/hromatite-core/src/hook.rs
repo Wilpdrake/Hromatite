@@ -860,6 +860,7 @@ const D_CRYPTED: usize = 0x30;
 const SEAL_START_DELAY_MS: u64 = 2_000;
 
 /// The probe lives in the image (that is the point) and is compared by the asm.
+#[allow(dead_code)]
 static SEAL_PROBE: AtomicU64 = AtomicU64::new(SEAL_MAGIC);
 /// Data page address, published once at install (0 = L2b not active).
 static SEAL_DATA: AtomicUsize = AtomicUsize::new(0);
@@ -1269,6 +1270,11 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax
     a.jcc(4, done); // je — already plaintext
+    // A window that is already open means the image is plaintext too (the tick
+    // shim decrypted it and has not closed it yet). Decrypting again would XOR it
+    // *back* into ciphertext while the faulting code is being executed.
+    a.bs(&[0x48, 0x83, 0x7F, D_LOCK as u8, 0x00]); // cmp qword [rdi+lock], 0
+    a.jcc(5, done); // jnz done
     a.mov_r10_tid();
     a.try_lock();
     a.jcc(5, done); // jnz — a tick owns the window (then it is plaintext already)
@@ -1664,16 +1670,25 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
             return None;
         }
     };
+    // The probe must *read back as the magic* while the image is plaintext: the
+    // headers are erased to zero, so stamp the magic into page 0 (it is dead
+    // space either way) and let the seal turn it into ciphertext.
+    unsafe {
+        let mut old = 0u32;
+        ffi::VirtualProtect(base as *mut u8, PAGE_SIZE, ffi::PAGE_READWRITE, &mut old);
+        core::ptr::write_volatile(base as *mut u64, SEAL_MAGIC);
+    }
     let params = ShimParams {
         base: base as u64,
         size: size as u64,
         data: 0, // filled in by `install_shims` once the page exists
-        // A page *inside* the image, not the address of a Rust static: statics
-        // can be placed elsewhere (measured: the probe landed 11 MB below the
-        // image), it then survives the seal and the shim takes the "plaintext"
-        // path against a sealed image — the detour executes ciphertext, faults,
-        // and the window is never released (lock/hits/windows all frozen).
-        probe: (base + PAGE_SIZE) as u64,
+        // Page 0 of the image: the injector erases the PE headers, so these
+        // bytes are free. The magic is written there below; after a seal they
+        // become ciphertext, which is exactly what the shim tests for.
+        // (A Rust static is NOT usable here: statics can be placed outside the
+        // mapped image — measured 11 MB below it — so they survive the seal and
+        // the shim keeps believing the image is plaintext.)
+        probe: base as u64,
         trampoline: p.trampoline as u64,
         detour: seal_detour as *const () as u64,
         vprotect,
