@@ -1189,8 +1189,10 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.jcc(5, done); // jnz — another thread owns the window
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
-    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    // Order matters: the pages are RW (that is what the seal left behind), so
+    // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
+    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
     // The decrypted bytes must be visible to the instruction fetcher:
     // FlushInstructionCache(GetCurrentProcess() = -1, base, size).
     a.mov_imm(1, p.base);
@@ -1256,8 +1258,13 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     a.mov_r10_tid();
     a.try_lock();
     a.jcc(5, done); // jnz — a tick owns the window (then it is plaintext already)
-    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    // decrypt while the pages are still RW, only then make them executable
     crypt(&mut a, p.base, p.size);
+    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    a.mov_imm(1, p.base);
+    a.mov_imm(2, p.size);
+    a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]);
+    a.call_imm(p.flush);
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 1);
     a.mov_mem_rdi_imm8_0(0); // release
     a.bind(done);
