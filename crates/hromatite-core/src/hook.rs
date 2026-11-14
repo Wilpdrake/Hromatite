@@ -1215,7 +1215,6 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     prologue(&mut a);
     a.mov_imm(7, p.data); // mov rdi, data page
     stage(&mut a, 1); // shim entered
-    note(&mut a, p, 1); // "the shim really runs" — safe only while the image is plaintext
     a.mov_imm(10, p.probe); // mov r10, probe
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax   — plaintext or ciphertext?
@@ -1234,7 +1233,6 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.jcc(4, done); // je done — nested call from inside our own detour
     a.try_lock();
     a.jcc(5, done); // jnz — another thread owns the window
-    note(&mut a, p, 5); // window taken, about to decrypt
     stage(&mut a, 5);
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
@@ -1243,6 +1241,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
     stage(&mut a, 6); // decrypt done
+    // (no logging inside the shim: log_tag -> QPC -> shim -> recursion)
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
     stage(&mut a, 7); // RX
     // The decrypted bytes must be visible to the instruction fetcher:
