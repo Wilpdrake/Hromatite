@@ -675,3 +675,40 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - Дописан §16 и правило «каждое завершение — сюда»; обновлены TL;DR, замеры
   slack, статусы L1.5a/L1.5b, добавлен §4.5 (loadlib), §7.4 (проект L2),
   баги 9–10 (STILL_ACTIVE, PEB unlink), CLI-флаги.
+
+### 2026-11-14 — M2 пробит: `il2cpp_domain_get` найден, 216 сборок в памяти
+
+- Коммиты `8571a16`, `0e8c1d4`-цепочка (diag getter probe → граф домена → массив сборок).
+- **Идея, которая сработала (не таблица UnityPlayer, а собственные экспорты):**
+  `symbols.rs` содержит (имя, RVA) всех 251 экспорта `GameAssembly.dll`, т.е. адрес
+  любой функции известен без всякой таблицы — неизвестна только *личность*
+  (какое обфусцированное имя = какая API-функция). Оффлайн по файлу: ровно **три**
+  экспорта компилируются в `48 8B 05 disp32 C3` (`mov rax,[rip+d]; ret`):
+  `zrUNgtwbjgD` (0xc27ef0), `wYRnnMQuvvH` (0xc27f00), `hwyFQMqtopx` (0xc28f50).
+  Payload теперь вызывает их напрямую по RVA и печатает результат с одним уровнем графа.
+- Результат в живой игре:
+  - `zrUNgtwbjgD` → `0xffe0` (не адрес, отбрасываем);
+  - `hwyFQMqtopx` → `0x2dc6c0`, UTF-16 мусор/константа (отбрасываем);
+  - **`wYRnnMQuvvH` → `0x3027c1c0`, стабильно, и по `+0x8` лежит массив сборок**:
+    `216 entries, first ["mscorlib", "DataModel", "UnityEngine.UIElementsModule",
+    "Epic.OnlineServices", "VRC.Udon.VRCWrapperModules", "System", …]`.
+  Это закрывает критерий M2 `domain_get_assemblies > 1` — без вызова
+  `il2cpp_domain_get_assemblies`, простым разбором памяти.
+- **Layout записи сборки (stride 0x48)** — снят из живой игры:
+  ```
+  +0x00 char*  имя ("mscorlib")        +0x08/+0x10  два счётчика (0x7e2/0x7cc)
+  +0x18 obj    (имя/namespace-объект)  +0x20 ptr   (кандидат Il2CppImage*)
+  +0x28 ptr    внутрь GameAssembly     +0x30 int   1
+  +0x38 char*  "mscorlib.dll"          +0x40 obj
+  ```
+- Прочее из того же прогона: `name pointers: 236` в куче (stride записей 24 =
+  0x18), но рядом с указателем на имя **нет** адреса из GameAssembly (±0x80),
+  т.е. это список имён для резолва, а не таблица адресов; «раны» указателей в GA
+  (430k слов) — это метадата il2cpp, а не таблица API.
+- Стенд: `tools/test-seal.sh` (запуск игры внутри SteamLinuxRuntime + attach);
+  вне контейнера `proton run` второго процесса висит, `wine` падает на
+  `/lib/ld-linux.so.2`. Перезапуск игры делает `steam steam://rungameid/438100`.
+- Осталось (M2 → M3): от `entry+0x20` дойти до `Il2CppImage` → массива классов →
+  `Il2CppClass*` для `UnityEngine.Camera` и полей; проверить, что кандидат
+  `+0x20` действительно образ (в `DataModel` там маленькое значение `0x1fa290` —
+  возможно, это смещение в метадате, а не указатель).
