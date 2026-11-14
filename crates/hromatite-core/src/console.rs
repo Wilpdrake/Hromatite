@@ -590,6 +590,40 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             out.extend(rep.notes.iter().cloned());
             (out, Action::None)
         }
+        // `c3 <fnaddr> <imageaddr> <ns> <name>` — call a candidate as
+        // `class_from_name(image, ns, name)` with an *explicit* image pointer.
+        // Needed because the assembly record offers four candidate pointers and
+        // only one of them is the real `Il2CppImage` (`+0x28` is CodeGenModule).
+        "c3" => {
+            let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+            if args.len() < 4 {
+                return (vec!["usage: c3 <fn> <image> <ns> <name>".into()], Action::None);
+            }
+            let (f, image) = match (parse_addr(args[0]), parse_addr(args[1])) {
+                (Some(f), Some(i)) => (f, i),
+                _ => return (vec!["usage: c3 <fn> <image> <ns> <name>".into()], Action::None),
+            };
+            let (ns, name) = (args[2], args[3]);
+            let ns_c = crate::ffi::cstr(ns);
+            let nm_c = crate::ffi::cstr(name);
+            let mut out = vec![format!("c3 {f:#x}({image:#x}, '{ns}', '{name}')")];
+            match crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize) {
+                Ok(r) => {
+                    out.push(format!("  -> {r:#x}"));
+                    if r >= 0x10000 && crate::safe::readable_at(r) {
+                        for d in (0..0x40).step_by(8) {
+                            if let Some(p) = crate::safe::read_u64(r + d) {
+                                if let Some(s) = crate::safe::ascii_at(p as usize, 48) {
+                                    out.push(format!("     [{d:#x}] -> '{s}'"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(er) => out.push(format!("  fault: {er}")),
+            }
+            (out, Action::None)
+        }
         // `cls3 <fnaddr> <ns> <name>` — call ONE candidate export as
         // class_from_name(image, ns, name) under VEH and inspect the result.
         // Cheaper and safer than the brute-force phase: the offline shortlist
