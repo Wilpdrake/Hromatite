@@ -1214,6 +1214,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
         (a.label(), a.label(), a.label(), a.label(), a.label(), a.label());
     prologue(&mut a);
     a.mov_imm(7, p.data); // mov rdi, data page
+    stage(&mut a, 1); // shim entered
     a.mov_imm(10, p.probe); // mov r10, probe
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax   — plaintext or ciphertext?
@@ -1222,7 +1223,9 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
 
     // ---- sealed: the normal path -------------------------------------------
     a.bind(sealed);
+    stage(&mut a, 3);
     a.call_imm(p.gettick);
+    stage(&mut a, 4);
     a.cmp_rax_mem_rdi(D_DUE as u8);
     a.jcc(2, done); // jb done — not due
     a.mov_r10_tid();
@@ -1234,19 +1237,20 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     stage(&mut a, 5);
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
-    stage(&mut a, 1);
+    stage(&mut a, 5);
     // Order matters: the pages are RW (that is what the seal left behind), so
     // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
-    note(&mut a, p, 6); // decrypt done, protecting
+    stage(&mut a, 6); // decrypt done
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    stage(&mut a, 7); // RX
     // The decrypted bytes must be visible to the instruction fetcher:
     // FlushInstructionCache(GetCurrentProcess() = -1, base, size).
     a.mov_imm(1, p.base);
     a.mov_imm(2, p.size);
     a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8d, -1
     a.call_imm(p.flush);
-    stage(&mut a, 2);
+    stage(&mut a, 8); // flushed
     a.jmp(call);
 
     // ---- plaintext ---------------------------------------------------------
@@ -1282,8 +1286,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(7, p.data);
     a.mov_rr(1, 7); // mov rcx, rdi — the detour takes the data page
     a.call_imm(p.detour);
-    note(&mut a, p, 3); // detour returned
-    stage(&mut a, 3);
+    stage(&mut a, 9); // detour returned
     a.cmp_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.jcc(4, release); // je release — no window was opened
     protect_call(&mut a, p, ffi::PAGE_READWRITE);
@@ -1293,7 +1296,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 0);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.bind(release);
-    stage(&mut a, 8); // about to release the window
+    stage(&mut a, 10); // about to release the window
     a.mov_mem_rdi_imm8_0(0); // release the window
     a.bind(done);
     epilogue(&mut a);
