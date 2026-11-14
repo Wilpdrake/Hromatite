@@ -418,6 +418,64 @@ fn window(at: usize, before: usize, after: usize, ga: (usize, usize), up: (usize
     out
 }
 
+/// Is `addr` in a committed, readable region? Checked before dereferencing a
+/// value returned by a function we do not fully understand.
+fn readable_at(addr: usize) -> bool {
+    unsafe {
+        let mut mbi = crate::ffi::MEMORY_BASIC_INFORMATION::default();
+        let n = crate::ffi::VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &mut mbi,
+            core::mem::size_of::<crate::ffi::MEMORY_BASIC_INFORMATION>(),
+        );
+        if n == 0 || mbi.State != crate::ffi::MEM_COMMIT {
+            return false;
+        }
+        let p = mbi.Protect & 0xFF;
+        p != crate::ffi::PAGE_NOACCESS && p != 0 && (mbi.Protect & crate::ffi::PAGE_GUARD) == 0
+    }
+}
+
+/// Offline-measured on this build: exactly three exports compile to
+/// `mov rax,[rip+d]; ret` (`zrUNgtwbjgD`, `wYRnnMQuvvH`, `hwyFQMqtopx`).
+/// `il2cpp_domain_get` is one of them, so call all of them and look at what
+/// comes back — a domain pointer is a stable heap object, the others are not.
+pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
+    let mut out = String::new();
+    let mut n = 0usize;
+    for (name, rva) in symbols::EXPORTS.iter() {
+        let addr = ga_base + *rva as usize;
+        if addr < ga_base || addr + 8 > ga_base + ga_size {
+            continue;
+        }
+        let mut b = [0u8; 8];
+        unsafe {
+            core::ptr::copy_nonoverlapping(addr as *const u8, b.as_mut_ptr(), 8);
+        }
+        let is_getter = b[0] == 0x48 && (b[1] == 0x8B || b[1] == 0x8D) && b[2] == 0x05 && b[7] == 0xC3;
+        if !is_getter {
+            continue;
+        }
+        n += 1;
+        let f: extern "system" fn() -> usize = unsafe { core::mem::transmute(addr) };
+        let v = f();
+        out.push_str(&format!(
+            "getter {name} rva {rva:#x} -> {v:#x} ({})\n",
+            if readable_at(v) { "readable" } else { "not mapped" }
+        ));
+        if readable_at(v) {
+            for i in 0..4usize {
+                let q = unsafe { *((v + i * 8) as *const u64) };
+                out.push_str(&format!("   +{:#x}: {q:#016x}\n", i * 8));
+            }
+        }
+    }
+    if n == 0 {
+        out.push_str("no getter-shaped exports at the expected RVAs\n");
+    }
+    out
+}
+
 /// Tiny getters (`mov rax,[rip+d]; ret` / `lea rax,[rip+d]; ret`) are how il2cpp
 /// exposes its singletons — including the domain. Shortlisting them lets the
 /// next stage pick candidates without calling random functions.
@@ -462,6 +520,13 @@ pub fn diagnose() -> String {
     if up.is_none() {
         return out + "UnityPlayer.dll not loaded yet\n";
     }
+
+    // Cheap, independent of the table hunt: the export names in symbols.rs *are*
+    // GameAssembly's exports, so each RVA is directly callable. Only the
+    // identity (which obfuscated name is which API) is unknown, and the three
+    // singleton getters are exactly where `il2cpp_domain_get` has to be.
+    out.push_str("--- getter probe (symbols.rs RVA -> call) ---\n");
+    out.push_str(&probe_getters(ga_base, ga_size));
 
     let budget: usize = std::env::var("HROMATITE_SCAN_MB")
         .ok()
