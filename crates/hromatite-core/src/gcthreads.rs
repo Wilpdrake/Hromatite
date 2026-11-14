@@ -340,8 +340,22 @@ pub fn watch() -> Vec<String> {
                 }
             }
         }
+        // A thread's start address is the only thing that names it while it is
+        // alive, so print it here: the "exited" line may come thirty seconds
+        // later, and by then the address is gone.
         for new in now.difference(&before) {
-            out.push(format!("thread {new:#x} started"));
+            let start = thread_start_address(*new);
+            let who = start.map(module_of).unwrap_or_default();
+            match start {
+                Some(a) => out.push(format!(
+                    "thread {new:#x} started at {a:#x} {who} (gc_record={})",
+                    table
+                        .as_ref()
+                        .map(|t| t.entries.iter().any(|e| e.id == *new))
+                        .unwrap_or(false)
+                )),
+                None => out.push(format!("thread {new:#x} started (start address unavailable)")),
+            }
         }
     }
     // a dead record that was already dead before is worth one line every time
