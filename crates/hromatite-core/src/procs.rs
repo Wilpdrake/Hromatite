@@ -74,6 +74,61 @@ pub fn module(pid: u32, name: &str) -> Option<(usize, usize)> {
         .map(|(_, b, s)| (b, s))
 }
 
+fn read_ptr(addr: usize) -> usize {
+    unsafe { *(addr as *const usize) }
+}
+
+/// Remove our own LDR_DATA_TABLE_ENTRY from the PEB module lists.
+///
+/// With a file-backed mapping (`LoadLibrary`) the pages look legitimate, but
+/// the module is listed in the PEB — this takes it out of the enumeration while
+/// the mapping itself stays section-backed.
+///
+/// Offsets (x64, both Windows and wine's LDR emulation):
+///   PEB+0x18 → Ldr, Ldr+0x20 → InMemoryOrderModuleList,
+///   entry+0x00 Flink/Blink, +0x10 DllBase, +0x20 SizeOfImage,
+///   +0x30 FullDllName, +0x40 BaseDllName.
+pub fn unlink_from_peb(module_base: usize) -> bool {
+    unsafe {
+        let peb: usize;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, nomem, preserves_flags));
+        if peb == 0 {
+            return false;
+        }
+        let ldr = read_ptr(peb + 0x18);
+        if ldr == 0 {
+            return false;
+        }
+        let head = ldr + 0x20; // InMemoryOrderModuleList
+        let mut cur = read_ptr(head);
+        let mut walked = 0;
+        // NOTE: `cur` points at the InMemoryOrderLinks field, which sits 0x10
+        // bytes into LDR_DATA_TABLE_ENTRY, so every field offset is shifted by
+        // -0x10: DllBase = +0x20, SizeOfImage = +0x28, BaseDllName = +0x48.
+        while cur != head && cur != 0 && walked < 512 {
+            let base = read_ptr(cur + 0x20);
+            if base == module_base {
+                let flink = read_ptr(cur);
+                let blink = read_ptr(cur + 8);
+                // splice out
+                *((blink + 0) as *mut usize) = flink;
+                *((flink + 8) as *mut usize) = blink;
+                // also drop from the load/in-memory lists is not needed for
+                // enumeration by name; zeroing our own links keeps it tidy.
+                *((cur) as *mut usize) = cur;
+                *((cur + 8) as *mut usize) = cur;
+                return true;
+            }
+            cur = read_ptr(cur);
+            walked += 1;
+        }
+        crate::log::log(&format!(
+            "peb: walked {walked} entries, self base {module_base:#x} not found (ldr {ldr:#x})"
+        ));
+        false
+    }
+}
+
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
     unsafe {

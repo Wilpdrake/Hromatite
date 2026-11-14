@@ -47,6 +47,40 @@ fn u64_at(mem: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(mem[off..off + 8].try_into().unwrap())
 }
 
+/// Single pass over the image collecting `name -> offset` for every known
+/// export name. Debug builds scanning per-name were taking minutes.
+fn locate_names(mem: &[u8]) -> Vec<(&'static str, usize)> {
+    use std::collections::HashMap;
+    let wanted: HashMap<&'static str, usize> =
+        symbols::EXPORTS.iter().map(|(n, _)| (*n, 0usize)).collect();
+    let mut out: Vec<(&'static str, usize)> = Vec::with_capacity(wanted.len());
+    let mut seen: HashMap<&'static str, ()> = HashMap::with_capacity(wanted.len());
+
+    let is_name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i < mem.len() {
+        if !is_name_byte(mem[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < mem.len() && is_name_byte(mem[i]) {
+            i += 1;
+        }
+        let len = i - start;
+        if (4..=32).contains(&len) {
+            if let Ok(s) = core::str::from_utf8(&mem[start..i]) {
+                if let Some((k, _)) = wanted.get_key_value(s) {
+                    if seen.insert(k, ()).is_none() {
+                        out.push((k, start));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy)]
 pub struct Slot {
     pub name: &'static str,
@@ -76,13 +110,9 @@ pub fn resolve_table() -> (Vec<Slot>, i64) {
     let ga_lo = ga_base;
     let ga_hi = ga_base + ga_size;
 
-    // 1. locate every export name inside UnityPlayer's image
-    let mut found: Vec<(&'static str, usize)> = Vec::new();
-    for (name, _rva) in symbols::EXPORTS {
-        if let Some(off) = find(mem, name.as_bytes()) {
-            found.push((name, off));
-        }
-    }
+    // 1. locate every export name inside UnityPlayer's image in ONE pass: walk
+    //    printable runs and look them up, instead of scanning 34 MB per name.
+    let found = locate_names(mem);
     if found.is_empty() {
         return (Vec::new(), 0);
     }

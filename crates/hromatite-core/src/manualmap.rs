@@ -279,6 +279,34 @@ fn stomp_alloc(r: &Remote, module: &str, size: usize) -> Option<usize> {
     r.alloc_at(mbase + start, size, crate::ffi::PAGE_READWRITE)
 }
 
+/// Load the DLL through the target's loader: file-backed sections (an img
+/// mapping in /proc/<pid>/maps belongs to a real file), at the cost of a PEB
+/// entry — which the DLL removes itself (see `procs::unlink_from_peb`).
+pub fn inject_loadlib(pid: u32, dll_win_path: &str) -> Result<usize, String> {
+    let r = Remote::open(pid)?;
+    let k32 = procs::module(pid, "kernel32.dll")
+        .map(|(b, _)| b)
+        .ok_or("kernel32.dll not found in target")?;
+    let llw = r.export(k32, "LoadLibraryW").ok_or("kernel32!LoadLibraryW unresolved")?;
+
+    let w = crate::ffi::wide(dll_win_path);
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2) };
+    let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE).ok_or("alloc path failed")?;
+    if !r.write(arg, bytes) {
+        return Err("write path failed".into());
+    }
+    let code = r
+        .call(llw, arg, 60_000)
+        .ok_or("CreateRemoteThread(LoadLibraryW) failed")?;
+    if code == 0 {
+        return Err(format!("LoadLibraryW returned NULL (err {:#x})", code));
+    }
+    log::log(&format!(
+        "loadlib: {dll_win_path} mapped at {code:#x} by the target's loader"
+    ));
+    Ok(code as usize)
+}
+
 /// Map `dll_path` into `pid` by hand. Returns the remote base address.
 pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String> {
     let img = PeImage::from_file(dll_path)?;

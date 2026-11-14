@@ -80,20 +80,37 @@ fn bridge(target: &str) -> i32 {
     0
 }
 
-fn inject(dll: &str, target: &str, opts: &manualmap::Options) -> i32 {
+fn inject(
+    dll: &str,
+    target: &str,
+    opts: &manualmap::Options,
+    mode: &str,
+    forced: Option<u32>,
+) -> i32 {
     log::log_echo("=== hromatite inject (manual map) ===");
-    let pid = match wait_pid(30, target) {
-        Some(p) => p,
-        None => {
-            log::log_echo(&format!("{target} not found"));
-            return 1;
+    let pid = match forced {
+        Some(p) => {
+            log::log_echo(&format!("using forced pid {p}"));
+            p
         }
+        None => match wait_pid(30, target) {
+            Some(p) => p,
+            None => {
+                log::log_echo(&format!("{target} not found"));
+                return 1;
+            }
+        },
     };
     log::log_echo(&format!(
         "target pid {pid}, dll {dll}, erase_headers={}, stomp={:?}",
         opts.erase_headers, opts.stomp
     ));
-    match manualmap::inject(pid, dll, opts) {
+    let result = if mode == "loadlib" {
+        manualmap::inject_loadlib(pid, dll)
+    } else {
+        manualmap::inject(pid, dll, opts)
+    };
+    match result {
         Ok(base) => {
             log::log_echo(&format!("mapped at {base:#x}"));
             0
@@ -109,6 +126,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dll: Option<String> = None;
     let mut target = String::from(GAME_EXE);
+    // Explicit pid skips Toolhelp enumeration (it can block for minutes under
+    // wine when two wine servers fight over the prefix).
+    let mut forced_pid: Option<u32> = None;
+    // manual = map by hand (no PEB entry, anonymous region);
+    // loadlib = let the target's loader map us (file-backed pages, PEB entry
+    //           removed by the payload itself).
+    let mut mode = String::from("manual");
     // Stealth defaults: no PE headers in memory, fresh RX region.
     let mut opts = manualmap::Options {
         erase_headers: true,
@@ -121,6 +145,12 @@ fn main() {
             i += 2;
         } else if args[i] == "--proc" && i + 1 < args.len() {
             target = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--pid" && i + 1 < args.len() {
+            forced_pid = args[i + 1].parse::<u32>().ok();
+            i += 2;
+        } else if args[i] == "--mode" && i + 1 < args.len() {
+            mode = args[i + 1].clone();
             i += 2;
         } else if args[i] == "--stomp" && i + 1 < args.len() {
             opts.stomp = Some(args[i + 1].clone());
@@ -136,7 +166,7 @@ fn main() {
     let code = match cmd {
         "bridge" => bridge(&target),
         "inject" => match dll {
-            Some(d) => inject(&d, &target, &opts),
+            Some(d) => inject(&d, &target, &opts, &mode, forced_pid),
             None => {
                 log::log_echo("inject needs --dll <path>");
                 1
@@ -148,6 +178,21 @@ fn main() {
             }
             0
         }
+        // Verification helper: what a module sweep (Toolhelp/Ldr) sees in the
+        // target after injection.
+        "mods" => match procs::find_pid(&target) {
+            Some(pid) => {
+                log::log_echo(&format!("modules of {target} (pid {pid}):"));
+                for (name, base, size) in procs::modules(pid) {
+                    println!("  {base:>12x} {size:>9x}  {name}");
+                }
+                0
+            }
+            None => {
+                log::log_echo(&format!("{target} not found"));
+                1
+            }
+        },
         _ => {
             usage();
             1

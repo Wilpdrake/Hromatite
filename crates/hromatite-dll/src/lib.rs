@@ -36,7 +36,7 @@ fn wait_for_modules(max_secs: u32) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
-    _hinst: *mut core::ffi::c_void,
+    hinst: *mut core::ffi::c_void,
     reason: u32,
     _reserved: *mut core::ffi::c_void,
 ) -> i32 {
@@ -44,7 +44,18 @@ pub extern "system" fn DllMain(
         // Boot marker: proves execution even if the logger itself is at fault.
         let _ = std::fs::write("C:\\dllmain-probe.txt", b"reached DllMain\n");
         log::log_tag("dll", "DllMain(PROCESS_ATTACH), inline (no extra thread)");
-        if wait_for_modules(120) {
+
+        // LoadLibrary-style delivery leaves us in the PEB module list; drop the
+        // entry so a module sweep sees only the game's own files.
+        let unlinked = procs::unlink_from_peb(hinst as usize);
+        log::log_tag("dll", &format!("peb unlink: {unlinked}"));
+
+        // Tests set HROMATITE_WAIT=2 so the stub thread returns quickly.
+        let budget: u32 = std::env::var("HROMATITE_WAIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        if wait_for_modules(budget) {
             il2cpp::run_once();
         }
         log::log_tag("dll", "recon done, returning from DllMain");
