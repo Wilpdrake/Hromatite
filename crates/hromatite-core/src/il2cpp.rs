@@ -466,6 +466,11 @@ pub fn walk_assembly_array(base: usize) -> (usize, Vec<String>) {
         let mut names = Vec::new();
         let mut p = base + off;
         while names.len() < 400 {
+            // unguarded deref here crashes the game (AV in the stub thread) the
+            // moment the array ends at a page boundary — never skip this check
+            if !readable_at(p) {
+                break;
+            }
             let q = unsafe { *(p as *const u64) } as usize;
             match cstr_ascii(q, 64) {
                 Some(n)
