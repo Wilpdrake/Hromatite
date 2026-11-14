@@ -564,6 +564,90 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             }
             (out, Action::None)
         }
+        // `imgc <fnaddr> <index>` — call a 1/2-arg image function under VEH and
+        // dump what it returns. 0x4cbd70 is `mov rax,[rcx+8]; ret`, i.e. the
+        // image's typeCount (0x1dc5); the same shape with an index argument is
+        // `il2cpp_image_get_class`, which is enough to enumerate classes without
+        // ever guessing `class_from_name`.
+        "imgc" => {
+            let (f, idx) = match (parse_addr(a1), parse_addr(a2)) {
+                (Some(f), Some(i)) => (f, i),
+                _ => return (vec!["usage: imgc <fnaddr> <index>".into()], Action::None),
+            };
+            let image = match crate::api::image_of("UnityEngine.CoreModule") {
+                Some(i) => i,
+                None => return (vec!["no image".into()], Action::None),
+            };
+            let mut out = vec![format!("imgc: {f:#x}(image {image:#x}, {idx:#x})")];
+            match crate::veh::call2(f, image, idx) {
+                Ok(r) => {
+                    out.push(format!("  -> {r:#x}"));
+                    if r >= 0x10000 && crate::safe::readable_at(r) {
+                        out.extend(dump_qwords(r, 8));
+                    }
+                }
+                Err(er) => out.push(format!("  fault: {er}")),
+            }
+            (out, Action::None)
+        }
+        // `imgfind <fnaddr> <max> <name>` — enumerate the image's classes with
+        // `il2cpp_image_get_class(image, i)` and report every index whose object
+        // holds a pointer to a string equal to <name> in its first 0x60 bytes.
+        // Layout-agnostic: it also prints the offset where the name was found.
+        "imgfind" => {
+            let (f, max) = match (parse_addr(a1), parse_addr(a2)) {
+                (Some(f), Some(m)) => (f, m),
+                _ => return (vec!["usage: imgfind <fnaddr> <max> <name>".into()], Action::None),
+            };
+            let want = rest.trim();
+            if want.is_empty() {
+                return (vec!["usage: imgfind <fnaddr> <max> <name>".into()], Action::None);
+            }
+            let image = match crate::api::image_of("UnityEngine.CoreModule") {
+                Some(i) => i,
+                None => return (vec!["no image".into()], Action::None),
+            };
+            let mut out = vec![format!("imgfind: {f:#x} image {image:#x}, 0..{max}, '{want}'")];
+            let mut hits = 0usize;
+            let mut faults = 0usize;
+            for i in 0..max {
+                match crate::veh::call2(f, image, i) {
+                    Ok(r) if r >= 0x10000 && crate::safe::readable_at(r) => {
+                        for d in (0..0x60).step_by(8) {
+                            if let Some(p) = crate::safe::read_u64(r + d) {
+                                if let Some(s) = crate::safe::ascii_at(p as usize, 64) {
+                                    if s == want {
+                                        hits += 1;
+                                        out.push(format!(
+                                            "  [{i}] class {r:#x} name@+{d:#x} ns@{:?}",
+                                            {
+                                                // рядом обычно лежит namespace
+                                                crate::safe::read_u64(r + d - 8)
+                                                    .and_then(|q| crate::safe::ascii_at(q as usize, 64))
+                                            }
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        faults += 1;
+                        if faults > 8 {
+                            out.push(format!("  stopped at {i}: too many faults"));
+                            break;
+                        }
+                    }
+                }
+                if hits >= 8 {
+                    break;
+                }
+            }
+            out.push(format!("  hits {hits}, faults {faults}"));
+            (out, Action::None)
+        }
         // `cls2 <ns> <name> [assembly]` — the real il2cpp lookup path:
         // domain -> assembly -> Il2CppImage (+0x28) -> class_from_name.
         "cls2" => {
