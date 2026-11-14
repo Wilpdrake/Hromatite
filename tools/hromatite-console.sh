@@ -52,6 +52,8 @@ say() { printf '%s\n' "$*"; }
 
 # --- status -----------------------------------------------------------------
 if [ "$STATUS" = 1 ]; then
+    TMPF=$(mktemp "${TMPDIR:-/tmp}/hromatite-status.XXXXXX")
+    trap 'rm -f "$TMPF"' EXIT
     printf 'лог: %s\n' "$LOG"
     if [ -f "$LOG" ]; then
         printf 'размер: %s, изменён: %s\n' "$(wc -c <"$LOG")" "$(date -r "$LOG" '+%H:%M:%S')"
@@ -65,18 +67,29 @@ if [ "$STATUS" = 1 ]; then
     done)
     if [ -n "${GPID:-}" ]; then
         printf 'процесс игры: pid %s\n' "$GPID"
-        printf 'кандидаты в наш образ (анонимные rw-p, 512 KB..2 MB, заголовки стёрты):\n'
-        # размер образа release-DLL ~0xef000; ищем именно такой регион
-        awk '$6=="0" && $2=="rw-p" {print $1, $2}' "/proc/$GPID/maps" 2>/dev/null \
-        | while read -r rng perm; do
+        # Подпись запечатанного образа: keystream нулевой страницы постоянен,
+        # поэтому первые 8 байт шифра всегда одни и те же. Так наш регион
+        # находится без знания его адреса.
+        SEAL_SIG="c6 2f ed 2c 76 06 ec 7b"
+        found=0
+        printf 'наш образ (поиск по подписи шифра):\n'
+        awk '$5=="0" && $2=="rw-p" {print $1}' "/proc/$GPID/maps" 2>/dev/null | head -200 \
+        | while read -r rng; do
             s=$((0x${rng%-*})); e=$((0x${rng#*-})); sz=$((e - s))
-            if [ "$sz" -ge 524288 ] && [ "$sz" -le 2621440 ]; then
-                b=$(dd if="/proc/$GPID/mem" bs=1 skip="$s" count=16 2>/dev/null | od -A n -t x1 | tr -s ' ')
-                printf '  %s %s  %s KB  первые байты:%s\n' "$rng" "$perm" "$((sz / 1024))" "${b:- (нет доступа)}"
-            fi
+            [ "$sz" -ge 262144 ] || continue
+            # /proc/<pid>/mem может блокироваться (ptrace) — таймаут обязателен
+            b=$(timeout 3 dd if="/proc/$GPID/mem" bs=1 skip="$s" count=8 2>/dev/null | od -A n -t x1 | tr -s ' ' | sed 's/^ *//;s/ *$//')
+            case "$b" in
+                "$SEAL_SIG")
+                    printf '  ЗАПЕЧАТАННЫЙ %s  %s KB  (ни PE, ни кода; RW, не exec)\n' "$rng" "$((sz / 1024))"
+                    echo "1" >>"$TMPF" ;;
+                4d\ 5a*)
+                    printf '  PE-в-анонимной-памяти %s  %s KB  (MZ: заголовки НЕ стёрты)\n' "$rng" "$((sz / 1024))" ;;
+            esac
         done
-        printf 'exec-страницы вне модулей (анонимные):\n'
-        awk '$2 ~ /^r.x/ && $6=="0" {print "  " $1, $2}' "/proc/$GPID/maps" 2>/dev/null | head -8
+        [ -s "$TMPF" ] || printf '  не найден (игра запущена без --seal или образ ещё открыт)\n'
+        printf 'анонимные exec-страницы (кандидаты в детект):\n'
+        awk '$5=="0" && $2 ~ /^r.x/ {print "  " $1, $2}' "/proc/$GPID/maps" 2>/dev/null | head -6
     else
         printf 'процесс игры не найден\n'
     fi
