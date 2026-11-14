@@ -125,6 +125,12 @@ pub struct Stats {
     pub votes: Vec<usize>,
     /// (absolute address of run start, word count, first word)
     pub runs: Vec<(usize, usize, usize)>,
+    /// Snapshot of the neighbourhood of the first few name-pointer slots, taken
+    /// *during* the scan: the heap is live (the game allocates and frees while
+    /// we walk it), so re-reading the same address later shows recycled bytes.
+    pub snaps: Vec<(usize, &'static str, usize, Vec<u8>)>,
+    /// Distances between consecutive name-pointer slots (struct stride, if any).
+    pub strides: Vec<usize>,
     pub secs: f32,
 }
 
@@ -228,6 +234,22 @@ fn scan_process(
     runs.sort_by_key(|r| core::cmp::Reverse(r.1));
     runs.truncate(8);
     stats.runs = runs;
+
+    // Snapshot the neighbourhood *now* — the heap is live and a later read of
+    // the same address returns whatever the game has since allocated there.
+    const SNAP: usize = 0x80;
+    for (addr, name) in hits.iter().take(6) {
+        let lo = *addr - SNAP;
+        let mut buf = vec![0u8; SNAP * 2];
+        unsafe {
+            core::ptr::copy_nonoverlapping(lo as *const u8, buf.as_mut_ptr(), buf.len());
+        }
+        stats.snaps.push((*addr, name, lo, buf));
+    }
+    let mut sorted: Vec<usize> = hits.iter().map(|(a, _)| *a).collect();
+    sorted.sort_unstable();
+    stats.strides = sorted.windows(2).take(24).map(|w| w[1] - w[0]).collect();
+
     (hits, stats)
 }
 
@@ -341,6 +363,36 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
         hits,
         run_base,
     })
+}
+
+/// Dump a captured snapshot: 8-byte words, tags for addresses that land in
+/// GameAssembly/UnityPlayer, plus the ASCII form of the same bytes.
+fn snap_dump(at: usize, lo: usize, buf: &[u8], ga: (usize, usize), up: (usize, usize)) -> String {
+    let mut out = String::new();
+    let mut p = 0usize;
+    while p + 8 <= buf.len() {
+        let v = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        let tag = if v as usize >= ga.0 && (v as usize) < ga.0 + ga.1 {
+            "GA"
+        } else if v as usize >= up.0 && (v as usize) < up.0 + up.1 {
+            "UP"
+        } else if v < 0x10000 {
+            "small"
+        } else {
+            ""
+        };
+        let mark = if lo + p == at { "<<" } else { "  " };
+        let asc: String = buf[p..p + 8]
+            .iter()
+            .map(|&b| if (32..127).contains(&b) { b as char } else { '.' })
+            .collect();
+        out.push_str(&format!(
+            "  {mark}{:#x}: {v:#018x} '{asc}' {tag}\n",
+            lo + p
+        ));
+        p += 8;
+    }
+    out
 }
 
 /// 8-byte words around `at` for the report: `addr [hex] as_u64 (ga|up|…)`.
@@ -488,11 +540,16 @@ pub fn diagnose() -> String {
         out.push_str(&describe(&res.order, "oracle2(pool-order)"));
     }
 
-    // Raw neighbourhood of the first few name-pointer slots: the layout of the
-    // runtime table is what the next stage has to mimic.
-    for (addr, name) in res.hits.iter().take(3) {
-        out.push_str(&format!("window around {name} @{addr:#x}:\n"));
-        out.push_str(&window(*addr, 0x20, 0x40, (ga_base, ga_size), upm));
+    out.push_str(&format!(
+        "strides between consecutive name slots: {:?}\n",
+        res.stats.strides
+    ));
+
+    // Snapshots taken during the scan: the layout of the runtime table is what
+    // the next stage has to mimic.
+    for (addr, name, lo, buf) in res.stats.snaps.iter().take(3) {
+        out.push_str(&format!("snapshot around {name} @{addr:#x}:\n"));
+        out.push_str(&snap_dump(*addr, *lo, buf, (ga_base, ga_size), upm));
     }
     out
 }
