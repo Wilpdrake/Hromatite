@@ -129,6 +129,58 @@ pub fn unlink_from_peb(module_base: usize) -> bool {
     }
 }
 
+/// One committed, readable region of our own address space.
+#[derive(Clone, Copy)]
+pub struct Region {
+    pub base: usize,
+    pub size: usize,
+    pub protect: u32,
+    pub ty: u32,
+}
+
+impl Region {
+    pub fn readable(&self) -> bool {
+        let p = self.protect & 0xFF;
+        p != PAGE_NOACCESS && p != 0 && (self.protect & PAGE_GUARD) == 0
+    }
+    pub fn executable(&self) -> bool {
+        let p = self.protect & 0xFF;
+        (p & 0x10) != 0 || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY
+    }
+}
+
+/// Walk our own address space with VirtualQuery. Used by the il2cpp
+/// recon: the table UnityPlayer fills in is *not* inside its image, so the
+/// scan has to reach the heap as well.
+pub fn regions(max_regions: usize) -> Vec<Region> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut addr = 0x10000usize;
+        let top = 0x0000_7FFF_FFFF_0000usize;
+        while addr < top && out.len() < max_regions {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            let n = VirtualQuery(
+                addr as *const core::ffi::c_void,
+                &mut mbi,
+                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            if n == 0 || mbi.RegionSize == 0 {
+                break;
+            }
+            if mbi.State == MEM_COMMIT {
+                out.push(Region {
+                    base: mbi.BaseAddress,
+                    size: mbi.RegionSize,
+                    protect: mbi.Protect,
+                    ty: mbi.Type,
+                });
+            }
+            addr = mbi.BaseAddress.wrapping_add(mbi.RegionSize);
+        }
+    }
+    out
+}
+
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
     unsafe {

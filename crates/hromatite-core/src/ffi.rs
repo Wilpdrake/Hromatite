@@ -22,9 +22,35 @@ pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_RELEASE: u32 = 0x8000;
 
+pub const PAGE_NOACCESS: u32 = 0x01;
+pub const PAGE_READONLY: u32 = 0x02;
 pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_WRITECOPY: u32 = 0x08;
+pub const PAGE_EXECUTE: u32 = 0x10;
 pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+pub const PAGE_GUARD: u32 = 0x100;
+pub const PAGE_NOCACHE: u32 = 0x200;
+
+pub const MEM_IMAGE: u32 = 0x0100_0000;
+pub const MEM_MAPPED: u32 = 0x0040_0000;
+
+/// x64 layout (48 bytes): every field is 8-byte aligned, the two DWORD pairs
+/// are padded. Must match both Windows and wine's implementation.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MEMORY_BASIC_INFORMATION {
+    pub BaseAddress: usize,
+    pub AllocationBase: usize,
+    pub AllocationProtect: u32,
+    pub __alignment1: u32,
+    pub RegionSize: usize,
+    pub State: u32,
+    pub Protect: u32,
+    pub Type: u32,
+    pub __alignment2: u32,
+}
 
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const DLL_PROCESS_ATTACH: u32 = 1;
@@ -87,6 +113,7 @@ unsafe extern "system" {
 
     pub fn VirtualAllocEx(h: HANDLE, addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
     pub fn VirtualProtectEx(h: HANDLE, addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
+    pub fn VirtualQuery(addr: *const core::ffi::c_void, mbi: *mut MEMORY_BASIC_INFORMATION, len: usize) -> usize;
 
     pub fn CreateRemoteThread(
         h: HANDLE,

@@ -20,9 +20,15 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 PROTON="${HROMATITE_PROTON:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton}"
 DIST=$(dirname "$PROTON")/files
-BIN="$ROOT/target/x86_64-pc-windows-gnu/debug"
+BIN="$ROOT/target/x86_64-pc-windows-gnu/release"
 EXE="$BIN/Hromatite.exe"
-DLL_WIN='Z:\home\wilpdrake\RustroverProjects\Hromatite\target\x86_64-pc-windows-gnu\debug\hromatite.dll'
+DLL_WIN='Z:\home\wilpdrake\RustroverProjects\Hromatite\target\x86_64-pc-windows-gnu\release\hromatite.dll'
+# L2 (seal): after the payload returns, the injector XORs the whole mapping and
+# leaves it RW. HROMATITE_SEAL=0 disables it for an A/B run.
+INJECT_ARGS="inject --dll $DLL_WIN"
+if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
+    INJECT_ARGS="$INJECT_ARGS --seal"
+fi
 LOG="$HOME/.hromatite-launch.log"
 GAME_LOG="$HOME/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/hromatite.log"
 
@@ -65,7 +71,7 @@ find_game_pid() {
     while [ "$t" -le "$tries" ]; do
         echo "[hromatite] inject attempt $t/$tries (mode $mode)" >>"$LOG"
         if [ "$mode" = "proton" ] || [ -z "$GPID" ]; then
-            "$PROTON" run "$EXE" inject --dll "$DLL_WIN" >>"$LOG" 2>&1
+            "$PROTON" run "$EXE" $INJECT_ARGS >>"$LOG" 2>&1
         else
             ENVF=$(mktemp)
             # Values contain ';', spaces and '=' (WINEDLLOVERRIDES), so every
@@ -83,14 +89,14 @@ find_game_pid() {
                 . "$ENVF"
                 set +a
                 echo "[hromatite] attach env: prefix=$WINEPREFIX wine=$WINE" >>"$LOG"
-                "$WINE" "$EXE" inject --dll "$DLL_WIN"
+                "$WINE" "$EXE" $INJECT_ARGS
             ) >"$OUT" 2>&1
             cat "$OUT" >>"$LOG"
             # Old-style wow64 wine wants a 32-bit loader that only the runtime
             # container ships; outside it, fall back to proton's own wine setup.
             if grep -q "ld-linux.so.2: could not open" "$OUT"; then
                 echo "[hromatite] attach mode unusable here, falling back to proton run" >>"$LOG"
-                "$PROTON" run "$EXE" inject --dll "$DLL_WIN" >>"$LOG" 2>&1
+                "$PROTON" run "$EXE" $INJECT_ARGS >>"$LOG" 2>&1
             fi
             rm -f "$OUT"
             rm -f "$ENVF"

