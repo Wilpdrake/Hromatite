@@ -430,8 +430,15 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         return Err("stub write failed".into());
     }
     r.protect(stub_mem, stub.len(), crate::ffi::PAGE_EXECUTE_READ);
-    r.call(stub_mem, 0, 60_000)
+    // Sealing rewrites every page of the image, so the payload must be *done*:
+    // wait far longer than the default when a seal is going to follow.
+    let wait_ms = if opts.seal { 600_000 } else { 60_000 };
+    let code = r
+        .call(stub_mem, 0, wait_ms)
         .ok_or("CreateRemoteThread(stub) failed")?;
+    if opts.seal && code == 0x103 {
+        log::log("seal: stub thread still active (0x103), skipping seal to avoid rewriting live code");
+    }
 
     log::log(&format!(
         "manualmap: {dll_path} mapped at {base:#x} (delta {delta:#x}, relocs {relocs}, rx sections {rx}, \
@@ -442,7 +449,7 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
 
     // L2: the payload has returned into the stub thread, so no instruction
     // fetch can land in the image any more — encrypt it and leave it RW.
-    if opts.seal {
+    if opts.seal && code != 0x103 {
         let before = r.read_vec(base, 16).unwrap_or_default();
         let (pages, failed) = seal_image(&r, base, size);
         let after = r.read_vec(base, 16).unwrap_or_default();
