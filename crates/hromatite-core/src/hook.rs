@@ -1149,6 +1149,14 @@ fn crypt(a: &mut Asm, base: u64, size: u64) {
     a.bind(done);
 }
 
+
+/// Stage breadcrumb: `mov qword [rdi+D_OLD], imm8`. `old_prot` is only used
+/// inside `protect_call`, so between calls it is a free slot that the host can
+/// read from `/proc/<pid>/mem` — the shim has no logger of its own.
+fn stage(a: &mut Asm, n: u8) {
+    a.bs(&[0x48, 0xC7, 0x47, D_OLD as u8, n]);
+}
+
 /// `VirtualProtect(base, size, prot, &old_prot)`
 fn protect_call(a: &mut Asm, p: &ShimParams, prot: u32) {
     a.set_args(p.base, p.size, prot, p.data + D_OLD as u64);
@@ -1198,6 +1206,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.jcc(5, done); // jnz — another thread owns the window
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
+    stage(&mut a, 1);
     // Order matters: the pages are RW (that is what the seal left behind), so
     // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
@@ -1208,6 +1217,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(2, p.size);
     a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8d, -1
     a.call_imm(p.flush);
+    stage(&mut a, 2);
     a.jmp(call);
 
     // ---- plaintext ---------------------------------------------------------
@@ -1243,11 +1253,13 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(7, p.data);
     a.mov_rr(1, 7); // mov rcx, rdi — the detour takes the data page
     a.call_imm(p.detour);
+    stage(&mut a, 3);
     a.cmp_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.jcc(4, release); // je release — no window was opened
     protect_call(&mut a, p, ffi::PAGE_READWRITE);
     crypt(&mut a, p.base, p.size);
     a.mov_imm(7, p.data); // crypt clobbered rdi
+    stage(&mut a, 4);
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 0);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.bind(release);
