@@ -196,6 +196,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "s <addr>                  — ascii-строка".into(),
                 "ws <addr>                 — utf-16 строка".into(),
                 "find <hex64>              — поиск значения по всей читаемой памяти".into(),
+                "findb <text> / findw <t>  — поиск ascii / utf-16 строки".into(),
                 "asm [фильтр]              — сборки (имя + адрес записи)".into(),
                 "entry <имя>               — поля записи сборки".into(),
                 "domain                    — домен и его геттер".into(),
@@ -234,6 +235,48 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             ),
             None => (vec!["usage: ws <addr>".into()], Action::None),
         },
+        "findb" | "findw" => {
+            // сырой остаток строки — чтобы искать пробелы и точки
+            let rest = line.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+            if rest.is_empty() {
+                return (vec!["usage: findb <ascii text>".into()], Action::None);
+            }
+            let pat: Vec<u8> = if cmd == "findw" {
+                rest.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+            } else {
+                rest.as_bytes().to_vec()
+            };
+            let mut hits = Vec::new();
+            let mut total = 0usize;
+            for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+                if total >= 64 {
+                    break;
+                }
+                let mut a = r.base;
+                let end = r.base + r.size;
+                let n = pat.len();
+                // регион уже проверен как committed+readable, поэтому читаем
+                // напрямую: VirtualQuery на каждый байт — это минуты
+                while a + n <= end && total < 64 {
+                    let b0 = unsafe { *(a as *const u8) };
+                    if b0 == pat[0] {
+                        let window = unsafe { core::slice::from_raw_parts(a as *const u8, n) };
+                        if window == &pat[..] {
+                            total += 1;
+                            hits.push(format!("  {a:#x}"));
+                            a += n;
+                            continue;
+                        }
+                    }
+                    a += 1;
+                }
+            }
+            hits.insert(
+                0,
+                format!("{} '{}': {total} hit(s){}", cmd, rest, if total >= 64 { " (capped)" } else { "" }),
+            );
+            (hits, Action::None)
+        }
         "find" => {
             let want = match parse_addr(a1) {
                 Some(v) => v as u64,
