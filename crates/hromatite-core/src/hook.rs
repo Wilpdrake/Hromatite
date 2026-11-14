@@ -882,6 +882,14 @@ fn env_flag(name: &str) -> bool {
 /// base and its size — the same numbers the injector sealed. `HROMATITE_IMAGE`
 /// (`base:size`, hex) overrides it for tests.
 fn own_image_range() -> Option<(usize, usize)> {
+    // The injector's own numbers win: it sealed exactly this range.
+    let (hb, hs) = (
+        IMAGE_BASE.load(Ordering::Acquire),
+        IMAGE_SIZE.load(Ordering::Acquire),
+    );
+    if hb != 0 && hs >= PAGE_SIZE {
+        return Some((hb, hs));
+    }
     if let Ok(v) = std::env::var("HROMATITE_IMAGE") {
         let (b, s) = v.split_once(':')?;
         let parse = |t: &str| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
@@ -1584,6 +1592,21 @@ fn register(h: Hook) {
 /// Trampoline the current shim jumps back to (an install can be retried on a
 /// second anchor, and the address is baked into the code).
 static SEAL_TRAMP: AtomicUsize = AtomicUsize::new(0);
+/// Image range measured by the injector (`base, size`). Preferred over
+/// `VirtualQuery`, which reports the section split rather than `SizeOfImage` —
+/// with the wrong size the L2b shim decrypts a sub-range, the probe keeps reading
+/// ciphertext and every QPC call pays a full decrypt (~150k/s → frozen game).
+static IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
+static IMAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Called from `DllMain` with the values the injector passed (r8).
+pub fn set_image_range(base: usize, size: usize) {
+    if base != 0 && size != 0 {
+        IMAGE_BASE.store(base, Ordering::Release);
+        IMAGE_SIZE.store(size, Ordering::Release);
+        log::log_tag("hook", &format!("image range from injector: {base:#x}+{size:#x}"));
+    }
+}
 
 /// Build the shim page for this trampoline and arm it — idempotent.
 fn arm_l2b(p: &Prep) -> Option<usize> {

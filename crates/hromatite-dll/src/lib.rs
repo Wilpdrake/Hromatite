@@ -76,7 +76,20 @@ fn console_loop(secs: u32) -> bool {
     }
 }
 
-fn attach(hinst: *mut core::ffi::c_void) {
+fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
+    // The injector's stub passes `r8 = &{base, size}`: the payload cannot read its
+    // own PE header (erased) and `VirtualQuery` reports the section split, so L2b
+    // needs the exact range the injector is going to seal.
+    if !reserved.is_null() {
+        unsafe {
+            let p = reserved as *const usize;
+            let base = *p;
+            let size = *p.add(1);
+            if base > 0x10000 && size > 0 {
+                hook::set_image_range(base, size);
+            }
+        }
+    }
     // Boot marker: proves execution even if the logger itself is at fault.
     let _ = std::fs::write("C:\\dllmain-probe.txt", b"reached DllMain\n");
     log::log_tag("dll", "DllMain(PROCESS_ATTACH), inline (no extra thread)");
@@ -141,7 +154,7 @@ fn attach(hinst: *mut core::ffi::c_void) {
 pub extern "system" fn DllMain(
     hinst: *mut core::ffi::c_void,
     reason: u32,
-    _reserved: *mut core::ffi::c_void,
+    reserved: *mut core::ffi::c_void,
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
         // Install before anything can panic, then run the body under a guard:
@@ -151,7 +164,7 @@ pub extern "system" fn DllMain(
         // is armed (`veh::call_*`), so installing it at attach costs nothing and
         // guarantees the very first guarded call is already covered.
         hromatite_core::veh::install();
-        if log::guard("dllmain", || attach(hinst)).is_none() {
+        if log::guard("dllmain", || attach(hinst, reserved)).is_none() {
             log::log_tag("dll", "DllMain: panic escaped the attach phase, returning 1 anyway");
         }
     }

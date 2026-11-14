@@ -272,14 +272,19 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
 /// `CreateRemoteThread` hands over a single argument and wine does not
 /// special-case DLL entry points, so TLS callbacks *and* DllMain both need this
 /// shim. Combining them keeps the game at one stray thread instead of two.
-fn dll_stub(base: u64, targets: &[u64]) -> Vec<u8> {
+fn dll_stub(base: u64, targets: &[u64], reserved: u64) -> Vec<u8> {
     let mut code = Vec::new();
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     for cb in targets {
         code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
         code.extend_from_slice(&base.to_le_bytes());
         code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
-        code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d
+        // r8 = reserved argument: the payload's only channel for values the
+        // injector knows and it cannot discover itself (the image range needed by
+        // L2b — VirtualQuery reports the section split, not SizeOfImage, so the
+        // shim used to decrypt the wrong range and ran the cipher on every call).
+        code.extend_from_slice(&[0x49, 0xB8]); // mov r8, imm64
+        code.extend_from_slice(&reserved.to_le_bytes());
         code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
         code.extend_from_slice(&cb.to_le_bytes());
         code.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -433,7 +438,17 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     let entry = base + img.entry as usize;
     targets.push(entry as u64);
 
-    let stub = dll_stub(base as u64, &targets);
+    // (base, size) for the payload: it cannot read its own PE header any more.
+    let params = r
+        .alloc(16, crate::ffi::PAGE_READWRITE)
+        .ok_or("param alloc failed")?;
+    let mut pbuf = [0u8; 16];
+    pbuf[..8].copy_from_slice(&(base as u64).to_le_bytes());
+    pbuf[8..].copy_from_slice(&(size as u64).to_le_bytes());
+    if !r.write(params, &pbuf) {
+        return Err("param write failed".into());
+    }
+    let stub = dll_stub(base as u64, &targets, params as u64);
     let stub_mem = r
         .alloc(stub.len(), crate::ffi::PAGE_READWRITE)
         .ok_or("stub alloc failed")?;
