@@ -524,6 +524,46 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             out.extend(rep.notes.iter().cloned());
             (out, Action::None)
         }
+        // `cls3 <fnaddr> <ns> <name>` — call ONE candidate export as
+        // class_from_name(image, ns, name) under VEH and inspect the result.
+        // Cheaper and safer than the brute-force phase: the offline shortlist
+        // (prologue reads both rdx and r8) narrows 251 exports to 16, and
+        // passing `image` to an allocator costs gigabytes.
+        "cls3" => {
+            let (f, ns, name) = match (parse_addr(a1), a2, rest.trim()) {
+                (Some(f), ns, nm) if !ns.is_empty() && !nm.is_empty() => (f, ns, nm),
+                _ => return (vec!["usage: cls3 <fnaddr> <ns> <name>".into()], Action::None),
+            };
+            let image = match crate::api::image_of("UnityEngine.CoreModule")
+                .or_else(|| crate::api::image_of("mscorlib"))
+            {
+                Some(i) => i,
+                None => return (vec!["no image (assemble lookup failed)".into()], Action::None),
+            };
+            let ns_c = crate::ffi::cstr(ns);
+            let nm_c = crate::ffi::cstr(name);
+            let mut out = vec![format!(
+                "cls3: {f:#x}(image {image:#x}, '{ns}', '{name}')"
+            )];
+            let called = crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize);
+            match called {
+                Ok(r) => {
+                    out.push(format!("  -> {r:#x}"));
+                    if r >= 0x10000 && crate::safe::readable_at(r) {
+                        match crate::api::class_probe(r) {
+                            Some(l) => out.push(format!(
+                                "  class layout: name@+{:#x} ns@+{:#x}",
+                                l.name_off, l.ns_off
+                            )),
+                            None => out.push("  no name/ns pair in +/-0x40".into()),
+                        }
+                        out.extend(dump_qwords(r.saturating_sub(0x20), 10));
+                    }
+                }
+                Err(er) => out.push(format!("  fault: {er}")),
+            }
+            (out, Action::None)
+        }
         // `cls2 <ns> <name> [assembly]` — the real il2cpp lookup path:
         // domain -> assembly -> Il2CppImage (+0x28) -> class_from_name.
         "cls2" => {

@@ -520,7 +520,7 @@ fn run_identify(phase: u8) -> Report {
 /// Look for the two name pointers in the first 0x80 bytes of a returned class.
 /// Only exact matches count: `ascii_at` rejects any non-printable byte, so a
 /// number or a pointer to something else cannot masquerade as "Camera".
-fn class_probe(r: usize) -> Option<ClassLayout> {
+pub fn class_probe(r: usize) -> Option<ClassLayout> {
     if r < 0x10000 || !safe::readable_at(r) {
         return None;
     }
