@@ -52,15 +52,13 @@ DLL_WIN="${HROMATITE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/re
 #
 # Both variables must reach the *game* process (it is the payload's environment),
 # hence the export: the payload reads them to decide how to install the tick.
-if [ "${HROMATITE_FRAME_HOOK:-0}" = "1" ]; then
-    if [ "${HROMATITE_L2B:-0}" = "1" ]; then
-        HROMATITE_SEAL="${HROMATITE_SEAL:-1}"
-    else
-        HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
-    fi
-    export HROMATITE_SEAL
-    export HROMATITE_L2B="${HROMATITE_L2B:-0}"
+if [ "${HROMATITE_FRAME_HOOK:-0}" = "1" ] && [ "${HROMATITE_L2B:-0}" != "1" ]; then
+    # frame hook without L2b: the seal would kill the detour, so it stays off
+    HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
 fi
+HROMATITE_SEAL="${HROMATITE_SEAL:-1}"
+HROMATITE_L2B="${HROMATITE_L2B:-0}"
+export HROMATITE_SEAL HROMATITE_L2B
 INJECT_ARGS="inject --dll $DLL_WIN"
 if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
     INJECT_ARGS="$INJECT_ARGS --seal"
