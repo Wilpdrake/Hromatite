@@ -1690,6 +1690,7 @@ static CODE_HI: AtomicUsize = AtomicUsize::new(0);
 pub fn set_code_range(lo: usize, hi: usize) {
     CODE_LO.store(lo, Ordering::Release);
     CODE_HI.store(hi, Ordering::Release);
+    log::log_tag("hook", &format!("code range for RX: {lo:#x}..{hi:#x}"));
 }
 
 /// Range that stays plaintext when the image is sealed (the payload's `.text`).
