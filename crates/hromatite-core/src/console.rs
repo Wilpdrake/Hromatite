@@ -590,6 +590,45 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             out.extend(rep.notes.iter().cloned());
             (out, Action::None)
         }
+        // `ustub <fileoff> [a1] [a2] [a3]` — call a lazily-resolving il2cpp stub
+        // inside UnityPlayer.dll by its *file offset* (found offline by signature).
+        // Each stub stores the resolved pointer in a global and forwards, so the
+        // call works even though every export name is obfuscated.
+        "ustub" => {
+            let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+            let off = match args.first().and_then(|s| parse_addr(s)) {
+                Some(v) => v,
+                None => return (vec!["usage: ustub <fileoff> [a1] [a2] [a3]".into()], Action::None),
+            };
+            let a: Vec<usize> = args.iter().skip(1).map(|s| parse_addr(s).unwrap_or(0)).collect();
+            let get = |i: usize| a.get(i).copied().unwrap_or(0);
+            let base = match procs::own_module(crate::UNITY_PLAYER) {
+                Some((b, _)) => b,
+                None => return (vec!["UnityPlayer not loaded".into()], Action::None),
+            };
+            let target = base + off;
+            let mut out = vec![format!(
+                "ustub {off:#x} -> {target:#x} ({:#x}, {:#x}, {:#x})",
+                get(0), get(1), get(2)
+            )];
+            match crate::veh::call3(target, get(0), get(1), get(2)) {
+                Ok(r) => {
+                    out.push(format!("  -> {r:#x}"));
+                    if r >= 0x10000 && crate::safe::readable_at(r) {
+                        for d in (0..0x20).step_by(8) {
+                            if let Some(p) = crate::safe::read_u64(r + d) {
+                                let tag = crate::safe::ascii_at(p as usize, 40)
+                                    .map(|s| format!(" '{s}'"))
+                                    .unwrap_or_default();
+                                out.push(format!("     [{d:#x}] {p:#x}{tag}"));
+                            }
+                        }
+                    }
+                }
+                Err(e) => out.push(format!("  fault: {e}")),
+            }
+            (out, Action::None)
+        }
         // `c3 <fnaddr> <imageaddr> <ns> <name>` — call a candidate as
         // `class_from_name(image, ns, name)` with an *explicit* image pointer.
         // Needed because the assembly record offers four candidate pointers and
