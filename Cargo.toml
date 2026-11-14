@@ -12,4 +12,8 @@ hromatite-core = { path = "crates/hromatite-core" }
 
 [profile.release]
 opt-level = 2
-panic = "abort"
+# unwind, not abort: a panic in the payload must not take the game down.
+# `catch_unwind` in the DLL only works when the whole graph is built with the
+# unwinding runtime (a per-package `panic` override is only honoured when that
+# package is the build target, which a workspace build is not).
+panic = "unwind"

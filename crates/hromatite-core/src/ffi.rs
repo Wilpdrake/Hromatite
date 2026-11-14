@@ -55,6 +55,52 @@ pub struct MEMORY_BASIC_INFORMATION {
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 
+// ---- exceptions / vectored handler (plan 2) -------------------------------
+
+pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+pub const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
+
+pub const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+pub const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+pub const EXCEPTION_PRIV_INSTRUCTION: u32 = 0xC000_0096;
+pub const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+pub const EXCEPTION_STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+/// x64 layout: 4 DWORDs, a pointer, a counter, and 15 ulong-sized params.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EXCEPTION_RECORD {
+    pub ExceptionCode: u32,
+    pub ExceptionFlags: u32,
+    pub ExceptionRecord: *mut EXCEPTION_RECORD,
+    pub ExceptionAddress: usize,
+    pub NumberParameters: u32,
+    pub __pad: u32,
+    pub ExceptionInformation: [usize; 15],
+}
+
+impl Default for EXCEPTION_RECORD {
+    fn default() -> Self {
+        // SAFETY: plain old data
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EXCEPTION_POINTERS {
+    pub ExceptionRecord: *mut EXCEPTION_RECORD,
+    pub ContextRecord: *mut core::ffi::c_void,
+}
+
+impl Default for EXCEPTION_POINTERS {
+    fn default() -> Self {
+        // SAFETY: plain old data
+        unsafe { core::mem::zeroed() }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PROCESSENTRY32W {
@@ -140,6 +186,15 @@ unsafe extern "system" {
     pub fn LoadLibraryW(path: *const u16) -> HMODULE;
     pub fn GetModuleFileNameW(m: HMODULE, buf: *mut u16, size: u32) -> u32;
     pub fn GetLastError() -> u32;
+
+    // present in ntdll and forwarders both under Windows and wine
+    pub fn AddVectoredExceptionHandler(first: u32, handler: *const core::ffi::c_void) -> *mut core::ffi::c_void;
+    pub fn RemoveVectoredExceptionHandler(handle: *mut core::ffi::c_void) -> u32;
+    pub fn SetUnhandledExceptionFilter(filter: *const core::ffi::c_void) -> *mut core::ffi::c_void;
+
+    pub fn VirtualProtect(addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
+    pub fn FlushInstructionCache(h: HANDLE, base: *const u8, size: usize) -> BOOL;
+    pub fn GetCurrentProcess() -> HANDLE;
 }
 
 /// Rust `&str` -> NUL-terminated wide buffer (stack or heap, caller keeps it).
