@@ -737,3 +737,33 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - Сокеты/пайпы сознательно не вводились: порт/пайп видны как объект ядра.
   Если понадобится двусторонний канал — сначала файловый (`hromatite-cmd.txt`,
   payload читает при следующем тике), сокет только как последний вариант.
+
+### 2026-11-14 — Командный канал (консоль → игра → лог) и первые шаги M3
+
+- Коммиты `bda2e92`, далее `feat(console): findb/findw`.
+- **Канал работает в живой игре.** Хост: `tools/hromatite-console.sh --send "<cmd>"`
+  или `--shell` (stdin → файл команд). Payload (`HROMATITE_LIVE=1800`, ставит
+  wrapper) читает `…/drive_c/users/steamuser/hromatite-cmd.txt` тем же стаб-потоком
+  (новых потоков нет) и отвечает строками `[con]` в обычный лог.
+  Проверено: `help`, `asm UnityEngine`, `findb`, `find`, `q`, `s`, `entry` —
+  ответы приходят в лог, консоль их показывает.
+- Команды: `help q b s ws find findb findw asm entry domain diag echo seal quit`.
+  `findb/findw` ищут ascii/utf-16 в читаемых регионах (регион проверяется один раз,
+  побайтовый VirtualQuery не делается).
+- Инжектор при `--seal` ждёт entry до 30 мин, чтобы печать образа шла после
+  последнего ответа, а не по таймауту (`wait_ms = 1_800_000`).
+- **Разведка M3, что уже снято через консоль:**
+  - `asm UnityEngine` — 216 сборок с адресами записей (`Il2CppAssemblyName`-подобные,
+    stride 0x48): например `UnityEngine.CoreModule @0x3027c450`.
+  - Запись сборки (CoreModule): `+0x00` имя без .dll, `+0x28` указатель в
+    **GameAssembly** (`0x6ffff7b54140`) — это и есть `Il2CppImage` в `.data`;
+    `+0x38` имя с `.dll`.
+  - `Il2CppImage` (по `+0x28`): `+0x00` char* `"UnityEngine.CoreModule.dll"`,
+    `+0x08` = `0x1dc5` (похоже на typeCount), `+0x10` → таблица указателей в GA
+    (проверено: элементы — код, т.е. это методы, а не классы), `+0x18` = `0x34c`,
+    `+0x20` → `{index, fnptr}`-таблица.
+  - Массив классов (`Il2CppClass*`, где `+0x10` имя, `+0x18` namespace) пока **не
+    найден**; следующий шаг — идти от `Il2CppImage+0x10/+0x20` дальше или искать
+    глобальную `Il2CppMetadataRegistration`.
+- Побочно: `find <qword>` находил «указатели» в куче, которые уже переехали —
+  куча живёт, поэтому результаты `find` валидны только сразу после выдачи.
