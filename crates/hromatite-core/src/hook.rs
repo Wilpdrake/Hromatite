@@ -1247,13 +1247,11 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     // (no logging inside the shim: log_tag -> QPC -> shim -> recursion)
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
     stage(&mut a, 7); // RX
-    // The decrypted bytes must be visible to the instruction fetcher:
-    // FlushInstructionCache(GetCurrentProcess() = -1, base, size).
-    a.mov_imm(1, p.base);
-    a.mov_imm(2, p.size);
-    a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8d, -1
-    a.call_imm(p.flush);
-    stage(&mut a, 8); // flushed
+    // No FlushInstructionCache here: measured live (`stage=7` stuck, window held
+    // forever) the call blocks inside the shim. x86 has a coherent I-cache and
+    // `VirtualProtect` is a serialising round-trip through the kernel anyway, so
+    // the freshly decrypted bytes are already visible to the instruction fetcher.
+    stage(&mut a, 8); // pages executable
     a.jmp(call);
 
     // ---- plaintext ---------------------------------------------------------
@@ -1334,7 +1332,6 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(1, p.base);
     a.mov_imm(2, p.size);
     a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]);
-    a.call_imm(p.flush);
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 1);
     a.mov_mem_rdi_imm8_0(0); // release
     a.bind(done);
