@@ -1215,6 +1215,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     prologue(&mut a);
     a.mov_imm(7, p.data); // mov rdi, data page
     stage(&mut a, 1); // shim entered
+    note(&mut a, p, 1); // "the shim really runs" — safe only while the image is plaintext
     a.mov_imm(10, p.probe); // mov r10, probe
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax   — plaintext or ciphertext?
