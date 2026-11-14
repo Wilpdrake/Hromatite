@@ -40,10 +40,22 @@ EXE="$BIN/Hromatite.exe"
 DLL_WIN='Z:\home\wilpdrake\RustroverProjects\Hromatite\target\x86_64-pc-windows-gnu\release\hromatite.dll'
 # L2 (seal): after the payload returns, the injector XORs the whole mapping and
 # leaves it RW. HROMATITE_SEAL=0 disables it for an A/B run.
+#
+# Plan 3 (HROMATITE_FRAME_HOOK=1) makes DllMain return immediately, so the seal
+# would fire at once and XOR the detour along with the payload — the next tick
+# would execute ciphertext. Hence seal defaults to off in frame-hook mode;
+# set HROMATITE_SEAL=1 explicitly to test the (known-broken) pair.
+if [ "${HROMATITE_FRAME_HOOK:-0}" = "1" ]; then
+    HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
+    export HROMATITE_SEAL
+fi
 INJECT_ARGS="inject --dll $DLL_WIN"
 if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
     INJECT_ARGS="$INJECT_ARGS --seal"
 fi
+# Payload-is-live markers: the stub-thread console in one, the frame hook (which
+# has no console_loop at all) in the other.
+LIVE_PAT='console ready|tick hook installed'
 # Интерактивное окно консоли (секунды). 0 = one-shot, ровно как раньше.
 # Пока окно открыто, payload читает hromatite-cmd.txt тем же стаб-потоком.
 export HROMATITE_LIVE="${HROMATITE_LIVE:-1800}"
@@ -104,7 +116,7 @@ find_game_pid() {
     wait_live() { # $1 = сколько секунд
         n=0
         while [ "$n" -lt "$1" ]; do
-            new_tail | grep -q "console ready" && return 0
+            new_tail | grep -qE "$LIVE_PAT" && return 0
             n=$((n + 1))
             sleep 1
         done
@@ -142,7 +154,7 @@ find_game_pid() {
             n=0
             while [ "$n" -lt 90 ]; do
                 # успех определяем по строке payload'а в логе игры
-                if new_tail | grep -q "console ready"; then
+                if new_tail | grep -qE "$LIVE_PAT"; then
                     mark_live
                     break
                 fi
