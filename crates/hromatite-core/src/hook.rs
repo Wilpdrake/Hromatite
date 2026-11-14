@@ -1948,6 +1948,50 @@ pub fn command(line: &str) -> Option<Vec<String>> {
     let a1 = it.next().unwrap_or("");
     let a2 = it.next().unwrap_or("");
     match cmd.as_str() {
+        // `l2b` — self-inspection of the shim from inside the payload: the host
+        // cannot read /proc/<pid>/mem under ptrace_scope=1, but the payload can
+        // read its own address space.
+        "l2b" => {
+            let entry = SEAL_ENTRY.load(Ordering::Acquire);
+            let data = SEAL_DATA.load(Ordering::Acquire);
+            let tramp = SEAL_TRAMP.load(Ordering::Acquire);
+            let mut out = vec![format!(
+                "l2b: entry {entry:#x}, data {data:#x}, trampoline {tramp:#x}, probe {:#x}",
+                IMAGE_BASE.load(Ordering::Acquire)
+            )];
+            if entry != 0 {
+                let head = crate::safe::read_upto(entry, 16);
+                let hex: Vec<String> = head.iter().map(|b| format!("{b:02x}")).collect();
+                out.push(format!("  shim bytes: {}", hex.join(" ")));
+            }
+            if data != 0 {
+                let f = |off: usize| crate::safe::read_u64(data + off).unwrap_or(0);
+                out.push(format!(
+                    "  data: lock={:#x} due={:#x} hits={} leaked={} windows={} crypted={} stage={:#x}",
+                    f(0x00),
+                    f(0x08),
+                    f(0x10),
+                    f(0x18),
+                    f(0x28),
+                    f(0x30),
+                    f(0x38)
+                ));
+            }
+            if let Ok(g) = HOOKS.lock() {
+                for h in g.iter() {
+                    let b = crate::safe::read_upto(h.target, 8);
+                    let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+                    out.push(format!(
+                        "  anchor {:#x} -> detour {:#x}, bytes {}",
+                        h.target,
+                        h.detour,
+                        hex.join(" ")
+                    ));
+                }
+            }
+            out.push(format!("  ticks={} installed={}", TICKS.load(Ordering::Relaxed), INSTALLED.load(Ordering::Relaxed)));
+            Some(out)
+        }
         "hook" => {
             let ok = log::guard("hook::install", install_tick).unwrap_or(false);
             Some(vec![format!(
