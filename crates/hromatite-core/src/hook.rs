@@ -1326,6 +1326,14 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     prologue(&mut a);
     a.mov_imm(7, p.data);
     stage(&mut a, 0xF); // the vectored shim was entered (15 = fault path)
+    // Record what faulted: `rcx` = EXCEPTION_POINTERS*, [rcx] = EXCEPTION_RECORD*,
+    // +0x10 = ExceptionAddress, +0x00 = ExceptionCode. Written into the data page
+    // (outside the image) so the host can read it with /proc/<pid>/mem.
+    a.bs(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]
+    a.bs(&[0x48, 0x8B, 0x50, 0x10]); // mov rdx, [rax+0x10]
+    a.bs(&[0x48, 0x89, 0x57, 0x40]); // mov [rdi+0x40], rdx
+    a.bs(&[0x8B, 0x10]); // mov edx, [rax]
+    a.bs(&[0x48, 0x89, 0x57, 0x48]); // mov [rdi+0x48], rdx
     a.mov_imm(10, p.probe);
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax
