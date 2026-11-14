@@ -119,6 +119,10 @@ pub extern "system" fn DllMain(
         // Install before anything can panic, then run the body under a guard:
         // unwinding out of `extern "system"` is UB, returning 1 always is not.
         log::install_panic_hook();
+        // Plan 2: the vectored handler is process-wide and inert until a guard
+        // is armed (`veh::call_*`), so installing it at attach costs nothing and
+        // guarantees the very first guarded call is already covered.
+        hromatite_core::veh::install();
         if log::guard("dllmain", || attach(hinst)).is_none() {
             log::log_tag("dll", "DllMain: panic escaped the attach phase, returning 1 anyway");
         }
