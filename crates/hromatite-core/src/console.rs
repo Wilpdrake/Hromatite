@@ -188,6 +188,66 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
     out
 }
 
+/// domain → assembly record → `Il2CppImage` (+0x28) → `il2cpp_class_from_name`.
+///
+/// This is the *real* lookup path (the older `cls` command brute-forces memory);
+/// it needs `api::identify()` to have found `class_from_name`, which it does on
+/// first use. The assembly is guessed from the namespace and then verified by
+/// the returned class name, so a wrong guess costs a fault-tolerant call.
+fn cls2_lookup(ns: &str, name: &str, asm_hint: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let d = match crate::api::domain() {
+        Some(d) => d,
+        None => return vec!["domain getter not found".into()],
+    };
+    let rep = crate::api::identify();
+    if rep.class_fn.is_none() {
+        out.push("class_from_name not identified — see `api` (retry with `api reset`)".into());
+    }
+
+    let mut cands: Vec<&str> = Vec::new();
+    if !asm_hint.is_empty() {
+        cands.push(asm_hint);
+    }
+    if ns.starts_with("UnityEngine") {
+        cands.push("UnityEngine.CoreModule");
+    }
+    if ns.starts_with("System") || ns.starts_with("Microsoft") {
+        cands.push("mscorlib");
+    }
+    cands.push("Assembly-CSharp");
+    cands.push("mscorlib");
+    cands.push("UnityEngine.CoreModule");
+    let mut seen: Vec<String> = Vec::new();
+    cands.retain(|c| {
+        let k = c.to_ascii_lowercase();
+        let fresh = !seen.contains(&k);
+        seen.push(k);
+        fresh
+    });
+
+    for asm in cands {
+        let img = match crate::api::image_of_domain(d, asm) {
+            Some(i) => i,
+            None => continue,
+        };
+        if let Some(c) = crate::api::class_from_name(img, ns, name) {
+            out.push(format!(
+                "class {ns}.{name} = {c:#x} (assembly {asm}, image {img:#x})"
+            ));
+            if let Some(n) = crate::api::class_name(c) {
+                let ns2 = crate::api::class_namespace(c).unwrap_or_default();
+                out.push(format!("  name: '{n}' namespace: '{ns2}'"));
+            } else {
+                out.push("  name: (unreadable)".into());
+            }
+            return out;
+        }
+    }
+    out.push(format!("class {ns}.{name}: not found (domain {d:#x})"));
+    out
+}
+
 /// Execute one command. Returns the answer lines and a control action.
 pub fn dispatch(line: &str) -> (Vec<String>, Action) {
     let mut it = line.splitn(4, char::is_whitespace);
@@ -210,6 +270,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "entry <имя>               — поля записи сборки".into(),
                 "domain                    — домен и его геттер".into(),
                 "diag                      — полный recon заново".into(),
+                "guard <addr>              — вызов функции под VEH (fault -> Err, не смерть)".into(),
+                "api [reset]               — идентифицировать il2cpp API среди экспортов".into(),
+                "cls2 <ns> <name> [asm]    — класс через il2cpp_class_from_name".into(),
+                "cam                       — короткий тест: UnityEngine.Camera".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
                 "av [addr]                 — safe-чтение + сырое разыменование (проверка VEH)".into(),
                 "seal | quit               — выйти из интерактива (инжектор запечатает образ)".into(),
@@ -399,6 +463,69 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             il2cpp::diagnose().lines().map(|s| s.to_string()).collect(),
             Action::None,
         ),
+        // ---- plan 2: guarded calls + behavioural API identification -------
+        // `guard <addr>` calls a raw GameAssembly RVA-relative function through
+        // the vectored handler: the answer is either a return value or a fault
+        // line, never a dead game (that is the whole point of `veh`).
+        "guard" => match parse_addr(a1) {
+            Some(addr) => {
+                crate::log::log_tag("con", &format!("guard {addr:#x}: calling under VEH"));
+                match crate::veh::call0(addr) {
+                    Ok(v) => (vec![format!("guard {addr:#x}: returned {v:#x}")], Action::None),
+                    Err(f) => (vec![format!("guard {addr:#x}: {f}")], Action::None),
+                }
+            }
+            None => (vec!["usage: guard <addr>".into()], Action::None),
+        },
+        // `api` runs (or reports) the identification of domain_get_assemblies /
+        // class_from_name among the 251 obfuscated exports.
+        "api" => {
+            if a1.eq_ignore_ascii_case("reset") {
+                crate::api::reset();
+                crate::log::log_tag("con", "api cache reset");
+            }
+            let rep = crate::api::identify();
+            let mut out = vec![format!(
+                "domain {:#x}, image {:#x}, tried {}, faulted {}",
+                rep.domain, rep.image, rep.tried, rep.faulted
+            )];
+            match rep.assemblies_fn {
+                Some(f) => out.push(format!(
+                    "domain_get_assemblies: {} rva={:#x} addr={:#x}",
+                    f.name, f.rva, f.addr
+                )),
+                None => out.push("domain_get_assemblies: NOT identified".into()),
+            }
+            match rep.class_fn {
+                Some(f) => out.push(format!(
+                    "class_from_name: {} rva={:#x} addr={:#x}",
+                    f.name, f.rva, f.addr
+                )),
+                None => out.push("class_from_name: NOT identified".into()),
+            }
+            if let Some(l) = rep.layout {
+                out.push(format!(
+                    "class layout: name@+{:#x} ns@+{:#x}",
+                    l.name_off, l.ns_off
+                ));
+            }
+            out.extend(rep.notes.iter().cloned());
+            (out, Action::None)
+        }
+        // `cls2 <ns> <name> [assembly]` — the real il2cpp lookup path:
+        // domain -> assembly -> Il2CppImage (+0x28) -> class_from_name.
+        "cls2" => {
+            if a1.is_empty() || a2.is_empty() {
+                return (vec!["usage: cls2 <namespace> <name> [assembly]".into()], Action::None);
+            }
+            (cls2_lookup(a1, a2, rest.trim()), Action::None)
+        }
+        // `cam` — the shortest end-to-end proof: UnityEngine.Camera must resolve.
+        "cam" => {
+            let mut out = vec!["probe: UnityEngine.Camera".to_string()];
+            out.extend(cls2_lookup("UnityEngine", "Camera", ""));
+            (out, Action::None)
+        }
         // ---- plan 5 self-tests: prove guard()/VEH actually hold -----------
         // `panic` must produce a `[dll] PANIC at file:line:` line and *not*
         // kill the game; the session continues with the next command.
