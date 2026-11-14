@@ -461,7 +461,7 @@ fn cstr_ascii(p: usize, max: usize) -> Option<String> {
 /// Walk a suspected `Il2CppAssembly` array: entries sit 0x48 bytes apart and
 /// the first word of each is a pointer to an ASCII name ("mscorlib.dll",
 /// "DataModel.dll", …). Returned as (offset from `base`, names).
-pub fn walk_assembly_array(base: usize) -> (usize, Vec<String>) {
+pub fn walk_assembly_array(base: usize) -> (usize, Vec<(String, usize)>) {
     for off in (0..0x200).step_by(8) {
         let mut names = Vec::new();
         let mut p = base + off;
@@ -478,7 +478,7 @@ pub fn walk_assembly_array(base: usize) -> (usize, Vec<String>) {
                         && n.chars()
                             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') =>
                 {
-                    names.push(n);
+                    names.push((n, p));
                     p += 0x48;
                 }
                 _ => break,
@@ -489,6 +489,50 @@ pub fn walk_assembly_array(base: usize) -> (usize, Vec<String>) {
         }
     }
     (0, Vec::new())
+}
+
+/// Find the domain without hardcoding an obfuscated name: the domain getter is
+/// one of the few `mov rax,[rip+d]; ret` exports and the only one whose value
+/// carries an assembly array (names rotate on every game update).
+pub fn find_domain() -> Option<usize> {
+    let (ga_base, ga_size) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
+    for (name, rva) in symbols::EXPORTS.iter() {
+        let addr = ga_base + *rva as usize;
+        if addr + 8 > ga_base + ga_size {
+            continue;
+        }
+        let mut b = [0u8; 8];
+        unsafe {
+            core::ptr::copy_nonoverlapping(addr as *const u8, b.as_mut_ptr(), 8);
+        }
+        let is_getter =
+            b[0] == 0x48 && (b[1] == 0x8B || b[1] == 0x8D) && b[2] == 0x05 && b[7] == 0xC3;
+        if !is_getter {
+            continue;
+        }
+        let f: extern "system" fn() -> usize = unsafe { core::mem::transmute(addr) };
+        let v = f();
+        if readable_at(v) && v > 0x10000 && !walk_assembly_array(v).1.is_empty() {
+            log::log(&format!(
+                "console: domain getter {name} (rva {rva:#x}) -> {v:#x}"
+            ));
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Every assembly the runtime holds, in table order, as (name, entry address).
+pub fn assemblies(domain: usize) -> Vec<(String, usize)> {
+    walk_assembly_array(domain).1
+}
+
+/// Look up one assembly by name prefix (case-insensitive).
+pub fn assembly(domain: usize, name: &str) -> Option<(String, usize)> {
+    let want = name.to_ascii_lowercase();
+    assemblies(domain)
+        .into_iter()
+        .find(|(n, _)| n.to_ascii_lowercase().starts_with(&want))
 }
 
 /// Offline-measured on this build: exactly three exports compile to

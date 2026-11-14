@@ -432,7 +432,10 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     r.protect(stub_mem, stub.len(), crate::ffi::PAGE_EXECUTE_READ);
     // Sealing rewrites every page of the image, so the payload must be *done*:
     // wait far longer than the default when a seal is going to follow.
-    let wait_ms = if opts.seal { 600_000 } else { 60_000 };
+    // 30 min: interactive mode (HROMATITE_LIVE) keeps the entry point alive while
+    // the host explores through the command file, and the seal has to happen
+    // after the last answer, not on a timeout.
+    let wait_ms = if opts.seal { 1_800_000 } else { 60_000 };
     let code = r
         .call(stub_mem, 0, wait_ms)
         .ok_or("CreateRemoteThread(stub) failed")?;

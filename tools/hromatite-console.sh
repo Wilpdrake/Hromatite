@@ -28,6 +28,8 @@ FILTER="all"
 FOLLOW=1
 STATUS=0
 RAW=0
+SEND=""
+SHELL_MODE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -36,6 +38,8 @@ while [ $# -gt 0 ]; do
         -n)       HIST="$2"; shift 2 ;;
         -f|--filter) FILTER="$2"; shift 2 ;;
         --no-follow) FOLLOW=0; shift ;;
+        -s|--send) SEND="$2"; shift 2 ;;
+        --shell) SHELL_MODE=1; shift ;;
         --status) STATUS=1; shift ;;
         --raw)    RAW=1; shift ;;
         -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
@@ -44,6 +48,9 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$LOG" ] || LOG="$PREFIX/drive_c/users/steamuser/hromatite.log"
+# командный канал — тот же файл, что читает payload (см. core/src/console.rs)
+CMD_FILE="$PREFIX/drive_c/users/steamuser/hromatite-cmd.txt"
+send_cmd() { printf '%s\n' "$1" >>"$CMD_FILE"; }
 
 COL=1
 [ -t 1 ] || COL=0
@@ -157,4 +164,25 @@ BEGIN { prev = 0 }
 AWKPID=$!
 
 trap 'kill $AWKPID 2>/dev/null; exit 0' INT TERM
-wait $AWKPID
+
+# одна команда и выход («консоль» без интерактива — удобно из скрипта)
+if [ -n "$SEND" ]; then
+    send_cmd "$SEND"
+    printf '%s→ %s%s\n' "$C_DIM" "$SEND" "$C_RST"
+    sleep 1
+    kill $AWKPID 2>/dev/null
+    exit 0
+fi
+
+# интерактив: строки stdin уходят в файл команд, ответы приходят в этот же поток
+if [ "$SHELL_MODE" = 1 ]; then
+    printf '%sконсоль: команда + Enter (help, asm, q 0x…, domain, seal). Ctrl-D — выход.%s\n' "$C_DIM" "$C_RST"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        send_cmd "$line"
+        printf '%s→ %s%s\n' "$C_DIM" "$line" "$C_RST"
+    done
+fi
+
+kill $AWKPID 2>/dev/null
+exit 0

@@ -3,6 +3,7 @@
 //! Everything here targets `x86_64-pc-windows-gnu` — both the injector exe and
 //! the injected dll are Windows binaries, even though the host is Linux.
 
+pub mod console;
 pub mod ffi;
 pub mod il2cpp;
 pub mod log;

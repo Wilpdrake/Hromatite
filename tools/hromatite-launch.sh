@@ -29,6 +29,9 @@ INJECT_ARGS="inject --dll $DLL_WIN"
 if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
     INJECT_ARGS="$INJECT_ARGS --seal"
 fi
+# Интерактивное окно консоли (секунды). 0 = one-shot, ровно как раньше.
+# Пока окно открыто, payload читает hromatite-cmd.txt тем же стаб-потоком.
+export HROMATITE_LIVE="${HROMATITE_LIVE:-1800}"
 LOG="$HOME/.hromatite-launch.log"
 GAME_LOG="$HOME/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/hromatite.log"
 
