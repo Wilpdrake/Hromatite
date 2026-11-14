@@ -183,13 +183,18 @@ fn dump_qwords(addr: usize, n: usize) -> Vec<String> {
 fn find_string(text: &str, max: usize) -> Vec<usize> {
     let pat = text.as_bytes();
     let mut out = Vec::new();
+    let need = pat.len() + 1;
+    if pat.is_empty() {
+        return out;
+    }
     for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
-        if out.len() >= max {
-            break;
+        if out.len() >= max || r.size < need + 1 {
+            continue;
         }
         let mut a = r.base;
-        let end = r.base + r.size;
-        while a + pat.len() < end && out.len() < max {
+        // last start such that a+pat.len() (the NUL) is still inside the region
+        let last = r.base + r.size - need;
+        while a <= last && out.len() < max {
             if unsafe { *(a as *const u8) } == pat[0]
                 && unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
                 && unsafe { *((a + pat.len()) as *const u8) } == 0
@@ -209,8 +214,10 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
     let want = value as u64;
     let mut out = Vec::new();
     for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
-        if out.len() >= max {
-            break;
+        // без проверки размера `base + size - 8` уходит в минус на крошечных
+        // регионах, и цикл читает неотображённую память (это убивало игру)
+        if out.len() >= max || r.size < 16 {
+            continue;
         }
         let mut a = (r.base + 7) & !7usize;
         let end = r.base + r.size - 8;
@@ -342,13 +349,19 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     let mut d = -0x40i64;
                     while d <= 0x40 {
                         let p = slot as i64 + d;
-                        if p > 0 && ns_a.contains(&(unsafe { *(p as usize as *const u64) } as usize)) {
+                        // окно может выйти за границу страницы: без проверки
+                        // здесь был AV, который уронил игру
+                        if p <= 0 || !readable(p as usize) {
+                            d += 8;
+                            continue;
+                        }
+                        if ns_a.contains(&(unsafe { *(p as usize as *const u64) } as usize)) {
                             found += 1;
                             out.push(format!(
                                 "  [{found}] name@{slot:#x} ns@{p:#x} (delta {d:+#x})"
                             ));
                             out.push(format!("     struct base ~{:#x}, window:", slot.wrapping_sub(0x20)));
-                            out.extend(dump_qwords(slot - 0x20, 10));
+                            out.extend(dump_qwords(slot.saturating_sub(0x20), 10));
                         }
                         d += 8;
                     }
