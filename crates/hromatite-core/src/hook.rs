@@ -1468,6 +1468,9 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 static ORIG: AtomicUsize = AtomicUsize::new(0);
 static READER: Mutex<Option<console::Reader>> = Mutex::new(None);
 static POLL_MS: AtomicU64 = AtomicU64::new(0);
+/// Set when a stub-thread console loop exists (`HROMATITE_LIVE > 0`): the tick then
+/// does no file IO, only the heartbeat.
+static LIVE_MODE: AtomicU64 = AtomicU64::new(0);
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
 fn now_ms() -> u64 {
@@ -1517,6 +1520,12 @@ fn work(n: u64, now: u64, dt: u64) {
             "hook",
             &format!("tick {n}, dt={dt}ms (interval {iv}ms)", iv = INTERVAL_MS.load(Ordering::Relaxed)),
         );
+    }
+    // In LIVE mode the stub thread owns the command channel; polling it from
+    // inside a QPC detour makes Unity's GC `SuspendThread` fail ("Fatal error in
+    // GC — SuspendThread loop failed"), so the tick stays passive there.
+    if LIVE_MODE.load(Ordering::Relaxed) > 0 {
+        return;
     }
     let _ = log::guard("hook::work", || {
         let cmds = {
@@ -1853,6 +1862,15 @@ pub fn install_tick() -> bool {
     // decrypt). Cheaper and far less risky than the full shim; the region is still
     // `rw-p` and not PE, only the code pages stay executable.
     let partial = env_flag("HROMATITE_L2B_PARTIAL");
+    let live = std::env::var("HROMATITE_LIVE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    LIVE_MODE.store(live, Ordering::Relaxed);
+    log::log_tag(
+        "hook",
+        &format!(
+            "live_mode={live} (tick polling {})",
+            if live > 0 { "off" } else { "on" }
+        ),
+    );
     let l2b = (env_flag("HROMATITE_L2B") || env_flag("HROMATITE_SEAL")) && !partial;
     log::log_tag(
         "hook",
