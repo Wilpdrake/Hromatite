@@ -8,6 +8,12 @@
 //! and do our work on the game's own stack, for a few microseconds every
 //! `HROMATITE_TICK_MS`.
 //!
+//! Layout: the patched `jmp rel32` lands on a *relay* inside the trampoline page
+//! (allocated within ±2 GiB of the target), and the relay performs an absolute
+//! jump to the detour. That indirection is not optional: wine maps ntdll around
+//! 0x6fff_xxxx_xxxx while a manual-mapped payload lives near 0x1xx_xxxx, a gap
+//! of ~25 TB that no rel32 can span.
+//!
 //! Rules of the house (same spirit as `safe`):
 //!   * never patch what we have not decoded — an unknown opcode in the prologue
 //!     means "refuse the hook", not "guess";
@@ -397,8 +403,9 @@ pub struct Hook {
     pub prologue: usize,
     alloc_base: usize,
     alloc_size: usize,
-    /// 16-byte aligned original bytes (the windows we may rewrite live here)
-    orig16: [u8; 16],
+    /// 16-byte aligned original bytes (32 of them: the 5-byte patch may straddle
+    /// a 16-byte boundary, see `wmode 0`)
+    orig32: [u8; 32],
     base16: usize,
     /// 8 = single 8-byte atomic store, 16 = `cmpxchg16b`, 0 = narrow fallback
     wmode: u8,
@@ -415,14 +422,14 @@ pub struct Hook {
 ///   blocks: write the `rel32` tail first, then the opcode. A thread that
 ///   fetches in between sees the original opcode with a patched displacement —
 ///   the only non-atomic case.
-unsafe fn write_window(base16: usize, target: usize, new16: &[u8; 16], wmode: u8) -> bool {
+unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8) -> bool {
     let o16 = target - base16;
     match wmode {
         8 => {
             let base = if o16 >= 8 { base16 + 8 } else { base16 };
             let off = o16 - (base - base16);
             let mut w = [0u8; 8];
-            w.copy_from_slice(&new16[off..off + 8]);
+            w.copy_from_slice(&new32[off..off + 8]);
             unsafe { core::ptr::write_volatile(base as *mut u64, u64::from_le_bytes(w)) };
             true
         }
@@ -437,7 +444,7 @@ unsafe fn write_window(base16: usize, target: usize, new16: &[u8; 16], wmode: u8
             let mut newv = [0u64; 2];
             for i in 0..2 {
                 let mut w = [0u8; 8];
-                w.copy_from_slice(&new16[i * 8..i * 8 + 8]);
+                w.copy_from_slice(&new32[i * 8..i * 8 + 8]);
                 newv[i] = u64::from_le_bytes(w);
             }
             for _ in 0..8 {
@@ -476,10 +483,10 @@ unsafe fn write_window(base16: usize, target: usize, new16: &[u8; 16], wmode: u8
         }
         _ => {
             // narrow: rel32 part first, opcode last
-            let tail = [new16[o16 + 1], new16[o16 + 2], new16[o16 + 3], new16[o16 + 4]];
+            let tail = [new32[o16 + 1], new32[o16 + 2], new32[o16 + 3], new32[o16 + 4]];
             unsafe {
                 core::ptr::write_volatile((target + 1) as *mut [u8; 4], tail);
-                core::ptr::write_volatile(target as *mut u8, new16[o16]);
+                core::ptr::write_volatile(target as *mut u8, new32[o16]);
             }
             true
         }
@@ -500,10 +507,18 @@ fn flush(addr: usize, len: usize) {
     }
 }
 
+/// Offset of the relay slot inside the trampoline page. The detour usually lives
+/// far outside rel32 reach (wine maps ntdll at 0x6fff_xxxx_xxxx while a
+/// manual-mapped payload sits near 0x1xx_xxxx), so the patched `jmp rel32` lands
+/// on this relay, which does an absolute jump to the real detour.
+const RELAY_OFF: usize = 0x100;
+
 struct Prep {
     target: usize,
     prologue: usize,
     trampoline: usize,
+    /// `trampoline + RELAY_OFF`; holds `ff 25 00000000 <qword detour>`
+    relay: usize,
     alloc_base: usize,
     alloc_size: usize,
 }
@@ -589,38 +604,75 @@ fn prepare(target: usize) -> Option<Prep> {
     code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
     let back = (target + prologue) as u64;
     code.extend_from_slice(&back.to_le_bytes());
+    if code.len() > RELAY_OFF {
+        log::log_tag("hook", &format!("prepare: trampoline code {} bytes, relay slot busy", code.len()));
+        return None;
+    }
+
+    // relay slot: ff 25 00000000 <qword detour> — filled in by `patch`
+    let mut relay_bytes = [0u8; 14];
+    relay_bytes[0] = 0xFF;
+    relay_bytes[1] = 0x25;
 
     unsafe {
         core::ptr::copy_nonoverlapping(code.as_ptr(), tramp as *mut u8, code.len());
+        core::ptr::copy_nonoverlapping(relay_bytes.as_ptr(), (tramp + RELAY_OFF) as *mut u8, 14);
     }
-    if set_range_protect(tramp, PAGE_SIZE, ffi::PAGE_EXECUTE_READ).is_none() {
-        log::log_tag("hook", "prepare: VirtualProtect(RX) on trampoline failed");
+    // left RW on purpose: `patch` still has to fill the relay, and only after
+    // that does anyone jump here (the target is patched last)
+    if set_range_protect(tramp, PAGE_SIZE, ffi::PAGE_EXECUTE_READWRITE).is_none() {
+        log::log_tag("hook", "prepare: VirtualProtect(RWX) on trampoline failed");
         return None;
     }
-    flush(tramp, code.len());
-    Some(Prep { target, prologue, trampoline: tramp, alloc_base: tramp, alloc_size })
+    Some(Prep {
+        target,
+        prologue,
+        trampoline: tramp,
+        relay: tramp + RELAY_OFF,
+        alloc_base: tramp,
+        alloc_size: PAGE_SIZE,
+    })
 }
 
 /// Install the hook for an already prepared trampoline.
 fn patch(p: &Prep, detour: usize) -> Option<Hook> {
-    let rel = detour as i64 - (p.target as i64 + 5);
+    // The patched instruction can only reach the relay (same ±2 GiB); the relay
+    // then jumps absolutely to the detour wherever it lives.
+    let rel = p.relay as i64 - (p.target as i64 + 5);
     if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
-        log::log_tag("hook", &format!("patch: detour {detour:#x} out of rel32 reach of {:#x}", p.target));
+        log::log_tag("hook", &format!("patch: relay {:#x} out of rel32 reach of {:#x}", p.relay, p.target));
         return None;
     }
+    // publish the detour in the relay *before* the target can jump to it
+    unsafe {
+        core::ptr::write_volatile((p.relay + 6) as *mut u64, detour as u64);
+    }
+    if set_range_protect(p.trampoline, PAGE_SIZE, ffi::PAGE_EXECUTE_READ).is_none() {
+        log::log_tag("hook", "patch: VirtualProtect(RX) on trampoline failed");
+        return None;
+    }
+    flush(p.trampoline, PAGE_SIZE);
     let base16 = p.target & !15usize;
     let o16 = p.target - base16;
     let wmode: u8 = if o16 <= 3 { 8 } else if o16 <= 11 { 16 } else { 0 };
-    let orig = crate::safe::read_bytes(base16, 16)?;
-    let mut orig16 = [0u8; 16];
-    orig16.copy_from_slice(&orig);
+    // 32 bytes: a 5-byte patch can start at offset 13 of a 16-byte block
+    let mut orig32 = [0u8; 32];
+    let got = crate::safe::read_upto(base16, 32);
+    if got.len() < o16 + 5 || got.len() < 16 {
+        log::log_tag(
+            "hook",
+            &format!("patch: only {} bytes readable at {base16:#x}, target {:#x}", got.len(), p.target),
+        );
+        return None;
+    }
+    orig32[..got.len()].copy_from_slice(&got);
 
     let old_prot = set_range_protect(p.target, p.prologue + 8, ffi::PAGE_EXECUTE_READWRITE)?;
 
-    let mut new16 = orig16;
-    new16[o16] = 0xE9;
-    new16[o16 + 1..o16 + 5].copy_from_slice(&(rel as i32).to_le_bytes());
-    let ok = unsafe { write_window(base16, p.target, &new16, wmode) };
+    let mut new32 = orig32;
+    new32[o16] = 0xE9;
+    new32[o16 + 1..o16 + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+    let ok = unsafe { write_window(base16, p.target, &new32, wmode) };
 
     // restore: the old protection when it was executable, RX otherwise
     let back = if old_prot & 0xF0 != 0 { old_prot } else { ffi::PAGE_EXECUTE_READ };
@@ -634,8 +686,8 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
     log::log_tag(
         "hook",
         &format!(
-            "patch: {:#x} -> jmp {detour:#x} (rel32 {rel:+#x}), prologue {} bytes, window {} bytes at {base16:#x}, protect {old_prot:#x}",
-            p.target, p.prologue,
+            "patch: {:#x} -> jmp relay {:#x} (rel32 {rel:+#x}) -> detour {detour:#x}, prologue {} bytes, window {} bytes at {base16:#x}, protect {old_prot:#x}",
+            p.target, p.relay, p.prologue,
             if wmode == 8 { 8 } else { 16 }
         ),
     );
@@ -646,7 +698,7 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
         prologue: p.prologue,
         alloc_base: p.alloc_base,
         alloc_size: p.alloc_size,
-        orig16,
+        orig32,
         base16,
         wmode,
         detached: false,
@@ -654,8 +706,10 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
 }
 
 /// Install an inline hook at `target`: the first instruction(s) are copied to a
-/// newly allocated page (forced near, so the jump back is a rel32/absolute
-/// sequence) and are then patched to jump to `detour`.
+/// newly allocated page (forced near, so the patched `jmp` can reach it) and the
+/// target is patched to jump to a relay in that page, which jumps absolutely to
+/// `detour` — the detour itself may live anywhere in the address space (wine
+/// keeps ntdll near 0x6fff_xxxx_xxxx, far outside rel32 reach of a payload).
 ///
 /// Thread safety: the patch itself is one atomic store, so a concurrently
 /// executing thread sees either the old or the new instruction stream. It cannot
@@ -675,7 +729,7 @@ impl Hook {
         }
         // the whole 16-byte window is rewritten, so the original snapshot is
         // the payload — no read-back needed
-        let cur = self.orig16;
+        let cur = self.orig32;
         let old = set_range_protect(self.target, self.prologue + 8, ffi::PAGE_EXECUTE_READWRITE);
         let ok = if old.is_some() {
             unsafe { write_window(self.base16, self.target, &cur, self.wmode) }
@@ -943,6 +997,7 @@ pub fn install_tick() -> bool {
         log::log_tag("hook", &format!("tick interval set to {}ms", n.max(1)));
     }
     START_MS.store(now_ms(), Ordering::Relaxed);
+    WORK_MS.store(now_ms(), Ordering::Relaxed);
     if let Ok(mut g) = READER.lock()
         && g.is_none()
     {
