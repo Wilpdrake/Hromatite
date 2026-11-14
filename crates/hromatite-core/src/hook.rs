@@ -1683,6 +1683,15 @@ static SEAL_TRAMP: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
+/// Executable sections only: the range the shim protects `RX` inside a window.
+static CODE_LO: AtomicUsize = AtomicUsize::new(0);
+static CODE_HI: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_code_range(lo: usize, hi: usize) {
+    CODE_LO.store(lo, Ordering::Release);
+    CODE_HI.store(hi, Ordering::Release);
+}
+
 /// Range that stays plaintext when the image is sealed (the payload's `.text`).
 /// With `HROMATITE_L2B_PARTIAL=1` the tick is the ordinary in-image detour and
 /// the injector simply skips these pages — no shim, no decrypt-on-call.
@@ -1767,7 +1776,7 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         flush: flush_fn,
         gettick,
         note: l2b_note as *const () as u64,
-        text_lo: KEEP_LO.load(Ordering::Acquire) as u64,
+        text_lo: CODE_LO.load(Ordering::Acquire) as u64,
         text_hi: KEEP_HI.load(Ordering::Acquire) as u64,
     };
     let (code, data) = install_shims(params)?;

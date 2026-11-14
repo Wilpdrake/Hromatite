@@ -482,14 +482,29 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     } else {
         None
     };
+    // Executable sections only: the shim makes exactly this range `RX` inside the
+    // window. Using the `keep` range instead turned `.data` read-only, and the
+    // Rust detour faulted on its own statics (measured: `stage=7`, lock stuck).
+    let code = img
+        .sections
+        .iter()
+        .filter(|s| s.is_executable())
+        .fold((usize::MAX, 0usize), |(lo, hi), s| {
+            let l = base + s.va as usize;
+            let h = l + s.vsize as usize;
+            (lo.min(l), hi.max(h))
+        });
+    let (code_lo, code_hi) = if code.0 == usize::MAX { (0, 0) } else { code };
     let params = r
-        .alloc(32, crate::ffi::PAGE_READWRITE)
+        .alloc(48, crate::ffi::PAGE_READWRITE)
         .ok_or("param alloc failed")?;
-    let mut pbuf = [0u8; 32];
+    let mut pbuf = [0u8; 48];
     pbuf[..8].copy_from_slice(&(base as u64).to_le_bytes());
     pbuf[8..16].copy_from_slice(&(size as u64).to_le_bytes());
     pbuf[16..24].copy_from_slice(&(text.0 as u64).to_le_bytes());
     pbuf[24..32].copy_from_slice(&(text.1 as u64).to_le_bytes());
+    pbuf[32..40].copy_from_slice(&(code_lo as u64).to_le_bytes());
+    pbuf[40..48].copy_from_slice(&(code_hi as u64).to_le_bytes());
     if !r.write(params, &pbuf) {
         return Err("param write failed".into());
     }

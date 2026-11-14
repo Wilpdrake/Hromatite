@@ -97,6 +97,11 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
             if text_lo > base && text_hi > text_lo {
                 hook::set_keep_range(text_lo, text_hi);
             }
+            let code_lo = *p.add(4);
+            let code_hi = *p.add(5);
+            if code_lo > base && code_hi > code_lo {
+                hook::set_code_range(code_lo, code_hi);
+            }
         }
     }
     // Boot marker: proves execution even if the logger itself is at fault.
