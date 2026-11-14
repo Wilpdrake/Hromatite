@@ -436,6 +436,56 @@ fn readable_at(addr: usize) -> bool {
     }
 }
 
+/// Printable NUL-terminated ASCII string at `p`, or None.
+fn cstr_ascii(p: usize, max: usize) -> Option<String> {
+    if p < 0x10000 || !readable_at(p) {
+        return None;
+    }
+    let mut s = String::new();
+    for i in 0..max {
+        if !readable_at(p + i) {
+            return None;
+        }
+        let b = unsafe { *((p + i) as *const u8) };
+        if b == 0 {
+            return Some(s);
+        }
+        if !(32..127).contains(&b) {
+            return None;
+        }
+        s.push(b as char);
+    }
+    Some(s)
+}
+
+/// Walk a suspected `Il2CppAssembly` array: entries sit 0x48 bytes apart and
+/// the first word of each is a pointer to an ASCII name ("mscorlib.dll",
+/// "DataModel.dll", …). Returned as (offset from `base`, names).
+pub fn walk_assembly_array(base: usize) -> (usize, Vec<String>) {
+    for off in (0..0x200).step_by(8) {
+        let mut names = Vec::new();
+        let mut p = base + off;
+        while names.len() < 400 {
+            let q = unsafe { *(p as *const u64) } as usize;
+            match cstr_ascii(q, 64) {
+                Some(n)
+                    if n.len() >= 3
+                        && n.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') =>
+                {
+                    names.push(n);
+                    p += 0x48;
+                }
+                _ => break,
+            }
+        }
+        if names.len() >= 2 {
+            return (off, names);
+        }
+    }
+    (0, Vec::new())
+}
+
 /// Offline-measured on this build: exactly three exports compile to
 /// `mov rax,[rip+d]; ret` (`zrUNgtwbjgD`, `wYRnnMQuvvH`, `hwyFQMqtopx`).
 /// `il2cpp_domain_get` is one of them, so call all of them and look at what
@@ -482,6 +532,14 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
                         out.push_str(&format!("        [..]+{:#x}: {qq:#016x}\n", j * 8));
                     }
                 }
+            }
+            let (off, names) = walk_assembly_array(v);
+            if names.len() >= 2 {
+                out.push_str(&format!(
+                    "   assembly array @+{off:#x}: {} entries, first {:?}\n",
+                    names.len(),
+                    &names[..names.len().min(8)]
+                ));
             }
         }
     }
