@@ -4,9 +4,11 @@
 //! everything runs inline on the stub thread the injector already started.
 //! Waiting for il2cpp there is fine — that thread is ours, not the game's.
 //!
-//! M1/M2 scope: prove we are inside VRChat's wine process, that
-//! GameAssembly/UnityPlayer are there, and resolve UnityPlayer's private export
-//! table. No game function is called except the ones we have identified.
+//! Failure containment (plan 5): a Rust panic must never escape `DllMain`.
+//! Unwinding through an `extern "system"` frame is UB, and under Proton it shows
+//! up as "Fatal error in GC" rather than a message — so every stage is run
+//! through `log::guard`, and the whole body again at the entry point.
+//! (Access violations are *not* caught here: that is the VEH, plan 2.)
 
 use hromatite_core::{console, il2cpp, log, procs, GAME_ASSEMBLY, UNITY_PLAYER};
 
@@ -49,7 +51,12 @@ fn console_loop(secs: u32) -> bool {
     loop {
         for line in reader.poll() {
             log::log_tag("con", &format!("> {line}"));
-            let (out, action) = console::dispatch(&line);
+            // One bad command (a panic in a scan loop) must not end the session.
+            let answered = log::guard("console::dispatch", || console::dispatch(&line));
+            let (out, action) = match answered {
+                Some(v) => v,
+                None => (vec!["command panicked (see PANIC line above)".to_string()], console::Action::None),
+            };
             for l in out {
                 log::log_tag("con", &l);
             }
@@ -69,6 +76,39 @@ fn console_loop(secs: u32) -> bool {
     }
 }
 
+fn attach(hinst: *mut core::ffi::c_void) {
+    // Boot marker: proves execution even if the logger itself is at fault.
+    let _ = std::fs::write("C:\\dllmain-probe.txt", b"reached DllMain\n");
+    log::log_tag("dll", "DllMain(PROCESS_ATTACH), inline (no extra thread)");
+
+    // LoadLibrary-style delivery leaves us in the PEB module list; drop the
+    // entry so a module sweep sees only the game's own files.
+    let unlinked = log::guard("peb-unlink", || procs::unlink_from_peb(hinst as usize))
+        .unwrap_or(false);
+    log::log_tag("dll", &format!("peb unlink: {unlinked}"));
+
+    // Tests set HROMATITE_WAIT=2 so the stub thread returns quickly.
+    let budget: u32 = std::env::var("HROMATITE_WAIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
+    if ready {
+        // The recon walks unknown structures; a panic (index/Option arithmetic)
+        // is expected there sooner or later and must stay contained.
+        let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
+    }
+    // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
+    let live: u32 = std::env::var("HROMATITE_LIVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if live > 0 {
+        let _ = log::guard("console_loop", || console_loop(live));
+    }
+    log::log_tag("dll", "recon done, returning from DllMain");
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
     hinst: *mut core::ffi::c_void,
@@ -76,32 +116,12 @@ pub extern "system" fn DllMain(
     _reserved: *mut core::ffi::c_void,
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
-        // Boot marker: proves execution even if the logger itself is at fault.
-        let _ = std::fs::write("C:\\dllmain-probe.txt", b"reached DllMain\n");
-        log::log_tag("dll", "DllMain(PROCESS_ATTACH), inline (no extra thread)");
-
-        // LoadLibrary-style delivery leaves us in the PEB module list; drop the
-        // entry so a module sweep sees only the game's own files.
-        let unlinked = procs::unlink_from_peb(hinst as usize);
-        log::log_tag("dll", &format!("peb unlink: {unlinked}"));
-
-        // Tests set HROMATITE_WAIT=2 so the stub thread returns quickly.
-        let budget: u32 = std::env::var("HROMATITE_WAIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120);
-        if wait_for_modules(budget) {
-            il2cpp::run_once();
+        // Install before anything can panic, then run the body under a guard:
+        // unwinding out of `extern "system"` is UB, returning 1 always is not.
+        log::install_panic_hook();
+        if log::guard("dllmain", || attach(hinst)).is_none() {
+            log::log_tag("dll", "DllMain: panic escaped the attach phase, returning 1 anyway");
         }
-        // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
-        let live: u32 = std::env::var("HROMATITE_LIVE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if live > 0 {
-            console_loop(live);
-        }
-        log::log_tag("dll", "recon done, returning from DllMain");
     }
     1
 }

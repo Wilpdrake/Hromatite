@@ -123,6 +123,10 @@ fn inject(
 }
 
 fn main() {
+    // Same panic reporting in the injector as in the payload, so a panic in the
+    // mapper leaves a `[dll] PANIC at file:line:` line in the log instead of
+    // only a message on a stderr nobody reads under Proton.
+    log::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dll: Option<String> = None;
     let mut target = String::from(GAME_EXE);
