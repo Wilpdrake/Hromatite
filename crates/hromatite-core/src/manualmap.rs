@@ -472,7 +472,12 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
             (lo, hi.max(lo + s.vsize as usize))
         })
         .unwrap_or((0, 0));
-    let keep_range = if text.0 != 0 && text.1 > text.0 {
+    // Only the partial mode keeps pages plaintext; the shim mode seals everything
+    // (it decrypts on entry instead).
+    let partial = std::env::var("HROMATITE_L2B_PARTIAL")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    let keep_range = if partial && text.0 != 0 && text.1 > text.0 {
         Some((text.0 & !0xFFF, (text.1 + 0xFFF) & !0xFFF))
     } else {
         None
