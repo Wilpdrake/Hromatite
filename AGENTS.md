@@ -596,99 +596,48 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 
 ---
 
-## 16. Задание на следующую сессию (план 5 → 2 → 3 → 4)
+## 16. Состояние и план следующей сессии
 
-Порядок выбран сознательно: сначала гигиена (паника в DLL = смерть игры), потом
-infra guarded-call (она же нужна хуку и трамплину), потом уход своего потока,
-и только потом L2b на этом фундаменте.
+Порядок работ выбран пользователем: **план 5 → 2 → 3 → 4**, план 1 (M3 «в лоб»,
+ручной разбор структур) отложен. Обоснование порядка: гигиена нужна до всего
+(паника в DLL = смерть игры); VEH/guarded-call — инфраструктура, на которой
+потом держатся хук и трамплин; хук убирает свой поток и `HROMATITE_LIVE`;
+L2b строится на трамплине из плана 3.
 
-Готовый промпт для новой сессии (копировать целиком):
+Где мы сейчас (проверено, не переоткрывать):
+- Инжект работает: manual map, RX-страницы, стёртые заголовки, один стаб-поток;
+  `--seal` после возврата payload'а XOR'ит образ → регион `rw-p`, содержимое не PE
+  (проверено по `/proc/<pid>/maps` в живой игре).
+- Домен il2cpp находится без хардкода имён: `il2cpp::find_domain()` перебирает
+  экспорты формы `mov rax,[rip+d]; ret` и берёт тот, чей результат даёт ≥2 записи
+  в `walk_assembly_array`. Сейчас **216 сборок**, запись stride 0x48.
+- `entry+0x28` — `Il2CppCodeGenModule` (имя `*.dll`, 0x1dc5 указателей кода,
+  adjustor thunks); `+0x00` имя без `.dll`, `+0x38` имя с `.dll`.
+  Таблица `Il2CppClass` ещё не найдена — это и есть вход в M3.
+- Консоль: файл-канал `hromatite-cmd.txt`, ноль сокетов; команды
+  `q b s ws find findb findw asm entry domain cls diag seal quit`; окно
+  открывается автоматически при старте игры (`tools/hromatite-autoconsole.sh`).
+  `HROMATITE_LIVE=<сек>` держит окно (костыль для дебага, в проде его уберёт хук).
+- `panic = "abort"` в release: любая паника/AV в payload убивает игру
+  (наблюдали «Fatal error in GC / SuspendThread loop failed»).
 
-```
-Проект: /home/wilpdrake/RustroverProjects/Hromatite — Rust workspace под
-x86_64-pc-windows-gnu: Hromatite.exe (инжектор/CLI в wine), crates/hromatite-core
-(вся Win32/PE/il2cpp-механика), crates/hromatite-dll (payload, cdylib),
-crates/test-target (подставной exe). Сборка: `cargo build --workspace --release`.
-Перед началом прочитай AGENTS.md (§0–§8 и последние записи §17-журнала) —
-там все проверенные факты и грабли.
-
-Игра: VRChat (appid 438100) через Proton Experimental + EAC.
-Запуск: `steam steam://rungameid/438100`; launch options = %command% с
-/home/wilpdrake/RustroverProjects/Hromatite/tools/hromatite-launch.sh.
-Wrapper сам инжектит payload и открывает консоль (tools/hromatite-autoconsole.sh
-следит за маркером ~/.hromatite-live).
-
-Логи и управление:
-- ~/.hromatite-launch.log — wrapper; <prefix>/drive_c/users/steamuser/hromatite.log
-  — payload; <prefix>/…/hromatite-cmd.txt — файл-канал команд.
-- консоль: `tools/hromatite-console.sh --shell` (интерактив) или
-  `--send "<cmd>"`; команды: help q b s ws find findb findw asm entry domain cls
-  diag seal quit; `--status` ищет наш образ по подписи шифра.
-
-Что уже проверено в живой игре (не переоткрывать):
-- HROMATITE_LIVE=<сек> держит окно консоли; 0 = one-shot. Инжектор при --seal
-  ждёт entry до 30 мин и затем XOR'ит образ (L2 seal).
-- Домен ищется без хардкода: il2cpp::find_domain() перебирает экспорты формы
-  `mov rax,[rip+d]; ret`, вызывает их и берёт тот, у которого
-  walk_assembly_array находит ≥2 сборки. Сейчас 216 сборок (stride 0x48).
-- entry+0x28 = Il2CppCodeGenModule (имя ".dll", 0x1dc5 указателей кода,
-  adjustor thunks); entry+0x00 имя без .dll, +0x38 имя с .dll.
-- В release-профиле `panic = "abort"`: любая паника в DLL убивает игру
-  (наблюдали «Fatal error in GC / SuspendThread loop failed» после
-  неохраняемого чтения в консольной команде).
-- Консоль: только файлы, ноль сокетов; в LIVE-режиме живёт один наш стаб-поток.
-
-Задача сессии — четыре плана строго в этом порядке.
-
-ПЛАН 5 — гигиена (делать первым)
-1. Собрать DLL так, чтобы паника не убивала игру: отдельный профиль с
-   panic="unwind" для hromatite-dll (проверить, поддерживает ли cargo
-   per-package profile override) + std::panic::catch_unwind вокруг
-   console::dispatch и вокруг шагов recon; паника → строка в логе.
-2. Пройти все чтения памяти: каждое разыменование вне проверенного региона —
-   через readable()/try_read. В console.rs (cls/find/findb) уже поправлено;
-   проверить il2cpp.rs (probe_getters, window, snap_dump, walk_assembly_array)
-   и manualmap.rs.
-3. A/B по EAC, по 30 минут на режим: (A) HROMATITE_DISABLE=1 — чистый запуск;
-   (B) инжект + --seal + HROMATITE_LIVE=0; (C) инжект + окно консоли открыто.
-   Фиксировать kick / error 16 / «Fatal error in GC», результат — таблица в
-   AGENTS §8.4.
-Done: паника в консольной команде не убивает игру; таблица A/B заполнена.
-
-ПЛАН 2 — il2cpp API через guarded call
-1. VEH: AddVectoredExceptionHandler (ffi.rs) + флаг «внутри нашего вызова» —
-   AV превращается в Err, процесс живёт.
-2. Найти среди 251 экспорта (RVA есть в symbols.rs) функции
-   il2cpp_domain_get_assemblies, il2cpp_class_from_name, il2cpp_field_get_value.
-   Идентификация поведенческая: вызвать под VEH с заведомо валидными
-   аргументами и проверить, что вернулся указатель с ожидаемыми строками.
-3. Слой безопасных обёрток (core/src/api.rs) — M3 писать на нём.
-Done: class_from_name(image,"UnityEngine","Camera") отдаёт стабильный
-указатель, имя читается.
-
-ПЛАН 3 — хук в поток игры, убрать свой поток
-1. Найти функцию раз-в-кадр (PlayerLoop в GameAssembly) или Present; поставить
-   trampoline-хук (5-байтовый jmp + восстановленные инструкции), тик раз в N
-   кадров.
-2. DllMain возвращается сразу, вся логика в хуке; HROMATITE_LIVE остаётся
-   fallback-ом.
-3. Проверить, что кадр не рвётся и что изменение .text не палится (EAC на
-   Linux читает память; проверить, есть ли хэш .text).
-Done: при закрытом инжекторе и HROMATITE_LIVE=0 консоль всё равно отвечает.
-
-ПЛАН 4 — L2b, шифр в покое при живом коде
-1. Трамплин-страница вне образа (RX, одна страница): расшифровать страницы →
-   VirtualProtect RX → вызвать → RW → XOR обратно.
-2. Тик из хука ходит только через трамплин.
-3. `tools/hromatite-console.sh --status` должен одновременно показывать
-   запечатанный регион и получать живые ответы на команды.
-Done: между тиками регион rw-p, содержимое не PE, команды отвечают.
-
-Правила работы: план → согласование (нумерованные варианты 1/2/3/4) → код →
-короткий отчёт с фактами из логов. Коммит на каждое изменение, в конце — запись
-в AGENTS.md §17-журнал. Файлы игры не трогать. Не запускать второй `proton run`
-на живом префиксе.
-```
+Ближайшие четыре шага (кратко, без готового промпта):
+1. **План 5 — гигиена.** panic="unwind" для DLL + `catch_unwind` вокруг
+   `console::dispatch` и шагов recon; все разыменования через `readable()`;
+   A/B по EAC на 30 мин на режим (чистый запуск / seal без окна / с окном) →
+   таблица в §8.4. Готово: паника в команде не убивает игру; таблица заполнена.
+2. **План 2 — guarded call.** VEH + флаг «внутри вызова» → AV возвращается как
+   ошибка; поведенческая идентификация `domain_get_assemblies`,
+   `class_from_name`, `field_get_value` среди 251 экспорта; слой обёрток
+   `core/src/api.rs`. Готово: `class_from_name(image,"UnityEngine","Camera")`
+   отдаёт стабильный указатель с читаемым именем.
+3. **План 3 — хук в поток игры.** Найти функцию раз-в-кадр (`PlayerLoop`/Present),
+   trampoline-хук, тик раз в N кадров; `DllMain` возвращается сразу,
+   `HROMATITE_LIVE` — только fallback. Готово: при `HROMATITE_LIVE=0` и закрытом
+   инжекторе консоль отвечает.
+4. **План 4 — L2b.** Трамплин-страница вне образа: расшифровать → RX → вызвать →
+   RW → XOR; тик ходит только через трамплин. Готово: между тиками регион `rw-p`
+   и не PE, команды отвечают.
 
 ## 17. Журнал работ (дополнять после каждого завершения)
 
