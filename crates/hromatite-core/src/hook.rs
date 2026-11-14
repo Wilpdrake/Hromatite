@@ -1159,6 +1159,29 @@ fn stage(a: &mut Asm, n: u8) {
     a.bs(&[0x48, 0xC7, 0x47, 0x38, n]);
 }
 
+/// Stage logger for the shim. The shim has no logger of its own, but the image is
+/// plaintext while it runs, so a plain Rust call is legal. Printed once per stage
+/// (a static array dedupes), which makes the log itself the breadcrumb trail.
+static mut NOTE_SEEN: [bool; 16] = [false; 16];
+
+pub unsafe extern "system" fn l2b_note(stage: u64) {
+    let i = (stage as usize) & 0xF;
+    unsafe {
+        if NOTE_SEEN[i] {
+            return;
+        }
+        NOTE_SEEN[i] = true;
+    }
+    log::log_tag("l2b", &format!("stage {stage}"));
+}
+
+/// `mov rcx, imm; call rax` — one breadcrumb.
+fn note(a: &mut Asm, p: &ShimParams, stage: u64) {
+    a.mov_imm(1, stage);
+    a.call_imm(p.note);
+    a.mov_imm(7, p.data); // a Rust call may clobber rdi (it is not preserved by our callee)
+}
+
 /// `VirtualProtect(base, size, prot, &old_prot)`
 fn protect_call(a: &mut Asm, p: &ShimParams, prot: u32) {
     a.set_args(p.base, p.size, prot, p.data + D_OLD as u64);
@@ -1177,6 +1200,7 @@ pub struct ShimParams {
     pub vprotect: u64,
     pub flush: u64,
     pub gettick: u64,
+    pub note: u64,
 }
 
 /// The tick shim, entered by every `QueryPerformanceCounter` call.
@@ -1206,13 +1230,15 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.jcc(4, done); // je done — nested call from inside our own detour
     a.try_lock();
     a.jcc(5, done); // jnz — another thread owns the window
-    stage(&mut a, 5); // window taken, about to decrypt
+    note(&mut a, p, 5); // window taken, about to decrypt
+    stage(&mut a, 5);
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
     stage(&mut a, 1);
     // Order matters: the pages are RW (that is what the seal left behind), so
     // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
+    note(&mut a, p, 6); // decrypt done, protecting
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
     // The decrypted bytes must be visible to the instruction fetcher:
     // FlushInstructionCache(GetCurrentProcess() = -1, base, size).
@@ -1256,6 +1282,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_imm(7, p.data);
     a.mov_rr(1, 7); // mov rcx, rdi — the detour takes the data page
     a.call_imm(p.detour);
+    note(&mut a, p, 3); // detour returned
     stage(&mut a, 3);
     a.cmp_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.jcc(4, release); // je release — no window was opened
@@ -1711,6 +1738,7 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         vprotect,
         flush: flush_fn,
         gettick,
+        note: l2b_note as *const () as u64,
     };
     let (code, data) = install_shims(params)?;
     let entry = code;
@@ -2058,6 +2086,7 @@ mod tests {
             vprotect: 0x7f00_0001_0000,
             flush: 0x7f00_0001_0100,
             gettick: 0x7f00_0001_0200,
+            note: 0x7f00_0001_0300,
         }
     }
 
