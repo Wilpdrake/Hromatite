@@ -1671,6 +1671,19 @@ static SEAL_TRAMP: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 static IMAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
+/// Range that stays plaintext when the image is sealed (the payload's `.text`).
+/// With `HROMATITE_L2B_PARTIAL=1` the tick is the ordinary in-image detour and
+/// the injector simply skips these pages — no shim, no decrypt-on-call.
+static KEEP_LO: AtomicUsize = AtomicUsize::new(0);
+static KEEP_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Called from `DllMain` with the values the injector passed (r8).
+pub fn set_keep_range(lo: usize, hi: usize) {
+    KEEP_LO.store(lo, Ordering::Release);
+    KEEP_HI.store(hi, Ordering::Release);
+    log::log_tag("hook", &format!("code range kept plaintext: {lo:#x}..{hi:#x}"));
+}
+
 /// Called from `DllMain` with the values the injector passed (r8).
 pub fn set_image_range(base: usize, size: usize) {
     if base != 0 && size != 0 {
@@ -1801,7 +1814,20 @@ pub fn install_tick() -> bool {
     // tick is entered through a shim page instead of `qpc_detour` directly.
     // `HROMATITE_SEAL` and `HROMATITE_L2B` both arm it (the wrapper exports SEAL
     // as 0 when neither is set, which keeps the old in-image behaviour).
-    let l2b = env_flag("HROMATITE_L2B") || env_flag("HROMATITE_SEAL");
+    // `HROMATITE_L2B_PARTIAL=1`: the injector seals everything except our `.text`,
+    // so the tick runs as a plain in-image detour (no shim page, no per-call
+    // decrypt). Cheaper and far less risky than the full shim; the region is still
+    // `rw-p` and not PE, only the code pages stay executable.
+    let partial = env_flag("HROMATITE_L2B_PARTIAL");
+    let l2b = (env_flag("HROMATITE_L2B") || env_flag("HROMATITE_SEAL")) && !partial;
+    log::log_tag(
+        "hook",
+        &format!(
+            "l2b shim={l2b} partial_seal={partial}, kept {:x}..{:x}",
+            KEEP_LO.load(Ordering::Acquire),
+            KEEP_HI.load(Ordering::Acquire)
+        ),
+    );
     log::log_tag("hook", &format!("l2b requested={l2b} (HROMATITE_L2B/HROMATITE_SEAL)"));
 
     let cands: [(&str, &str, usize); 3] = [

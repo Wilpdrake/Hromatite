@@ -85,8 +85,13 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
             let p = reserved as *const usize;
             let base = *p;
             let size = *p.add(1);
+            let text_lo = *p.add(2);
+            let text_hi = *p.add(3);
             if base > 0x10000 && size > 0 {
                 hook::set_image_range(base, size);
+            }
+            if text_lo > base && text_hi > text_lo {
+                hook::set_keep_range(text_lo, text_hi);
             }
         }
     }

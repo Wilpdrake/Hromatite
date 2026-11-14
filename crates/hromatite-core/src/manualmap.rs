@@ -29,7 +29,12 @@ pub struct Options {
 /// same function the payload's shim page re-runs in machine code (plan 4). Any
 /// divergence here means the tick decrypts garbage, so the page index and the
 /// page length are the contract, not an implementation detail.
-fn seal_image(r: &Remote, base: usize, size: usize) -> (usize, usize) {
+fn seal_image(
+    r: &Remote,
+    base: usize,
+    size: usize,
+    keep: Option<(usize, usize)>,
+) -> (usize, usize) {
     const PAGE: usize = crate::crypto::PAGE;
     let mut done = 0usize;
     let mut failed = 0usize;
@@ -37,6 +42,12 @@ fn seal_image(r: &Remote, base: usize, size: usize) -> (usize, usize) {
     while off < size {
         let n = (size - off).min(PAGE);
         let addr = base + off;
+        if let Some((k_lo, k_hi)) = keep {
+            if addr >= k_lo && addr < k_hi {
+                off += n;
+                continue;
+            }
+        }
         if !r.protect(addr, n, crate::ffi::PAGE_READWRITE) {
             failed += 1;
             off += n;
@@ -438,13 +449,31 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     let entry = base + img.entry as usize;
     targets.push(entry as u64);
 
-    // (base, size) for the payload: it cannot read its own PE header any more.
+    // (base, size, text_lo, text_hi) for the payload: it cannot read its own PE
+    // header any more, and L2b-style sealing needs to know which pages must stay
+    // plaintext (its own code) so the tick can run without a shim.
+    let text = img
+        .sections
+        .iter()
+        .find(|s| s.is_executable())
+        .map(|s| {
+            let lo = base + s.va as usize;
+            (lo, lo + s.vsize as usize)
+        })
+        .unwrap_or((0, 0));
+    let keep_range = if text.0 != 0 && text.1 > text.0 {
+        Some((text.0 & !0xFFF, (text.1 + 0xFFF) & !0xFFF))
+    } else {
+        None
+    };
     let params = r
-        .alloc(16, crate::ffi::PAGE_READWRITE)
+        .alloc(32, crate::ffi::PAGE_READWRITE)
         .ok_or("param alloc failed")?;
-    let mut pbuf = [0u8; 16];
+    let mut pbuf = [0u8; 32];
     pbuf[..8].copy_from_slice(&(base as u64).to_le_bytes());
-    pbuf[8..].copy_from_slice(&(size as u64).to_le_bytes());
+    pbuf[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+    pbuf[16..24].copy_from_slice(&(text.0 as u64).to_le_bytes());
+    pbuf[24..32].copy_from_slice(&(text.1 as u64).to_le_bytes());
     if !r.write(params, &pbuf) {
         return Err("param write failed".into());
     }
@@ -480,7 +509,8 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     // fetch can land in the image any more — encrypt it and leave it RW.
     if opts.seal && code != 0x103 {
         let before = r.read_vec(base, 16).unwrap_or_default();
-        let (pages, failed) = seal_image(&r, base, size);
+        let keep = keep_range.filter(|(lo, hi)| *lo > base && *hi <= base + size);
+        let (pages, failed) = seal_image(&r, base, size, keep);
         let after = r.read_vec(base, 16).unwrap_or_default();
         log::log(&format!(
             "seal: {pages} pages XORed, {failed} failed, size {size:#x}, crypto=block8; \
