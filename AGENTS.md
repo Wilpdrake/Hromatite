@@ -844,3 +844,68 @@ L2b строится на трамплине из плана 3.
   **4 (L2b)** — шифр в покое при живом коде, строится на трамплине из 3.
 - План 1 (M3 «в лоб», ручной разбор структур) по решению пользователя пока
   отложен.
+### 2026-11-14 — План 5 «гигиена»: паника и AV в payload больше не убивают игру
+
+- Коммиты `c250e73` (родитель: `panic = "unwind"` + декларации VEH/protect в
+  `ffi.rs` + пустые `veh.rs`/`api.rs`/`hook.rs`), затем **`7e0eaea`**,
+  **`7b417a7`**.
+- **Чтения чужой памяти** сведены в один модуль `crates/hromatite-core/src/safe.rs`:
+  `span_at` / `readable_at` / `readable_range` (VirtualQuery, `PAGE_GUARD`
+  считается нечитаемым), `read_u64/u32/u16/u8`, `read_bytes` (all-or-nothing),
+  `read_upto` (частичное чтение для консоли), `ascii_at` / `ascii_lossy` /
+  `utf16_lossy`, `write_usize`, `find_qword_in_span` (обход региона по границам
+  `Span`, без VirtualQuery на каждое слово).
+- **Закрытые дыры** (все — AV, `catch_unwind` их не ловит):
+  - `il2cpp.rs::diagnose` «hits with a GA pointer within ±0x80» — читал
+    `*(p as *const u64)` по окну, выходящему за страницу → `safe::read_u64`;
+  - `il2cpp.rs::scan_process` голосование по `DELTAS` читало `cand` без проверки
+    (только `>= 0`), и `base + size - 8` уходил в минус на регионах < 8 байт →
+    границы региона + `safe::read_u64`, `size < 8 ⇒ skip`;
+  - `il2cpp.rs` снапшоты `lo = addr - 0x80` + `copy_nonoverlapping(0x100)` →
+    `safe::read_bytes` (снапшот просто пропускается, если окно не целиком);
+  - `il2cpp.rs::probe_getters` вложенный `*(q + j*8)` (4 итерации) и `v + i*8` →
+    `safe::read_u64`; `is_getter` / `find_domain` / `walk_assembly_array` — тоже;
+  - мёртвая `il2cpp::window()` удалена;
+  - `procs.rs::unlink_from_peb` читал `Flink`/`Blink`/`DllBase` и писал сплайс без
+    проверок → каждое чтение `safe::read_usize`, каждая запись
+    `safe::write_usize`, лимит 512 записей сохранён;
+  - `console.rs` `q`/`b`/`s`/`ws`/`cls`/`find` — на `safe`; в `find` был
+    underflow `base + size - 8` на регионах < 8 байт;
+  - `manualmap.rs`: `cstr_at` падал на RVA за концом образа (`d[o..]`),
+    `rd_u64(image, oft)` читал по непроверенному RVA, `apply_relocs` —
+    `page + ofs` переведён на `checked_add`; `tls_targets` / `stomp_alloc` /
+    `is_pe` проверены — уже `Option` (`r.u64`/`r.u32`), unwrap'ов нет.
+- **Паники**: в `log.rs` — `install_panic_hook()` (через `Once`, заменяет
+  дефолтный хук, чтобы не зависеть от stderr) и `guard(label, f)`
+  (`catch_unwind` + `AssertUnwindSafe`, пишет `guard[label]: panic caught`).
+  Хук ставится и в DLL (`DllMain`), и в инжекторе (`main`).
+  В `crates/hromatite-dll/src/lib.rs` обёрнуты: тело `DllMain` целиком,
+  `unlink_from_peb`, `wait_for_modules`, `il2cpp::run_once`, каждый
+  `console::dispatch`, `console_loop`; `DllMain` всегда возвращает 1 (паника
+  через границу `extern "system"` — UB).
+- **Инструмент доказательства**: команды `panic [msg]` и `av [addr]` (default
+  `0x1`) в `console.rs`, обе в `help`; `av` сначала делает `safe::read_u64` (AV
+  не будет), затем намеренное сырое разыменование — это и есть мишень для VEH
+  из плана 2.
+- **Чем подтверждено (без запуска игры)**:
+  - `cargo build --workspace --release` — OK; каждый из двух коммитов собирается
+    отдельно (проверено сборкой из `git worktree` на `7e0eaea`);
+  - `cargo clippy --workspace --all-targets --release` — 0 ошибок, только
+    стилевые warning'и (collapsible_if и т.п., часть была и раньше);
+  - `x86_64-w64-mingw32-nm target/…/release/hromatite.dll | grep -c Unwind_Resume`
+    → **2** (`_Unwind_Resume`, `_Unwind_Resume_or_Rethrow` — unwinding-рантайм
+    реально в образе; в `Hromatite.exe` тоже 2);
+  - живой прогон **panic-пути** в отдельном win-префиксе (Proton 10.0 wine,
+    игры нет): `log::guard("selftest-panic", || panic!("boom"))` → процесс
+    выжил, `caught panic -> None`, `normal call -> Some(42)`, в логе
+    `[dll] PANIC at src/main.rs:5: boom from selftest` +
+    `[dll] guard[selftest-panic]: panic caught, continuing`. Стенд:
+    `~/.hermes/cache/scratch/panictest` (вне репозитория).
+- **Что осталось (за родителем)**: live-проверка в игре — что `panic` в консоли
+  не роняет VRChat и сессия продолжается; что `av 0x1` без VEH роняет только
+  стаб-поток (ожидаемо), а после плана 2 — перехватывается; A/B по EAC
+  (новых потоков/аллокаций не добавилось, но хук паники ставит `Box`).
+- Известное ограничение: `safe::readable_at` — это `VirtualQuery`, в горячих
+  циклах его быть не должно; сканы по-прежнему читают внутри региона,
+  провалидированного `procs::regions` (границы проверяются арифметикой).
+
