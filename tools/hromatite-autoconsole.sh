@@ -76,6 +76,21 @@ open_console() {
 }
 
 case "${1:-}" in
+    --install-autostart)
+        d="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+        mkdir -p "$d"
+        cat >"$d/hromatite-autoconsole.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=hromatite auto-console
+Comment=Открывает консоль hromatite, когда игра запускается с wrapper-ом
+Exec=$HERE/hromatite-autoconsole.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
+EOF
+        echo "written: $d/hromatite-autoconsole.desktop"
+        exit 0
+        ;;
     --open)
         open_console
         exit $?

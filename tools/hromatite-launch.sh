@@ -72,9 +72,11 @@ find_game_pid() {
 
     # Маркер для хостового сторожа автоконсоли (tools/hromatite-autoconsole.sh).
     mark_live() {
+        DONE=1
+        # HROMATITE_CONSOLE=0 — не поднимать окно консоли автоматически
+        [ "${HROMATITE_CONSOLE:-1}" = "1" ] || return 0
         printf '%s %s\n' "$(date +%s)" "$PFX" >"$HOME/.hromatite-live" 2>/dev/null &&
             echo "[hromatite] live marker written" >>"$LOG"
-        DONE=1
     }
 
     # Инжектор живёт столько же, сколько открыто окно консоли (HROMATITE_LIVE),

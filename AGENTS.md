@@ -767,3 +767,26 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
     глобальную `Il2CppMetadataRegistration`.
 - Побочно: `find <qword>` находил «указатели» в куче, которые уже переехали —
   куча живёт, поэтому результаты `find` валидны только сразу после выдачи.
+
+### 2026-11-14 — Консоль поднимается сама при старте игры
+
+- Коммиты `38c2576` + этот.
+- Цепочка: wrapper (`hromatite-launch.sh`) запускает инжектор **в фоне** (он теперь
+  живёт столько же, сколько окно консоли, `HROMATITE_LIVE`), ждёт в новом хвосте
+  лога игры строку payload'а `console ready` и пишет маркер `~/.hromatite-live`.
+- Хостовый сторож `tools/hromatite-autoconsole.sh` следит за маркером и открывает
+  терминал (`konsole --hold -e sh -c '… --shell'`). Если у процесса нет
+  DISPLAY/WAYLAND (агент, systemd), сторож **заимствует окружение** у уже
+  запущенного терминала через `/proc/<pid>/environ` — проверено, окно реально
+  открывается. Одна консоль на запуск (проверка по `--shell`).
+- Автостарт сторожа при логине: `tools/hromatite-autoconsole.sh --install-autostart`
+  (пишет `~/.config/autostart/hromatite-autoconsole.desktop`; на этом хосте
+  создан).
+- Проверено вживую дважды: после инжекта маркер `1794670359 …/compatdata/438100/pfx`
+  → `[18:32:41] marker changed` → `[18:32:43] console started`, окно konsole с
+  `hromatite-console.sh --shell` (pid 250485).
+- Выключатели: `HROMATITE_CONSOLE=0` — не открывать окно; `HROMATITE_LIVE=0` —
+  payload без интерактива (маркер тогда не пишется, окно не появится).
+- Грабли, на которые уже наступили: `proton run`/инжектор при `--seal` блокируются
+  до конца окна консоли, поэтому старый `grep "mapped at"` в wrapper'е не срабатывал
+  вовсе — сигналом стало `console ready` из лога payload'а.
