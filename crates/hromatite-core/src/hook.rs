@@ -1187,7 +1187,15 @@ fn note(a: &mut Asm, p: &ShimParams, stage: u64) {
 
 /// `VirtualProtect(base, size, prot, &old_prot)`
 fn protect_call(a: &mut Asm, p: &ShimParams, prot: u32) {
-    a.set_args(p.base, p.size, prot, p.data + D_OLD as u64);
+    // Only `.text` changes protection: making `.data` RX kills the Rust detour
+    // (it writes its own statics), and leaving `.text` RW is not executable under
+    // NX. Everything else stays as the seal left it (RW).
+    let (lo, hi) = if p.text_hi > p.text_lo && p.text_lo >= p.base {
+        (p.text_lo, p.text_hi - p.text_lo)
+    } else {
+        (p.base, p.size)
+    };
+    a.set_args(lo, hi, prot, p.data + D_OLD as u64);
     a.call_imm(p.vprotect);
 }
 
@@ -1204,6 +1212,10 @@ pub struct ShimParams {
     pub flush: u64,
     pub gettick: u64,
     pub note: u64,
+    /// The payload's `.text` (executable) range: only these pages may be `RX`,
+    /// `.data` must stay `RW` or the Rust detour faults on its own statics.
+    pub text_lo: u64,
+    pub text_hi: u64,
 }
 
 /// The tick shim, entered by every `QueryPerformanceCounter` call.
@@ -1755,6 +1767,8 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         flush: flush_fn,
         gettick,
         note: l2b_note as *const () as u64,
+        text_lo: KEEP_LO.load(Ordering::Acquire) as u64,
+        text_hi: KEEP_HI.load(Ordering::Acquire) as u64,
     };
     let (code, data) = install_shims(params)?;
     let entry = code;
@@ -2160,6 +2174,8 @@ mod tests {
             flush: 0x7f00_0001_0100,
             gettick: 0x7f00_0001_0200,
             note: 0x7f00_0001_0300,
+            text_lo: 0x1000_3000,
+            text_hi: 0x1000_4000,
         }
     }
 
