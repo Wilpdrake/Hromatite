@@ -452,13 +452,24 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     // (base, size, text_lo, text_hi) for the payload: it cannot read its own PE
     // header any more, and L2b-style sealing needs to know which pages must stay
     // plaintext (its own code) so the tick can run without a shim.
+    // Keep everything the running tick touches: its code *and* the writable
+    // sections (statics, Mutexes, the reader). Sealing `.data` while code still
+    // runs is fatal — measured, the game dies right after `seal: 73 pages`.
+    // What gets sealed then: headers, `.rdata`, `.reloc`.
     let text = img
         .sections
         .iter()
         .find(|s| s.is_executable())
         .map(|s| {
             let lo = base + s.va as usize;
-            (lo, lo + s.vsize as usize)
+            let hi = img
+                .sections
+                .iter()
+                .filter(|x| !x.is_executable() && x.characteristics & 0x8000_0000 != 0)
+                .map(|x| base + x.va as usize + x.vsize as usize)
+                .max()
+                .unwrap_or(lo + s.vsize as usize);
+            (lo, hi.max(lo + s.vsize as usize))
         })
         .unwrap_or((0, 0));
     let keep_range = if text.0 != 0 && text.1 > text.0 {
