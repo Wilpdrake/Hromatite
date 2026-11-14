@@ -103,6 +103,13 @@ fn attach(hinst: *mut core::ffi::c_void) {
 
     let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
     if frame_hook {
+        // Plan 4: same flow, no extra code path — `install_tick` sees
+        // HROMATITE_SEAL/HROMATITE_L2B and puts the tick behind a shim page
+        // that decrypts the image for the duration of the call. We still return
+        // immediately, which is what lets the injector seal us.
+        let seal = std::env::var("HROMATITE_SEAL").unwrap_or_else(|_| "-".into());
+        let l2b = std::env::var("HROMATITE_L2B").unwrap_or_else(|_| "-".into());
+        log::log_tag("dll", &format!("FRAME_HOOK: HROMATITE_SEAL={seal} HROMATITE_L2B={l2b}"));
         // Install the tick *before* any recon: the full diagnose() scan takes
         // seconds and must not delay getting off the stub thread. `diag` stays
         // available as a console command for the same reason.

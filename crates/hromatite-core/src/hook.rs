@@ -23,11 +23,13 @@
 //!   * the tick body runs inside `log::guard`: a Rust panic unwinding through
 //!     the game's frame is UB, and under Proton it shows up as a dead game.
 //!
-//! Known interaction: in `--seal` the injector XORs the image in place as soon
-//! as `DllMain` returns, so the detour (which lives in the image) turns to
-//! garbage and the next tick executes random bytes. Frame hook and seal are
-//! therefore mutually exclusive until plan 4 moves the detour into the
-//! trampoline page.
+//! Plan 4 (`HROMATITE_SEAL=1` / `HROMATITE_L2B=1`) removes the last limitation of
+//! this file: in `--seal` the injector XORs the image in place as soon as
+//! `DllMain` returns, so a detour *inside* the image would turn to garbage. The
+//! tick is therefore entered through a hand-written shim page allocated outside
+//! the image, which decrypts the image, calls the Rust detour, and encrypts it
+//! again — see the "L2b" section below. Without those variables nothing changes:
+//! `qpc_detour` is installed directly.
 
 use crate::console;
 use crate::ffi;
@@ -770,6 +772,586 @@ impl Hook {
 }
 
 // ---------------------------------------------------------------------------
+// L2b: the image lives encrypted; a stub page holds the only plaintext code
+// ---------------------------------------------------------------------------
+//
+// Plan 4. With `--seal` the injector XORs the whole mapping the moment
+// `DllMain` returns, so everything of ours — the detour included — turns to
+// ciphertext and the next tick executes noise. Plan 4 fixes that by moving the
+// only code that ever runs *while the image is sealed* into a page of its own,
+// allocated with `VirtualAlloc` (never part of the image, never sealed):
+//
+//     QPC prologue ──jmp rel32──► relay ──jmp abs──► shim (this page)
+//                                                    ├ decrypt [base,base+size)
+//                                                    ├ VirtualProtect → RX
+//                                                    ├ call <Rust detour>   ← image is plaintext
+//                                                    ├ VirtualProtect → RW
+//                                                    ├ encrypt back
+//                                                    └ jmp <trampoline>     ← the real QPC
+//
+// The shim therefore touches *no* memory of the image except through the Rust
+// function it calls: every address it needs (image range, the data page, the
+// detour, the trampoline, `VirtualProtect`, `FlushInstructionCache`,
+// `GetTickCount64`) is an immediate patched in at install time. Statics, the
+// mutexes, the console reader — all of that lives in the image and is only ever
+// read *inside* the decrypted window, which is exactly what the design allows.
+//
+// Two invariants make the window safe:
+//
+//   * one window at a time. The data page (also outside the image) holds an
+//     owner thread id; the shim opens a window with `lock cmpxchg` and the
+//     nested case (a QPC call from inside our own detour) skips the whole dance
+//     instead of decrypting twice — XOR is an involution, a second pass would
+//     re-encrypt the image under the first caller's feet;
+//   * never touch the image before the injector sealed it. `SEAL_PROBE` is a
+//     magic word inside the image: if it still reads back as the magic, the
+//     image is plaintext and the shim only forwards to the trampoline (and the
+//     injector's seal is still in flight — the first tick is 2 s away anyway).
+//
+// Exception dispatch: the vectored handler installed at `DllMain` is image code
+// too, so a single exception in the game while sealed would execute garbage.
+// A second shim is registered as a *vectored handler* (registered later with
+// `first = 1`, so ntdll calls it before ours): it decrypts, marks the window
+// "leaked" (the plaintext must stay readable for the handlers that follow) and
+// returns; the next tick closes the window — i.e. re-encrypts — on its way out.
+
+/// Magic the probe holds while the image is in plaintext (never equal to its
+/// ciphertext but with probability 2^-64).
+const SEAL_MAGIC: u64 = 0x4C32_425F_5348_494D; // "L2B_SHIM"
+
+/// Window bookkeeping, in a page of its own so that the shim can read it while
+/// every byte of the image is ciphertext. Layout is fixed: the asm hard-codes
+/// the offsets, `SealData` mirrors them.
+#[repr(C)]
+#[derive(Default)]
+pub struct SealData {
+    /// 0x00 owner thread id, 0 = window closed
+    pub lock: u64,
+    /// 0x08 absolute `GetTickCount64` deadline (written by the Rust detour)
+    pub due: u64,
+    /// 0x10 how many times the shim was entered (kept for the `tick` command)
+    pub hits: u64,
+    /// 0x18 the image is plaintext because an exception shim opened the window
+    pub leaked: u64,
+    /// 0x20 scratch for `VirtualProtect`'s old protection
+    pub old_prot: u64,
+    /// 0x28 number of ticks that ran inside a window (diagnostics)
+    pub windows: u64,
+    /// 0x30 this call opened a window, i.e. the image must be encrypted on the
+    /// way out (0 when we merely ran the detour over an unsealed image)
+    pub crypted: u64,
+}
+
+// Referenced by the asm byte offsets; `D_LOCK`/`D_WINDOWS` are only spelled out
+// here (and asserted against `SealData` in the tests) so the layout is in one
+// place.
+#[allow(dead_code)]
+const D_LOCK: usize = 0x00;
+const D_DUE: usize = 0x08;
+const D_HITS: usize = 0x10;
+const D_LEAKED: usize = 0x18;
+const D_OLD: usize = 0x20;
+#[allow(dead_code)]
+const D_WINDOWS: usize = 0x28;
+const D_CRYPTED: usize = 0x30;
+
+/// How long after install the first tick may run: the injector seals only after
+/// `DllMain` returns, and we must not decrypt a half-sealed image.
+const SEAL_START_DELAY_MS: u64 = 2_000;
+
+/// The probe lives in the image (that is the point) and is compared by the asm.
+static SEAL_PROBE: AtomicU64 = AtomicU64::new(SEAL_MAGIC);
+/// Data page address, published once at install (0 = L2b not active).
+static SEAL_DATA: AtomicUsize = AtomicUsize::new(0);
+/// Entering the shim page.
+static SEAL_ENTRY: AtomicUsize = AtomicUsize::new(0);
+static SEAL_VEH: AtomicUsize = AtomicUsize::new(0);
+
+pub fn seal_active() -> bool {
+    SEAL_DATA.load(Ordering::Acquire) != 0
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// `[base, size)` of our own mapping. A manual map is one `VirtualAllocEx`, so
+/// `VirtualQuery` on any address inside the image answers with the allocation
+/// base and its size — the same numbers the injector sealed. `HROMATITE_IMAGE`
+/// (`base:size`, hex) overrides it for tests.
+fn own_image_range() -> Option<(usize, usize)> {
+    if let Ok(v) = std::env::var("HROMATITE_IMAGE") {
+        let (b, s) = v.split_once(':')?;
+        let parse = |t: &str| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok();
+        if let (Some(b), Some(s)) = (parse(b), parse(s))
+            && b >= 0x10000
+            && s >= PAGE_SIZE
+        {
+            log::log_tag("hook", &format!("l2b: image range from HROMATITE_IMAGE {b:#x}+{s:#x}"));
+            return Some((b, s));
+        }
+        log::log_tag("hook", &format!("l2b: HROMATITE_IMAGE={v:?} unparsable, falling back to VirtualQuery"));
+    }
+    let mut mbi = ffi::MEMORY_BASIC_INFORMATION::default();
+    let n = unsafe {
+        ffi::VirtualQuery(
+            &SEAL_PROBE as *const _ as *const core::ffi::c_void,
+            &mut mbi,
+            core::mem::size_of::<ffi::MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if n == 0 || mbi.AllocationBase == 0 || mbi.RegionSize < PAGE_SIZE {
+        return None;
+    }
+    Some((mbi.AllocationBase, mbi.RegionSize))
+}
+
+// ---- the assembler ---------------------------------------------------------
+
+/// Byte emitter with labels, so the shim can be built (and tested) on the host.
+/// Deliberately tiny: only the handful of x64 forms the shim needs.
+struct Asm {
+    c: Vec<u8>,
+    /// (offset of the rel32 field, label)
+    jumps: Vec<(usize, u8)>,
+    labels: Vec<Option<usize>>,
+}
+
+#[allow(dead_code)]
+impl Asm {
+    fn new() -> Asm {
+        Asm { c: Vec::with_capacity(1024), jumps: Vec::new(), labels: Vec::new() }
+    }
+    fn b(&mut self, x: u8) {
+        self.c.push(x);
+    }
+    fn bs(&mut self, s: &[u8]) {
+        self.c.extend_from_slice(s);
+    }
+    fn len(&self) -> usize {
+        self.c.len()
+    }
+    fn label(&mut self) -> u8 {
+        self.labels.push(None);
+        (self.labels.len() - 1) as u8
+    }
+    fn bind(&mut self, l: u8) {
+        self.labels[l as usize] = Some(self.c.len());
+    }
+    /// conditional jump, rel32 (`0F 8x`)
+    fn jcc(&mut self, cond: u8, l: u8) {
+        self.bs(&[0x0F, 0x80 | cond]);
+        self.jumps.push((self.c.len(), l));
+        self.bs(&[0, 0, 0, 0]);
+    }
+    fn jmp(&mut self, l: u8) {
+        self.b(0xE9);
+        self.jumps.push((self.c.len(), l));
+        self.bs(&[0, 0, 0, 0]);
+    }
+    /// `mov r64, imm64` (`REX.W B8+rd`)
+    fn mov_imm(&mut self, reg: u8, v: u64) {
+        self.b(if reg >= 8 { 0x49 } else { 0x48 });
+        self.b(0xB8 | (reg & 7));
+        self.bs(&v.to_le_bytes());
+    }
+    /// `mov r64, r64` (`REX.W 89 /r`)
+    fn mov_rr(&mut self, dst: u8, src: u8) {
+        let rex = 0x48 | if src >= 8 { 0x04 } else { 0 } | if dst >= 8 { 0x01 } else { 0 };
+        self.b(rex);
+        self.b(0x89);
+        self.b(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+    fn push(&mut self, reg: u8) {
+        if reg >= 8 {
+            self.b(0x41);
+        }
+        self.b(0x50 | (reg & 7));
+    }
+    fn pop(&mut self, reg: u8) {
+        if reg >= 8 {
+            self.b(0x41);
+        }
+        self.b(0x58 | (reg & 7));
+    }
+    /// `call rax`
+    fn call_rax(&mut self) {
+        self.bs(&[0xFF, 0xD0]);
+    }
+    /// `cmp rax, [rdi+disp8]`
+    fn cmp_rax_mem_rdi(&mut self, disp: u8) {
+        self.bs(&[0x48, 0x3B, 0x47, disp]);
+    }
+    /// `cmp qword [rdi+disp8], imm8`
+    fn cmp_mem_rdi_imm8(&mut self, disp: u8, v: u8) {
+        self.bs(&[0x48, 0x83, 0x7F, disp, v]);
+    }
+    /// `mov qword [rdi+disp8], imm8`
+    fn mov_mem_rdi_imm8(&mut self, disp: u8, v: u8) {
+        self.bs(&[0x48, 0xC7, 0x47, disp, v, 0, 0, 0]);
+    }
+    /// `mov qword [rdi], imm8`
+    fn mov_mem_rdi_imm8_0(&mut self, v: u8) {
+        self.bs(&[0x48, 0xC7, 0x07, v, 0, 0, 0]);
+    }
+    /// `add qword [rdi+disp8], imm8`
+    fn add_mem_rdi_imm8(&mut self, disp: u8, v: u8) {
+        self.bs(&[0x48, 0x83, 0x47, disp, v]);
+    }
+    /// `mov r10, gs:[0x48]` — the current thread id (TEB.ClientId.UniqueThread)
+    fn mov_r10_tid(&mut self) {
+        self.bs(&[0x65, 0x4C, 0x8B, 0x14, 0x25, 0x48, 0x00, 0x00, 0x00]);
+    }
+    /// `mov rax, <fn>` + `call rax`
+    fn call_imm(&mut self, f: u64) {
+        self.mov_imm(0, f);
+        self.call_rax();
+    }
+    /// `mov rcx, imm64` / `mov rdx, imm64` / `mov r8d, imm32` / `mov r9, imm64`
+    fn set_args(&mut self, a: u64, b: u64, c: u32, d: u64) {
+        self.mov_imm(1, a);
+        self.mov_imm(2, b);
+        self.b(0x41);
+        self.b(0xB8);
+        self.bs(&c.to_le_bytes());
+        self.mov_imm(9, d);
+    }
+    /// `lock cmpxchg [rdi], r10` with zeroed rax (expect 0); ZF = acquired
+    fn try_lock(&mut self) {
+        self.bs(&[0x31, 0xC0]); // xor eax, eax
+        self.bs(&[0xF0, 0x4C, 0x0F, 0xB1, 0x17]); // lock cmpxchg [rdi], r10
+    }
+    /// `cmp qword [rdi], r10`
+    fn cmp_mem_rdi_r10(&mut self) {
+        self.bs(&[0x4C, 0x3B, 0x17]);
+    }
+    /// `jmp qword [rip+0]` followed by the address (14 bytes, touches no register)
+    fn jmp_abs(&mut self, to: u64) {
+        self.bs(&[0xFF, 0x25, 0, 0, 0, 0]);
+        self.bs(&to.to_le_bytes());
+    }
+    fn finish(mut self) -> Vec<u8> {
+        for (at, l) in core::mem::take(&mut self.jumps) {
+            let to = self.labels[l as usize].expect("unbound label") as i64;
+            let rel = to - (at as i64 + 4);
+            let rel = rel as i32;
+            self.c[at..at + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        self.c
+    }
+}
+
+/// Push the ten registers the shim borrows, then realign the stack to 16 so the
+/// `call`s below see the ABI's `rsp % 16 == 8` inside the callee.
+///
+/// Entry state: `rsp % 16 == 8` (a `call`/the dispatcher pushed the return
+/// address). Ten pushes = 80 bytes ≡ 0 (mod 16) → still 8; the extra `sub rsp, 8`
+/// brings it to 0, and a `call` from there hands the callee 8 again.
+const PUSHED: [u8; 10] = [0, 1, 2, 3, 6, 7, 8, 9, 10, 11]; // rax rcx rdx rbx rsi rdi r8 r9 r10 r11
+
+fn prologue(a: &mut Asm) {
+    for r in PUSHED {
+        a.push(r);
+    }
+    a.bs(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+}
+
+fn epilogue(a: &mut Asm) {
+    a.bs(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    for r in PUSHED.iter().rev() {
+        a.pop(*r);
+    }
+}
+
+/// XOR `[base, base+size)` with `crypto::xor_page`'s stream, in place.
+///
+/// Registers: `rsi` cursor, `rbx` bytes left, `rdi` page index, `rax` xorshift
+/// state, `rdx` the 8-byte key, `rcx` loop counter, `r8` scratch. Nothing here
+/// is callee-saved except what the prologue already pushed, so the block can be
+/// dropped between two `call`s.
+fn crypt(a: &mut Asm, base: u64, size: u64) {
+    let (page, step, blk, tail, tail_loop, page_done, done) =
+        (a.label(), a.label(), a.label(), a.label(), a.label(), a.label(), a.label());
+
+    a.mov_imm(6, base); // mov rsi, base
+    a.mov_imm(3, size); // mov rbx, size
+    a.bs(&[0x31, 0xFF]); // xor edi, edi      — page index
+
+    a.bind(page);
+    // rax = SEAL_KEY ^ page * GOLDEN
+    a.mov_rr(0, 7); // mov rax, rdi
+    a.mov_imm(1, crate::crypto::GOLDEN);
+    a.bs(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+    a.mov_imm(1, crate::crypto::SEAL_KEY);
+    a.bs(&[0x48, 0x31, 0xC8]); // xor rax, rcx
+    // r9 = min(rbx, 4096): one page, the last one may be short
+    a.bs(&[0x49, 0xC7, 0xC1, 0x00, 0x10, 0x00, 0x00]); // mov r9, 4096
+    a.bs(&[0x4C, 0x39, 0xCB]); // cmp rbx, r9
+    a.bs(&[0x4C, 0x0F, 0x42, 0xCB]); // cmovb r9, rbx
+
+    // eight xorshift rounds, low byte of each state → the repeating 8-byte key
+    a.bs(&[0x31, 0xD2]); // xor edx, edx      — key accumulator
+    a.bs(&[0xB9, 0x08, 0x00, 0x00, 0x00]); // mov ecx, 8
+    a.bind(step);
+    a.mov_rr(8, 0); // mov r8, rax
+    a.bs(&[0x49, 0xC1, 0xE0, 0x0D]); // shl r8, 13
+    a.bs(&[0x4C, 0x31, 0xC0]); // xor rax, r8
+    a.mov_rr(8, 0);
+    a.bs(&[0x49, 0xC1, 0xE8, 0x07]); // shr r8, 7
+    a.bs(&[0x4C, 0x31, 0xC0]); // xor rax, r8
+    a.mov_rr(8, 0);
+    a.bs(&[0x49, 0xC1, 0xE0, 0x11]); // shl r8, 17
+    a.bs(&[0x4C, 0x31, 0xC0]); // xor rax, r8
+    a.bs(&[0x44, 0x0F, 0xB6, 0xC0]); // movzx r8d, al
+    a.bs(&[0x48, 0xC1, 0xE2, 0x08]); // shl rdx, 8
+    a.bs(&[0x4C, 0x09, 0xC2]); // or rdx, r8
+    a.bs(&[0xFF, 0xC9]); // dec ecx
+    a.jcc(5, step); // jnz step
+    a.bs(&[0x48, 0x0F, 0xCA]); // bswap rdx   (big-endian accumulation → LE word)
+
+    a.bind(blk);
+    a.bs(&[0x49, 0x83, 0xF9, 0x08]); // cmp r9, 8   — bytes left in *this* page
+    a.jcc(2, tail); // jb tail
+    a.bs(&[0x48, 0x31, 0x16]); // xor [rsi], rdx
+    a.bs(&[0x48, 0x83, 0xC6, 0x08]); // add rsi, 8
+    a.bs(&[0x49, 0x83, 0xE9, 0x08]); // sub r9, 8
+    a.bs(&[0x48, 0x83, 0xEB, 0x08]); // sub rbx, 8
+    a.jmp(blk);
+
+    a.bind(tail); // 0..7 trailing bytes of a short last page
+    a.bs(&[0x4D, 0x85, 0xC9]); // test r9, r9
+    a.jcc(4, page_done); // jz
+    a.mov_rr(0, 2); // mov rax, rdx
+    a.bind(tail_loop);
+    a.bs(&[0x41, 0x88, 0xC0]); // mov r8b, al
+    a.bs(&[0x44, 0x30, 0x06]); // xor [rsi], r8b
+    a.bs(&[0x48, 0xC1, 0xE8, 0x08]); // shr rax, 8
+    a.bs(&[0x48, 0xFF, 0xC6]); // inc rsi
+    a.bs(&[0x48, 0xFF, 0xCB]); // dec rbx
+    a.bs(&[0x49, 0xFF, 0xC9]); // dec r9   (flags from here: loop while r9 != 0)
+    a.jcc(5, tail_loop); // jnz
+    a.bind(page_done);
+    a.bs(&[0x48, 0x85, 0xDB]); // test rbx, rbx
+    a.jcc(4, done); // jz done
+    a.bs(&[0x48, 0xFF, 0xC7]); // inc rdi
+    a.jmp(page);
+    a.bind(done);
+}
+
+/// `VirtualProtect(base, size, prot, &old_prot)`
+fn protect_call(a: &mut Asm, p: &ShimParams, prot: u32) {
+    a.set_args(p.base, p.size, prot, p.data + D_OLD as u64);
+    a.call_imm(p.vprotect);
+}
+
+/// Everything the two shims need to know, baked in as immediates.
+#[derive(Clone, Copy)]
+pub struct ShimParams {
+    pub base: u64,
+    pub size: u64,
+    pub data: u64,
+    pub probe: u64,
+    pub trampoline: u64,
+    pub detour: u64,
+    pub vprotect: u64,
+    pub flush: u64,
+    pub gettick: u64,
+}
+
+/// The tick shim, entered by every `QueryPerformanceCounter` call.
+///
+/// Fast path (the common case, ~350 k/s): decrypt state untouched, only a
+/// `GetTickCount64` and a compare against the deadline, then jump to the
+/// trampoline. The expensive path runs at most once per `HROMATITE_TICK_MS`.
+fn build_tick(p: &ShimParams) -> Vec<u8> {
+    let mut a = Asm::new();
+    let (sealed, plain, leaked, call, release, done) =
+        (a.label(), a.label(), a.label(), a.label(), a.label(), a.label());
+    prologue(&mut a);
+    a.mov_imm(7, p.data); // mov rdi, data page
+    a.mov_imm(10, p.probe); // mov r10, probe
+    a.mov_imm(0, SEAL_MAGIC);
+    a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax   — plaintext or ciphertext?
+    a.jcc(5, sealed); // jnz sealed — the probe no longer reads back as the magic
+    a.jmp(plain);
+
+    // ---- sealed: the normal path -------------------------------------------
+    a.bind(sealed);
+    a.call_imm(p.gettick);
+    a.cmp_rax_mem_rdi(D_DUE as u8);
+    a.jcc(2, done); // jb done — not due
+    a.mov_r10_tid();
+    a.cmp_mem_rdi_r10();
+    a.jcc(4, done); // je done — nested call from inside our own detour
+    a.try_lock();
+    a.jcc(5, done); // jnz — another thread owns the window
+    a.add_mem_rdi_imm8(D_HITS as u8, 1);
+    a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
+    // Order matters: the pages are RW (that is what the seal left behind), so
+    // decrypt first and only then make them executable — a store into RX faults.
+    crypt(&mut a, p.base, p.size);
+    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    // The decrypted bytes must be visible to the instruction fetcher:
+    // FlushInstructionCache(GetCurrentProcess() = -1, base, size).
+    a.mov_imm(1, p.base);
+    a.mov_imm(2, p.size);
+    a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov r8d, -1
+    a.call_imm(p.flush);
+    a.jmp(call);
+
+    // ---- plaintext ---------------------------------------------------------
+    a.bind(plain);
+    a.cmp_mem_rdi_imm8(D_LEAKED as u8, 0);
+    a.jcc(5, leaked); // jnz leaked
+    // Not sealed (yet): run the detour straight away, nothing to encrypt. The
+    // deadline gate still applies, so a tick never races the injector's seal.
+    a.call_imm(p.gettick);
+    a.cmp_rax_mem_rdi(D_DUE as u8);
+    a.jcc(2, done); // jb done
+    a.mov_r10_tid();
+    a.cmp_mem_rdi_r10();
+    a.jcc(4, done);
+    a.try_lock();
+    a.jcc(5, done);
+    a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
+    a.jmp(call);
+
+    // The exception shim decrypted the image and could not encrypt it again
+    // (the handlers after it still need readable code): close it here.
+    a.bind(leaked);
+    a.mov_r10_tid();
+    a.try_lock();
+    a.jcc(5, done);
+    a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
+
+    a.bind(call);
+    a.mov_rr(1, 7); // mov rcx, rdi — the detour takes the data page
+    a.call_imm(p.detour);
+    a.cmp_mem_rdi_imm8(D_CRYPTED as u8, 0);
+    a.jcc(4, release); // je release — no window was opened
+    protect_call(&mut a, p, ffi::PAGE_READWRITE);
+    crypt(&mut a, p.base, p.size);
+    a.mov_mem_rdi_imm8(D_LEAKED as u8, 0);
+    a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
+    a.bind(release);
+    a.mov_mem_rdi_imm8_0(0); // release the window
+    a.bind(done);
+    epilogue(&mut a);
+    a.jmp_abs(p.trampoline);
+    a.finish()
+}
+
+/// The vectored-exception shim: decrypt, mark the window leaked, return
+/// `EXCEPTION_CONTINUE_SEARCH`. The handlers that run after it (`veh`'s own,
+/// the game's) then find readable code; the next tick re-encrypts.
+fn build_veh(p: &ShimParams) -> Vec<u8> {
+    let mut a = Asm::new();
+    let done = a.label();
+    prologue(&mut a);
+    a.mov_imm(7, p.data);
+    a.mov_imm(10, p.probe);
+    a.mov_imm(0, SEAL_MAGIC);
+    a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax
+    a.jcc(4, done); // je — already plaintext
+    a.mov_r10_tid();
+    a.try_lock();
+    a.jcc(5, done); // jnz — a tick owns the window (then it is plaintext already)
+    // decrypt while the pages are still RW, only then make them executable
+    crypt(&mut a, p.base, p.size);
+    protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
+    a.mov_imm(1, p.base);
+    a.mov_imm(2, p.size);
+    a.bs(&[0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF]);
+    a.call_imm(p.flush);
+    a.mov_mem_rdi_imm8(D_LEAKED as u8, 1);
+    a.mov_mem_rdi_imm8_0(0); // release
+    a.bind(done);
+    epilogue(&mut a);
+    a.bs(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, EXCEPTION_CONTINUE_SEARCH
+    a.b(0xC3); // ret
+    a.finish()
+}
+
+/// Allocate the shim page + data page, write both shims, make the code RX.
+///
+/// Layout: page 0 = code (tick shim at +0, exception shim at `VEH_OFF`),
+/// page 1 = `SealData`. Neither is ever part of the image, so `--seal` does not
+/// touch them.
+const VEH_OFF: usize = 0x800;
+
+fn install_shims(mut p: ShimParams) -> Option<(usize, usize)> {
+    // The data page is an operand of the shim itself (`&old_prot`), so it has to
+    // exist before the code is generated.
+    let mem = unsafe { ffi::VirtualAlloc(0, 2 * PAGE_SIZE, ffi::MEM_COMMIT | ffi::MEM_RESERVE, ffi::PAGE_READWRITE) };
+    if mem.is_null() {
+        log::log_tag("hook", "l2b: VirtualAlloc(2 pages) failed");
+        return None;
+    }
+    let code = mem as usize;
+    let data = code + PAGE_SIZE;
+    p.data = data as u64;
+    let tick = build_tick(&p);
+    let veh = build_veh(&p);
+    if tick.len() > VEH_OFF {
+        log::log_tag("hook", &format!("l2b: tick shim {} bytes > slot {VEH_OFF:#x}", tick.len()));
+        return None;
+    }
+    if VEH_OFF + veh.len() > PAGE_SIZE {
+        log::log_tag("hook", &format!("l2b: exception shim {} bytes overflows the page", veh.len()));
+        return None;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(tick.as_ptr(), code as *mut u8, tick.len());
+        core::ptr::copy_nonoverlapping(veh.as_ptr(), (code + VEH_OFF) as *mut u8, veh.len());
+    }
+    let mut old = 0u32;
+    if unsafe { ffi::VirtualProtect(code as *mut u8, PAGE_SIZE, ffi::PAGE_EXECUTE_READ, &mut old) } == 0 {
+        log::log_tag("hook", "l2b: VirtualProtect(RX) on the shim page failed");
+        return None;
+    }
+    flush(code, PAGE_SIZE);
+    log::log_tag(
+        "hook",
+        &format!(
+            "l2b: shim page {code:#x} (tick {} B at +0, exception {} B at +{VEH_OFF:#x}), \
+             data page {data:#x}, image {:#x}+{:#x}, crypto=block8(repeat8)",
+            tick.len(),
+            veh.len(),
+            p.base,
+            p.size
+        ),
+    );
+    Some((code, data))
+}
+
+/// Detour called by the shim *inside* the decrypted window. It must not touch
+/// anything outside the image: it is image code running from plaintext.
+///
+/// # Safety
+/// `data` is the shim's `SealData` page (passed in `rcx` by the asm).
+pub unsafe extern "system" fn seal_detour(data: *mut SealData) {
+    if data.is_null() {
+        return;
+    }
+    let now = now_ms();
+    let iv = INTERVAL_MS.load(Ordering::Relaxed).max(1);
+    // The shim asks again in `iv` ms; the deadline lives outside the image so
+    // that the sealed fast path can read it without decrypting anything.
+    unsafe { core::ptr::write_volatile(&mut (*data).due, now + iv) };
+    unsafe { core::ptr::write_volatile(&mut (*data).windows, (*data).windows.wrapping_add(1)) };
+
+    let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let prev = WORK_MS.swap(now, Ordering::Relaxed);
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = log::guard("hook::tick", || work(n, now, now.wrapping_sub(prev)));
+    BUSY.store(false, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
 // Tick source
 // ---------------------------------------------------------------------------
 
@@ -999,6 +1581,90 @@ fn register(h: Hook) {
     g.push(h);
 }
 
+/// Trampoline the current shim jumps back to (an install can be retried on a
+/// second anchor, and the address is baked into the code).
+static SEAL_TRAMP: AtomicUsize = AtomicUsize::new(0);
+
+/// Build the shim page for this trampoline and arm it — idempotent.
+fn arm_l2b(p: &Prep) -> Option<usize> {
+    if seal_active() {
+        let t = SEAL_TRAMP.load(Ordering::Acquire);
+        if t == p.trampoline {
+            return Some(SEAL_ENTRY.load(Ordering::Acquire));
+        }
+        log::log_tag(
+            "hook",
+            &format!(
+                "l2b: shim is bound to trampoline {t:#x}, this anchor has {:#x} — building a second page",
+                p.trampoline
+            ),
+        );
+    }
+    let (base, size) = match own_image_range() {
+        Some(v) => v,
+        None => {
+            log::log_tag("hook", "l2b: cannot determine own image range (VirtualQuery failed)");
+            return None;
+        }
+    };
+    // Page-align: the injector seals whole `SizeOfImage` pages, and every page
+    // index must mean the same thing on both sides.
+    let base = base & !(PAGE_SIZE - 1);
+    let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let (vprotect, flush_fn, gettick) = match (
+        try_resolve("kernel32.dll", "VirtualProtect"),
+        try_resolve("kernel32.dll", "FlushInstructionCache"),
+        try_resolve("kernel32.dll", "GetTickCount64"),
+    ) {
+        (Some(a), Some(b), Some(c)) => (a as u64, b as u64, c as u64),
+        _ => {
+            log::log_tag("hook", "l2b: kernel32!VirtualProtect/FlushInstructionCache/GetTickCount64 missing");
+            return None;
+        }
+    };
+    let params = ShimParams {
+        base: base as u64,
+        size: size as u64,
+        data: 0, // filled in by `install_shims` once the page exists
+        probe: &SEAL_PROBE as *const _ as u64,
+        trampoline: p.trampoline as u64,
+        detour: seal_detour as *const () as u64,
+        vprotect,
+        flush: flush_fn,
+        gettick,
+    };
+    let (code, data) = install_shims(params)?;
+    let entry = code;
+    let vein = code + VEH_OFF;
+    SEAL_DATA.store(data, Ordering::Release);
+    SEAL_ENTRY.store(entry, Ordering::Release);
+    SEAL_VEH.store(vein, Ordering::Release);
+    SEAL_TRAMP.store(p.trampoline, Ordering::Release);
+    // First tick no earlier than `SEAL_START_DELAY_MS`: the injector seals only
+    // after `DllMain` returns, and a half-sealed image must not be decrypted.
+    unsafe {
+        let d = data as *mut SealData;
+        core::ptr::write_volatile(&mut (*d).due, now_ms() + SEAL_START_DELAY_MS);
+        (*d).lock = 0;
+        (*d).leaked = 0;
+        (*d).hits = 0;
+        (*d).windows = 0;
+    }
+    let h = unsafe {
+        ffi::AddVectoredExceptionHandler(1, vein as *const core::ffi::c_void)
+    };
+    log::log_tag(
+        "hook",
+        &format!(
+            "l2b: armed — decrypt-on-entry at {entry:#x}, exception shim {vein:#x} registered={}, \
+             first tick in {SEAL_START_DELAY_MS}ms, probe {:#x}",
+            !h.is_null(),
+            params.probe
+        ),
+    );
+    Some(entry)
+}
+
 /// Install the tick hook. Returns true once the game is calling us.
 ///
 /// Anchor choice, in order: `kernel32!QueryPerformanceCounter` (called
@@ -1021,6 +1687,13 @@ pub fn install_tick() -> bool {
     }
     log::log_tag("hook", &format!("console file {}", console::cmd_path().display()));
 
+    // L2b: with a seal ahead of us the detour must live outside the image, so the
+    // tick is entered through a shim page instead of `qpc_detour` directly.
+    // `HROMATITE_SEAL` and `HROMATITE_L2B` both arm it (the wrapper exports SEAL
+    // as 0 when neither is set, which keeps the old in-image behaviour).
+    let l2b = env_flag("HROMATITE_L2B") || env_flag("HROMATITE_SEAL");
+    log::log_tag("hook", &format!("l2b requested={l2b} (HROMATITE_L2B/HROMATITE_SEAL)"));
+
     let cands: [(&str, &str, usize); 3] = [
         ("kernel32.dll", "QueryPerformanceCounter", qpc_detour as *const () as usize),
         ("ntdll.dll", "RtlQueryPerformanceCounter", qpc_detour as *const () as usize),
@@ -1040,6 +1713,22 @@ pub fn install_tick() -> bool {
                 log::log_tag("hook", &format!("install: cannot prepare {module}!{func} at {addr:#x}"));
                 continue;
             }
+        };
+        // L2b: swap the in-image detour for the shim page. If that fails we
+        // still hook (the seal then breaks the tick, which the log says loudly).
+        let detour = if l2b {
+            match arm_l2b(&p) {
+                Some(d) => d,
+                None => {
+                    log::log_tag(
+                        "hook",
+                        "l2b: shim not armed, falling back to the in-image detour (a seal will break it)",
+                    );
+                    detour
+                }
+            }
+        } else {
+            detour
         };
         // publish the trampoline *before* the patch: a thread entering the
         // detour in the gap calls the original through it, not through us
@@ -1179,8 +1868,23 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             let start = START_MS.load(Ordering::Relaxed);
             let up = now_ms().saturating_sub(start);
             let rate = if up > 0 { n as f64 * 1000.0 / up as f64 } else { 0.0 };
+            let d = SEAL_DATA.load(Ordering::Acquire) as *const SealData;
+            // Reading this is only legal *because* we are inside the detour, i.e.
+            // the image is decrypted right now (see the module comment).
+            let l2b = if d.is_null() {
+                "l2b=off".to_string()
+            } else {
+                let s = unsafe { &*d };
+                format!(
+                    "l2b=on shim_hits={} windows={} leaked={} due_in={}ms",
+                    s.hits,
+                    s.windows,
+                    s.leaked,
+                    s.due.saturating_sub(now_ms())
+                )
+            };
             Some(vec![format!(
-                "tick {n}, uptime {up}ms ({rate:.1}/s), interval {}ms, hooks={}, busy={}",
+                "tick {n}, uptime {up}ms ({rate:.1}/s), interval {}ms, hooks={}, busy={}, {l2b}",
                 INTERVAL_MS.load(Ordering::Relaxed),
                 match HOOKS.lock() {
                     Ok(g) => g.len(),
@@ -1246,6 +1950,104 @@ mod tests {
         assert_eq!(first.len, 8);
         assert_eq!(first.rel, None);
         assert_eq!(first.rip, None);
+    }
+
+    // ---- L2b shim ---------------------------------------------------------
+
+    /// The shim's operands are hard-coded byte offsets; Rust must agree.
+    #[test]
+    fn seal_data_layout_matches_the_asm() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(SealData, lock), D_LOCK);
+        assert_eq!(offset_of!(SealData, due), D_DUE);
+        assert_eq!(offset_of!(SealData, hits), D_HITS);
+        assert_eq!(offset_of!(SealData, leaked), D_LEAKED);
+        assert_eq!(offset_of!(SealData, old_prot), D_OLD);
+        assert_eq!(offset_of!(SealData, windows), D_WINDOWS);
+        assert_eq!(offset_of!(SealData, crypted), D_CRYPTED);
+        assert_eq!(core::mem::size_of::<SealData>(), 0x38);
+    }
+
+    fn shim_params() -> ShimParams {
+        ShimParams {
+            base: 0x1000_0000,
+            size: 0x4_0000,
+            data: 0x2000_0000,
+            probe: 0x1000_1000,
+            trampoline: 0x3000_0000,
+            detour: 0x1000_2000,
+            vprotect: 0x7f00_0001_0000,
+            flush: 0x7f00_0001_0100,
+            gettick: 0x7f00_0001_0200,
+        }
+    }
+
+    /// Dump the two shims so the bytes can be disassembled outside the test run
+    /// (`objdump -D -b binary -m i386:x86-64`): the point of this module is that
+    /// the machine code is readable, so it has to be checkable.
+    #[test]
+    fn dump_shims() {
+        let p = shim_params();
+        let tick = build_tick(&p);
+        let veh = build_veh(&p);
+        let dir = std::env::temp_dir();
+        let t = dir.join("hromatite-shim-tick.bin");
+        let v = dir.join("hromatite-shim-veh.bin");
+        std::fs::write(&t, &tick).unwrap();
+        std::fs::write(&v, &veh).unwrap();
+        for (name, b) in [("tick", &tick), ("veh", &veh)] {
+            println!("{name}: {} bytes -> {}", b.len(), dir.display());
+            println!("{name}_hex={}", b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        }
+        assert!(tick.len() < VEH_OFF, "tick shim {} bytes does not fit", tick.len());
+        assert!(VEH_OFF + veh.len() <= PAGE_SIZE);
+    }
+
+    // Execute the emitted cipher block on the host and compare it with
+    // `crypto::xor_page`: the asm and the Rust reference must agree byte for
+    // byte, otherwise the payload decrypts garbage after the injector sealed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crypt_asm_matches_crypto() {
+        use crate::crypto;
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        }
+        let size = 3 * PAGE_SIZE + 37; // two whole pages, one short tail
+        let mut buf = vec![0u8; size];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i * 31 + 7) as u8;
+        }
+        let orig = buf.clone();
+        // blob: push rbx/rsi/rdi, crypt, pop rdi/rsi/rbx, ret
+        let mut a = Asm::new();
+        a.bs(&[0x53, 0x56, 0x57]); // push rbx, rsi, rdi
+        crypt(&mut a, buf.as_ptr() as u64, size as u64);
+        a.bs(&[0x5F, 0x5E, 0x5B, 0xC3]); // pop rdi, rsi, rbx, ret
+        let code = a.finish();
+        let mem = unsafe { mmap(core::ptr::null_mut(), 4096, 7, 0x22, -1, 0) }; // RWX, MAP_ANON|PRIVATE
+        assert!(!mem.is_null() && mem as isize != -1, "mmap failed");
+        unsafe {
+            core::ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len());
+            let f: extern "C" fn() = core::mem::transmute(mem);
+            f();
+        }
+        let mut want = orig.clone();
+        for (i, chunk) in want.chunks_mut(PAGE_SIZE).enumerate() {
+            crypto::xor_page(i as u64, chunk);
+        }
+        if let Some(i) = (0..buf.len()).find(|&i| buf[i] != want[i]) {
+            let page = i / PAGE_SIZE;
+            let first = page * PAGE_SIZE;
+            let n = (i - first).min(24);
+            panic!(
+                "asm and crypto::xor_page disagree: first at {i} (page {page}+{:#x});\n asm  {:02x?}\n rust {:02x?}",
+                i - first,
+                &buf[first..first + n],
+                &want[first..first + n]
+            );
+        }
+        assert_ne!(&want[..16], &orig[..16], "the cipher did nothing");
     }
 
     #[test]

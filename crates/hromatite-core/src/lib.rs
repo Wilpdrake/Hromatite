@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod console;
+pub mod crypto;
 pub mod ffi;
 pub mod hook;
 pub mod il2cpp;

@@ -25,12 +25,12 @@ pub struct Options {
     pub seal: bool,
 }
 
-/// Fixed ASCII key, expanded per page so neighbouring pages do not repeat.
-const SEAL_KEY: u64 = 0x4852_4f4d_4154_4954; // "HROMATIT"
-
-/// XOR one page of the remote image in place.
+/// XOR one page of the remote image in place with `crypto::xor_page` — the very
+/// same function the payload's shim page re-runs in machine code (plan 4). Any
+/// divergence here means the tick decrypts garbage, so the page index and the
+/// page length are the contract, not an implementation detail.
 fn seal_image(r: &Remote, base: usize, size: usize) -> (usize, usize) {
-    const PAGE: usize = 4096;
+    const PAGE: usize = crate::crypto::PAGE;
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut off = 0usize;
@@ -44,13 +44,7 @@ fn seal_image(r: &Remote, base: usize, size: usize) -> (usize, usize) {
         }
         match r.read_vec(addr, n) {
             Some(mut buf) => {
-                let mut ks = SEAL_KEY ^ (off as u64 / PAGE as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                for b in buf.iter_mut() {
-                    ks ^= ks << 13;
-                    ks ^= ks >> 7;
-                    ks ^= ks << 17;
-                    *b ^= (ks & 0xFF) as u8;
-                }
+                crate::crypto::xor_page((off / PAGE) as u64, &mut buf);
                 if r.write(addr, &buf) {
                     done += 1;
                 } else {
@@ -474,7 +468,7 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         let (pages, failed) = seal_image(&r, base, size);
         let after = r.read_vec(base, 16).unwrap_or_default();
         log::log(&format!(
-            "seal: {pages} pages XORed, {failed} failed, size {size:#x}; \
+            "seal: {pages} pages XORed, {failed} failed, size {size:#x}, crypto=block8; \
              before {:02x?}; after {:02x?}",
             &before[..before.len().min(16)],
             &after[..after.len().min(16)]
