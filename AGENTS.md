@@ -1187,3 +1187,50 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - **Следующий шаг**: вызвать `image_get_class` для индексов 1..N, дампить
   структуру (16 qword), найти поле с печатной строкой = `name`/`namespaze`,
   и перебором (маленькие чтения, без сканов) найти класс `Camera`.
+
+### 2026-11-15 — «GC SuspendThread loop failed»: дампы вскрыты, механизм доказан (причина падений)
+
+- Коммит: см. следующий (`docs(agents): GC crash forensics — dumps prove Boehm abort`).
+  Репозиторий не менялся (работа только по логам/дампам и офлайн-строкам GameAssembly).
+- **Дампы нашлись**: `…/users/steamuser/AppData/Local/Temp/VRChat/VRChat/Crashes/Crash_*/crash.dmp`,
+  **8 штук** (все падения с 07:22 14.11 по 02:31 15.11). Разобраны minidump'ом.
+- **Все 8 — один и тот же фатал**: `0x80000003` (int3) по `GameAssembly.dll+0xc41b65`,
+  рядом в .rdata строки `SuspendThread loop failed`, `ResumeThread failed`,
+  `SuspendThread loop failed: thread id= 0x%x, handle= %p, errcode= 0x%X`.
+- **Механизм (по исходникам bdwgc + Unity-форк)**: `GC_suspend()` в цикле до
+  `MAX_SUSPEND_THREAD_RETRIES = 1 000 000`: `SuspendThread` → `GetThreadContext`;
+  если контекст не пришёл — `ResumeThread` и снова. На 0xFDCF0/0xFDDA0 стека
+  абортившего потока — ровно `0xf4240`. Значит GC **не смог получить CONTEXT**
+  от одного зарегистрированного потока, SuspendThread при этом «успешен».
+- **Ключевое наблюдение по дампам**: во всех 8 дампах у ВСЕХ 110–200 потоков
+  `SuspendCount ≥ 1` (83–116 с `1`, 1–116 с `2`), и **ни одного** потока с
+  `SuspendCount == 0`, кроме самого абортившего. Т.е. тот поток, который GC
+  пытался приостановить, **в списке потоков процесса уже отсутствует** —
+  классика «протухшей записи в `GC_threads[]`»: поток завершился, но запись
+  (и её handle, который держит сам Boehm) осталась; `GetThreadContext` для
+  TERMINATED под wine всегда падает → 1e6 итераций → ABORT-int3.
+- **Проверено в бинаре игры**: есть env-хуки `GC_PRINT_STATS`, `GC_PRINT_VERBOSE_STATS`,
+  `GC_LOOP_ON_ABORT`; строка `Threads explicit registering is not previously enabled`
+  → сборка собрана **без** `HAS_WIN32_THREADS_DISCOVERY`, т.е. Boehm **не перечисляет**
+  потоки сам, а только регистрирует «свои» (`GC_register_my_thread`), и наш
+  `CreateRemoteThread`-стаб в таблицу **не попадает**, пока сам не зарегистрируется.
+- **С корреляцией по времени**: все 8 падений — через 55 с … 7 мин ПОСЛЕ
+  `mapped at` (возврат stub-потока), ни одного падения в сессии без инжекта;
+  последняя команда payload'а каждый раз разная (recon / ничего / cls / imgc / find / q),
+  т.е. падение вызывает не операция, а сама инъекция (следствие изменения
+  множества потоков в процессе).
+- **Отчёт форензики**: `~/.hermes/cache/scratch/gc-forensics.md`;
+  механизм/эксперименты: `~/.hermes/cache/scratch/gc-mechanism.md`;
+  аудит кода: `~/.hermes/cache/scratch/gc-code-audit.md`.
+- **Аудит кода (кандидаты, НЕ доказано)**: файловый I/O на потоке игры
+  (`log.rs` открывает/закрывает файл на каждую строку; `hook.rs:1530-1543`
+  опрашивает файл команд из QPC-детура при `LIVE=0`), `std::Mutex`, утекающий
+  залоченным при longjmp из `veh.rs:226`, tight-loop без yield внутри региона
+  (`find_string`, `findb`, `find_qword_in_span`).
+- **Осталось (дешёвый добивающий шаг)**: прочитать таблицу `GC_threads[256]`
+  из payload'а (GameAssembly `.data`), сопоставить `id` записей с живыми потоками
+  процесса (Toolhelp32) и печатать в лог periodically → на следующем падении
+  в логе останется **точный id протухшего потока** (и станет ясно, наш ли это стаб:
+  payload будет логировать и свой TID). Альтернатива — `GC_LOOP_ON_ABORT=1` +
+  gdb внутри wine: при аборте цикл не завершает процесс, и `t->id` читается
+  прямо из кадра `GC_suspend`.
