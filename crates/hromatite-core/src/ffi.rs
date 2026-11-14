@@ -55,6 +55,24 @@ pub struct MEMORY_BASIC_INFORMATION {
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 
+/// `PROCESS_MEMORY_COUNTERS` (psapi). Used as a watchdog around calls into
+/// unknown exports: one of the il2cpp API entries is an allocator, and feeding
+/// it a domain pointer as a size argument OOM-killed the game (7.4 GB anon).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PROCESS_MEMORY_COUNTERS {
+    pub cb: u32,
+    pub PageFaultCount: u32,
+    pub PeakWorkingSetSize: usize,
+    pub WorkingSetSize: usize,
+    pub QuotaPeakPagedPoolUsage: usize,
+    pub QuotaPagedPoolUsage: usize,
+    pub QuotaPeakNonPagedPoolUsage: usize,
+    pub QuotaNonPagedPoolUsage: usize,
+    pub PagefileUsage: usize,
+    pub PeakPagefileUsage: usize,
+}
+
 // ---- exceptions / vectored handler (plan 2) -------------------------------
 
 pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -198,6 +216,12 @@ unsafe extern "system" {
     pub fn GetCurrentProcess() -> HANDLE;
     pub fn GetCurrentThreadId() -> u32;
     pub fn GetTickCount64() -> u64;
+    // kernel32 in wine, psapi on Windows (both present under Proton)
+    pub fn K32GetProcessMemoryInfo(
+        h: HANDLE,
+        counters: *mut PROCESS_MEMORY_COUNTERS,
+        cb: u32,
+    ) -> BOOL;
 
     /// setjmp/longjmp, x64 flavour: capture the caller's context, and later
     /// restore it to resume there. This is how a vectored handler abandons a

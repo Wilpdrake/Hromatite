@@ -271,7 +271,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "domain                    — домен и его геттер".into(),
                 "diag                      — полный recon заново".into(),
                 "guard <addr>              — вызов функции под VEH (fault -> Err, не смерть)".into(),
-                "api [reset]               — идентифицировать il2cpp API среди экспортов".into(),
+                "api [1|2|reset]           — идентифицировать il2cpp API (1=assemblies, 2=class)".into(),
                 "cls2 <ns> <name> [asm]    — класс через il2cpp_class_from_name".into(),
                 "cam                       — короткий тест: UnityEngine.Camera".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
@@ -484,7 +484,19 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 crate::api::reset();
                 crate::log::log_tag("con", "api cache reset");
             }
-            let rep = crate::api::identify();
+            // `api 1` / `api 2` run one phase only: the two phases have very
+            // different risk (pointers vs three pointer args), and a memory
+            // watchdog aborts a phase that starts allocating.
+            let phase = match a1 {
+                "1" => 1u8,
+                "2" => 2u8,
+                _ => 0u8,
+            };
+            let rep = if phase == 0 {
+                crate::api::identify()
+            } else {
+                crate::api::identify_only(phase)
+            };
             let mut out = vec![format!(
                 "domain {:#x}, image {:#x}, tried {}, faulted {}",
                 rep.domain, rep.image, rep.tried, rep.faulted

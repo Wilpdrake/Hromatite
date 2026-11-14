@@ -32,9 +32,58 @@ use crate::veh;
 /// the one we are looking for.
 const SENTINEL: usize = 0xDEAD_BEEF;
 /// Per-phase budget: a wrong function can be expensive, so cap the search.
-const MAX_TRIED: usize = 120;
+/// Brute-forcing all 251 exports OOM-killed the live game (one export was an
+/// allocator that received `domain` (=0x3027c1c0) as its size argument and
+/// allocated ~800 MB per call until VRChat died at 7.4 GB anon), so the default
+/// is small and `HROMATITE_API_TRIED` raises it deliberately.
+fn max_tried() -> usize {
+    std::env::var("HROMATITE_API_TRIED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40)
+}
 /// How many fault lines a phase may write to the log.
 const MAX_FAULT_LOGS: usize = 5;
+/// Abort a phase if one call grows the working set by more than this.
+const RSS_BUDGET_MB: usize = 96;
+
+/// Current working set of this process (watched around calls into unknown code).
+fn rss_mb() -> usize {
+    unsafe {
+        let mut c = ffi::PROCESS_MEMORY_COUNTERS::default();
+        c.cb = core::mem::size_of::<ffi::PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = ffi::K32GetProcessMemoryInfo(
+            ffi::GetCurrentProcess(),
+            &mut c,
+            c.cb,
+        );
+        if ok == 0 { 0 } else { c.WorkingSetSize / (1024 * 1024) }
+    }
+}
+
+/// Release a value that looks like an allocation of a function we called by
+/// mistake: `il2cpp_free` is one of the few exports whose name survived.
+fn try_free(rep: &mut Report, ptr: usize) {
+    if ptr < 0x10000 {
+        return;
+    }
+    for (base, size) in [crate::GAME_ASSEMBLY, crate::UNITY_PLAYER]
+        .iter()
+        .filter_map(|m| procs::own_module(m))
+    {
+        if ptr >= base && ptr < base + size {
+            return; // inside a module: not an allocation
+        }
+    }
+    let free_fn = symbols::EXPORTS
+        .iter()
+        .find(|(n, _)| *n == "il2cpp_free")
+        .and_then(|(_, rva)| ga_addr(*rva));
+    if let Some(f) = free_fn {
+        let _ = veh::call1(f, ptr);
+        rep.note(format!("freed {ptr:#x} with il2cpp_free after memory watchdog"));
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Func {
@@ -84,7 +133,7 @@ pub fn identify() -> Report {
             return r.clone();
         }
     }
-    let r = run_identify();
+    let r = run_identify(0);
     *slot = Some(r.clone());
     r
 }
@@ -92,6 +141,17 @@ pub fn identify() -> Report {
 /// Forget the cache (console: retry after the game finished loading).
 pub fn reset() {
     *REPORT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Run one phase only (`1` = domain_get_assemblies, `2` = class_from_name),
+/// bypassing the cache. Debugging aid: the two phases have very different risk
+/// profiles (one calls unknown functions with a pointer argument, the other
+/// three pointer arguments) and the memory watchdog is per phase.
+pub fn identify_only(phase: u8) -> Report {
+    reset();
+    let r = run_identify(phase);
+    *REPORT.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.clone());
+    r
 }
 
 fn ga_addr(rva: u32) -> Option<usize> {
@@ -109,7 +169,8 @@ fn callable(addr: usize) -> bool {
     !il2cpp::is_getter(addr)
 }
 
-fn run_identify() -> Report {
+fn run_identify(phase: u8) -> Report {
+    // phase 0 = both, 1 = domain_get_assemblies only, 2 = class_from_name only
     let mut rep = Report::default();
     let (ga_base, ga_size) = match procs::own_module(crate::GAME_ASSEMBLY) {
         Some(v) => v,
@@ -141,11 +202,12 @@ fn run_identify() -> Report {
     let mut tried_addrs: Vec<usize> = Vec::new();
 
     // ---- phase 1: il2cpp_domain_get_assemblies(domain, &count) ------------
-    if want >= 2 {
+    if want >= 2 && phase != 2 {
         let mut faults = 0usize;
         let mut logged = 0usize;
+        let budget = max_tried();
         'outer: for (name, rva) in symbols::EXPORTS.iter() {
-            if tried_addrs.len() >= MAX_TRIED {
+            if tried_addrs.len() >= budget {
                 break;
             }
             let addr = match ga_addr(*rva) {
@@ -159,7 +221,19 @@ fn run_identify() -> Report {
             rep.tried += 1;
 
             let mut count = SENTINEL;
+            let rss_before = rss_mb();
             let p1 = veh::call2(addr, domain, &mut count as *mut usize as usize);
+            let grew = rss_mb().saturating_sub(rss_before);
+            if grew > RSS_BUDGET_MB {
+                rep.note(format!(
+                    "memory watchdog: +{grew} MB after {name} rva={rva:#x} (ret {:?}), phase stopped",
+                    p1.as_ref().map(|v| *v)
+                ));
+                if let Ok(v) = p1 {
+                    try_free(&mut rep, v);
+                }
+                break 'outer;
+            }
             match p1 {
                 Ok(ptr) => {
                     if count != want {
@@ -213,7 +287,7 @@ fn run_identify() -> Report {
     }
 
     // ---- phase 2: il2cpp_class_from_name(image, ns, name) ------------------
-    if rep.image != 0 {
+    if rep.image != 0 && phase != 1 {
         let ns = ffi::cstr("UnityEngine");
         let nm = ffi::cstr("Camera");
         let skip = rep.assemblies_fn.map(|f| f.addr).unwrap_or(0);
@@ -221,8 +295,9 @@ fn run_identify() -> Report {
         let mut faults = 0usize;
         let mut logged = 0usize;
         let mut tried_addrs2: Vec<usize> = Vec::new();
+        let budget2 = max_tried();
         'class: for (name, rva) in symbols::EXPORTS.iter() {
-            if tried >= MAX_TRIED {
+            if tried >= budget2 {
                 break;
             }
             let addr = match ga_addr(*rva) {
@@ -235,12 +310,24 @@ fn run_identify() -> Report {
             tried_addrs2.push(addr);
             tried += 1;
 
-            let r = match veh::call3(
+            let rss_before = rss_mb();
+            let called = veh::call3(
                 addr,
                 rep.image,
                 ns.as_ptr() as usize,
                 nm.as_ptr() as usize,
-            ) {
+            );
+            let grew = rss_mb().saturating_sub(rss_before);
+            if grew > RSS_BUDGET_MB {
+                rep.note(format!(
+                    "memory watchdog: +{grew} MB after {name} rva={rva:#x} (class phase), stopped"
+                ));
+                if let Ok(v) = called {
+                    try_free(&mut rep, v);
+                }
+                break 'class;
+            }
+            let r = match called {
                 Ok(r) => r,
                 Err(f) => {
                     faults += 1;
