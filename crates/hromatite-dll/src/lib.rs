@@ -10,7 +10,7 @@
 //! through `log::guard`, and the whole body again at the entry point.
 //! (Access violations are *not* caught here: that is the VEH, plan 2.)
 
-use hromatite_core::{console, il2cpp, log, procs, GAME_ASSEMBLY, UNITY_PLAYER};
+use hromatite_core::{console, hook, il2cpp, log, procs, GAME_ASSEMBLY, UNITY_PLAYER};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -97,6 +97,23 @@ fn attach(hinst: *mut core::ffi::c_void) {
         // The recon walks unknown structures; a panic (index/Option arithmetic)
         // is expected there sooner or later and must stay contained.
         let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
+    }
+    // Plan 3: HROMATITE_FRAME_HOOK=1 replaces the long-lived stub thread with a
+    // tick inside a function the game already calls. DllMain returns right away,
+    // so there is no thread of ours left and the injector stops waiting for us.
+    // (Trade-off: `--seal` XORs the image the moment we return, which also
+    // destroys the detour — frame hook and seal are exclusive for now.)
+    let frame_hook = std::env::var("HROMATITE_FRAME_HOOK")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if frame_hook {
+        let ok = log::guard("install_tick", hook::install_tick).unwrap_or(false);
+        log::log_tag(
+            "dll",
+            &format!("FRAME_HOOK: tick hook installed={ok}, returning from DllMain (no console_loop)"),
+        );
+        log::log_tag("dll", "recon done, returning from DllMain");
+        return;
     }
     // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
     let live: u32 = std::env::var("HROMATITE_LIVE")
