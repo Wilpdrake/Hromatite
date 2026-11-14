@@ -1325,7 +1325,7 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     let done = a.label();
     prologue(&mut a);
     a.mov_imm(7, p.data);
-    stage(&mut a, 7); // the vectored shim was entered
+    stage(&mut a, 0xF); // the vectored shim was entered (15 = fault path)
     a.mov_imm(10, p.probe);
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax
