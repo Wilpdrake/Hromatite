@@ -195,6 +195,8 @@ unsafe extern "system" {
     pub fn VirtualProtect(addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
     pub fn FlushInstructionCache(h: HANDLE, base: *const u8, size: usize) -> BOOL;
     pub fn GetCurrentProcess() -> HANDLE;
+    pub fn GetCurrentThreadId() -> u32;
+    pub fn GetTickCount64() -> u64;
 
     /// setjmp/longjmp, x64 flavour: capture the caller's context, and later
     /// restore it to resume there. This is how a vectored handler abandons a
