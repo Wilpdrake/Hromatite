@@ -65,9 +65,15 @@ impl Remote {
         }
     }
 
-    pub fn alloc(&self, size: usize) -> Option<usize> {
+    pub fn alloc(&self, size: usize, protect: u32) -> Option<usize> {
+        self.alloc_at(0, size, protect)
+    }
+
+    /// Allocate at a requested address (0 = anywhere). Used for module stomping,
+    /// where the region must land inside an already-mapped image.
+    pub fn alloc_at(&self, addr: usize, size: usize, protect: u32) -> Option<usize> {
         let p = unsafe {
-            VirtualAllocEx(self.h, 0, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            VirtualAllocEx(self.h, addr, size, MEM_COMMIT | MEM_RESERVE, protect)
         };
         (!p.is_null()).then_some(p as usize)
     }

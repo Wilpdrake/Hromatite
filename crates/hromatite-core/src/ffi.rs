@@ -23,6 +23,7 @@ pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_RELEASE: u32 = 0x8000;
 
 pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_EXECUTE_READ: u32 = 0x20;
 pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
 pub const INFINITE: u32 = 0xFFFF_FFFF;

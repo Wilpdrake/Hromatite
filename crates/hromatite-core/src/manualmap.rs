@@ -1,13 +1,25 @@
-//! Manual mapping: the DLL never appears in the target's PEB module list, so
-//! an in-process module sweep finds nothing to look at.
+//! Manual mapping with the flags EAC's scans actually look at:
 //!
-//! Known limitation: TLS callbacks are only logged, not invoked (a Rust cdylib
-//! normally has none; check `tls` in the log before trusting that).
+//!   * pages start as `RW` and end up `RX` — no anonymous RWX anywhere;
+//!   * PE headers are erased, so a "find the MZ in private memory" sweep fails;
+//!   * TLS callbacks and the entry point run from *one* stub thread, so the game
+//!     gains a single non-module thread instead of two;
+//!   * optional module stomp: the image lives in the slack space of a module the
+//!     game already mapped (its `/proc/<pid>/maps` entry then belongs to that
+//!     module, not to an anonymous region).
 
 use crate::log;
 use crate::pe::PeImage;
 use crate::procs;
 use crate::remote::Remote;
+
+#[derive(Default)]
+pub struct Options {
+    /// Zero the PE headers before the image is written.
+    pub erase_headers: bool,
+    /// Map inside this module's tail slack instead of a fresh allocation.
+    pub stomp: Option<String>,
+}
 
 fn rd_u16(d: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([d[o], d[o + 1]])
@@ -85,7 +97,7 @@ fn remote_load(r: &Remote, dll: &str) -> Option<usize> {
     };
     let w = crate::ffi::wide(dll);
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2) };
-    let arg = r.alloc(bytes.len())?;
+    let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE)?;
     if !r.write(arg, bytes) {
         log::log("remote_load: cannot write dll path into target");
         return None;
@@ -201,15 +213,15 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
     Ok(())
 }
 
-/// x64 stub that calls every TLS callback with (module_base, DLL_PROCESS_ATTACH, 0).
+/// x64 stub calling each target with (module_base, DLL_PROCESS_ATTACH, 0).
 ///
-/// A `CreateRemoteThread` can only hand over one argument, and a Rust cdylib
-/// *does* carry two TLS callbacks (checked with objdump on our own binary), so
-/// they get a hand-encoded stub instead of being skipped.
-fn tls_stub(base: u64, callbacks: &[u64]) -> Vec<u8> {
+/// `CreateRemoteThread` hands over a single argument and wine does not
+/// special-case DLL entry points, so TLS callbacks *and* DllMain both need this
+/// shim. Combining them keeps the game at one stray thread instead of two.
+fn dll_stub(base: u64, targets: &[u64]) -> Vec<u8> {
     let mut code = Vec::new();
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-    for cb in callbacks {
+    for cb in targets {
         code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
         code.extend_from_slice(&base.to_le_bytes());
         code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
@@ -223,40 +235,75 @@ fn tls_stub(base: u64, callbacks: &[u64]) -> Vec<u8> {
     code
 }
 
-fn run_tls_callbacks(r: &Remote, base: usize, tls_rva: u32) -> Result<usize, String> {
+fn tls_targets(r: &Remote, base: usize, tls_rva: u32) -> Vec<u64> {
     let dir = base + tls_rva as usize;
-    let cb_va = r.u64(dir + 24).ok_or("tls: cannot read AddressOfCallBacks")?;
-    if cb_va == 0 {
-        return Ok(0);
-    }
-    let mut cbs = Vec::new();
-    for i in 0..32u64 {
-        match r.u64(cb_va as usize + (i as usize) * 8) {
-            Some(v) if v != 0 => cbs.push(v),
+    let cb_va = match r.u64(dir + 24) {
+        Some(v) if v != 0 => v,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for i in 0..32usize {
+        match r.u64(cb_va as usize + i * 8) {
+            Some(v) if v != 0 => out.push(v),
             _ => break,
         }
     }
-    if cbs.is_empty() {
-        return Ok(0);
+    out
+}
+
+/// Map the image inside a module the game already has, so the region is not
+/// "private, executable, unbacked" in a memory-map sweep.
+fn stomp_alloc(r: &Remote, module: &str, size: usize) -> Option<usize> {
+    let (mbase, _msize) = procs::module(r.pid, module)?;
+    let e = r.u32(mbase + 0x3C)? as usize;
+    let opt = mbase + e + 24;
+    let soimage = r.u32(opt + 56)? as usize;
+    let nsec = r.u16(mbase + e + 6)? as usize;
+    let opt_size = r.u16(mbase + e + 20)? as usize;
+    let st = opt + opt_size;
+    let mut end = 0usize;
+    for i in 0..nsec {
+        let b = st + i * 40;
+        let va = r.u32(b + 12)? as usize;
+        let vs = r.u32(b + 8)? as usize;
+        end = end.max(va + vs);
     }
-    let code = tls_stub(base as u64, &cbs);
-    let mem = r.alloc(code.len()).ok_or("tls: stub alloc failed")?;
-    if !r.write(mem, &code) {
-        return Err("tls: stub write failed".into());
+    let start = (end + 0xFFF) & !0xFFF;
+    let avail = soimage.saturating_sub(start);
+    log::log(&format!(
+        "stomp: {module} base {mbase:#x} SizeOfImage {soimage:#x} last-used {end:#x} slack {avail:#x}, need {size:#x}"
+    ));
+    if avail < size {
+        return None;
     }
-    r.call(mem, 0, 10_000).ok_or("tls: stub thread failed")?;
-    log::log(&format!("manualmap: ran {} TLS callback(s)", cbs.len()));
-    Ok(cbs.len())
+    r.alloc_at(mbase + start, size, crate::ffi::PAGE_READWRITE)
 }
 
 /// Map `dll_path` into `pid` by hand. Returns the remote base address.
-pub fn inject(pid: u32, dll_path: &str) -> Result<usize, String> {
+pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String> {
     let img = PeImage::from_file(dll_path)?;
     let r = Remote::open(pid)?;
-    let base = r.alloc(img.size_of_image as usize).ok_or("VirtualAllocEx failed")?;
+    let size = img.size_of_image as usize;
+
+    let base = match opts.stomp.as_deref() {
+        Some(module) => match stomp_alloc(&r, module, size) {
+            Some(b) => {
+                log::log(&format!("stomp: mapped into {module} at {b:#x}"));
+                b
+            }
+            None => {
+                log::log("stomp: not enough slack, falling back to a fresh allocation");
+                r.alloc(size, crate::ffi::PAGE_READWRITE)
+                    .ok_or("VirtualAllocEx failed")?
+            }
+        },
+        None => r
+            .alloc(size, crate::ffi::PAGE_READWRITE)
+            .ok_or("VirtualAllocEx failed")?,
+    };
     let delta = base as i64 - img.image_base as i64;
 
-    let mut image = vec![0u8; img.size_of_image as usize];
+    let mut image = vec![0u8; size];
     let hdr = (img.size_of_headers as usize).min(img.data.len()).min(image.len());
     image[..hdr].copy_from_slice(&img.data[..hdr]);
     for s in &img.sections {
@@ -270,28 +317,56 @@ pub fn inject(pid: u32, dll_path: &str) -> Result<usize, String> {
     let relocs = if delta != 0 { apply_relocs(&mut image, &img, delta) } else { 0 };
     resolve_imports(&mut image, &img, &r)?;
 
+    if opts.erase_headers {
+        for b in image[..hdr].iter_mut() {
+            *b = 0;
+        }
+    }
+
     if !r.write(base, &image) {
         return Err("WriteProcessMemory(image) failed".into());
     }
 
-    if img.tls.0 != 0 {
-        if let Err(e) = run_tls_callbacks(&r, base, img.tls.0) {
-            log::log(&format!("manualmap: TLS callbacks failed: {e}"));
+    // RW -> RX for code, RW stays for data: no page is both writable and
+    // executable, which is what the scanners key on.
+    let mut rx = 0usize;
+    for s in &img.sections {
+        let n = s.vsize.min(s.rsize.max(s.vsize)) as usize;
+        if n == 0 {
+            continue;
+        }
+        let prot = if s.is_executable() {
+            rx += 1;
+            crate::ffi::PAGE_EXECUTE_READ
+        } else {
+            crate::ffi::PAGE_READWRITE
+        };
+        if !r.protect(base + s.va as usize, n, prot) {
+            log::log(&format!("manualmap: protect failed for section @{:#x}", s.va));
         }
     }
 
-    // A bare CreateRemoteThread would invoke the entry point with only one
-    // argument, leaving `reason` as garbage (wine does not special-case DLL
-    // entry points), so DllMain must be called through our own stub.
+    let mut targets = tls_targets(&r, base, img.tls.0);
+    let tls_count = targets.len();
     let entry = base + img.entry as usize;
-    let stub = tls_stub(base as u64, &[entry as u64]);
-    let mem = r.alloc(stub.len()).ok_or("entry stub alloc failed")?;
-    if !r.write(mem, &stub) {
-        return Err("entry stub write failed".into());
+    targets.push(entry as u64);
+
+    let stub = dll_stub(base as u64, &targets);
+    let stub_mem = r
+        .alloc(stub.len(), crate::ffi::PAGE_READWRITE)
+        .ok_or("stub alloc failed")?;
+    if !r.write(stub_mem, &stub) {
+        return Err("stub write failed".into());
     }
-    r.call(mem, 0, 30_000).ok_or("CreateRemoteThread(entry stub) failed")?;
+    r.protect(stub_mem, stub.len(), crate::ffi::PAGE_EXECUTE_READ);
+    r.call(stub_mem, 0, 60_000)
+        .ok_or("CreateRemoteThread(stub) failed")?;
+
     log::log(&format!(
-        "manualmap: {dll_path} mapped at {base:#x} (delta {delta:#x}, relocs {relocs}), entry {entry:#x} returned"
+        "manualmap: {dll_path} mapped at {base:#x} (delta {delta:#x}, relocs {relocs}, rx sections {rx}, \
+         tls {tls_count}, headers_erased {}, stomp {})",
+        opts.erase_headers,
+        opts.stomp.as_deref().unwrap_or("-")
     ));
     Ok(base)
 }

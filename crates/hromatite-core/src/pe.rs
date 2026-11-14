@@ -7,6 +7,13 @@ pub struct Section {
     pub vsize: u32,
     pub raw: u32,
     pub rsize: u32,
+    pub characteristics: u32,
+}
+
+impl Section {
+    pub fn is_executable(&self) -> bool {
+        self.characteristics & 0x2000_0000 != 0
+    }
 }
 
 pub struct PeImage {
@@ -66,6 +73,7 @@ impl PeImage {
                 va: u32_at(&data, b + 12),
                 rsize: u32_at(&data, b + 16),
                 raw: u32_at(&data, b + 20),
+                characteristics: u32_at(&data, b + 36),
             });
         }
         Ok(Self {

@@ -80,7 +80,7 @@ fn bridge(target: &str) -> i32 {
     0
 }
 
-fn inject(dll: &str, target: &str) -> i32 {
+fn inject(dll: &str, target: &str, opts: &manualmap::Options) -> i32 {
     log::log_echo("=== hromatite inject (manual map) ===");
     let pid = match wait_pid(30, target) {
         Some(p) => p,
@@ -89,8 +89,11 @@ fn inject(dll: &str, target: &str) -> i32 {
             return 1;
         }
     };
-    log::log_echo(&format!("target pid {pid}, dll {dll}"));
-    match manualmap::inject(pid, dll) {
+    log::log_echo(&format!(
+        "target pid {pid}, dll {dll}, erase_headers={}, stomp={:?}",
+        opts.erase_headers, opts.stomp
+    ));
+    match manualmap::inject(pid, dll, opts) {
         Ok(base) => {
             log::log_echo(&format!("mapped at {base:#x}"));
             0
@@ -106,6 +109,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut dll: Option<String> = None;
     let mut target = String::from(GAME_EXE);
+    // Stealth defaults: no PE headers in memory, fresh RX region.
+    let mut opts = manualmap::Options {
+        erase_headers: true,
+        stomp: None,
+    };
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--dll" && i + 1 < args.len() {
@@ -114,6 +122,12 @@ fn main() {
         } else if args[i] == "--proc" && i + 1 < args.len() {
             target = args[i + 1].clone();
             i += 2;
+        } else if args[i] == "--stomp" && i + 1 < args.len() {
+            opts.stomp = Some(args[i + 1].clone());
+            i += 2;
+        } else if args[i] == "--keep-headers" {
+            opts.erase_headers = false;
+            i += 1;
         } else {
             i += 1;
         }
@@ -122,7 +136,7 @@ fn main() {
     let code = match cmd {
         "bridge" => bridge(&target),
         "inject" => match dll {
-            Some(d) => inject(&d, &target),
+            Some(d) => inject(&d, &target, &opts),
             None => {
                 log::log_echo("inject needs --dll <path>");
                 1
