@@ -196,6 +196,46 @@ fn writes_second_arg(bytes: &[u8]) -> bool {
     false
 }
 
+/// Does the body dereference the second (`rdx`) or third (`r8`) argument?
+/// A class lookup must read the namespace/name strings immediately; an allocator
+/// only looks at `rcx` — and passing `image`/`domain` as a *size* is what
+/// allocated 5 GB in the live game.
+fn reads_arg2_or_3(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let b = bytes[i];
+        // mov r64/r32, [rdx(+disp)] / [r8(+disp)] incl. REX forms
+        if b == 0x8B || (b >= 0x40 && b <= 0x4F) {
+            let mut j = i;
+            if b >= 0x40 && b <= 0x4F {
+                j += 1;
+            }
+            if j + 1 < bytes.len() {
+                let op = bytes[j];
+                let modrm = bytes[j + 1];
+                // 0x8B = mov r, r/m; 0x0F B6 = movzx r, r/m8 (string byte load)
+                if op == 0x8B && (modrm & 0x07 == 0x02 || modrm & 0x07 == 0x00) {
+                    // rm=010 → rdx, rm=000 → r8 (with REX.B in the REX byte)
+                    if modrm & 0x07 == 0x02 {
+                        return true;
+                    }
+                    if b >= 0x41 && b & 1 == 1 {
+                        return true;
+                    }
+                }
+                if op == 0x0F && j + 2 < bytes.len() && bytes[j + 1] == 0xB6 {
+                    let m = bytes[j + 2];
+                    if m & 0x07 == 0x02 || (m & 0x07 == 0x00 && b >= 0x41) {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Is this export address callable-looking? Getter-shaped exports take no
 /// arguments and return a singleton; they are useless as 2/3-arg candidates.
 fn callable(addr: usize) -> bool {
@@ -276,7 +316,6 @@ fn run_identify(phase: u8) -> Report {
                 break;
             }
             tried_addrs.push(addr);
-            let tried_so_far = tried_addrs.len();
 
             let mut count = SENTINEL;
             let rss_before = rss_mb();
@@ -355,16 +394,36 @@ fn run_identify(phase: u8) -> Report {
         let mut logged = 0usize;
         let mut tried_addrs2: Vec<usize> = Vec::new();
         let budget2 = max_tried();
-        'class: for (name, rva) in symbols::EXPORTS.iter() {
-            if tried >= budget2 {
-                break;
-            }
+        // Order by "reads the string arguments" first: `class_from_name(image,
+        // ns, name)` must touch rdx/r8 right away, while an allocator only looks
+        // at rcx — and passing `image` (0x6fff…) as a size is how the previous
+        // phase allocated 5 GB.
+        let mut cands2: Vec<(&'static str, u32, usize, bool)> = Vec::new();
+        let mut seen2: Vec<usize> = Vec::new();
+        for (name, rva) in symbols::EXPORTS.iter() {
             let addr = match ga_addr(*rva) {
                 Some(a) => a,
                 None => continue,
             };
-            if addr == skip || tried_addrs2.contains(&addr) || !callable(addr) {
+            if addr == skip || seen2.contains(&addr) || !callable(addr) {
                 continue;
+            }
+            let b = body(addr, 64);
+            if looks_tiny(&b) {
+                continue;
+            }
+            seen2.push(addr);
+            cands2.push((name, *rva, addr, reads_arg2_or_3(&b)));
+        }
+        cands2.sort_by_key(|c| !c.3);
+        rep.note(format!(
+            "phase2 candidates: {} ({} read rdx/r8, budget {budget2})",
+            cands2.len(),
+            cands2.iter().filter(|c| c.3).count()
+        ));
+        'class: for (name, rva, addr, _priority) in cands2.into_iter() {
+            if tried >= budget2 {
+                break;
             }
             tried_addrs2.push(addr);
             tried += 1;
@@ -417,7 +476,7 @@ fn run_identify(phase: u8) -> Report {
             if r2 != r {
                 continue;
             }
-            rep.class_fn = Some(Func { name, rva: *rva, addr });
+            rep.class_fn = Some(Func { name, rva, addr });
             rep.layout = Some(layout);
             rep.note(format!(
                 "found: class_from_name = {name} rva={rva:#x} addr={addr:#x} \
