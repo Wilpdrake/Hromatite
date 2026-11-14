@@ -459,14 +459,26 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
         n += 1;
         let f: extern "system" fn() -> usize = unsafe { core::mem::transmute(addr) };
         let v = f();
+        let v2 = f();
         out.push_str(&format!(
-            "getter {name} rva {rva:#x} -> {v:#x} ({})\n",
+            "getter {name} rva {rva:#x} -> {v:#x} (stable {}, {})\n",
+            v == v2,
             if readable_at(v) { "readable" } else { "not mapped" }
         ));
-        if readable_at(v) {
-            for i in 0..4usize {
+        if readable_at(v) && v > 0x10000 {
+            // One level of the object graph: a domain is a small struct full of
+            // pointers, so this is enough to tell it apart from a plain string
+            // or an integer singleton.
+            for i in 0..12usize {
                 let q = unsafe { *((v + i * 8) as *const u64) };
-                out.push_str(&format!("   +{:#x}: {q:#016x}\n", i * 8));
+                let tag = if readable_at(q as usize) && q > 0x10000 { "->" } else { "  " };
+                out.push_str(&format!("   +{:#x}: {q:#016x} {tag}\n", i * 8));
+                if tag == "->" {
+                    for j in 0..4usize {
+                        let qq = unsafe { *((q as usize + j * 8) as *const u64) };
+                        out.push_str(&format!("        [..]+{:#x}: {qq:#016x}\n", j * 8));
+                    }
+                }
             }
         }
     }
