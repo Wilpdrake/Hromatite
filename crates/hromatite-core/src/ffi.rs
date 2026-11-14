@@ -195,7 +195,19 @@ unsafe extern "system" {
     pub fn VirtualProtect(addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
     pub fn FlushInstructionCache(h: HANDLE, base: *const u8, size: usize) -> BOOL;
     pub fn GetCurrentProcess() -> HANDLE;
+
+    /// setjmp/longjmp, x64 flavour: capture the caller's context, and later
+    /// restore it to resume there. This is how a vectored handler abandons a
+    /// faulting game call and returns an error to *our* frame.
+    /// The buffer is 1232 bytes on x64 (`CONTEXT`, must be 16-byte aligned);
+    /// its contents are opaque to us.
+    pub fn RtlCaptureContext(ctx: *mut u64);
+    /// Non-returning when the restored context differs from the current one.
+    pub fn RtlRestoreContext(ctx: *const u64, exception_record: *const core::ffi::c_void);
 }
+
+/// Size of an x64 `CONTEXT` in qwords (1232 bytes), 16-byte aligned by host code.
+pub const CONTEXT_QWORDS: usize = 154;
 
 /// Rust `&str` -> NUL-terminated wide buffer (stack or heap, caller keeps it).
 pub fn wide(s: &str) -> Vec<u16> {

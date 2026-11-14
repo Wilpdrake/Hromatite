@@ -448,7 +448,14 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             (vec![msg.trim().to_string()], Action::None)
         }
         "" => (Vec::new(), Action::None),
-        other => (vec![format!("unknown command: {other} (try help)")], Action::None),
+        other => {
+            // Extension point for modules that own their own commands (hook,
+            // api); keeps this file from being a merge conflict every wave.
+            if let Some(out) = crate::hook::command(line) {
+                return (out, Action::None);
+            }
+            (vec![format!("unknown command: {other} (try help)")], Action::None)
+        }
     }
 }
 
