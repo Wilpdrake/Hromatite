@@ -27,7 +27,7 @@ pub fn scan_yield() {
         ms = std::env::var("HROMATITE_SCAN_PAUSE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(5);
         MS.store(ms, Ordering::Relaxed);
     }
     if ms > 0 {

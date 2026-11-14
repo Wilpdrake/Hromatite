@@ -88,6 +88,18 @@ pub enum Action {
     Seal,
 }
 
+/// How much of the address space a scan may touch. A full pass (1.5 GB) keeps the
+/// injected thread busy long enough for Unity's GC `SuspendThread` to fail and the
+/// game to freeze; 512 MB is enough for the il2cpp metadata and heap we care about.
+fn scan_budget() -> usize {
+    std::env::var("HROMATITE_SCAN_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+        * 1024
+        * 1024
+}
+
 fn parse_addr(s: &str) -> Option<usize> {
     let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     usize::from_str_radix(t, 16).ok()
@@ -161,7 +173,11 @@ fn find_string(text: &str, max: usize) -> Vec<usize> {
     if pat.is_empty() {
         return out;
     }
+    let mut spent = 0usize;
+    let budget = scan_budget();
     for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+        spent += r.size;
+        if spent > budget { break; }
         if out.len() >= max || r.size < need + 1 {
             continue;
         }
@@ -188,7 +204,11 @@ fn find_string(text: &str, max: usize) -> Vec<usize> {
 fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
     let want = value as u64;
     let mut out = Vec::new();
+    let mut spent = 0usize;
+    let budget = scan_budget();
     for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+        spent += r.size;
+        if spent > budget { break; }
         // без проверки размера `base + size - 8` уходит в минус на крошечных
         // регионах, и цикл читает неотображённую память (это убивало игру)
         if out.len() >= max || r.size < 16 {
@@ -338,7 +358,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             };
             let mut hits = Vec::new();
             let mut total = 0usize;
+            let mut spent = 0usize;
+            let budget = scan_budget();
             for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+                spent += r.size;
+                if spent > budget { break; }
                 if total >= 64 {
                     break;
                 }
@@ -424,7 +448,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 None => return (vec!["usage: find <hex64>".into()], Action::None),
             };
             let mut hits = Vec::new();
+            let mut spent = 0usize;
+            let budget = scan_budget();
             for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+                spent += r.size;
+                if spent > budget { break; }
                 if hits.len() >= 24 {
                     break;
                 }
