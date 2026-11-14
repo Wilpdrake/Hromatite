@@ -1668,7 +1668,12 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         base: base as u64,
         size: size as u64,
         data: 0, // filled in by `install_shims` once the page exists
-        probe: &SEAL_PROBE as *const _ as u64,
+        // A page *inside* the image, not the address of a Rust static: statics
+        // can be placed elsewhere (measured: the probe landed 11 MB below the
+        // image), it then survives the seal and the shim takes the "plaintext"
+        // path against a sealed image — the detour executes ciphertext, faults,
+        // and the window is never released (lock/hits/windows all frozen).
+        probe: (base + PAGE_SIZE) as u64,
         trampoline: p.trampoline as u64,
         detour: seal_detour as *const () as u64,
         vprotect,
