@@ -16,6 +16,25 @@
 
 use crate::ffi::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
 
+/// Give the game's GC a window: `SuspendThread` fails ("Fatal error in GC") when
+/// our injected thread is busy inside a long memory scan, and the game freezes.
+/// Every full-memory scan in the console calls this once per region.
+pub fn scan_yield() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let mut ms = MS.load(Ordering::Relaxed);
+    if ms == u64::MAX {
+        ms = std::env::var("HROMATITE_SCAN_PAUSE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        MS.store(ms, Ordering::Relaxed);
+    }
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// One committed, readable, guard-free region as reported by `VirtualQuery`.
 #[derive(Clone, Copy, Debug)]
 pub struct Span {

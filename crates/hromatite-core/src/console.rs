@@ -165,6 +165,7 @@ fn find_string(text: &str, max: usize) -> Vec<usize> {
         if out.len() >= max || r.size < need + 1 {
             continue;
         }
+        crate::safe::scan_yield(); // let Unity's GC suspend us
         let mut a = r.base;
         // last start such that a+pat.len() (the NUL) is still inside the region
         let last = r.base + r.size - need;
@@ -193,6 +194,7 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
         if out.len() >= max || r.size < 16 {
             continue;
         }
+        crate::safe::scan_yield();
         // регион уже проверен как committed+readable → прямой обход внутри
         // его границ (per-word VirtualQuery здесь стоил бы минуты)
         let span = crate::safe::Span { base: r.base, size: r.size, protect: r.protect };
@@ -340,6 +342,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 if total >= 64 {
                     break;
                 }
+                crate::safe::scan_yield();
                 let mut a = r.base;
                 let end = r.base + r.size;
                 let n = pat.len();
@@ -425,6 +428,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 if hits.len() >= 24 {
                     break;
                 }
+                crate::safe::scan_yield();
                 // `size < 16`: иначе `base + size - 8` уходит ниже начала региона
                 if r.size < 16 {
                     continue;
