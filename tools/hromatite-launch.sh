@@ -16,6 +16,21 @@
 
 set -u
 
+# Steam launches the game from the client's environment, so an A/B run cannot be
+# selected by exporting variables in a shell. Read them from a file instead:
+#   echo HROMATITE_DISABLE=1 > ~/.hromatite-mode
+#   echo HROMATITE_LIVE=0 > ~/.hromatite-mode   (one KEY=VALUE per line)
+# Absent/empty file = normal injected run.
+MODE_FILE="${HROMATITE_MODE_FILE:-$HOME/.hromatite-mode}"
+if [ -r "$MODE_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '' | \#*) continue ;;
+            *=*) export "$line" ;;
+        esac
+    done <"$MODE_FILE"
+fi
+
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 PROTON="${HROMATITE_PROTON:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton}"
