@@ -276,7 +276,7 @@ fn run_identify(phase: u8) -> Report {
                 break;
             }
             tried_addrs.push(addr);
-            rep.tried += 1;
+            let tried_so_far = tried_addrs.len();
 
             let mut count = SENTINEL;
             let rss_before = rss_mb();
@@ -334,10 +334,11 @@ fn run_identify(phase: u8) -> Report {
             }
         }
         rep.faulted += faults;
+        rep.tried = tried_addrs.len();
         if rep.assemblies_fn.is_none() {
             rep.note(format!(
                 "domain_get_assemblies: NOT found (tried {}, faulted {faults}, expected count {want})",
-                rep.tried
+                tried_addrs.len()
             ));
         }
     } else {
@@ -436,6 +437,7 @@ fn run_identify(phase: u8) -> Report {
             break 'class;
         }
         rep.faulted += faults;
+        rep.tried = tried_addrs.len() + tried_addrs2.len();
         if rep.class_fn.is_none() {
             rep.note(format!(
                 "class_from_name: NOT found (tried {tried}, faulted {faults})"
