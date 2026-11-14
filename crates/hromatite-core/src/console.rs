@@ -91,6 +91,27 @@ pub enum Action {
 /// How much of the address space a scan may touch. A full pass (1.5 GB) keeps the
 /// injected thread busy long enough for Unity's GC `SuspendThread` to fail and the
 /// game to freeze; 512 MB is enough for the il2cpp metadata and heap we care about.
+/// Regions in an order that finds il2cpp structures inside the budget: the game's
+/// own modules first (`.data`/`.rdata` hold the class tables), the heap last. A
+/// flat walk spends the whole budget on the heap and never reaches them.
+fn ordered_regions() -> Vec<procs::Region> {
+    let mut all: Vec<procs::Region> = procs::regions(200_000)
+        .into_iter()
+        .filter(|r| r.readable())
+        .collect();
+    let mods: Vec<(usize, usize)> = [crate::GAME_ASSEMBLY, crate::UNITY_PLAYER]
+        .iter()
+        .filter_map(|m| procs::own_module(m))
+        .collect();
+    all.sort_by_key(|r| {
+        let in_mod = mods
+            .iter()
+            .any(|(b, s)| r.base < b + s && r.base + r.size > *b);
+        if in_mod { 0 } else { 1 }
+    });
+    all
+}
+
 fn scan_budget() -> usize {
     std::env::var("HROMATITE_SCAN_MB")
         .ok()
@@ -175,7 +196,7 @@ fn find_string(text: &str, max: usize) -> Vec<usize> {
     }
     let mut spent = 0usize;
     let budget = scan_budget();
-    for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+    for r in ordered_regions() {
         spent += r.size;
         if spent > budget { break; }
         if out.len() >= max || r.size < need + 1 {
@@ -206,7 +227,7 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut spent = 0usize;
     let budget = scan_budget();
-    for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+    for r in ordered_regions() {
         spent += r.size;
         if spent > budget { break; }
         // без проверки размера `base + size - 8` уходит в минус на крошечных
@@ -360,7 +381,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let mut total = 0usize;
             let mut spent = 0usize;
             let budget = scan_budget();
-            for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+            for r in ordered_regions() {
                 spent += r.size;
                 if spent > budget { break; }
                 if total >= 64 {
@@ -450,7 +471,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let mut hits = Vec::new();
             let mut spent = 0usize;
             let budget = scan_budget();
-            for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+            for r in ordered_regions() {
                 spent += r.size;
                 if spent > budget { break; }
                 if hits.len() >= 24 {
