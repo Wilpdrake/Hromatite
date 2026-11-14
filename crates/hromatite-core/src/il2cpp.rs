@@ -469,7 +469,10 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
             // One level of the object graph: a domain is a small struct full of
             // pointers, so this is enough to tell it apart from a plain string
             // or an integer singleton.
-            for i in 0..12usize {
+            for i in 0..32usize {
+                if !readable_at(v + i * 8) {
+                    break;
+                }
                 let q = unsafe { *((v + i * 8) as *const u64) };
                 let tag = if readable_at(q as usize) && q > 0x10000 { "->" } else { "  " };
                 out.push_str(&format!("   +{:#x}: {q:#016x} {tag}\n", i * 8));
