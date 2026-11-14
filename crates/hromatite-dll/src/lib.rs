@@ -49,7 +49,11 @@ fn console_loop(secs: u32) -> bool {
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs as u64);
     loop {
-        for line in reader.poll() {
+        // `poll()` is the one call in this loop that is not a `dispatch`: an AV
+        // there used to kill the payload thread silently (the log simply stops
+        // right after "console ready" and every command goes unanswered).
+        let lines = log::guard("reader.poll", || reader.poll()).unwrap_or_default();
+        for line in lines {
             log::log_tag("con", &format!("> {line}"));
             // One bad command (a panic in a scan loop) must not end the session.
             let answered = log::guard("console::dispatch", || console::dispatch(&line));
