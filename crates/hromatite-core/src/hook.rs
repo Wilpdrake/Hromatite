@@ -1255,6 +1255,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     // Order matters: the pages are RW (that is what the seal left behind), so
     // decrypt first and only then make them executable — a store into RX faults.
     crypt(&mut a, p.base, p.size);
+    a.mov_imm(7, p.data); // crypt uses rdi as its page counter — restore the data page
     stage(&mut a, 6); // decrypt done
     // (no logging inside the shim: log_tag -> QPC -> shim -> recursion)
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
@@ -1348,6 +1349,7 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     a.jcc(5, done); // jnz — a tick owns the window (then it is plaintext already)
     // decrypt while the pages are still RW, only then make them executable
     crypt(&mut a, p.base, p.size);
+    a.mov_imm(7, p.data); // crypt clobbers rdi
     protect_call(&mut a, p, ffi::PAGE_EXECUTE_READ);
     a.mov_imm(1, p.base);
     a.mov_imm(2, p.size);
