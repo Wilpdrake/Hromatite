@@ -37,17 +37,29 @@ PROTON="${HROMATITE_PROTON:-$HOME/.local/share/Steam/steamapps/common/Proton - E
 DIST=$(dirname "$PROTON")/files
 BIN="$ROOT/target/x86_64-pc-windows-gnu/release"
 EXE="$BIN/Hromatite.exe"
-DLL_WIN='Z:\home\wilpdrake\RustroverProjects\Hromatite\target\x86_64-pc-windows-gnu\release\hromatite.dll'
+# The DLL to inject always comes from *this* checkout (so a worktree build can
+# be tested by pointing Steam at that worktree's copy of this script).
+DLL_WIN="${HROMATITE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/release/hromatite.dll" | tr '/' '\\\\')}"
 # L2 (seal): after the payload returns, the injector XORs the whole mapping and
 # leaves it RW. HROMATITE_SEAL=0 disables it for an A/B run.
 #
 # Plan 3 (HROMATITE_FRAME_HOOK=1) makes DllMain return immediately, so the seal
-# would fire at once and XOR the detour along with the payload — the next tick
-# would execute ciphertext. Hence seal defaults to off in frame-hook mode;
-# set HROMATITE_SEAL=1 explicitly to test the (known-broken) pair.
+# fires at once and XORs the detour along with the payload. Plan 4 (L2b) moves
+# the tick into a shim page outside the image, which decrypts the image only for
+# the duration of the call — the pair is usable now, but only when asked for:
+#
+#   HROMATITE_FRAME_HOOK=1  HROMATITE_L2B=1     frame hook + cipher at rest
+#
+# Both variables must reach the *game* process (it is the payload's environment),
+# hence the export: the payload reads them to decide how to install the tick.
 if [ "${HROMATITE_FRAME_HOOK:-0}" = "1" ]; then
-    HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
+    if [ "${HROMATITE_L2B:-0}" = "1" ]; then
+        HROMATITE_SEAL="${HROMATITE_SEAL:-1}"
+    else
+        HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
+    fi
     export HROMATITE_SEAL
+    export HROMATITE_L2B="${HROMATITE_L2B:-0}"
 fi
 INJECT_ARGS="inject --dll $DLL_WIN"
 if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
