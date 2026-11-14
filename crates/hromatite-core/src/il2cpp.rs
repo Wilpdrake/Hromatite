@@ -540,6 +540,21 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
                     names.len(),
                     &names[..names.len().min(8)]
                 ));
+                // Layout of one entry (stride 0x48): needed to get from an
+                // assembly to its image/class table later.
+                for e in 0..2usize {
+                    let base = v + off + e * 0x48;
+                    out.push_str(&format!("   entry[{e}] @{base:#x}:\n"));
+                    for j in 0..9usize {
+                        if !readable_at(base + j * 8) {
+                            break;
+                        }
+                        let q = unsafe { *((base + j * 8) as *const u64) };
+                        let ascii = cstr_ascii(q as usize, 24).unwrap_or_default();
+                        let wname = if ascii.is_empty() { String::new() } else { format!(" '{ascii}'") };
+                        out.push_str(&format!("     +{:#x}: {q:#016x}{wname}\n", j * 8));
+                    }
+                }
             }
         }
     }
