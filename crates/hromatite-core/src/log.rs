@@ -72,16 +72,24 @@ pub fn install_panic_hook() {
 
 /// Run `f`, turning a Rust panic into a log line instead of a dead game.
 ///
-/// `AssertUnwindSafe` is correct here: every closure we guard owns its state and
-/// nothing observes a half-updated structure afterwards — the alternative (a
-/// panic through the `extern "system"` boundary) is real UB.
+/// Not `catch_unwind`: the payload is a manually mapped image with erased PE
+/// headers, so the OS unwinder cannot find its `.pdata` and any real unwind
+/// takes the process down (measured live — `PANIC` line, then the game is gone).
+/// `veh::call_guarded` catches the panic's SEH raise (`0x20474343`) and longjmps
+/// back to this frame, which needs no unwind tables at all.
+///
+/// Trade-off: locals of `f` are leaked on the panic path (no destructors). That
+/// is the right price for a debug command that panics.
 pub fn guard<T>(label: &str, f: impl FnOnce() -> T) -> Option<T> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+    match crate::veh::call_guarded(f) {
         Ok(v) => Some(v),
-        Err(_) => {
-            // The hook has already logged location + message; this line names
-            // the call site so the log reads top-down.
-            log_tag("dll", &format!("guard[{label}]: panic caught, continuing"));
+        Err(fault) => {
+            // The hook has already logged location + message (it runs before the
+            // raise); this line names the call site so the log reads top-down.
+            log_tag(
+                "dll",
+                &format!("guard[{label}]: {fault} caught, continuing"),
+            );
             None
         }
     }

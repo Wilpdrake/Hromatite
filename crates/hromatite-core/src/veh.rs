@@ -1,67 +1,127 @@
 //! Guarded calls: VEH-based "setjmp/longjmp" for calling functions we have not
-//! proven safe.
+//! proven safe, and for containing Rust panics inside the payload.
 //!
 //! `catch_unwind` cannot catch an access violation; only a vectored exception
-//! handler can turn a fault inside a game function into an `Err`. The handler
-//! acts only while our own guard is armed **on the same thread** (flag + thread
-//! id), so the game's own exceptions are never swallowed.
+//! handler can turn a fault inside a game function into an `Err`. Worse, a panic
+//! in the payload cannot be unwound at all: the image is manually mapped with
+//! its PE headers erased, so the OS unwinder cannot find `.pdata` and dies
+//! mid-unwind (measured live: the `PANIC` line appears, then the game is gone and
+//! the injector reports "275 pages failed"). Both cases therefore go through the
+//! same mechanism: capture a context, let the exception happen, and *longjmp*
+//! back. No unwind tables involved.
 //!
 //! # How the jump works
 //!
 //! `RtlCaptureContext` writes the current register state into our buffer and
-//! returns normally (first return). We then call the target. If it faults, the
-//! handler sees `IN_GUARD`, records the fault, and calls `RtlRestoreContext`
-//! with the captured context — which re-enters `call_with` right after
-//! `RtlCaptureContext`, but this time with `RESUMED == true`. That second pass
-//! returns `Err(Fault)` to *our* frame as if nothing happened.
+//! returns normally (first return). We then call the target. If it faults (or
+//! raises a Rust panic while `CATCH_PANIC` is set), the handler sees the armed
+//! slot, records the fault, and calls `RtlRestoreContext` with the captured
+//! context — which re-enters `call_with` right after `RtlCaptureContext`, this
+//! time with `resumed == true`. That second pass returns `Err(Fault)` to *our*
+//! frame as if nothing happened.
+//!
+//! # Nesting
+//!
+//! Guards nest: a command runs under `log::guard`, then calls a game function
+//! under `call2`, and that function may panic. Contexts are kept on a small
+//! stack (`MAX_DEPTH`), the innermost one catches, and the parent slot is
+//! restored afterwards. `CATCH_PANIC` is sticky downwards (an inner guard never
+//! un-catches a panic the outer guard asked to catch).
 //!
 //! # Rules for callers
 //!
-//! Restoring a context **abandons every intermediate frame** of the faulting
-//! call: their destructors never run, their stack memory is simply reused. So:
+//! Restoring a context **abandons every intermediate frame**: their destructors
+//! never run, their stack memory is reused. So:
 //!   * the target must be an `extern "system"` function (or plain data reads);
-//!   * the closure passed to `call_with` must not hold `&mut` borrows that the
-//!     rest of the program observes afterwards — on the fault path they are
-//!     leaked, not released;
-//!   * do not let Rust values with `Drop` live across the guarded call inside
-//!     the closure (a leaked `Vec` is a heap leak, a leaked lock is a hang).
+//!   * do not keep a `MutexGuard`, a file handle or any other `Drop` resource
+//!     alive across the guarded call — on the fault path it leaks (a leaked lock
+//!     is a hang, not just memory).
 //!
-//! Nesting is not supported (one saved context per thread): a nested guard on
-//! the same thread is logged as a configuration error and runs unguarded inside
-//! the outer guard, so a fault still unwinds to the *outer* frame.
+//! The payload is single-threaded by design; if two threads guard at once the
+//! second one runs unguarded (logged once per process) rather than corrupting
+//! the first one's context.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::ffi;
 use crate::log;
 
+/// How deep guards may nest before the innermost ones run unguarded.
+const MAX_DEPTH: usize = 8;
+
 static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Armed only while our frame is the fault target.
-static IN_GUARD: AtomicBool = AtomicBool::new(false);
-static GUARD_TID: AtomicU32 = AtomicU32::new(0);
-/// Pointer to the 16-byte-aligned `CONTEXT` buffer of the armed `call_with`.
+/// Thread that currently owns the guard stack (0 = free). Re-entrant: the same
+/// thread may nest `call_with` (a command guard that calls into a guarded game
+/// function), another thread has to run unguarded.
+static LOCK_TID: AtomicU32 = AtomicU32::new(0);
+/// Number of armed guards on the stack (single payload thread → global is fine).
+static DEPTH: AtomicUsize = AtomicUsize::new(0);
+/// Context pointer of the **innermost** armed guard; the handler jumps here.
 static SAVED: AtomicUsize = AtomicUsize::new(0);
-/// Set by the handler just before `RtlRestoreContext`; `call_with` checks it on
-/// the second return from `RtlCaptureContext`.
-static RESUMED: AtomicBool = AtomicBool::new(false);
+static GUARD_TID: AtomicU32 = AtomicU32::new(0);
+/// While set, a Rust panic (SEH code `0x20474343`) is caught and longjmp'ed
+/// instead of being unwound. Sticky for nested guards.
+static CATCH_PANIC: AtomicBool = AtomicBool::new(false);
 static LAST_CODE: AtomicU32 = AtomicU32::new(0);
 static LAST_ADDR: AtomicU64 = AtomicU64::new(0);
+static LOGGED_CONTENTION: AtomicBool = AtomicBool::new(false);
 
 /// SEH code `x86_64-pc-windows-gnu` uses for Rust panics ("CGC " in ASCII).
-/// Those unwind normally, so the handler steps aside.
 const RUST_PANIC_CODE: u32 = 0x2047_4343;
 
-/// What went wrong inside a guarded call (never a Rust panic — those are
-/// `log::guard`'s job; this is a hardware exception).
+/// x64 `CONTEXT` is 1232 bytes and must be 16-byte aligned: `RtlCaptureContext`
+/// stores XMM registers with aligned moves.
+#[repr(align(16))]
+pub struct CtxBuf([u64; ffi::CONTEXT_QWORDS]);
+
+impl CtxBuf {
+    const ZERO: CtxBuf = CtxBuf([0u64; ffi::CONTEXT_QWORDS]);
+}
+
+/// One nesting level: what to restore when this level finishes, and whether the
+/// handler already jumped back into it.
+struct Slot {
+    saved: usize,
+    resumed: bool,
+    prev_saved: usize,
+    prev_tid: u32,
+    prev_catch: bool,
+}
+
+impl Slot {
+    const EMPTY: Slot = Slot {
+        saved: 0,
+        resumed: false,
+        prev_saved: 0,
+        prev_tid: 0,
+        prev_catch: false,
+    };
+}
+
+static mut CTX: [CtxBuf; MAX_DEPTH] = [CtxBuf::ZERO; MAX_DEPTH];
+static mut SLOTS: [Slot; MAX_DEPTH] = [Slot::EMPTY; MAX_DEPTH];
+
+/// What went wrong inside a guarded call.
 #[derive(Clone, Copy, Debug)]
 pub struct Fault {
     pub code: u32,
     pub addr: usize,
 }
 
+impl Fault {
+    /// True when the "fault" was actually a Rust panic, not a hardware exception.
+    pub fn is_panic(&self) -> bool {
+        self.code == RUST_PANIC_CODE
+    }
+}
+
 impl core::fmt::Display for Fault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "exception {:#010x} at {:#x}", self.code, self.addr)
+        if self.is_panic() {
+            write!(f, "panic (0x{:08x}) at {:#x}", self.code, self.addr)
+        } else {
+            write!(f, "exception {:#010x} at {:#x}", self.code, self.addr)
+        }
     }
 }
 
@@ -79,7 +139,10 @@ pub fn install() -> bool {
     if ok {
         log::log_tag("veh", "installed (first=1, guard-armed only)");
     } else {
-        log::log_tag("veh", "AddVectoredExceptionHandler failed — guarded calls are unguarded");
+        log::log_tag(
+            "veh",
+            "AddVectoredExceptionHandler failed — guarded calls are unguarded",
+        );
     }
     ok
 }
@@ -90,7 +153,8 @@ pub fn installed() -> bool {
 
 unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
     // Cheap gates first: on the game's own exceptions this must cost nothing.
-    if !IN_GUARD.load(Ordering::Acquire) {
+    let depth = DEPTH.load(Ordering::Acquire);
+    if depth == 0 {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
     if GUARD_TID.load(Ordering::Relaxed) != unsafe { ffi::GetCurrentThreadId() } {
@@ -106,10 +170,9 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
             addr = unsafe { (*rec).ExceptionAddress };
         }
     }
-    // `x86_64-pc-windows-gnu` unwinds Rust panics with its own SEH code
-    // ("CGC " = 0x20474343). Those must reach `catch_unwind` normally: restoring
-    // our context instead would skip every destructor on the way out.
-    if code == RUST_PANIC_CODE {
+    // A Rust panic only counts as "ours" when a guard asked for it; otherwise it
+    // must reach whatever `catch_unwind` the caller set up.
+    if code == RUST_PANIC_CODE && !CATCH_PANIC.load(Ordering::Relaxed) {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -119,39 +182,37 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
     let saved = SAVED.load(Ordering::Relaxed);
     log::log_tag(
         "veh",
-        &format!(
-            "caught {code:#010x} at {addr:#x} — restoring captured context ({saved:#x})"
-        ),
+        &format!("caught {code:#010x} at {addr:#x} — restoring captured context ({saved:#x})"),
     );
     if saved == 0 {
         // No context to go back to (should not happen): let the game see it.
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
-    RESUMED.store(true, Ordering::Release);
+    unsafe {
+        SLOTS[depth - 1].resumed = true;
+    }
     // Does not return when the restored context differs from the current one.
     unsafe { ffi::RtlRestoreContext(saved as *const u64, core::ptr::null()) };
     // Only reachable if the "restore" was a no-op.
     ffi::EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Clears the armed flag on every exit path, including early returns of the
-/// closure body and panics (a panic that left `IN_GUARD` set would hijack the
-/// next unrelated game exception).
-struct Disarm;
+/// Undo one nesting level: pop the slot and re-arm the parent (if any).
+fn pop(depth: usize) {
+    unsafe {
+        let slot = &mut SLOTS[depth - 1];
+        let prev_saved = slot.prev_saved;
+        let prev_tid = slot.prev_tid;
+        let prev_catch = slot.prev_catch;
+        slot.resumed = false;
+        slot.saved = 0;
 
-impl Drop for Disarm {
-    fn drop(&mut self) {
-        IN_GUARD.store(false, Ordering::Release);
-        SAVED.store(0, Ordering::Relaxed);
-        RESUMED.store(false, Ordering::Relaxed);
-        GUARD_TID.store(0, Ordering::Relaxed);
+        DEPTH.store(depth - 1, Ordering::Release);
+        SAVED.store(prev_saved, Ordering::Relaxed);
+        GUARD_TID.store(prev_tid, Ordering::Relaxed);
+        CATCH_PANIC.store(prev_catch, Ordering::Relaxed);
     }
 }
-
-/// x64 `CONTEXT` is 1232 bytes and must be 16-byte aligned: `RtlCaptureContext`
-/// stores XMM registers with aligned moves.
-#[repr(align(16))]
-struct CtxBuf([u64; ffi::CONTEXT_QWORDS]);
 
 /// Run `f` under the vectored handler; a hardware exception inside it becomes
 /// `Err(Fault)` in this frame instead of a dead process.
@@ -159,37 +220,82 @@ pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
     install();
 
     let tid = unsafe { ffi::GetCurrentThreadId() };
-    if IN_GUARD.load(Ordering::Acquire) {
-        if GUARD_TID.load(Ordering::Relaxed) == tid {
-            // One saved context per thread: nesting would clobber it.
-            log::log_tag("veh", "nested guard on the same thread — running inside the outer guard");
+    // Re-entrant per thread: the slots are global, so another *thread* has to
+    // run unguarded rather than clobber the owner's context.
+    let mut acquired = false;
+    match LOCK_TID.compare_exchange(0, tid, Ordering::Acquire, Ordering::Relaxed) {
+        Ok(_) => acquired = true,
+        Err(owner) if owner == tid => {}
+        Err(_) => {
+            if !LOGGED_CONTENTION.swap(true, Ordering::Relaxed) {
+                log::log_tag(
+                    "veh",
+                    "another thread holds the guard — running unguarded",
+                );
+            }
             return Ok(f());
         }
-        // Different thread: our statics are global, so this thread has to wait
-        // its turn or it would overwrite the armed context. Single-threaded
-        // payload (inline DllMain) makes this a non-issue; be explicit anyway.
-        log::log_tag("veh", "guard armed on another thread — running unguarded");
+    }
+    let depth = DEPTH.load(Ordering::Acquire);
+    if depth >= MAX_DEPTH {
+        if acquired {
+            LOCK_TID.store(0, Ordering::Release);
+        }
+        log::log_tag("veh", "guard stack full — running unguarded");
         return Ok(f());
     }
 
-    let mut ctx = CtxBuf([0u64; ffi::CONTEXT_QWORDS]);
+    let ctx_ptr = unsafe { CTX[depth].0.as_mut_ptr() as usize };
+    unsafe {
+        let slot = &mut SLOTS[depth];
+        slot.saved = ctx_ptr;
+        slot.resumed = false;
+        slot.prev_saved = SAVED.load(Ordering::Relaxed);
+        slot.prev_tid = GUARD_TID.load(Ordering::Relaxed);
+        slot.prev_catch = CATCH_PANIC.load(Ordering::Relaxed);
+    }
+    SAVED.store(ctx_ptr, Ordering::Relaxed);
     GUARD_TID.store(tid, Ordering::Relaxed);
-    SAVED.store(ctx.0.as_ptr() as usize, Ordering::Relaxed);
-    RESUMED.store(false, Ordering::Relaxed);
-    IN_GUARD.store(true, Ordering::Release);
-    let _disarm = Disarm;
+    DEPTH.store(depth + 1, Ordering::Release);
 
-    unsafe { ffi::RtlCaptureContext(ctx.0.as_mut_ptr()) };
+    unsafe { ffi::RtlCaptureContext(ctx_ptr as *mut u64) };
 
     // Second return: the handler longjmp'ed here.
-    if RESUMED.load(Ordering::Acquire) {
+    if unsafe { SLOTS[depth].resumed } {
+        pop(depth + 1);
+        if acquired {
+            LOCK_TID.store(0, Ordering::Release);
+        }
         return Err(Fault {
             code: LAST_CODE.load(Ordering::Relaxed),
             addr: LAST_ADDR.load(Ordering::Relaxed) as usize,
         });
     }
 
-    Ok(f())
+    let value = f();
+    pop(depth + 1);
+    if acquired {
+        LOCK_TID.store(0, Ordering::Release);
+    }
+    Ok(value)
+}
+
+/// Like [`call_with`], but a Rust **panic** raised inside `f` is caught by the
+/// same handler and turned into `Err` (code `0x20474343`).
+///
+/// This is what `log::guard` uses: the only reliable containment for a payload
+/// whose unwind tables are invisible to the OS.
+///
+/// Cost: the panic payload and every local of `f` leak (their `Drop` never runs).
+/// The panic hook still logs file/line/message before the raise, so nothing is
+/// lost but memory.
+pub fn call_guarded<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
+    CATCH_PANIC.store(true, Ordering::Relaxed);
+    let r = call_with(f);
+    // `pop` already restored the parent's value; if this was the outermost call
+    // make sure the flag does not stay set.
+    CATCH_PANIC.store(false, Ordering::Relaxed);
+    r
 }
 
 /// Call a raw function pointer with 0..3 integer/pointer arguments.
