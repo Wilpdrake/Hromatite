@@ -1235,12 +1235,18 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
 
     a.bind(call);
+    // `crypt` uses rdi as its page counter (`xor edi, edi`), so it must be
+    // reloaded here: passing the counter instead of the data page makes the Rust
+    // detour write into 0x122 and fault on the game's thread (measured: no ticks,
+    // image left decrypted).
+    a.mov_imm(7, p.data);
     a.mov_rr(1, 7); // mov rcx, rdi — the detour takes the data page
     a.call_imm(p.detour);
     a.cmp_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.jcc(4, release); // je release — no window was opened
     protect_call(&mut a, p, ffi::PAGE_READWRITE);
     crypt(&mut a, p.base, p.size);
+    a.mov_imm(7, p.data); // crypt clobbered rdi
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 0);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.bind(release);
