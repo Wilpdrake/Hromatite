@@ -55,7 +55,7 @@ if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
 fi
 # Payload-is-live markers: the stub-thread console in one, the frame hook (which
 # has no console_loop at all) in the other.
-LIVE_PAT='console ready|tick hook installed'
+LIVE_PAT='console ready|tick hook installed|pages XORed'
 # Интерактивное окно консоли (секунды). 0 = one-shot, ровно как раньше.
 # Пока окно открыто, payload читает hromatite-cmd.txt тем же стаб-потоком.
 export HROMATITE_LIVE="${HROMATITE_LIVE:-1800}"
