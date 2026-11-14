@@ -179,6 +179,51 @@ fn dump_qwords(addr: usize, n: usize) -> Vec<String> {
     out
 }
 
+/// Exact NUL-terminated string occurrences in readable memory (capped).
+fn find_string(text: &str, max: usize) -> Vec<usize> {
+    let pat = text.as_bytes();
+    let mut out = Vec::new();
+    for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+        if out.len() >= max {
+            break;
+        }
+        let mut a = r.base;
+        let end = r.base + r.size;
+        while a + pat.len() < end && out.len() < max {
+            if unsafe { *(a as *const u8) } == pat[0]
+                && unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
+                && unsafe { *((a + pat.len()) as *const u8) } == 0
+            {
+                out.push(a);
+                a += pat.len();
+                continue;
+            }
+            a += 1;
+        }
+    }
+    out
+}
+
+/// Slots (addresses) whose 8-byte word equals `value`.
+fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
+    let want = value as u64;
+    let mut out = Vec::new();
+    for r in procs::regions(200_000).into_iter().filter(|r| r.readable()) {
+        if out.len() >= max {
+            break;
+        }
+        let mut a = (r.base + 7) & !7usize;
+        let end = r.base + r.size - 8;
+        while a <= end && out.len() < max {
+            if unsafe { *(a as *const u64) } == want {
+                out.push(a);
+            }
+            a += 8;
+        }
+    }
+    out
+}
+
 /// Execute one command. Returns the answer lines and a control action.
 pub fn dispatch(line: &str) -> (Vec<String>, Action) {
     let mut it = line.splitn(4, char::is_whitespace);
@@ -276,6 +321,43 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 format!("{} '{}': {total} hit(s){}", cmd, rest, if total >= 64 { " (capped)" } else { "" }),
             );
             (hits, Action::None)
+        }
+        "cls" => {
+            // layout-agnostic поиск Il2CppClass: ищем указатель на строку имени
+            // и рядом (в пределах ±0x40) указатель на строку namespace
+            let ns = a1;
+            let name = a2;
+            if ns.is_empty() || name.is_empty() {
+                return (vec!["usage: cls <namespace> <name>".into()], Action::None);
+            }
+            let ns_a = find_string(ns, 4);
+            let nm_a = find_string(name, 6);
+            let mut out = vec![
+                format!("ns '{ns}' at {:?}", ns_a.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>()),
+                format!("name '{name}' at {:?}", nm_a.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>()),
+            ];
+            let mut found = 0usize;
+            for na in &nm_a {
+                for slot in find_qword_slots(*na, 24) {
+                    let mut d = -0x40i64;
+                    while d <= 0x40 {
+                        let p = slot as i64 + d;
+                        if p > 0 && ns_a.contains(&(unsafe { *(p as usize as *const u64) } as usize)) {
+                            found += 1;
+                            out.push(format!(
+                                "  [{found}] name@{slot:#x} ns@{p:#x} (delta {d:+#x})"
+                            ));
+                            out.push(format!("     struct base ~{:#x}, window:", slot.wrapping_sub(0x20)));
+                            out.extend(dump_qwords(slot - 0x20, 10));
+                        }
+                        d += 8;
+                    }
+                }
+            }
+            if found == 0 {
+                out.push("  no struct with name+namespace pair found".into());
+            }
+            (out, Action::None)
         }
         "find" => {
             let want = match parse_addr(a1) {
