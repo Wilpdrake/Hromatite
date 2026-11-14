@@ -1,0 +1,129 @@
+//! Minimal hand-written Win32 surface. No external crates: the DLL must build
+//! with nothing but mingw, and every symbol here is one we actually call.
+#![allow(non_snake_case, non_camel_case_types, dead_code)]
+
+pub type HANDLE = *mut core::ffi::c_void;
+pub type HMODULE = *mut core::ffi::c_void;
+pub type BOOL = i32;
+pub type DWORD = u32;
+
+pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+pub const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
+pub const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
+pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+
+pub const PROCESS_CREATE_THREAD: u32 = 0x0002;
+pub const PROCESS_VM_OPERATION: u32 = 0x0008;
+pub const PROCESS_VM_READ: u32 = 0x0010;
+pub const PROCESS_VM_WRITE: u32 = 0x0020;
+pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+
+pub const MEM_COMMIT: u32 = 0x1000;
+pub const MEM_RESERVE: u32 = 0x2000;
+pub const MEM_RELEASE: u32 = 0x8000;
+
+pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+pub const INFINITE: u32 = 0xFFFF_FFFF;
+pub const DLL_PROCESS_ATTACH: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PROCESSENTRY32W {
+    pub dwSize: u32,
+    pub cntUsage: u32,
+    pub th32ProcessID: u32,
+    pub th32DefaultHeapID: usize,
+    pub th32ModuleID: u32,
+    pub cntThreads: u32,
+    pub th32ParentProcessID: u32,
+    pub pcPriClassBase: i32,
+    pub dwFlags: u32,
+    pub szExeFile: [u16; 260],
+}
+
+impl Default for PROCESSENTRY32W {
+    fn default() -> Self {
+        // SAFETY: plain old data, all-zero is a valid initial state.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MODULEENTRY32W {
+    pub dwSize: u32,
+    pub th32ModuleID: u32,
+    pub th32ProcessID: u32,
+    pub GlblcntUsage: u32,
+    pub ProccntUsage: u32,
+    pub modBaseAddr: *mut u8,
+    pub modBaseSize: u32,
+    pub hModule: HMODULE,
+    pub szModule: [u16; 256],
+    pub szExePath: [u16; 260],
+}
+
+impl Default for MODULEENTRY32W {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+unsafe extern "system" {
+    pub fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> HANDLE;
+    pub fn Process32FirstW(h: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Process32NextW(h: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Module32FirstW(h: HANDLE, e: *mut MODULEENTRY32W) -> BOOL;
+    pub fn Module32NextW(h: HANDLE, e: *mut MODULEENTRY32W) -> BOOL;
+
+    pub fn OpenProcess(access: u32, inherit: BOOL, pid: u32) -> HANDLE;
+    pub fn CloseHandle(h: HANDLE) -> BOOL;
+
+    pub fn ReadProcessMemory(h: HANDLE, base: *const u8, buf: *mut u8, size: usize, read: *mut usize) -> BOOL;
+    pub fn WriteProcessMemory(h: HANDLE, base: *mut u8, buf: *const u8, size: usize, written: *mut usize) -> BOOL;
+
+    pub fn VirtualAllocEx(h: HANDLE, addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
+    pub fn VirtualProtectEx(h: HANDLE, addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
+
+    pub fn CreateRemoteThread(
+        h: HANDLE,
+        sa: usize,
+        stack: usize,
+        start: usize,
+        param: usize,
+        flags: u32,
+        tid: *mut u32,
+    ) -> HANDLE;
+    pub fn CreateThread(
+        sa: *mut core::ffi::c_void,
+        stack: usize,
+        start: usize,
+        param: *mut core::ffi::c_void,
+        flags: u32,
+        tid: *mut u32,
+    ) -> HANDLE;
+    pub fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
+    pub fn GetExitCodeThread(h: HANDLE, code: *mut u32) -> BOOL;
+
+    pub fn GetModuleHandleW(name: *const u16) -> HMODULE;
+    pub fn GetProcAddress(m: HMODULE, name: *const u8) -> *mut core::ffi::c_void;
+    pub fn LoadLibraryW(path: *const u16) -> HMODULE;
+    pub fn GetModuleFileNameW(m: HMODULE, buf: *mut u16, size: u32) -> u32;
+    pub fn GetLastError() -> u32;
+}
+
+/// Rust `&str` -> NUL-terminated wide buffer (stack or heap, caller keeps it).
+pub fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
+pub fn cstr(s: &str) -> Vec<u8> {
+    s.bytes().chain(core::iter::once(0)).collect()
+}
+
+pub fn wide_to_string(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}

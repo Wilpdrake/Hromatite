@@ -1,0 +1,9 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+# NixOS: rustc asks for -l:libpthread.a, which lives in the mingw winpthreads
+# package (exposed via mingw.windows.pthreads in modules/packages.nix).
+rustflags = ["-C", "link-arg=-L/run/current-system/sw/lib"]

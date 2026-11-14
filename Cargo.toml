@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/hromatite-core", "crates/hromatite-dll", "crates/test-target"]
+resolver = "3"
+
+[package]
+name = "Hromatite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hromatite-core = { path = "crates/hromatite-core" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"

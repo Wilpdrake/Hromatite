@@ -1,0 +1,11 @@
+[package]
+name = "hromatite-dll"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "hromatite"
+crate-type = ["cdylib"]
+
+[dependencies]
+hromatite-core = { path = "../hromatite-core" }
