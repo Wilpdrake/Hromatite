@@ -160,6 +160,39 @@ fn ga_addr(rva: u32) -> Option<usize> {
     (a < base + size).then_some(a)
 }
 
+/// Prologue bytes of an export (for cheap static filtering).
+fn body(addr: usize, n: usize) -> Vec<u8> {
+    safe::read_upto(addr, n)
+}
+
+/// Too small to be a multi-argument API entry: a `ret` in the first 12 bytes
+/// means "field getter" (measured: the first exports in `symbols.rs` are all
+/// `48 8b 41 08 c3`-style single-argument getters, which `il2cpp::is_getter`
+/// does not catch because it only recognises rip-relative singletons). Calling
+/// them burns the candidate budget without ever writing the out-parameter.
+fn looks_tiny(bytes: &[u8]) -> bool {
+    bytes.iter().take(12).any(|&b| b == 0xC3)
+}
+
+/// Does the body write through the second argument (`mov [rdx], r64`)?
+/// `il2cpp_domain_get_assemblies(domain, size_t* count)` must. Used only to
+/// *order* candidates — a wrong guess here costs nothing.
+fn writes_second_arg(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        let rex = bytes[i];
+        if (rex == 0x48 || rex == 0x4C) && bytes[i + 1] == 0x89 {
+            let modrm = bytes[i + 2];
+            // mod=00, reg=any, rm=010 (rdx) → [rdx]
+            if modrm & 0xC7 == 0x02 {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Is this export address callable-looking? Getter-shaped exports take no
 /// arguments and return a singleton; they are useless as 2/3-arg candidates.
 fn callable(addr: usize) -> bool {
@@ -205,17 +238,39 @@ fn run_identify(phase: u8) -> Report {
     if want >= 2 && phase != 2 {
         let mut faults = 0usize;
         let mut logged = 0usize;
-        let budget = max_tried();
-        'outer: for (name, rva) in symbols::EXPORTS.iter() {
-            if tried_addrs.len() >= budget {
-                break;
-            }
+        // Order candidates before calling anything: functions that write through
+        // their second argument first (that is the shape of
+        // `domain_get_assemblies(domain, size_t* count)`), then everything that is
+        // not an obvious tiny getter. Calling all 251 blindly once cost the game
+        // its life — an allocator export got `domain` (0x3027c1c0) as its size.
+        let mut cands: Vec<(&'static str, u32, usize, bool)> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for (name, rva) in symbols::EXPORTS.iter() {
             let addr = match ga_addr(*rva) {
                 Some(a) => a,
                 None => continue,
             };
-            if tried_addrs.contains(&addr) || !callable(addr) {
+            if seen.contains(&addr) || !callable(addr) {
                 continue;
+            }
+            let b = body(addr, 64);
+            if looks_tiny(&b) {
+                continue;
+            }
+            seen.push(addr);
+            cands.push((name, *rva, addr, writes_second_arg(&b)));
+        }
+        cands.sort_by_key(|c| !c.3);
+        rep.note(format!(
+            "phase1 candidates: {} ({} write [rdx], budget {})",
+            cands.len(),
+            cands.iter().filter(|c| c.3).count(),
+            max_tried()
+        ));
+        let budget = max_tried();
+        'outer: for (name, rva, addr, _priority) in cands.into_iter() {
+            if tried_addrs.len() >= budget {
+                break;
             }
             tried_addrs.push(addr);
             rep.tried += 1;
@@ -244,7 +299,7 @@ fn run_identify(phase: u8) -> Report {
                     let mut count2 = SENTINEL;
                     match veh::call2(addr, domain, &mut count2 as *mut usize as usize) {
                         Ok(ptr2) if count2 == want => {
-                            rep.assemblies_fn = Some(Func { name, rva: *rva, addr });
+                            rep.assemblies_fn = Some(Func { name, rva, addr });
                             rep.note(format!(
                                 "found: domain_get_assemblies = {name} rva={rva:#x} addr={addr:#x} \
                                  count={want} ptr={ptr:#x} (repeat ptr={ptr2:#x})"
