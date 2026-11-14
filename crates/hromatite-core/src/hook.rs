@@ -1788,7 +1788,7 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         gettick,
         note: l2b_note as *const () as u64,
         text_lo: CODE_LO.load(Ordering::Acquire) as u64,
-        text_hi: KEEP_HI.load(Ordering::Acquire) as u64,
+        text_hi: CODE_HI.load(Ordering::Acquire) as u64,
     };
     let (code, data) = install_shims(params)?;
     let entry = code;
