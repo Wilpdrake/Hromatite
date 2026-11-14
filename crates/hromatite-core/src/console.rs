@@ -15,6 +15,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 pub const CMD_FILE: &str = "hromatite-cmd.txt";
 
+/// Diagnostic: where the reader stands, plus the current file length.
+pub fn cmd_pos() -> String {
+    match std::fs::metadata(cmd_path()) {
+        Ok(m) => format!("{} of {}", std::fs::metadata(cmd_path()).map(|x| x.len()).unwrap_or(0), m.len()),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
 pub fn cmd_path() -> std::path::PathBuf {
     let base = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string());
     std::path::PathBuf::from(base).join(CMD_FILE)
@@ -32,6 +40,11 @@ impl Reader {
         let path = cmd_path();
         let pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         Self { path, pos }
+    }
+
+    /// Current read position (diagnostics).
+    pub fn pos(&self) -> u64 {
+        self.pos
     }
 
     /// Complete lines appended since the last call (a partial tail is kept for

@@ -783,6 +783,7 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static ORIG: AtomicUsize = AtomicUsize::new(0);
 static READER: Mutex<Option<console::Reader>> = Mutex::new(None);
+static POLL_MS: AtomicU64 = AtomicU64::new(0);
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
 fn now_ms() -> u64 {
@@ -847,6 +848,21 @@ fn work(n: u64, now: u64, dt: u64) {
                 None => Vec::new(),
             }
         };
+        // At most once per 5 s: what the reader actually sees. In frame-hook mode
+        // this is the only way to tell "nothing was appended" from "file IO fails
+        // inside a QPC detour".
+        let lg2 = POLL_MS.load(Ordering::Relaxed);
+        if lg2 == 0 || now.wrapping_sub(lg2) >= 5_000 {
+            if POLL_MS
+                .compare_exchange(lg2, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                log::log_tag(
+                    "hook",
+                    &format!("poll: {} command(s), {}", cmds.len(), console::cmd_pos()),
+                );
+            }
+        }
         for line in cmds {
             log::log_tag("con", &format!("> {line}"));
             let answered = log::guard("console::dispatch", || console::dispatch(&line));
