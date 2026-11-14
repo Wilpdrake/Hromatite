@@ -103,10 +103,17 @@ pub struct Slot {
     pub addr: usize,
 }
 
-/// Offsets (relative to the name-string pointer field) where the resolved
-/// function pointer may sit. The struct is private, so every layout is tried
-/// and the one with the most plausible hits wins.
-const DELTAS: [i64; 6] = [8, 16, 24, -8, 32, 40];
+/// Offsets (relative to the name-string pointer slot) where the resolved
+/// function pointer may sit, `-0x80..+0x80` in 8-byte steps. Measured on the
+/// live build 2026-11-14: the name pointers *were* found on the heap (236 of
+/// them) but none of `+8/+16/+24/-8/+32/+40` held a GameAssembly address, so
+/// the table is not a packed `{name, fn}` struct — hence the wider window and
+/// the per-hit dumps below.
+const DELTAS: [i64; 33] = [
+    -0x80, -0x78, -0x70, -0x68, -0x60, -0x58, -0x50, -0x48, -0x40, -0x38, -0x30, -0x28, -0x20,
+    -0x18, -0x10, -8, 0, 8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60,
+    0x68, 0x70, 0x78, 0x80,
+];
 
 #[derive(Default, Clone)]
 pub struct Stats {
@@ -115,7 +122,7 @@ pub struct Stats {
     pub regions: usize,
     pub scanned_mb: usize,
     pub name_ptrs: usize,
-    pub votes: [usize; DELTAS.len()],
+    pub votes: Vec<usize>,
     /// (absolute address of run start, word count, first word)
     pub runs: Vec<(usize, usize, usize)>,
     pub secs: f32,
@@ -126,6 +133,10 @@ pub struct Resolved {
     pub order: Vec<Slot>,
     pub delta: i64,
     pub stats: Stats,
+    /// absolute address + name of every slot found holding a name pointer
+    pub hits: Vec<(usize, &'static str)>,
+    /// absolute base of the run oracle 2 used, if any
+    pub run_base: usize,
 }
 
 fn is_readable(r: &procs::Region) -> bool {
@@ -142,7 +153,10 @@ fn scan_process(
     ga_hi: usize,
     budget_mb: usize,
 ) -> (Vec<(usize, &'static str)>, Stats) {
-    let mut stats = Stats::default();
+    let mut stats = Stats {
+        votes: vec![0usize; DELTAS.len()],
+        ..Default::default()
+    };
     let mut hits: Vec<(usize, &'static str)> = Vec::new();
     let mut runs: Vec<(usize, usize, usize)> = Vec::new();
 
@@ -243,6 +257,8 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
             order: Vec::new(),
             delta: 0,
             stats,
+            hits: Vec::new(),
+            run_base: 0,
         });
     }
 
@@ -280,9 +296,24 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
     }
 
     // oracle 2: if the process holds a contiguous array of GameAssembly
-    // pointers, its index order should follow the .rdata pool order.
+    // pointers, its index order should follow the .rdata pool order. Long runs
+    // are useless here (il2cpp's own metadata pages are full of pointers into
+    // GameAssembly: the best run measured 430 976 words), so only a run whose
+    // length is in the same ballpark as the export count is a table candidate.
+    let n_names = {
+        let mut u: Vec<&str> = found.iter().map(|(n, _)| *n).collect();
+        u.sort_unstable();
+        u.dedup();
+        u.len()
+    };
+    let cand_run = scan
+        .runs
+        .iter()
+        .filter(|(_, words, _)| *words >= n_names / 2 && *words <= n_names * 4)
+        .min_by_key(|(_, words, _)| words.abs_diff(n_names))
+        .copied();
     let mut order: Vec<Slot> = Vec::new();
-    if let Some((run_addr, run_words, _)) = scan.runs.first().copied() {
+    if let Some((run_addr, run_words, _)) = cand_run {
         let mut by_off: Vec<(&'static str, usize)> = found.clone();
         by_off.sort_by_key(|(_, o)| *o);
         by_off.dedup_by_key(|(n, _)| *n);
@@ -301,12 +332,38 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
     }
 
     scan.secs = t0.elapsed().as_secs_f32();
+    let run_base = cand_run.map(|r| r.0).unwrap_or(0);
     Some(Resolved {
         slots,
         order,
         delta,
         stats: scan,
+        hits,
+        run_base,
     })
+}
+
+/// 8-byte words around `at` for the report: `addr [hex] as_u64 (ga|up|…)`.
+fn window(at: usize, before: usize, after: usize, ga: (usize, usize), up: (usize, usize)) -> String {
+    let mut out = String::new();
+    let mut p = at - before;
+    let end = at + after;
+    while p < end {
+        let v = unsafe { *(p as *const u64) };
+        let tag = if v as usize >= ga.0 && (v as usize) < ga.0 + ga.1 {
+            "GA"
+        } else if v as usize >= up.0 && (v as usize) < up.0 + up.1 {
+            "UP"
+        } else if v < 0x10000 {
+            "small"
+        } else {
+            ""
+        };
+        let mark = if p == at { "<<" } else { "  " };
+        out.push_str(&format!("  {mark}{p:#x}: {v:#018x} {tag}\n"));
+        p += 8;
+    }
+    out
 }
 
 /// Tiny getters (`mov rax,[rip+d]; ret` / `lea rax,[rip+d]; ret`) are how il2cpp
@@ -394,13 +451,48 @@ pub fn diagnose() -> String {
         ));
     }
 
+    // How many name-pointer slots have a GameAssembly address anywhere close?
+    // If this is 0 the table does not store the resolved pointer next to the
+    // name at all, and the dump below shows what it does store.
+    let upm = procs::own_module("UnityPlayer.dll").unwrap_or((0, 0));
+    let mut near = 0usize;
+    for (addr, _) in res.hits.iter().take(4000) {
+        let mut p = addr.saturating_sub(0x80);
+        let mut found = false;
+        while p <= addr + 0x80 {
+            let v = unsafe { *(p as *const u64) } as usize;
+            if v >= ga_base && v < ga_base + ga_size {
+                found = true;
+                break;
+            }
+            p += 8;
+        }
+        if found {
+            near += 1;
+        }
+    }
+    out.push_str(&format!(
+        "hits with a GA pointer within +/-0x80: {near}/{} (UnityPlayer {:#x}+{:#x})\n",
+        res.hits.len().min(4000),
+        upm.0,
+        upm.1
+    ));
+
     for (addr, words, first) in &res.stats.runs {
         out.push_str(&format!(
             "run @{addr:#x}: {words} words, first -> {first:#x} (ga {ga_base:#x}+{ga_size:#x})\n"
         ));
     }
+    out.push_str(&format!("run used by oracle 2: {:#x}\n", res.run_base));
     if !res.order.is_empty() {
         out.push_str(&describe(&res.order, "oracle2(pool-order)"));
+    }
+
+    // Raw neighbourhood of the first few name-pointer slots: the layout of the
+    // runtime table is what the next stage has to mimic.
+    for (addr, name) in res.hits.iter().take(3) {
+        out.push_str(&format!("window around {name} @{addr:#x}:\n"));
+        out.push_str(&window(*addr, 0x20, 0x40, (ga_base, ga_size), upm));
     }
     out
 }
