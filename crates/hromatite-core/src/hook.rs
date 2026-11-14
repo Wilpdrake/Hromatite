@@ -1348,7 +1348,20 @@ pub unsafe extern "system" fn seal_detour(data: *mut SealData) {
     // The shim asks again in `iv` ms; the deadline lives outside the image so
     // that the sealed fast path can read it without decrypting anything.
     unsafe { core::ptr::write_volatile(&mut (*data).due, now + iv) };
-    unsafe { core::ptr::write_volatile(&mut (*data).windows, (*data).windows.wrapping_add(1)) };
+    let wins = unsafe { (*data).windows.wrapping_add(1) };
+    unsafe { core::ptr::write_volatile(&mut (*data).windows, wins) };
+    if wins == 1 {
+        // Proof that the shim reached Rust: if this line never appears, the
+        // window is being opened but the `call detour` goes somewhere else.
+        log::log_tag(
+            "l2b",
+            &format!(
+                "first window: now {now}, iv {iv}, hits {}, leaked {}",
+                unsafe { (*data).hits },
+                unsafe { (*data).leaked }
+            ),
+        );
+    }
 
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let prev = WORK_MS.swap(now, Ordering::Relaxed);
