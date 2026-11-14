@@ -151,10 +151,41 @@ pub fn installed() -> bool {
     INSTALLED.load(Ordering::Acquire)
 }
 
+/// `HROMATITE_LOG_AV=1`: report every exception that passes through while no
+/// guard is armed. A payload thread that dies silently (no panic, no log line)
+/// leaves no other trace — this names the faulting address instead.
+fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
+    use std::sync::atomic::AtomicBool;
+    static ON: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    if !INIT.swap(true, Ordering::Relaxed) {
+        ON.store(
+            std::env::var("HROMATITE_LOG_AV").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            Ordering::Relaxed,
+        );
+    }
+    if !ON.load(Ordering::Relaxed) || SEEN.load(Ordering::Relaxed) >= 16 {
+        return;
+    }
+    let (mut code, mut addr) = (0u32, 0usize);
+    if !info.is_null() {
+        let rec = unsafe { (*info).ExceptionRecord };
+        if !rec.is_null() {
+            code = unsafe { (*rec).ExceptionCode };
+            addr = unsafe { (*rec).ExceptionAddress };
+        }
+    }
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+        log::log_tag("veh", &format!("passing exception {code:#010x} at {addr:#x} (unguarded)"));
+    }
+}
+
 unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
     // Cheap gates first: on the game's own exceptions this must cost nothing.
     let depth = DEPTH.load(Ordering::Acquire);
     if depth == 0 {
+        log_passing(info);
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
     if GUARD_TID.load(Ordering::Relaxed) != unsafe { ffi::GetCurrentThreadId() } {
