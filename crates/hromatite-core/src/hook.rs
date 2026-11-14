@@ -1154,7 +1154,9 @@ fn crypt(a: &mut Asm, base: u64, size: u64) {
 /// inside `protect_call`, so between calls it is a free slot that the host can
 /// read from `/proc/<pid>/mem` — the shim has no logger of its own.
 fn stage(a: &mut Asm, n: u8) {
-    a.bs(&[0x48, 0xC7, 0x47, D_OLD as u8, n]);
+    // +0x38 is past `SealData` in a full page — `old_prot` (+0x20) is written by
+    // every `VirtualProtect`, so it cannot hold a breadcrumb.
+    a.bs(&[0x48, 0xC7, 0x47, 0x38, n]);
 }
 
 /// `VirtualProtect(base, size, prot, &old_prot)`
@@ -1264,6 +1266,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.mov_mem_rdi_imm8(D_LEAKED as u8, 0);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 0);
     a.bind(release);
+    stage(&mut a, 8); // about to release the window
     a.mov_mem_rdi_imm8_0(0); // release the window
     a.bind(done);
     epilogue(&mut a);
