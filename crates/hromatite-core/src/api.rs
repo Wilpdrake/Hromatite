@@ -40,7 +40,7 @@ fn max_tried() -> usize {
     std::env::var("HROMATITE_API_TRIED")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(40)
+        .unwrap_or(200)
 }
 /// How many fault lines a phase may write to the log.
 const MAX_FAULT_LOGS: usize = 5;
@@ -180,13 +180,16 @@ fn looks_tiny(bytes: &[u8]) -> bool {
 fn writes_second_arg(bytes: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 3 <= bytes.len() {
-        let rex = bytes[i];
-        if (rex == 0x48 || rex == 0x4C) && bytes[i + 1] == 0x89 {
-            let modrm = bytes[i + 2];
-            // mod=00, reg=any, rm=010 (rdx) → [rdx]
-            if modrm & 0xC7 == 0x02 {
-                return true;
-            }
+        // `mov [rdx(+disp)], r32/r64`: 0x89 then ModRM with rm = 010; REX is
+        // optional (`89 02` stores eax). Displacements are allowed.
+        if bytes[i] == 0x89 && bytes[i + 1] & 0x07 == 0x02 {
+            return true;
+        }
+        if (bytes[i] == 0x48 || bytes[i] == 0x4C)
+            && bytes[i + 1] == 0x89
+            && bytes[i + 2] & 0x07 == 0x02
+        {
+            return true;
         }
         i += 1;
     }
@@ -438,7 +441,7 @@ fn run_identify(phase: u8) -> Report {
                 "class_from_name: NOT found (tried {tried}, faulted {faults})"
             ));
         }
-    } else {
+    } else if phase != 1 {
         rep.note("no UnityEngine.CoreModule/mscorlib image — class_from_name skipped");
     }
 
