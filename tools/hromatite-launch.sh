@@ -72,8 +72,27 @@ export HROMATITE_LIVE="${HROMATITE_LIVE:-1800}"
 LOG="$HOME/.hromatite-launch.log"
 GAME_LOG="$HOME/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/hromatite.log"
 
+# --- capture what the game itself prints ------------------------------------
+# Unity writes "Fatal error in GC — SuspendThread loop failed" (and everything
+# Boehm prints with GC_PRINT_STATS) to its own stdout/stderr, which Steam
+# normally swallows. Keep it in a file next to the other logs.
+# `VRChat.gc.log` is Unity's GC log: it only gets a line when the collector dies,
+# and it is *overwritten* by the next run — so every launch makes a backup.
+DBG_DIR="${HROMATITE_DBG_DIR:-$HOME/.hromatite-logs}"
+mkdir -p "$DBG_DIR" 2>/dev/null
+TS=$(date +%Y%m%d-%H%M%S)
+GAME_OUT="$DBG_DIR/game-$TS.log"
+GC_LOG="${HROMATITE_GCLOG:-$HOME/.local/share/Steam/steamapps/common/VRChat/VRChat.gc.log}"
+[ -f "$GC_LOG" ] && cp -f "$GC_LOG" "$DBG_DIR/gc-$TS-before.log" 2>/dev/null
+# Boehm's own diagnostics: per-collection stats, and the thread id / handle /
+# errcode of the record that fails to suspend. Verbose is very loud, so it is
+# off unless asked for.
+export GC_PRINT_STATS="${GC_PRINT_STATS:-1}"
+export GC_PRINT_VERBOSE_STATS="${GC_PRINT_VERBOSE_STATS:-0}"
+
 echo "[hromatite] wrapper: $*" >>"$LOG"
-"$@" &
+echo "[hromatite] game output -> $GAME_OUT, gc log backup -> $DBG_DIR/gc-$TS-before.log" >>"$LOG"
+"$@" >>"$GAME_OUT" 2>&1 &
 GAME_PID=$!
 
 if [ "${HROMATITE_DISABLE:-0}" = "1" ]; then
@@ -197,3 +216,11 @@ find_game_pid() {
 ) &
 
 wait "$GAME_PID"
+
+# The GC log only ever gets content when the collector dies, so keep this run's
+# copy with its own timestamp, next to the game stdout capture.
+if [ -f "$GC_LOG" ]; then
+    cp -f "$GC_LOG" "$DBG_DIR/gc-$TS-after.log" 2>/dev/null &&
+        echo "[hromatite] gc log kept: $DBG_DIR/gc-$TS-after.log ($(wc -c <"$GC_LOG") bytes)" >>"$LOG"
+fi
+echo "[hromatite] game exited; output: $GAME_OUT" >>"$LOG"

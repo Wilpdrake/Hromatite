@@ -1234,3 +1234,51 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
   payload будет логировать и свой TID). Альтернатива — `GC_LOOP_ON_ABORT=1` +
   gdb внутри wine: при аборте цикл не завершает процесс, и `t->id` читается
   прямо из кадра `GC_suspend`.
+
+### 2026-11-15 — ДИАГНОЗ: протухшая запись Boehm — это поток ИГРЫ, а не наш стаб
+
+- Коммит: `feat(gc): read Boehm's GC_threads table — the dead record is a game thread`.
+- **Сделано и уже сработало в живой игре** (новый модуль `crates/hromatite-core/src/gcthreads.rs`):
+  - адрес таблицы найден статически: `GC_threads[]` = RVA **`0xe6bb180`** в `.data`
+    (256 бакетов, массив указателей); переоткрывается скриптом
+    `tools/gct_table.py` (ищет `mov (%r14,%rsi,8),%rbx; cmp %ecx,0x8(%rbx)` и
+    `lea r14,[rip+…]`); layout записи подтверждён кодом игры:
+    `+0x00 next`, `+0x08 id (DWORD)`, `+0x10 handle` (там же `CloseHandle`);
+  - команды консоли **`gct [rva]`** (детект + дамп всех записей) и **`threads`**
+    (все потоки процесса: tid, start-address через `NtQueryInformationThread`
+    класс 9, модуль+RVA, есть ли запись в GC);
+  - фоновое слежение каждые ~8 с: `[gct] gc_threads @ base: N record(s), L live,
+    D DEAD [ids]; our tid 0x…`, плюс события «thread 0x… exited / started» и, если
+    у вышедшего потока осталась запись, полная строка
+    `^ Boehm STILL holds it: bucket=… ptr=… handle=… stack=…`.
+- **ПЕРВЫЙ ЖЕ ЖИВОЙ ПРОГОН ДАЛ ОТВЕТ** (лог игры, 02:49–02:51 MSK):
+  ```
+  [con] stub thread tid=0x2e0, 66 thread(s) in the process
+  [gct] gc_threads @ 0x6ffff90cb180 (rva 0xe6bb180): 11 record(s), 11 live, 0 DEAD; our tid 0x2e0
+  [gct] … 31 record(s), 31 live, 0 DEAD
+  [gct] … 37 record(s), 36 live, 1 DEAD [0x220]; our tid 0x2e0     ← 02:51:02
+  ```
+  и через **13 секунд** — падение (новый дамп `Crash_2026-11-14_235115422`:
+  снова `0x80000003` int3 в GameAssembly, 115 потоков, гистограмма suspend
+  `{0:1, 1:104, 2:10}` — опять ровно один поток с count 0, т.е. абортивший).
+- **Вывод, который это даёт**: протухшая запись принадлежит **потоку игры**
+  (`id 0x220`), наш стаб — `0x2e0`, его запись жива. Значит причина не «наш поток
+  не приостанавливается», а «поток игры завершился, не вычеркнувшись из Boehm» —
+  и GC валится на следующей сборке. Почему это происходит только с инъекцией —
+  следующий вопрос (кандидаты: наш VEH `first=1` перехватывает исключение на потоке
+  игры, longjmp минует detach; либо churn потоков VRChat + узкое окно Boehm).
+- **Сбор Unity-логов (просьба пользователя)**: `tools/hromatite-launch.sh` теперь
+  - пишет stdout+stderr игры в `~/.hromatite-logs/game-<ts>.log` (Steam его глотает;
+    именно туда Unity/Boehm печатают `SuspendThread loop failed`);
+  - сохраняет `VRChat.gc.log` до и после запуска (`gc-<ts>-before/after.log`), т.к.
+    Unity перезаписывает его при каждом фатале;
+  - экспортирует `GC_PRINT_STATS=1` (по умолчанию) и `GC_PRINT_VERBOSE_STATS=0`
+    (переопределяются из `~/.hromatite-mode`) — Boehm печатает статистику сборок.
+- Проверено сборкой (`cargo build --workspace --release`, `sh -n` на wrapper'е) и
+  живым прогоном `gct` (см. лог выше). Стендовый прогон под wine
+  (`tools/test-loadlib.sh pmtestgc`) тоже отработал: `stub thread tid=0x174,
+  2 thread(s)`, `[gct] table not found` (GameAssembly не загружена) — без падений.
+- Осталось: снять `threads` в живой игре рядом со смертью (увидеть start-address
+  потока `0x220` и понять, какой это поток движка), затем проверить гипотезу
+  «наш VEH ломает detach» — например, запретить `first=1` или не глотать
+  исключения чужих потоков.

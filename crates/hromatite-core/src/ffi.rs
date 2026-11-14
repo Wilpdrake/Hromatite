@@ -8,6 +8,7 @@ pub type BOOL = i32;
 pub type DWORD = u32;
 
 pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+pub const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
 pub const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
 pub const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
 pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
@@ -17,6 +18,7 @@ pub const PROCESS_VM_OPERATION: u32 = 0x0008;
 pub const PROCESS_VM_READ: u32 = 0x0010;
 pub const PROCESS_VM_WRITE: u32 = 0x0020;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+pub const THREAD_QUERY_INFORMATION: u32 = 0x0040;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -162,15 +164,46 @@ impl Default for MODULEENTRY32W {
     }
 }
 
+/// x64 layout (28 bytes); `dwSize` must be set to `size_of` before the call.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct THREADENTRY32 {
+    pub dwSize: u32,
+    pub cntUsage: u32,
+    pub th32ThreadID: u32,
+    pub th32OwnerProcessID: u32,
+    pub tpBasePri: i32,
+    pub tpDeltaPri: i32,
+    pub dwFlags: u32,
+}
+
+impl Default for THREADENTRY32 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+
 unsafe extern "system" {
     pub fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> HANDLE;
     pub fn Process32FirstW(h: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
     pub fn Process32NextW(h: HANDLE, e: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Thread32First(h: HANDLE, e: *mut THREADENTRY32) -> BOOL;
+    pub fn Thread32Next(h: HANDLE, e: *mut THREADENTRY32) -> BOOL;
+    pub fn GetCurrentProcessId() -> u32;
     pub fn Module32FirstW(h: HANDLE, e: *mut MODULEENTRY32W) -> BOOL;
     pub fn Module32NextW(h: HANDLE, e: *mut MODULEENTRY32W) -> BOOL;
 
     pub fn OpenProcess(access: u32, inherit: BOOL, pid: u32) -> HANDLE;
+    pub fn OpenThread(access: u32, inherit: BOOL, tid: u32) -> HANDLE;
     pub fn CloseHandle(h: HANDLE) -> BOOL;
+    /// ntdll: `ThreadQuerySetWin32StartAddress` (class 9) fills a `PVOID`.
+    pub fn NtQueryInformationThread(
+        h: HANDLE,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        len: u32,
+        ret: *mut u32,
+    ) -> i32;
 
     pub fn ReadProcessMemory(h: HANDLE, base: *const u8, buf: *mut u8, size: usize, read: *mut usize) -> BOOL;
     pub fn WriteProcessMemory(h: HANDLE, base: *mut u8, buf: *const u8, size: usize, written: *mut usize) -> BOOL;

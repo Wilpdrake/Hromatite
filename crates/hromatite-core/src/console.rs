@@ -326,6 +326,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "entry <имя>               — поля записи сборки".into(),
                 "domain                    — домен и его геттер".into(),
                 "diag                      — полный recon заново".into(),
+                "gct [rva]                 — таблица потоков Boehm (живые/мёртвые записи)".into(),
+                "threads                   — все потоки процесса: старт-адрес и есть ли запись в GC".into(),
                 "guard <addr>              — вызов функции под VEH (fault -> Err, не смерть)".into(),
                 "api [1|2|reset]           — идентифицировать il2cpp API (1=assemblies, 2=class)".into(),
                 "cls2 <ns> <name> [asm]    — класс через il2cpp_class_from_name".into(),
@@ -529,6 +531,27 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             il2cpp::diagnose().lines().map(|s| s.to_string()).collect(),
             Action::None,
         ),
+        // Boehm's own thread table vs. the threads the process really has.
+        // `gct` alone = detection report + full dump; `gct <rva>` forces a base.
+        "gct" => {
+            let forced = parse_addr(a1).map(|v| v as u32);
+            let mut out = crate::gcthreads::probe(forced);
+            match crate::gcthreads::snapshot(forced) {
+                Some(t) => out.extend(t.lines()),
+                None => out.push("gct: table not found (see candidate scores above)".into()),
+            }
+            (out, Action::None)
+        }
+        // All threads with their start address (which function created them) and
+        // whether Boehm has a record for them: a thread without a record, or a
+        // record whose thread is gone, is what aborts the collector.
+        "threads" => {
+            let table = crate::gcthreads::snapshot(None);
+            (
+                crate::gcthreads::thread_rows(table.as_ref()),
+                Action::None,
+            )
+        }
         // ---- plan 2: guarded calls + behavioural API identification -------
         // `guard <addr>` calls a raw GameAssembly RVA-relative function through
         // the vectored handler: the answer is either a return value or a fault

@@ -47,8 +47,45 @@ fn console_loop(secs: u32) -> bool {
             console::cmd_path().display()
         ),
     );
+    // Our own thread id: the GC crash ("SuspendThread loop failed") is caused by
+    // a Boehm thread record whose OS thread is gone, so the log has to say which
+    // thread was ours before anything else can be blamed on it.
+    log::log_tag(
+        "con",
+        &format!(
+            "stub thread tid={:#x}, {} thread(s) in the process",
+            hromatite_core::gcthreads::own_tid(),
+            hromatite_core::gcthreads::live_tids().len()
+        ),
+    );
+    // Baseline of Boehm's own thread table: one line, cheap (256 reads).
+    log::log_tag(
+        "gct",
+        &log::guard("gct baseline", || {
+            hromatite_core::gcthreads::snapshot(None)
+                .map(|t| t.summary())
+                .unwrap_or_else(|| "table not found".to_string())
+        })
+        .unwrap_or_else(|| "guard".to_string()),
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs as u64);
+    let mut polls: u32 = 0;
     loop {
+        // Every ~16 s: the state of the GC thread table. If the game dies of a
+        // "SuspendThread loop failed", the last line before the end of the log
+        // names the record that made the collector spin.
+        polls += 1;
+        // Every ~8 s: thread births/deaths plus the state of Boehm's own thread
+        // table. The line we are hunting is "thread 0xNNN exited" immediately
+        // followed by "Boehm STILL holds it" — that record is what makes
+        // GC_suspend spin 1e6 times and abort the game a few seconds later.
+        if polls % 20 == 0 {
+            let lines = log::guard("gct watch", hromatite_core::gcthreads::watch)
+                .unwrap_or_else(|| vec!["guard".to_string()]);
+            for l in lines {
+                log::log_tag("gct", &l);
+            }
+        }
         // `poll()` is the one call in this loop that is not a `dispatch`: an AV
         // there used to kill the payload thread silently (the log simply stops
         // right after "console ready" and every command goes unanswered).
