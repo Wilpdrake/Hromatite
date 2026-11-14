@@ -92,12 +92,6 @@ fn attach(hinst: *mut core::ffi::c_void) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
-    let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
-    if ready {
-        // The recon walks unknown structures; a panic (index/Option arithmetic)
-        // is expected there sooner or later and must stay contained.
-        let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
-    }
     // Plan 3: HROMATITE_FRAME_HOOK=1 replaces the long-lived stub thread with a
     // tick inside a function the game already calls. DllMain returns right away,
     // so there is no thread of ours left and the injector stops waiting for us.
@@ -106,7 +100,12 @@ fn attach(hinst: *mut core::ffi::c_void) {
     let frame_hook = std::env::var("HROMATITE_FRAME_HOOK")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
+
+    let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
     if frame_hook {
+        // Install the tick *before* any recon: the full diagnose() scan takes
+        // seconds and must not delay getting off the stub thread. `diag` stays
+        // available as a console command for the same reason.
         let ok = log::guard("install_tick", hook::install_tick).unwrap_or(false);
         log::log_tag(
             "dll",
@@ -114,6 +113,11 @@ fn attach(hinst: *mut core::ffi::c_void) {
         );
         log::log_tag("dll", "recon done, returning from DllMain");
         return;
+    }
+    if ready {
+        // The recon walks unknown structures; a panic (index/Option arithmetic)
+        // is expected there sooner or later and must stay contained.
+        let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
     }
     // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
     let live: u32 = std::env::var("HROMATITE_LIVE")
