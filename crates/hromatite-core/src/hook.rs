@@ -1156,7 +1156,10 @@ fn crypt(a: &mut Asm, base: u64, size: u64) {
 fn stage(a: &mut Asm, n: u8) {
     // +0x38 is past `SealData` in a full page — `old_prot` (+0x20) is written by
     // every `VirtualProtect`, so it cannot hold a breadcrumb.
-    a.bs(&[0x48, 0xC7, 0x47, 0x38, n]);
+    // `mov qword [rdi+0x38], imm32` — the immediate is 4 bytes, and emitting
+    // only five bytes here desynchronised every following instruction (the CPU
+    // ate three bytes of the next opcode, so the shim faulted at +0x2A).
+    a.bs(&[0x48, 0xC7, 0x47, 0x38, n, 0, 0, 0]);
 }
 
 /// Stage logger for the shim. The shim has no logger of its own, but the image is
