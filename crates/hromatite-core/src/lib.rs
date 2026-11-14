@@ -13,6 +13,7 @@ pub mod manualmap;
 pub mod pe;
 pub mod procs;
 pub mod remote;
+pub mod safe;
 pub mod symbols;
 pub mod veh;
 

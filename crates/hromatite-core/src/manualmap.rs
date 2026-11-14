@@ -99,7 +99,12 @@ fn apply_relocs(image: &mut [u8], img: &PeImage, delta: i64) -> usize {
             let e = rd_u16(image, off + 8 + i * 2);
             let ty = e >> 12;
             let ofs = (e & 0x0FFF) as usize;
-            let p = page + ofs;
+            // `page` comes from the file: `page + ofs` may overflow on a
+            // corrupt block and wrap to a *valid-looking* small RVA
+            let p = match page.checked_add(ofs) {
+                Some(p) => p,
+                None => continue,
+            };
             match ty {
                 0 => {}
                 10 => {
@@ -117,7 +122,13 @@ fn apply_relocs(image: &mut [u8], img: &PeImage, delta: i64) -> usize {
     patched
 }
 
+/// NUL-terminated string inside the *local image buffer*. An RVA from the import
+/// directory is attacker-controlled as far as we know, so out-of-range means
+/// empty string, not a panic (`d[o..]` used to slice past the end).
 fn cstr_at(d: &[u8], o: usize) -> String {
+    if o >= d.len() {
+        return String::new();
+    }
     let end = d[o..].iter().position(|&c| c == 0).unwrap_or(0);
     String::from_utf8_lossy(&d[o..o + end]).to_string()
 }
@@ -217,8 +228,14 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
             // thunks have to be found by name in whichever module really owns
             // them (usually kernelbase). The first thunk holds the RVA of the
             // IMAGE_IMPORT_BY_NAME (2-byte hint, then the name).
-            let first_name_rva = rd_u64(image, if oft != 0 { oft } else { ft }) as usize;
-            let name = cstr_at(image, first_name_rva + 2);
+            // the thunk array offset is another file-controlled RVA
+            let src = if oft != 0 { oft } else { ft };
+            if src + 8 > image.len() {
+                d += 20;
+                continue;
+            }
+            let first_name_rva = rd_u64(image, src) as usize;
+            let name = cstr_at(image, first_name_rva.saturating_add(2));
             match find_export_anywhere(r, &name) {
                 Some((real_base, addr)) => {
                     log::log(&format!(

@@ -80,64 +80,25 @@ fn parse_addr(s: &str) -> Option<usize> {
     usize::from_str_radix(t, 16).ok()
 }
 
-fn readable(addr: usize) -> bool {
-    unsafe {
-        let mut mbi = crate::ffi::MEMORY_BASIC_INFORMATION::default();
-        let n = crate::ffi::VirtualQuery(
-            addr as *const core::ffi::c_void,
-            &mut mbi,
-            core::mem::size_of::<crate::ffi::MEMORY_BASIC_INFORMATION>(),
-        );
-        if n == 0 || mbi.State != crate::ffi::MEM_COMMIT {
-            return false;
-        }
-        let p = mbi.Protect & 0xFF;
-        p != crate::ffi::PAGE_NOACCESS && p != 0 && (mbi.Protect & crate::ffi::PAGE_GUARD) == 0
-    }
-}
+// Every read below goes through `safe` — the console's job is exploring memory
+// whose shape is unknown, so an unguarded deref here is an AV in the stub
+// thread, i.e. a dead game instead of a bad answer line.
 
 fn qword(addr: usize) -> Option<u64> {
-    if !readable(addr) {
-        return None;
-    }
-    Some(unsafe { *(addr as *const u64) })
+    crate::safe::read_u64(addr)
 }
 
 fn bytes(addr: usize, len: usize) -> Vec<u8> {
-    let mut v = Vec::with_capacity(len);
-    for i in 0..len {
-        if !readable(addr + i) {
-            break;
-        }
-        v.push(unsafe { *((addr + i) as *const u8) });
-    }
-    v
+    // partial read on purpose: `b <addr> n` should show what is there
+    crate::safe::read_upto(addr, len)
 }
 
 fn ascii(addr: usize, max: usize) -> String {
-    let mut s = String::new();
-    for b in bytes(addr, max) {
-        if b == 0 {
-            break;
-        }
-        s.push(if (32..127).contains(&b) { b as char } else { '.' });
-    }
-    s
+    crate::safe::ascii_lossy(addr, max)
 }
 
 fn utf16(addr: usize, max: usize) -> String {
-    let mut out = Vec::new();
-    for i in 0..max {
-        if !readable(addr + i * 2) {
-            break;
-        }
-        let c = unsafe { *((addr + i * 2) as *const u16) };
-        if c == 0 {
-            break;
-        }
-        out.push(c);
-    }
-    String::from_utf16_lossy(&out)
+    crate::safe::utf16_lossy(addr, max)
 }
 
 fn tag_of(v: usize) -> &'static str {
@@ -219,14 +180,10 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
         if out.len() >= max || r.size < 16 {
             continue;
         }
-        let mut a = (r.base + 7) & !7usize;
-        let end = r.base + r.size - 8;
-        while a <= end && out.len() < max {
-            if unsafe { *(a as *const u64) } == want {
-                out.push(a);
-            }
-            a += 8;
-        }
+        // регион уже проверен как committed+readable → прямой обход внутри
+        // его границ (per-word VirtualQuery здесь стоил бы минуты)
+        let span = crate::safe::Span { base: r.base, size: r.size, protect: r.protect };
+        crate::safe::find_qword_in_span(&span, want, max, &mut out);
     }
     out
 }
@@ -253,6 +210,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "entry <имя>               — поля записи сборки".into(),
                 "domain                    — домен и его геттер".into(),
                 "diag                      — полный recon заново".into(),
+                "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
+                "av [addr]                 — safe-чтение + сырое разыменование (проверка VEH)".into(),
                 "seal | quit               — выйти из интерактива (инжектор запечатает образ)".into(),
             ],
             Action::None,
@@ -351,11 +310,18 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                         let p = slot as i64 + d;
                         // окно может выйти за границу страницы: без проверки
                         // здесь был AV, который уронил игру
-                        if p <= 0 || !readable(p as usize) {
+                        if p <= 0 {
                             d += 8;
                             continue;
                         }
-                        if ns_a.contains(&(unsafe { *(p as usize as *const u64) } as usize)) {
+                        let word = match qword(p as usize) {
+                            Some(v) => v as usize,
+                            None => {
+                                d += 8;
+                                continue;
+                            }
+                        };
+                        if ns_a.contains(&word) {
                             found += 1;
                             out.push(format!(
                                 "  [{found}] name@{slot:#x} ns@{p:#x} (delta {d:+#x})"
@@ -382,13 +348,15 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 if hits.len() >= 24 {
                     break;
                 }
-                let mut a = (r.base + 7) & !7usize;
-                let end = r.base + r.size - 8;
-                while a <= end && hits.len() < 24 {
-                    if unsafe { *(a as *const u64) } == want {
-                        hits.push(format!("  {a:#x}"));
-                    }
-                    a += 8;
+                // `size < 16`: иначе `base + size - 8` уходит ниже начала региона
+                if r.size < 16 {
+                    continue;
+                }
+                let span = crate::safe::Span { base: r.base, size: r.size, protect: r.protect };
+                let mut slots = Vec::new();
+                crate::safe::find_qword_in_span(&span, want, 24 - hits.len(), &mut slots);
+                for a in slots {
+                    hits.push(format!("  {a:#x}"));
                 }
             }
             hits.insert(0, format!("find {want:#x}: {} hit(s)", hits.len()));
@@ -431,6 +399,44 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             il2cpp::diagnose().lines().map(|s| s.to_string()).collect(),
             Action::None,
         ),
+        // ---- plan 5 self-tests: prove guard()/VEH actually hold -----------
+        // `panic` must produce a `[dll] PANIC at file:line:` line and *not*
+        // kill the game; the session continues with the next command.
+        "panic" => {
+            let msg = line
+                .splitn(2, char::is_whitespace)
+                .nth(1)
+                .unwrap_or("console panic test")
+                .trim();
+            let msg = if msg.is_empty() { "console panic test" } else { msg };
+            crate::log::log_tag("con", &format!("panic test: about to panic with '{msg}'"));
+            panic!("console panic test: {msg}");
+        }
+        // `av <addr>` shows the difference between the two failure classes:
+        // the safe read survives (returns None), the raw deref is exactly what
+        // the VEH from plan 2 has to catch. Default 0x1 — never mapped.
+        "av" => {
+            let addr = parse_addr(a1).unwrap_or(1);
+            let guarded = match crate::safe::read_u64(addr) {
+                Some(v) => format!("{v:#016x}"),
+                None => "(unreadable, survived)".to_string(),
+            };
+            let head = format!(
+                "av @{addr:#x}: readable_at={}, safe::read_u64={guarded}",
+                crate::safe::readable_at(addr)
+            );
+            // log before the raw deref: if the process dies here, this line is
+            // the only witness we get.
+            crate::log::log_tag("con", &head);
+            let raw = unsafe { *(addr as *const u64) };
+            (
+                vec![
+                    head,
+                    format!("raw deref @{addr:#x} = {raw:#016x} (VEH did not run / addr was mapped)"),
+                ],
+                Action::None,
+            )
+        }
         "seal" => (vec!["seal requested, returning from DllMain".into()], Action::Seal),
         "quit" | "exit" => (vec!["bye".into()], Action::Quit),
         "echo" => {

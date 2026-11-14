@@ -179,18 +179,28 @@ fn scan_process(
             break;
         }
         let size = reg.size.min(budget - spent);
+        if size < 8 {
+            continue; // `reg.base + size - 8` would wrap below the region base
+        }
         spent += size;
         stats.scanned_mb = spent / (1024 * 1024);
 
+        // The region was validated by `procs::regions` (committed, readable,
+        // guard-free), so words inside `[rbase, rend)` are safe to read
+        // directly — but *nothing* outside it is (the DELTAS probe below used
+        // to read across the region edge, which is an AV, not a panic).
+        let rbase = reg.base;
+        let rend = rbase + size;
+
         // align to 8 bytes, walk words
-        let mut addr = (reg.base + 7) & !7usize;
-        let end = reg.base + size - 8;
+        let mut addr = (rbase + 7) & !7usize;
+        let end = rend - 8;
         let mut run_start = 0usize;
         let mut run_len = 0usize;
         let mut run_first = 0usize;
 
         while addr <= end {
-            let w = unsafe { *(addr as *const u64) } as usize;
+            let w = unsafe { core::ptr::read_unaligned(addr as *const u64) } as usize;
             let in_ga = w >= ga_lo && w < ga_hi;
 
             if in_ga {
@@ -217,7 +227,14 @@ fn scan_process(
                         if cand < 0 {
                             continue;
                         }
-                        let v = unsafe { *(cand as usize as *const u64) } as usize;
+                        let cand = cand as usize;
+                        // ±0x80 around a slot can leave the validated region
+                        // (page boundary, end of heap block): ask `safe`, the
+                        // range test alone does not make the word readable.
+                        let v = match crate::safe::read_u64(cand) {
+                            Some(v) => v as usize,
+                            None => continue,
+                        };
                         if v >= ga_lo && v < ga_hi {
                             stats.votes[idx] += 1;
                         }
@@ -239,12 +256,15 @@ fn scan_process(
     // the same address returns whatever the game has since allocated there.
     const SNAP: usize = 0x80;
     for (addr, name) in hits.iter().take(6) {
-        let lo = *addr - SNAP;
-        let mut buf = vec![0u8; SNAP * 2];
-        unsafe {
-            core::ptr::copy_nonoverlapping(lo as *const u8, buf.as_mut_ptr(), buf.len());
+        // `addr - 0x80` can be below the first page of the heap block (or wrap):
+        // copy through `safe` and skip the slot when the window is not all there.
+        let lo = match addr.checked_sub(SNAP) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Some(buf) = crate::safe::read_bytes(lo, SNAP * 2) {
+            stats.snaps.push((*addr, name, lo, buf));
         }
-        stats.snaps.push((*addr, name, lo, buf));
     }
     let mut sorted: Vec<usize> = hits.iter().map(|(a, _)| *a).collect();
     sorted.sort_unstable();
@@ -306,7 +326,13 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
         if cand < 0 {
             continue;
         }
-        let v = unsafe { *(cand as usize as *const u64) } as usize;
+        // The heap is live: the slot was readable during the scan, it may be
+        // unmapped by the time we re-read it. `safe` turns that into a skip
+        // instead of an AV.
+        let v = match crate::safe::read_u64(cand as usize) {
+            Some(v) => v as usize,
+            None => continue,
+        };
         if v >= ga_base && v < ga_base + ga_size {
             slots.push(Slot {
                 name,
@@ -342,7 +368,11 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
         if run_words >= by_off.len() {
             for (i, (name, name_off)) in by_off.iter().enumerate() {
                 let slot = run_addr + i * 8;
-                let addr = unsafe { *(slot as *const u64) } as usize;
+                // the run was found during the scan, but the heap moves
+                let addr = match crate::safe::read_u64(slot) {
+                    Some(v) => v as usize,
+                    None => break,
+                };
                 order.push(Slot {
                     name,
                     name_off: *name_off,
@@ -395,67 +425,16 @@ fn snap_dump(at: usize, lo: usize, buf: &[u8], ga: (usize, usize), up: (usize, u
     out
 }
 
-/// 8-byte words around `at` for the report: `addr [hex] as_u64 (ga|up|…)`.
-fn window(at: usize, before: usize, after: usize, ga: (usize, usize), up: (usize, usize)) -> String {
-    let mut out = String::new();
-    let mut p = at - before;
-    let end = at + after;
-    while p < end {
-        let v = unsafe { *(p as *const u64) };
-        let tag = if v as usize >= ga.0 && (v as usize) < ga.0 + ga.1 {
-            "GA"
-        } else if v as usize >= up.0 && (v as usize) < up.0 + up.1 {
-            "UP"
-        } else if v < 0x10000 {
-            "small"
-        } else {
-            ""
-        };
-        let mark = if p == at { "<<" } else { "  " };
-        out.push_str(&format!("  {mark}{p:#x}: {v:#018x} {tag}\n"));
-        p += 8;
-    }
-    out
-}
-
 /// Is `addr` in a committed, readable region? Checked before dereferencing a
-/// value returned by a function we do not fully understand.
+/// value returned by a function we do not fully understand. Thin alias for
+/// `safe::readable_at`, kept so the recon code reads like prose.
 fn readable_at(addr: usize) -> bool {
-    unsafe {
-        let mut mbi = crate::ffi::MEMORY_BASIC_INFORMATION::default();
-        let n = crate::ffi::VirtualQuery(
-            addr as *const core::ffi::c_void,
-            &mut mbi,
-            core::mem::size_of::<crate::ffi::MEMORY_BASIC_INFORMATION>(),
-        );
-        if n == 0 || mbi.State != crate::ffi::MEM_COMMIT {
-            return false;
-        }
-        let p = mbi.Protect & 0xFF;
-        p != crate::ffi::PAGE_NOACCESS && p != 0 && (mbi.Protect & crate::ffi::PAGE_GUARD) == 0
-    }
+    crate::safe::readable_at(addr)
 }
 
 /// Printable NUL-terminated ASCII string at `p`, or None.
 fn cstr_ascii(p: usize, max: usize) -> Option<String> {
-    if p < 0x10000 || !readable_at(p) {
-        return None;
-    }
-    let mut s = String::new();
-    for i in 0..max {
-        if !readable_at(p + i) {
-            return None;
-        }
-        let b = unsafe { *((p + i) as *const u8) };
-        if b == 0 {
-            return Some(s);
-        }
-        if !(32..127).contains(&b) {
-            return None;
-        }
-        s.push(b as char);
-    }
-    Some(s)
+    crate::safe::ascii_at(p, max)
 }
 
 /// Walk a suspected `Il2CppAssembly` array: entries sit 0x48 bytes apart and
@@ -471,7 +450,10 @@ pub fn walk_assembly_array(base: usize) -> (usize, Vec<(String, usize)>) {
             if !readable_at(p) {
                 break;
             }
-            let q = unsafe { *(p as *const u64) } as usize;
+            let q = match crate::safe::read_usize(p) {
+                Some(v) => v,
+                None => break,
+            };
             match cstr_ascii(q, 64) {
                 Some(n)
                     if n.len() >= 3
@@ -501,10 +483,12 @@ pub fn find_domain() -> Option<usize> {
         if addr + 8 > ga_base + ga_size {
             continue;
         }
-        let mut b = [0u8; 8];
-        unsafe {
-            core::ptr::copy_nonoverlapping(addr as *const u8, b.as_mut_ptr(), 8);
-        }
+        // prologue bytes: an export RVA is trusted, but the image may have been
+        // stomped/sealed, so never read it blind
+        let b = match crate::safe::read_bytes(addr, 8) {
+            Some(b) => b,
+            None => continue,
+        };
         let is_getter =
             b[0] == 0x48 && (b[1] == 0x8B || b[1] == 0x8D) && b[2] == 0x05 && b[7] == 0xC3;
         if !is_getter {
@@ -547,10 +531,10 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
         if addr < ga_base || addr + 8 > ga_base + ga_size {
             continue;
         }
-        let mut b = [0u8; 8];
-        unsafe {
-            core::ptr::copy_nonoverlapping(addr as *const u8, b.as_mut_ptr(), 8);
-        }
+        let b = match crate::safe::read_bytes(addr, 8) {
+            Some(b) => b,
+            None => continue,
+        };
         let is_getter = b[0] == 0x48 && (b[1] == 0x8B || b[1] == 0x8D) && b[2] == 0x05 && b[7] == 0xC3;
         if !is_getter {
             continue;
@@ -569,15 +553,20 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
             // pointers, so this is enough to tell it apart from a plain string
             // or an integer singleton.
             for i in 0..32usize {
-                if !readable_at(v + i * 8) {
-                    break;
-                }
-                let q = unsafe { *((v + i * 8) as *const u64) };
+                let q = match crate::safe::read_u64(v + i * 8) {
+                    Some(q) => q,
+                    None => break,
+                };
                 let tag = if readable_at(q as usize) && q > 0x10000 { "->" } else { "  " };
                 out.push_str(&format!("   +{:#x}: {q:#016x} {tag}\n", i * 8));
                 if tag == "->" {
                     for j in 0..4usize {
-                        let qq = unsafe { *((q as usize + j * 8) as *const u64) };
+                        // the pointee is a heap object: its tail can cross an
+                        // unmapped page even though its head is readable
+                        let qq = match crate::safe::read_u64(q as usize + j * 8) {
+                            Some(qq) => qq,
+                            None => break,
+                        };
                         out.push_str(&format!("        [..]+{:#x}: {qq:#016x}\n", j * 8));
                     }
                 }
@@ -595,10 +584,10 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
                     let base = v + off + e * 0x48;
                     out.push_str(&format!("   entry[{e}] @{base:#x}:\n"));
                     for j in 0..9usize {
-                        if !readable_at(base + j * 8) {
-                            break;
-                        }
-                        let q = unsafe { *((base + j * 8) as *const u64) };
+                        let q = match crate::safe::read_u64(base + j * 8) {
+                            Some(q) => q,
+                            None => break,
+                        };
                         let ascii = cstr_ascii(q as usize, 24).unwrap_or_default();
                         let wname = if ascii.is_empty() { String::new() } else { format!(" '{ascii}'") };
                         out.push_str(&format!("     +{:#x}: {q:#016x}{wname}\n", j * 8));
@@ -617,10 +606,11 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
 /// exposes its singletons — including the domain. Shortlisting them lets the
 /// next stage pick candidates without calling random functions.
 pub fn is_getter(addr: usize) -> bool {
-    let mut buf = [0u8; 8];
-    unsafe {
-        core::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), 8);
-    }
+    // called on addresses found by scanning, so the first byte is not guaranteed
+    let buf = match crate::safe::read_bytes(addr, 8) {
+        Some(b) => b,
+        None => return false,
+    };
     let is_mov = buf[0] == 0x48 && buf[1] == 0x8B && buf[2] == 0x05 && buf[7] == 0xC3;
     let is_lea = buf[0] == 0x48 && buf[1] == 0x8D && buf[2] == 0x05 && buf[7] == 0xC3;
     is_mov || is_lea
@@ -711,10 +701,20 @@ pub fn diagnose() -> String {
     let upm = procs::own_module("UnityPlayer.dll").unwrap_or((0, 0));
     let mut near = 0usize;
     for (addr, _) in res.hits.iter().take(4000) {
+        // `p` walks +/-0x80 around a heap slot: the window routinely crosses a
+        // page edge, so each step is a guarded read (this loop used to be the
+        // most likely place to take the game down with "Fatal error in GC").
         let mut p = addr.saturating_sub(0x80);
+        let hi = addr.saturating_add(0x80);
         let mut found = false;
-        while p <= addr + 0x80 {
-            let v = unsafe { *(p as *const u64) } as usize;
+        while p <= hi {
+            let v = match crate::safe::read_u64(p) {
+                Some(v) => v as usize,
+                None => {
+                    p += 8;
+                    continue;
+                }
+            };
             if v >= ga_base && v < ga_base + ga_size {
                 found = true;
                 break;

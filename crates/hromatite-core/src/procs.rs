@@ -74,8 +74,11 @@ pub fn module(pid: u32, name: &str) -> Option<(usize, usize)> {
         .map(|(_, b, s)| (b, s))
 }
 
-fn read_ptr(addr: usize) -> usize {
-    unsafe { *(addr as *const usize) }
+/// One word of the loader list. `None` = the address is not readable, which is
+/// the normal end-of-list / corrupt-list signal (never deref without it: a bad
+/// `Flink` is an AV inside `DllMain`, and the game dies with it).
+fn read_ptr(addr: usize) -> Option<usize> {
+    crate::safe::read_usize(addr)
 }
 
 /// Remove our own LDR_DATA_TABLE_ENTRY from the PEB module lists.
@@ -89,44 +92,70 @@ fn read_ptr(addr: usize) -> usize {
 ///   entry+0x00 Flink/Blink, +0x10 DllBase, +0x20 SizeOfImage,
 ///   +0x30 FullDllName, +0x40 BaseDllName.
 pub fn unlink_from_peb(module_base: usize) -> bool {
+    use crate::safe;
+    let peb: usize;
     unsafe {
-        let peb: usize;
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, nomem, preserves_flags));
-        if peb == 0 {
-            return false;
-        }
-        let ldr = read_ptr(peb + 0x18);
-        if ldr == 0 {
-            return false;
-        }
-        let head = ldr + 0x20; // InMemoryOrderModuleList
-        let mut cur = read_ptr(head);
-        let mut walked = 0;
-        // NOTE: `cur` points at the InMemoryOrderLinks field, which sits 0x10
-        // bytes into LDR_DATA_TABLE_ENTRY, so every field offset is shifted by
-        // -0x10: DllBase = +0x20, SizeOfImage = +0x28, BaseDllName = +0x48.
-        while cur != head && cur != 0 && walked < 512 {
-            let base = read_ptr(cur + 0x20);
-            if base == module_base {
-                let flink = read_ptr(cur);
-                let blink = read_ptr(cur + 8);
-                // splice out
-                *((blink + 0) as *mut usize) = flink;
-                *((flink + 8) as *mut usize) = blink;
-                // also drop from the load/in-memory lists is not needed for
-                // enumeration by name; zeroing our own links keeps it tidy.
-                *((cur) as *mut usize) = cur;
-                *((cur + 8) as *mut usize) = cur;
-                return true;
-            }
-            cur = read_ptr(cur);
-            walked += 1;
-        }
-        crate::log::log(&format!(
-            "peb: walked {walked} entries, self base {module_base:#x} not found (ldr {ldr:#x})"
-        ));
-        false
     }
+    if peb == 0 {
+        return false;
+    }
+    // Every step of the walk is a guarded read: the loader list is ours to
+    // corrupt if we splice it wrong, and a stale Flink is an AV in DllMain.
+    let ldr = match read_ptr(peb + 0x18) {
+        Some(v) if v != 0 => v,
+        _ => return false,
+    };
+    let head = match ldr.checked_add(0x20) {
+        Some(h) => h, // InMemoryOrderModuleList
+        None => return false,
+    };
+    let mut cur = match read_ptr(head) {
+        Some(v) => v,
+        None => return false,
+    };
+    let mut walked = 0;
+    // NOTE: `cur` points at the InMemoryOrderLinks field, which sits 0x10
+    // bytes into LDR_DATA_TABLE_ENTRY, so every field offset is shifted by
+    // -0x10: DllBase = +0x20, SizeOfImage = +0x28, BaseDllName = +0x48.
+    while cur != head && cur != 0 && walked < 512 {
+        let base = match read_ptr(cur + 0x20) {
+            Some(v) => v,
+            None => break,
+        };
+        if base == module_base {
+            let flink = match read_ptr(cur) {
+                Some(v) => v,
+                None => break,
+            };
+            let blink = match read_ptr(cur + 8) {
+                Some(v) => v,
+                None => break,
+            };
+            // splice out — only if all four writes land in readable memory
+            let ok = safe::write_usize(blink, flink)
+                && safe::write_usize(flink.wrapping_add(8), blink)
+                // drop from the load/in-memory lists is not needed for
+                // enumeration by name; zeroing our own links keeps it tidy.
+                && safe::write_usize(cur, cur)
+                && safe::write_usize(cur + 8, cur);
+            if !ok {
+                crate::log::log(&format!(
+                    "peb: entry for {module_base:#x} found at {cur:#x} but a link is unreadable"
+                ));
+            }
+            return ok;
+        }
+        cur = match read_ptr(cur) {
+            Some(v) => v,
+            None => break,
+        };
+        walked += 1;
+    }
+    crate::log::log(&format!(
+        "peb: walked {walked} entries, self base {module_base:#x} not found (ldr {ldr:#x})"
+    ));
+    false
 }
 
 /// One committed, readable region of our own address space.
@@ -183,17 +212,16 @@ pub fn regions(max_regions: usize) -> Vec<Region> {
 
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
-    unsafe {
-        let w = wide(name);
-        let h = GetModuleHandleW(w.as_ptr());
-        if h.is_null() {
-            return None;
-        }
-        let base = h as usize;
-        // SizeOfImage is at OptionalHeader + 56 for both PE32 and PE32+.
-        let e_lfanew = *(base as *const u32).add(0x3C as usize / 4) as usize;
-        let opt = base + e_lfanew + 4 + 20;
-        let size = *((opt + 56) as *const u32) as usize;
-        Some((base, size))
+    let w = wide(name);
+    let h = unsafe { GetModuleHandleW(w.as_ptr()) };
+    if h.is_null() {
+        return None;
     }
+    let base = h as usize;
+    // SizeOfImage is at OptionalHeader + 56 for both PE32 and PE32+.
+    // Read the header through `safe`: wine's apiset "handles" are not images.
+    let e_lfanew = crate::safe::read_u32(base + 0x3C)? as usize;
+    let opt = base.checked_add(e_lfanew)?.checked_add(4 + 20)?;
+    let size = crate::safe::read_u32(opt + 56)? as usize;
+    Some((base, size))
 }
