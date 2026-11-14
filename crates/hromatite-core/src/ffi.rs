@@ -157,6 +157,7 @@ unsafe extern "system" {
     pub fn ReadProcessMemory(h: HANDLE, base: *const u8, buf: *mut u8, size: usize, read: *mut usize) -> BOOL;
     pub fn WriteProcessMemory(h: HANDLE, base: *mut u8, buf: *const u8, size: usize, written: *mut usize) -> BOOL;
 
+    pub fn VirtualAlloc(addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
     pub fn VirtualAllocEx(h: HANDLE, addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
     pub fn VirtualProtectEx(h: HANDLE, addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
     pub fn VirtualQuery(addr: *const core::ffi::c_void, mbi: *mut MEMORY_BASIC_INFORMATION, len: usize) -> usize;
