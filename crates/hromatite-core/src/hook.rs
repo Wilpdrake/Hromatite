@@ -1204,6 +1204,7 @@ fn build_tick(p: &ShimParams) -> Vec<u8> {
     a.jcc(4, done); // je done — nested call from inside our own detour
     a.try_lock();
     a.jcc(5, done); // jnz — another thread owns the window
+    stage(&mut a, 5); // window taken, about to decrypt
     a.add_mem_rdi_imm8(D_HITS as u8, 1);
     a.mov_mem_rdi_imm8(D_CRYPTED as u8, 1);
     stage(&mut a, 1);
@@ -1278,6 +1279,7 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     let done = a.label();
     prologue(&mut a);
     a.mov_imm(7, p.data);
+    stage(&mut a, 7); // the vectored shim was entered
     a.mov_imm(10, p.probe);
     a.mov_imm(0, SEAL_MAGIC);
     a.bs(&[0x49, 0x3B, 0x02]); // cmp [r10], rax
