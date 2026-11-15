@@ -2,6 +2,7 @@
 
 use crate::model::{ConsoleModel, Mode, PALETTE};
 use crate::parser::LineKind;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default, Clone)]
 pub struct RenderContext {
@@ -161,18 +162,16 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
         Mode::Search => " filter> ",
         Mode::Palette => " palette> ",
     };
-    let available = width.saturating_sub(prompt.chars().count() + 1);
+    let prompt_width = UnicodeWidthStr::width(prompt);
+    let available = width.saturating_sub(prompt_width + 1);
     let before_cursor = &model.active_text()[..model.active_cursor()];
     let start = scroll_input_to_fit(before_cursor, available);
     let visible_input = &model.active_text()[start..];
-    let shown = take_chars(visible_input, available);
+    let shown = take_columns(visible_input, available);
     put(&mut lines[input_row], &format!("{prompt}{shown}"), width);
     styles[input_row] = Style::Input;
-    let cursor_chars = before_cursor[start..].chars().count().min(available);
-    let cursor = (
-        input_row,
-        (prompt.chars().count() + cursor_chars).min(width - 1),
-    );
+    let cursor_columns = UnicodeWidthStr::width(&before_cursor[start..]).min(available);
+    let cursor = (input_row, (prompt_width + cursor_columns).min(width - 1));
 
     let help = if model.notice().is_empty() {
         "F2 follow  F3 errors/GC  F4 palette  F5 telemetry  F8 clear  ^R search  Esc quit".into()
@@ -224,25 +223,33 @@ fn put(destination: &mut String, text: &str, width: usize) {
 }
 
 fn fit(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    let mut result = if count <= width {
+    let text_width = UnicodeWidthStr::width(text);
+    let mut result = if text_width <= width {
         text.to_string()
     } else if width == 0 {
         String::new()
     } else {
-        let mut value = take_chars(text, width - 1);
+        let mut value = take_columns(text, width - 1);
         value.push('…');
         value
     };
     result.extend(std::iter::repeat_n(
         ' ',
-        width.saturating_sub(result.chars().count()),
+        width.saturating_sub(UnicodeWidthStr::width(result.as_str())),
     ));
     result
 }
 
-fn take_chars(text: &str, count: usize) -> String {
-    text.chars().take(count).collect()
+fn take_columns(text: &str, width: usize) -> String {
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if UnicodeWidthStr::width(&text[..next]) > width {
+            break;
+        }
+        end = next;
+    }
+    text[..end].to_string()
 }
 
 fn sanitize_char(ch: char) -> char {
@@ -264,20 +271,23 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn scroll_input_to_fit(before_cursor: &str, available: usize) -> usize {
-    if available == 0 || before_cursor.chars().count() <= available {
+    if available == 0 || UnicodeWidthStr::width(before_cursor) <= available {
         return 0;
     }
-    let skip = before_cursor.chars().count() - available;
     before_cursor
         .char_indices()
-        .nth(skip)
-        .map_or(before_cursor.len(), |(index, _)| index)
+        .skip(1)
+        .find_map(|(index, _)| {
+            (UnicodeWidthStr::width(&before_cursor[index..]) <= available).then_some(index)
+        })
+        .unwrap_or(before_cursor.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{RenderContext, render};
     use crate::model::ConsoleModel;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn full_frame_has_fixed_geometry_and_status() {
@@ -292,7 +302,11 @@ mod tests {
         let frame = render(&model, &context, 80, 18);
         assert_eq!(frame.lines.len(), 18);
         for (index, line) in frame.lines.iter().enumerate() {
-            assert_eq!(line.chars().count(), 80, "row {index}: {line:?}");
+            assert_eq!(
+                UnicodeWidthStr::width(line.as_str()),
+                80,
+                "row {index}: {line:?}"
+            );
         }
         let text = frame.lines.join("\n");
         assert!(text.contains("DEMO — SYNTHETIC"));
@@ -301,6 +315,37 @@ mod tests {
         assert!(text.contains("FOLLOW"));
         assert!(text.contains("hits=42"));
         assert!(text.contains("/demo/hromatite-cmd.txt"));
+    }
+
+    #[test]
+    fn wide_player_names_have_exact_terminal_row_geometry() {
+        let mut model = ConsoleModel::new(false);
+        model.player = Some("玩家界🙂".into());
+        let frame = render(&model, &RenderContext::default(), 60, 12);
+        assert!(frame.lines[2].contains("玩家界🙂"));
+        for (row, line) in frame.lines.iter().enumerate() {
+            assert_eq!(
+                UnicodeWidthStr::width(line.as_str()),
+                60,
+                "row {row}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_input_cursor_and_scrolling_use_terminal_columns() {
+        let mut model = ConsoleModel::new(false);
+        model.set_active_text("界🙂x");
+        let frame = render(&model, &RenderContext::default(), 24, 8);
+        assert_eq!(frame.cursor, (6, 15));
+
+        model.set_active_text("1234567890界🙂xy");
+        let frame = render(&model, &RenderContext::default(), 24, 8);
+        assert_eq!(frame.lines[6].trim_end(), " command> 4567890界🙂xy");
+        assert_eq!(frame.cursor, (6, 23));
+        for line in &frame.lines {
+            assert_eq!(UnicodeWidthStr::width(line.as_str()), 24);
+        }
     }
 
     #[test]

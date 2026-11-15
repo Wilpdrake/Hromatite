@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Host-side interactive TUI for the Hromatite file console"
 
+[dependencies]
+unicode-width = "0.2.3"
+
 [lib]
 name = "hromatite_console"
 path = "src/lib.rs"

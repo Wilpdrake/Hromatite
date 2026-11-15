@@ -1,5 +1,5 @@
 //! Linux terminal driver and interactive loop. All UI decisions live in the
-//! dependency-free library, which is also what headless `--snapshot` exercises.
+//! library, which is also what headless `--snapshot` exercises.
 
 use hromatite_console::config::{Config, HELP};
 use hromatite_console::demo;
@@ -86,34 +86,31 @@ fn interactive(
         write!(stdout, "{}", ansi_frame(&frame))?;
         stdout.flush()?;
 
-        match io::stdin().read(&mut input) {
-            Ok(0) => continue,
-            Ok(count) => {
-                for key in decoder.feed(&input[..count]) {
-                    match model.handle(key) {
-                        Action::None => {}
-                        Action::Exit => return Ok(()),
-                        Action::Submit(command) => {
-                            if config.demo {
-                                model.set_notice(format!("DEMO: not sent: {command}"));
-                            } else if let Err(error) = writer.send(&command) {
-                                model.set_notice(format!("send failed: {error}"));
-                            }
-                        }
-                        Action::Refresh => {
-                            if config.demo {
-                                model.set_notice("DEMO: telemetry is synthetic; nothing requested");
-                            } else if let Err(error) =
-                                writer.send_batch(["pos", "who", "late", "gct"])
-                            {
-                                model.set_notice(format!("telemetry request failed: {error}"));
-                            }
-                        }
+        let keys = match io::stdin().read(&mut input) {
+            Ok(0) => decoder.timeout(),
+            Ok(count) => decoder.feed(&input[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        for key in keys {
+            match model.handle(key) {
+                Action::None => {}
+                Action::Exit => return Ok(()),
+                Action::Submit(command) => {
+                    if config.demo {
+                        model.set_notice(format!("DEMO: not sent: {command}"));
+                    } else if let Err(error) = writer.send(&command) {
+                        model.set_notice(format!("send failed: {error}"));
+                    }
+                }
+                Action::Refresh => {
+                    if config.demo {
+                        model.set_notice("DEMO: telemetry is synthetic; nothing requested");
+                    } else if let Err(error) = writer.send_batch(["pos", "who", "late", "gct"]) {
+                        model.set_notice(format!("telemetry request failed: {error}"));
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
         }
     }
 }
