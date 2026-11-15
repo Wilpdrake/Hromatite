@@ -532,86 +532,395 @@ fn class_or_materialise(ns: &str, name: &str, assembly: &str) -> Option<usize> {
     None
 }
 
-fn who_probe() -> Vec<String> {
-    let mut out = Vec::new();
-    let api = match class_or_materialise("VRC.SDKBase", "VRCPlayerApi", "VRCSDKBase") {
-        Some(c) => c,
-        None => return vec!["who: VRCPlayerApi class not found".into()],
-    };
-    let ms = crate::m3::methods(api);
-    let pick = |name: &str| ms.iter().find(|m| m.name == name).map(|m| m.entry);
-    let (Some(get_all), Some(get_id)) = (pick("get_AllPlayers"), pick("GetPlayerId")) else {
-        out.push("who: VRCPlayerApi has no get_AllPlayers/GetPlayerId".into());
-        return out;
-    };
-    let get_pos = pick("GetPosition");
-    let obj_name_fn = crate::m3::find("UnityEngine", "Object", 120_000)
+/// Method entries and classes that `who`/`esp` need, resolved once per process.
+///
+/// Resolving them walks the whole type table (tens of milliseconds) and `esp`
+/// runs four to five times per second, so the records are `Box::leak`ed instead
+/// of cached under a `Mutex`: a panic inside the guard longjmps past
+/// destructors, and a leaked `MutexGuard` would hang every later command.
+struct Sdk {
+    api_class: usize,
+    get_all: usize,
+    get_id: usize,
+    get_pos: usize,
+    get_objects: usize,
+    obj_name: usize,
+}
+
+struct CamApi {
+    get_main: usize,
+    get_transform: usize,
+    tr_position: usize,
+    tr_forward: usize,
+    get_proj: usize,
+    get_view: usize,
+    get_pixw: usize,
+    get_pixh: usize,
+}
+
+static SDK: AtomicUsize = AtomicUsize::new(0);
+static CAM: AtomicUsize = AtomicUsize::new(0);
+
+fn method_entry(ms: &[crate::m3::Method], name: &str) -> usize {
+    ms.iter().find(|m| m.name == name).map_or(0, |m| m.entry)
+}
+
+fn sdk() -> Option<&'static Sdk> {
+    let cached = SDK.load(Ordering::Relaxed);
+    if cached != 0 {
+        // SAFETY: `cached` is a `Box::into_raw` pointer that is never freed.
+        return Some(unsafe { &*(cached as *const Sdk) });
+    }
+    let api_class = class_or_materialise("VRC.SDKBase", "VRCPlayerApi", "VRCSDKBase")?;
+    let ms = crate::m3::methods(api_class);
+    let get_all = method_entry(&ms, "get_AllPlayers");
+    let get_id = method_entry(&ms, "GetPlayerId");
+    if get_all == 0 || get_id == 0 {
+        return None;
+    }
+    let obj_name = crate::m3::find("UnityEngine", "Object", 120_000)
         .first()
         .and_then(|(_, c)| {
             crate::m3::methods(*c)
                 .into_iter()
                 .find(|m| m.name == "get_name")
                 .map(|m| m.entry)
-        });
-    out.push(format!("who: VRCPlayerApi {api:#x}, get_pos {:?}", get_pos.is_some()));
+        })
+        .unwrap_or(0);
+    let rec = Sdk {
+        api_class,
+        get_all,
+        get_id,
+        get_pos: method_entry(&ms, "GetPosition"),
+        get_objects: method_entry(&ms, "GetPlayerObjects"),
+        obj_name,
+    };
+    let ptr = Box::into_raw(Box::new(rec));
+    SDK.store(ptr as usize, Ordering::Relaxed);
+    // SAFETY: freshly boxed and leaked on purpose; valid for the process.
+    Some(unsafe { &*ptr })
+}
 
+fn cam_api() -> Option<&'static CamApi> {
+    let cached = CAM.load(Ordering::Relaxed);
+    if cached != 0 {
+        // SAFETY: `cached` is a `Box::into_raw` pointer that is never freed.
+        return Some(unsafe { &*(cached as *const CamApi) });
+    }
+    let cam_class = crate::m3::find("UnityEngine", "Camera", 120_000).first()?.1;
+    let (trc, get_transform) = crate::m3::method_in_chain(cam_class, "get_transform")?;
+    let trms = crate::m3::methods(trc);
+    let ms = crate::m3::methods(cam_class);
+    let get_proj = method_entry(&ms, "get_projectionMatrix");
+    let get_view = method_entry(&ms, "get_worldToCameraMatrix");
+    let get_main = method_entry(&ms, "get_main");
+    if get_proj == 0 || get_view == 0 || get_main == 0 {
+        return None;
+    }
+    let rec = CamApi {
+        get_main,
+        get_transform,
+        tr_position: method_entry(&trms, "get_position"),
+        tr_forward: method_entry(&trms, "get_forward"),
+        get_proj,
+        get_view,
+        get_pixw: method_entry(&ms, "get_pixelWidth"),
+        get_pixh: method_entry(&ms, "get_pixelHeight"),
+    };
+    let ptr = Box::into_raw(Box::new(rec));
+    CAM.store(ptr as usize, Ordering::Relaxed);
+    // SAFETY: freshly boxed and leaked on purpose; valid for the process.
+    Some(unsafe { &*ptr })
+}
+
+/// One player as the SDK sees it.
+struct Pl {
+    api: usize,
+    id: usize,
+    pos: Option<(f32, f32, f32)>,
+    name: Option<String>,
+}
+
+struct Players {
+    list: usize,
+    size: usize,
+    items: usize,
+    rows: Vec<Pl>,
+}
+
+/// Walk `List<VRCPlayerApi>` into plain Rust data. Positions come from
+/// `GetPosition(player)` (Vector3 through a hidden output pointer).
+fn enumerate_players(sdk: &Sdk, with_name: bool) -> Result<Players, String> {
     // SAFETY: get_AllPlayers is the SDK's static accessor (no arguments).
-    let list = match unsafe { crate::veh::call0(get_all) } {
+    let list = match unsafe { crate::veh::call0(sdk.get_all) } {
         Ok(v) if v >= 0x10000 => v,
-        Ok(v) => {
-            out.push(format!("who: empty player list ({v:#x})"));
-            return out;
+        Ok(_) => {
+            return Ok(Players {
+                list: 0,
+                size: 0,
+                items: 0,
+                rows: Vec::new(),
+            });
         }
-        Err(e) => {
-            out.push(format!("who: get_AllPlayers faulted: {e}"));
-            return out;
-        }
+        Err(e) => return Err(format!("get_AllPlayers faulted: {e}")),
     };
     // List<T>: _items @+0x10, _size @+0x18; Il2CppArray: length @+0x18, data @+0x20.
     let items = crate::safe::read_usize(list + 0x10).unwrap_or(0);
     let size = crate::safe::read_u32(list + 0x18).unwrap_or(0) as usize;
     let maxlen = crate::safe::read_usize(items + 0x18).unwrap_or(0) as usize;
-    out.push(format!("who: list {list:#x}, size {size}, items {items:#x}, cap {maxlen}"));
-    let n = size.min(maxlen).min(256);
-    for i in 0..n {
+    let mut rows = Vec::new();
+    for i in 0..size.min(maxlen).min(256) {
         let p = crate::safe::read_usize(items + 0x20 + i * 8).unwrap_or(0);
         if p < 0x10000 {
             continue;
         }
         // SAFETY: GetPlayerId(VRCPlayerApi*) is a pure accessor on a live instance.
-        let id = unsafe { crate::veh::call1(get_id, p) }.unwrap_or(usize::MAX);
-        let mut pos = String::from("pos=?");
-        if let Some(f) = get_pos {
+        let id = unsafe { crate::veh::call1(sdk.get_id, p) }.unwrap_or(usize::MAX);
+        let mut pos = None;
+        if sdk.get_pos != 0 {
             let mut buf = [0u64; 2];
             // SAFETY: GetPosition returns Vector3 through a hidden output
             // pointer (rcx) with `this` in rdx; buf is a live stack buffer.
-            if unsafe { crate::veh::call2(f, buf.as_mut_ptr() as usize, p) }.is_ok() {
-                let (x, y, z) = vec3(buf);
-                pos = format!("pos=({x:.2}, {y:.2}, {z:.2})");
+            if unsafe { crate::veh::call2(sdk.get_pos, buf.as_mut_ptr() as usize, p) }.is_ok() {
+                pos = Some(vec3(buf));
             }
         }
         // The player's GameObject name (avatar/root name) — handy for a human
         // and read through UnityEngine.Object.get_name, nothing VRChat-specific.
-        let mut label = String::new();
-        if let Some(gpo) = pick("GetPlayerObjects")
-            && let Ok(arr) = unsafe { crate::veh::call1(gpo, p) }
+        let mut name = None;
+        if with_name
+            && sdk.get_objects != 0
+            && sdk.obj_name != 0
+            && let Ok(arr) = unsafe { crate::veh::call1(sdk.get_objects, p) }
             && arr >= 0x10000
         {
             let len = crate::safe::read_usize(arr + 0x18).unwrap_or(0) as usize;
             let first = crate::safe::read_usize(arr + 0x20).unwrap_or(0);
             if len > 0 && first >= 0x10000 {
-                if let Some(obj_name) = obj_name_fn {
-                    if let Ok(s) = unsafe { crate::veh::call1(obj_name, first) } {
-                        if let Some(text) = il2cpp_string(s) {
-                            label = format!(" go=\"{text}\"");
-                        }
-                    }
+                // SAFETY: Object.get_name on a live UnityEngine.Object.
+                if let Ok(s) = unsafe { crate::veh::call1(sdk.obj_name, first) } {
+                    name = il2cpp_string(s).filter(|s| !s.is_empty());
                 }
             }
         }
-        out.push(format!("  player #{i}: api {p:#x} id={id} {pos}{label}"));
+        rows.push(Pl { api: p, id, pos, name });
     }
-    out.push(format!("who: {n} player(s)"));
+    Ok(Players {
+        list,
+        size,
+        items,
+        rows,
+    })
+}
+
+fn who_probe() -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(sdk) = sdk() else {
+        return vec!["who: VRCPlayerApi not resolved (no get_AllPlayers/GetPlayerId)".into()];
+    };
+    out.push(format!(
+        "who: VRCPlayerApi {:#x}, get_pos {}",
+        sdk.api_class,
+        sdk.get_pos != 0
+    ));
+    let ps = match enumerate_players(sdk, true) {
+        Ok(v) => v,
+        Err(e) => {
+            out.push(format!("who: {e}"));
+            return out;
+        }
+    };
+    out.push(format!(
+        "who: list {:#x}, size {}, items {:#x}, cap {}",
+        ps.list,
+        ps.size,
+        ps.items,
+        ps.rows.len()
+    ));
+    for (i, p) in ps.rows.iter().enumerate() {
+        let pos = match p.pos {
+            Some((x, y, z)) => format!("pos=({x:.2}, {y:.2}, {z:.2})"),
+            None => "pos=?".to_string(),
+        };
+        let label = match &p.name {
+            Some(n) => format!(" go=\"{n}\""),
+            None => String::new(),
+        };
+        out.push(format!("  player #{i}: api {:#x} id={} {pos}{label}", p.api, p.id));
+    }
+    out.push(format!("who: {} player(s)", ps.rows.len()));
+    out
+}
+
+// ---- esp: players projected to screen pixels (M4) --------------------------
+
+/// `Matrix4x4` (64 B) returned through the hidden output pointer in `rcx`,
+/// `this` in `rdx` — the same ABI the Vector3 getters use, only bigger.
+fn call_matrix(f: usize, this: usize) -> Option<[f32; 16]> {
+    let mut buf = [0u64; 8];
+    // SAFETY: get_projectionMatrix/get_worldToCameraMatrix are pure getters; the
+    // buffer is a live 64-byte stack array and the VEH guards the call.
+    unsafe { crate::veh::call2(f, buf.as_mut_ptr() as usize, this) }.ok()?;
+    let mut out = [0f32; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = f32::from_bits((buf[i / 2] >> ((i % 2) * 32)) as u32);
+    }
+    Some(out)
+}
+
+/// `Transform.get_position` / `get_forward` (Vector3 through a hidden pointer).
+fn transform_vec3(entry: usize, this: usize) -> Option<(f32, f32, f32)> {
+    if entry == 0 || this < 0x10000 {
+        return None;
+    }
+    let mut buf = [0u64; 2];
+    // SAFETY: instance getter, hidden Vector3 return pointer in rcx and `this`
+    // in rdx; buf is a live stack buffer, VEH guards the call.
+    unsafe { crate::veh::call2(entry, buf.as_mut_ptr() as usize, this) }.ok()?;
+    Some(vec3(buf))
+}
+
+/// Column-major 4x4 multiply (`Matrix4x4` storage order in Unity).
+fn mul4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut r = [0f32; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut s = 0f32;
+            for k in 0..4 {
+                s += a[row + k * 4] * b[k + col * 4];
+            }
+            r[row + col * 4] = s;
+        }
+    }
+    r
+}
+
+fn mul_vec4(m: &[f32; 16], v: [f32; 4]) -> [f32; 4] {
+    let mut r = [0f32; 4];
+    for row in 0..4 {
+        r[row] = m[row] * v[0] + m[row + 4] * v[1] + m[row + 8] * v[2] + m[row + 12] * v[3];
+    }
+    r
+}
+
+/// World → pixel projection. Screen coordinates are top-left origin, because
+/// that is what the X11 overlay draws in; Unity works bottom-left.
+fn project(pv: &[f32; 16], w: f32, h: f32, p: (f32, f32, f32)) -> Option<(f32, f32)> {
+    let c = mul_vec4(pv, [p.0, p.1, p.2, 1.0]);
+    if c[3] <= 0.0001 {
+        return None; // behind the camera
+    }
+    let ndc_x = c[0] / c[3];
+    let ndc_y = c[1] / c[3];
+    Some(((ndc_x * 0.5 + 0.5) * w, (0.5 - ndc_y * 0.5) * h))
+}
+
+/// `esp` — every player's screen box, plus the camera rig it was computed from.
+///
+/// `projectionMatrix * worldToCameraMatrix` is read through the same guarded
+/// struct-return path the Vector3 getters use, and the multiplication happens in
+/// Rust, so no unknown ABI for struct *arguments* is involved (that is what
+/// makes `WorldToScreenPoint` risky and this safe).
+///
+/// Self-check in the header: the main camera's own position must project to the
+/// centre of the viewport, so `err` (pixels off centre) is 0 in a sane world.
+fn esp_probe() -> Vec<String> {
+    let mut out = Vec::new();
+    let (Some(cam), Some(sdk)) = (cam_api(), sdk()) else {
+        return vec![format!(
+            "esp: unresolved (camera {}, players {})",
+            cam_api().is_some(),
+            sdk().is_some()
+        )];
+    };
+    // SAFETY: Camera.get_main is the static accessor.
+    let inst = match unsafe { crate::veh::call0(cam.get_main) } {
+        Ok(v) if v >= 0x10000 => v,
+        Ok(v) => {
+            out.push(format!("esp: no main camera ({v:#x})"));
+            return out;
+        }
+        Err(e) => {
+            out.push(format!("esp: Camera.main faulted: {e}"));
+            return out;
+        }
+    };
+    let mut pw = if cam.get_pixw != 0 {
+        // SAFETY: Camera.pixelWidth is a constant instance getter.
+        unsafe { crate::veh::call1(cam.get_pixw, inst) }.unwrap_or(0) as u32
+    } else {
+        0
+    };
+    let mut ph = if cam.get_pixh != 0 {
+        // SAFETY: Camera.pixelHeight is a constant instance getter.
+        unsafe { crate::veh::call1(cam.get_pixh, inst) }.unwrap_or(0) as u32
+    } else {
+        0
+    };
+    if pw == 0 || ph == 0 {
+        pw = 1920;
+        ph = 1080;
+    }
+    // SAFETY: Component.get_transform on a live Camera instance.
+    let tr = unsafe { crate::veh::call1(cam.get_transform, inst) }.unwrap_or(0);
+    let cam_pos = transform_vec3(cam.tr_position, tr);
+    let fwd = transform_vec3(cam.tr_forward, tr);
+    let (Some(proj), Some(view)) = (
+        call_matrix(cam.get_proj, inst),
+        call_matrix(cam.get_view, inst),
+    ) else {
+        out.push("esp: projection/worldToCamera matrix faulted".into());
+        return out;
+    };
+    let pv = mul4(&proj, &view);
+    let (fw, fh) = (pw as f32, ph as f32);
+    let err = cam_pos
+        .and_then(|p| project(&pv, fw, fh, p))
+        .map(|(x, y)| (x - fw / 2.0).abs().max((y - fh / 2.0).abs()))
+        .unwrap_or(-1.0);
+    let players = match enumerate_players(sdk, true) {
+        Ok(v) => v.rows,
+        Err(e) => {
+            out.push(format!("esp: {e}"));
+            return out;
+        }
+    };
+    let head = |p: (f32, f32, f32)| (p.0, p.1 + 1.70, p.2);
+    out.push(format!(
+        "esp: head w={pw} h={ph} err={err:.1} cam=({:.2}, {:.2}, {:.2}) fwd=({:.2}, {:.2}, {:.2})",
+        cam_pos.map_or(0.0, |p| p.0),
+        cam_pos.map_or(0.0, |p| p.1),
+        cam_pos.map_or(0.0, |p| p.2),
+        fwd.map_or(0.0, |p| p.0),
+        fwd.map_or(0.0, |p| p.1),
+        fwd.map_or(0.0, |p| p.2)
+    ));
+    for p in players {
+        let Some(pos) = p.pos else { continue };
+        let Some((sx, sy)) = project(&pv, fw, fh, pos) else {
+            continue;
+        };
+        let Some((_, hy)) = project(&pv, fw, fh, head(pos)) else {
+            continue;
+        };
+        let dist = match cam_pos {
+            Some(c) => {
+                let (dx, dy, dz) = (pos.0 - c.0, pos.1 - c.1, pos.2 - c.2);
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            }
+            None => -1.0,
+        };
+        // `w=` carries the world position too: the host overlay uses it for the
+        // radar, and it costs nothing here.
+        out.push(format!(
+            "esp: id={} d={dist:.2} x={sx:.1} y={sy:.1} h={hy:.1} w={:.2},{:.2},{:.2} name={}",
+            p.id,
+            pos.0,
+            pos.1,
+            pos.2,
+            p.name.unwrap_or_default()
+        ));
+    }
     out
 }
 
@@ -654,6 +963,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "methods <class> [фильтр]   — методы класса: имя, entry point, RVA".into(),
                 "mcall <class> <method> [a1..a3] — вызов метода по entry point под VEH".into(),
                 "pos                       — Camera.main -> transform -> position (M3)".into(),
+                "esp                       — игроки в пикселях экрана (для оверлея)".into(),
                 "cam2                      — Camera через таблицу типов (без API)".into(),
                 "meta                      — version/счётчики расшифрованной metadata".into(),
                 "typelist <filter> [max]    — каталог типов из metadata".into(),
@@ -1580,6 +1890,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // VRCPlayerApi.get_AllPlayers → List<VRCPlayerApi> → GetPlayerId /
         // GetPosition. Obfuscated VRChat classes are not needed at all.
         "who" => (who_probe(), Action::None),
+        // `esp` — the same player list projected to *pixels*, so the host
+        // overlay can draw boxes over them. Costs four guarded calls per line of
+        // the camera rig (main, transform, both matrices, pixel size), which is
+        // why the method entries are cached in `CamApi`.
+        "esp" => (esp_probe(), Action::None),
         // `cam2` — Camera class found through the type table (not through any
         // il2cpp export), as a sanity check for the whole metadata walk.
         "cam2" => {
@@ -1847,4 +2162,62 @@ pub fn send(line: &str) -> bool {
         .open(cmd_path())
         .and_then(|mut f| writeln!(f, "{line}"))
         .is_ok()
+}
+
+#[cfg(test)]
+mod project_tests {
+    //! The projection is the one part of `esp` that can be checked without the
+    //! game: `projectionMatrix * worldToCameraMatrix` follows Unity's column-major
+    //! `Matrix4x4` storage, and a point straight ahead must land dead centre.
+
+    use super::{mul4, mul_vec4, project};
+
+    fn perspective(fov_y_deg: f32, aspect: f32) -> [f32; 16] {
+        let f = 1.0 / (fov_y_deg.to_radians() / 2.0).tan();
+        let mut m = [0f32; 16];
+        m[0] = f / aspect;
+        m[5] = f;
+        m[10] = -1.0002;
+        m[11] = -1.0;
+        m[14] = -0.20002;
+        m
+    }
+
+    fn identity() -> [f32; 16] {
+        let mut m = [0f32; 16];
+        for i in 0..4 {
+            m[i * 5] = 1.0;
+        }
+        m
+    }
+
+    #[test]
+    fn centre_of_view_projects_to_centre_of_screen() {
+        let pv = mul4(&perspective(60.0, 16.0 / 9.0), &identity());
+        let (x, y) = project(&pv, 1920.0, 1080.0, (0.0, 0.0, -5.0)).unwrap();
+        assert!((x - 960.0).abs() < 0.5, "x = {x}");
+        assert!((y - 540.0).abs() < 0.5, "y = {y}");
+    }
+
+    #[test]
+    fn behind_the_camera_is_none() {
+        let pv = mul4(&perspective(60.0, 16.0 / 9.0), &identity());
+        assert!(project(&pv, 1920.0, 1080.0, (0.0, 0.0, 5.0)).is_none());
+    }
+
+    #[test]
+    fn right_of_centre_lands_right_of_centre() {
+        let pv = mul4(&perspective(60.0, 16.0 / 9.0), &identity());
+        let (x, _) = project(&pv, 1920.0, 1080.0, (1.0, 0.0, -5.0)).unwrap();
+        assert!(x > 960.0, "x = {x}");
+    }
+
+    #[test]
+    fn column_major_multiply_matches_hand_math() {
+        let mut a = identity();
+        a[12] = 3.0; // translation on x, stored in the last column
+        let v = mul_vec4(&a, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(v[0], 4.0);
+        assert_eq!(v[1], 0.0);
+    }
 }
