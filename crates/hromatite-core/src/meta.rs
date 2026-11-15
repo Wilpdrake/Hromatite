@@ -540,7 +540,9 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     for r in procs::regions(65536) {
         // `.data`/`.bss` only: class tables are written at runtime, and scanning
         // the 250 MB of `.text` costs a minute and proves nothing.
-        let writable = matches!(r.protect & 0xff, 4 | 8 | 0x40 | 0x80);
+        // PAGE_GUARD (0x100) has to be excluded: touching such a page raises
+        // 0x80000001 on the game thread, which our VEH reports as a fault.
+        let writable = matches!(r.protect & 0xff, 4 | 8 | 0x40 | 0x80) && r.protect & 0x100 == 0;
         if r.base < lo || r.base >= hi || !writable {
             continue;
         }
