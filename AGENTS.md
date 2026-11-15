@@ -1392,3 +1392,37 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - Осталось: (1) длительное наблюдение (падения были на 1–7 минутах, этот прогон
   уже дольше); (2) отдельная задача — почему потоки движка умирают, не
   вычеркнувшись (гонка в самом il2cpp/Boehm, мы её только лечим).
+
+### 2026-11-15 — Анатомия «умирающих» потоков (офлайн-разбор GameAssembly)
+
+- Коммит: см. `feat(gc): log exit code + start address of every reaped record`.
+- **Кто такие потоки с `start = GameAssembly+0xbf8d10`.** Это НЕ тела потоков, а
+  общий il2cpp-трамплин (дизасм 0xbf8d10): копирует из параметра тройку
+  `{thread*, fn, out_tid*}`, вызывает рантайм-функцию, кладёт её результат
+  (`eax`) в `*out_tid`, затем `call *fn` с `rcx = thread*` и возвращается
+  (`xor eax,eax; ret`). То есть **`GC_unregister_my_thread` вызывается не здесь,
+  а внутри `fn`** — если тело выходит нештатно, unregister пропускается.
+- **Кто их создаёт**: единственная ссылка на трамплин — `0xbf5e4e` (внутри
+  функции ~0xbf5e00): выделяет 0x18-байтовую структуру `{thread, fn, arg}`,
+  заполняет её и вызывает `CreateThread(NULL, stack_from_thread, 0xbf8d10, struct,
+  0x10000, &tid)`; при NULL возвращает код 0x1f.
+- **Устройство GC-таблицы на этом билде**:
+  - `GC_threads[]` = RVA `0xe6bb180` (256 указателей, `.data`);
+  - `GC_lookup_thread_inner` = **0xc417b0** (не 0xc417a0): `mov (%r14,%rsi,8),%rbx;
+    cmp %ecx,0x8(%rbx); je …; mov (%rbx),%rbx; …` — **без проверки на NULL**;
+  - `GC_unregister_my_thread` ≈ **0xc41850**: берёт `GetCurrentThreadId`-подобное,
+    проверяет глобальный флаг `0xda2b1c0`, затем **безопасно** (`test rax,rax`)
+    ищет бакет и снимает запись. Внутри есть **assert-ветка с `int3`** —
+    ещё один кандидат в «int3 в GameAssembly», если unregister попадёт в момент,
+    когда флаг не выставлен.
+- **Живые данные (прогон 03:57–04:06, 8 мин)**: 8 выходов потоков, 4 из них —
+  потоки `GameAssembly+0xbf8d10`; все вычеркнулись сами (0 `DEAD`), таблица
+  `34 record(s), 34 live`, `gc.log` без `SuspendThread loop failed`, VEH не видел
+  **ни одного** исключения (`passing exception` = 0) → смерти потоков не связаны
+  с uncaught SEH.
+- Диагностика на следующий прогон (уже в бинаре): в строке `reaped dead record …`
+  теперь печатаются `exitcode=` (через `GetExitCodeThread` до вычеркивания) и
+  `start=` (сохранённый при старте потока адрес). Это отделит «нормальный выход,
+  но unregister пропущен» (exitcode 0) от «поток убили» (`TerminateThread(code)`).
+  `[veh] passing exception` теперь с `tid=` и лимитом 500 событий
+  (`HROMATITE_LOG_AV_MAX`).
