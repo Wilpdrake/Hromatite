@@ -1294,7 +1294,18 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 if nm > 0 && best.is_none() {
                     best = Some(*addr);
                 }
-                if out.len() > 20 {
+                // layout probe on the first few candidates: this is what turns a
+                // "record named Camera" into a usable class
+                if seen.len() <= 4 {
+                    let shapes = crate::meta::probe_layout(*addr);
+                    if shapes.is_empty() {
+                        out.push(format!("    {addr:#x}: no field/method shape"));
+                    }
+                    for sh in shapes.iter().take(4) {
+                        out.push(format!("    {addr:#x}:{sh}"));
+                    }
+                }
+                if out.len() > 24 {
                     break;
                 }
             }
@@ -1341,6 +1352,24 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     out.push(format!("      method {n} @ {e:#x}"));
                 }
             }
+            (out, Action::None)
+        }
+        // `lay <class>` — probe every slot of a candidate class for field/method
+        // table shapes and report the ones that fit (layout discovery).
+        "lay" => {
+            let c = match parse_addr(a1) {
+                Some(c) => c,
+                None => return (vec!["usage: lay <classaddr>".into()], Action::None),
+            };
+            let mut out = vec![format!(
+                "lay {c:#x} ({}):",
+                crate::meta::class_name(c).unwrap_or_else(|| "?".into())
+            )];
+            let hits = crate::meta::probe_layout(c);
+            if hits.is_empty() {
+                out.push("  no field/method table shape found in +0x10..+0x300".into());
+            }
+            out.extend(hits);
             (out, Action::None)
         }
         // `ctab` — find the runtime's global class arrays (Unity 6 keeps them

@@ -782,6 +782,103 @@ pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
     out
 }
 
+/// Layout probe: given a candidate class record, try every qword slot in its
+/// body as a pointer to an array of records, and report the shapes that fit —
+/// `(slot, stride, name_off, parent_off)` for fields, `(slot, fp_off, name_off)`
+/// for methods. Built because the 6000.0.3f1 header does not match this build.
+pub fn probe_layout(class: usize) -> Vec<String> {
+    let ranges = Ranges::new();
+    let ga = procs::own_module(crate::GAME_ASSEMBLY);
+    let mut out = Vec::new();
+    let mut slot = 0x10usize;
+    while slot <= 0x300 {
+        let p = match ranges.u64(class + slot) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        if p >= 0x10000 && ranges.readable(p, 0x40) {
+            // --- field-table shapes
+            for stride in [0x18usize, 0x20, 0x28, 0x30] {
+                for name_off in [0x00usize, 0x08, 0x10, 0x18] {
+                    for parent_off in [0x00usize, 0x08, 0x10, 0x18, 0x20] {
+                        if name_off == parent_off {
+                            continue;
+                        }
+                        let mut ok = 0usize;
+                        let mut first = String::new();
+                        for i in 0..4 {
+                            let e = p + i * stride;
+                            if !ranges.readable(e, stride) {
+                                break;
+                            }
+                            let np = ranges.u64(e + name_off).unwrap_or(0) as usize;
+                            let pp = ranges.u64(e + parent_off).unwrap_or(0) as usize;
+                            if pp != class {
+                                break;
+                            }
+                            match ranges.cstr(np, 64) {
+                                Some(s) if ident_like(&s) => {
+                                    if i == 0 {
+                                        first = s;
+                                    }
+                                    ok += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if ok == 4 {
+                            out.push(format!(
+                                "  FIELD table @+{slot:#x} -> {p:#x} stride {stride:#x} name+{name_off:#x} parent+{parent_off:#x} first '{first}'"
+                            ));
+                        }
+                    }
+                }
+            }
+            // --- method-table shapes (array of MethodInfo*)
+            for fp_off in [0x00usize, 0x08, 0x10] {
+                for name_off in [0x10usize, 0x18, 0x20, 0x28, 0x30] {
+                    if name_off == fp_off {
+                        continue;
+                    }
+                    let mut ok = 0usize;
+                    let mut first = String::new();
+                    for i in 0..4 {
+                        let mi = match ranges.u64(p + i * 8) {
+                            Some(v) => v as usize,
+                            None => break,
+                        };
+                        if mi < 0x10000 || !ranges.readable(mi, 0x40) {
+                            break;
+                        }
+                        let fp = ranges.u64(mi + fp_off).unwrap_or(0) as usize;
+                        let in_ga = ga.map(|(b, sz)| fp >= b && fp < b + sz).unwrap_or(false);
+                        if !in_ga {
+                            break;
+                        }
+                        let np = ranges.u64(mi + name_off).unwrap_or(0) as usize;
+                        match ranges.cstr(np, 64) {
+                            Some(s) if ident_like(&s) => {
+                                if i == 0 {
+                                    first = s;
+                                }
+                                ok += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if ok == 4 {
+                        out.push(format!(
+                            "  METHOD table @+{slot:#x} -> {p:#x} stride 8 fp+{fp_off:#x} name+{name_off:#x} first '{first}'"
+                        ));
+                    }
+                }
+            }
+        }
+        slot += 8;
+    }
+    out
+}
+
 /// Find a **method** by its name string and walk to its class.
 ///
 /// This avoids the `Il2CppClass` layout problem entirely: whatever the offsets
