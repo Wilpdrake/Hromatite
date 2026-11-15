@@ -520,45 +520,64 @@ fn class_like_in(r: &Ranges, p: usize) -> bool {
     }
 }
 
-/// Density scan of one region: returns merged `(start, words)` stretches where
-/// at least 75% of a 128-word window looks like class pointers.
-fn scan_region(start: usize, words: usize, ranges: &Ranges) -> Vec<(usize, usize)> {
+/// Density scan of one region, in chunks: returns the merged stretches where at
+/// least 75% of a 128-word window looks like class pointers, plus the best
+/// density seen (useful when nothing crosses the threshold).
+fn scan_region(start: usize, words: usize, ranges: &Ranges) -> (Vec<(usize, usize)>, f32) {
     const WIN: usize = 128;
-    let mut out = Vec::new();
-    let mut flags = vec![0u8; words];
-    for i in 0..words {
-        let v = match ranges.u64(start + i * 8) {
-            Some(v) => v as usize,
-            None => continue,
-        };
-        if v >= 0x10000 && class_like_in(ranges, v) {
-            flags[i] = 1;
+    const CH: usize = 1 << 16;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut best = 0f32;
+    let mut i = 0usize;
+    while i < words {
+        let n = CH.min(words - i);
+        // read one window past the chunk so windows are never truncated
+        let extra = WIN - 1;
+        let cnt = n + extra;
+        let mut flags = vec![0u8; cnt];
+        for k in 0..cnt {
+            let idx = i + k;
+            if idx >= words {
+                break;
+            }
+            let v = match ranges.u64(start + idx * 8) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            if v >= 0x10000 && class_like_in(ranges, v) {
+                flags[k] = 1;
+            }
         }
-    }
-    let mut prefix = vec![0u32; words + 1];
-    for i in 0..words {
-        prefix[i + 1] = prefix[i] + flags[i] as u32;
-    }
-    let mut marked: Vec<usize> = Vec::new();
-    for i in 0..=(words - WIN) {
-        let d = prefix[i + WIN] - prefix[i];
-        if d as usize * 4 >= WIN * 3 {
-            marked.push(i);
+        let mut prefix = vec![0u32; cnt + 1];
+        for k in 0..cnt {
+            prefix[k + 1] = prefix[k] + flags[k] as u32;
         }
-    }
-    if marked.is_empty() {
-        return out;
-    }
-    let (mut a, mut prev) = (marked[0], marked[0]);
-    for &m in marked.iter().skip(1) {
-        if m > prev + 1 {
-            out.push((start + a * 8, prev + WIN - a));
-            a = m;
+        let mut marked: Vec<usize> = Vec::new();
+        for w in 0..n {
+            if w + WIN > cnt {
+                break;
+            }
+            let d = prefix[w + WIN] - prefix[w];
+            let dens = d as f32 / WIN as f32;
+            if dens > best {
+                best = dens;
+            }
+            if d as usize * 4 >= WIN * 3 {
+                marked.push(i + w);
+            }
         }
-        prev = m;
+        for m in marked {
+            if let Some(last) = out.last_mut() {
+                if m <= last.0 + last.1 {
+                    last.1 = m + WIN - last.0;
+                    continue;
+                }
+            }
+            out.push((m, WIN));
+        }
+        i += n;
     }
-    out.push((start + a * 8, prev + WIN - a));
-    out
+    (out, best)
 }
 
 pub fn class_tables() -> Vec<(usize, usize)> {
@@ -571,36 +590,47 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     if !c.is_empty() {
         return c.clone();
     }
-    let (gbase, gsize) = match procs::own_module(crate::GAME_ASSEMBLY) {
-        Some(x) => x,
-        None => return Vec::new(),
-    };
-    let (lo, hi) = (gbase, gbase + gsize);
     let ranges = Ranges::new();
-    const WIN: usize = 128;
     let mut scanned_words = 0usize;
     let mut scanned_regions = 0usize;
+    // Unity 6 allocates the class table with `IL2CPP_MALLOC`, so it lives on the
+    // **heap**, not in GameAssembly's `.data`. Hence: every writable region.
     for r in procs::regions(65536) {
-        // `.data`/`.bss` only: class tables are written at runtime, and scanning
-        // the 250 MB of `.text` costs a minute and proves nothing.
         // PAGE_GUARD (0x100) has to be excluded: touching such a page raises
-        // 0x80000001 on the game thread, which our VEH reports as a fault.
+        // 0xC00000FD on the game thread, which our VEH reports as a fault.
         let writable = matches!(r.protect & 0xff, 4 | 8 | 0x40 | 0x80) && r.protect & 0x100 == 0;
-        if r.base < lo || r.base >= hi || !writable {
+        if !writable || r.size < 0x10000 {
             continue;
         }
+        // skip the classic module image ranges: `.text`/`.rdata` are read-only
         let start = (r.base + 7) & !7usize;
         let words = (r.base + r.size).saturating_sub(start) / 8;
-        if words < WIN * 2 {
+        if words < 256 {
             continue;
         }
         scanned_words += words;
         scanned_regions += 1;
+        if scanned_words > 60_000_000 {
+            break;
+        }
         // A stale page snapshot can still fault; the scan runs on the game's own
         // thread, so one guarded call per region keeps a bad page from costing
         // the whole command (and the game).
-        if let Ok(found) = crate::veh::call_with(|| scan_region(start, words, &ranges)) {
-            c.extend(found);
+        match crate::veh::call_with(|| scan_region(start, words, &ranges)) {
+            Ok((found, best)) => {
+                if best >= 0.5 {
+                    log::log_tag(
+                        "meta",
+                        &format!(
+                            "  region {start:#x}+{words}w best {:.2} windows {}",
+                            best,
+                            found.len()
+                        ),
+                    );
+                }
+                c.extend(found);
+            }
+            Err(_) => log::log_tag("meta", &format!("  region {start:#x}: fault")),
         }
     }
     c.sort_by_key(|(a, _)| *a);
@@ -611,15 +641,6 @@ pub fn class_tables() -> Vec<(usize, usize)> {
             "class tables ({} region(s), {} words): {:?}",
             scanned_regions,
             scanned_words,
-            c.iter()
-                .map(|(a, n)| format!("{a:#x}+{n}w"))
-                .collect::<Vec<_>>()
-        ),
-    );
-    log::log_tag(
-        "meta",
-        &format!(
-            "class tables: {:?}",
             c.iter()
                 .map(|(a, n)| format!("{a:#x}+{n}w"))
                 .collect::<Vec<_>>()
