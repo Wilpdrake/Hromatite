@@ -1608,3 +1608,29 @@ il2cpp одними чтениями памяти (без единого выз�
   зашифрованный файл игры (`missing decrypted metadata magic`) и CLI падает
   кодом 2, а не показывает фальшивую статистику.
 
+### 2026-11-15 — Повторный GC-фатал 0x3bc: репер теперь подключён к tick-режиму
+
+- Коммит: этот (`fix(gc): reap stale Boehm records from the game-thread tick`).
+- **Новое падение пользователя (06:11 MSK)**: процесс pid 400009 умер.
+  `gc-20261115-060523-after.log:1142-1143`:
+  `SuspendThread loop failed: thread id= 0x3bc, handle= 059C, errcode= 0x5`.
+  Новый `Crash_2026-11-15_031016139/crash.dmp`: `0x80000003` по
+  `GameAssembly+0xc41b65`, 107 потоков, suspend histogram `{0:1, 1:86, 2:20}`;
+  только аварийный GC-поток работает → протухшая запись `GC_threads[]`.
+- **Корень регрессии**: `gcthreads::reap()` был вызван только из
+  `console_loop(secs)` (LIVE>0), но рабочий безопасный режим —
+  `HROMATITE_FRAME_HOOK=1, LIVE=0` — возвращается из `DllMain` и этот loop вообще
+  не выполняет. Значит «23 минуты стабильности» было доказано в stub-thread режиме,
+  а не в tick-режиме. Теперь `hook::work` перед polling вызывает тот же
+  `gcthreads::reap()` (существующий QPC tick каждые 250 мс, никаких новых
+  потоков/сокетов/файлов), с `log::guard("gct tick reap")` и логом только
+  события защиты/вычеркивания. В LIVE>0 этот путь unchanged/passive.
+- Проверка сборки: `cargo test -p hromatite-core --target x86_64-unknown-linux-gnu`
+  — 19/19; `cargo build --workspace --release` — OK; `git diff --check` — OK.
+  Живой запуск — следующий шаг (нужны `reaped dead record` и отсутствие новых
+  `SuspendThread loop failed`).
+- Отдельная незавершённая работа: runtime catalog/console (`meta`, `typelist`,
+  `typedump`, `meths`, `fields2`, `dumpmeta`) из коммита `3a403f2`; `Meta::locate`
+  на той игре не нашёл магию (`0 rejected candidates`), поэтому парсер метаданных
+  требует структурного fallback, полный typedump ещё не подтверждён.
+

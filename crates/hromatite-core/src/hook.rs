@@ -1527,6 +1527,15 @@ fn work(n: u64, now: u64, dt: u64) {
     if LIVE_MODE.load(Ordering::Relaxed) > 0 {
         return;
     }
+    // The stub console loop reaped dead Boehm records every ~0.8 s, but the
+    // frame-hook path bypassed that loop entirely. Crash 2026-11-15_031016139
+    // proved the gap: tid 0x3bc, errcode 0x5. Run the same table scan on the
+    // existing tick (250 ms): no new thread, no file IO, only Win32 handle
+    // checks. Log only repairs/diagnostics, not another periodic heartbeat.
+    let reaped = log::guard("gct tick reap", crate::gcthreads::reap).unwrap_or_default();
+    for line in reaped {
+        log::log_tag("gct", &line);
+    }
     let _ = log::guard("hook::work", || {
         let cmds = {
             let mut g = match READER.lock() {
