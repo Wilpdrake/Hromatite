@@ -2085,3 +2085,38 @@ il2cpp одними чтениями памяти (без единого выз�
   рамки, попадающие на аватары. Если `err` велик — скорее всего `pixelWidth`
   отличается от размера окна (тогда overlay уже масштабирует по `w/h`) или
   матрицы читаются не с того объекта.
+
+### 2026-11-15 — Свежий GC-фатал 0x394: в stub-thread режиме не установлен inline-guard
+
+- Коммит: этот (`docs(agents): prove the stub-mode GC guard gap`). Код не менялся —
+  проведён разбор текущих логов, последнего minidump'а и мест установки защиты.
+- **Свежий прогон 21:25 (режим `FRAME_HOOK=0`, `LIVE=7200`)**:
+  `gc-20261115-212516-after.log:1075` содержит
+  `SuspendThread loop failed: thread id= 0x394, handle= 00000000000004E0,
+  errcode= 0x5` сразу при сборке #59. В первичном дампе потоков видно, что
+  `0x394` — рабочий поток `GameAssembly.dll+0xbf8d10`, зарегистрированный в GC;
+  наш stub — `0x300` и в GC не зарегистрирован (`hromatite.log:41395,41488`).
+- В ту же секунду репер вычеркнул **два** умерших рабочих потока:
+  `reaped dead record id=0x394 … exitcode=0x0 … GameAssembly.dll+0xbf8d10`
+  и `id=0x3e0 … exitcode=0x0 …` (`hromatite.log:41656-41657`). Значит это не
+  зависший живой поток и не убитый нашим кодом поток: оба завершились нормально,
+  но их записи в Boehm остались. Периодический репер опоздал: текущий GC уже
+  вошёл в `SuspendThread → GetThreadContext` retry-loop, который unlink извне
+  не прерывает. Перед смертью новых `[veh]`-исключений нет.
+- **Почему защита не сработала, подтверждено кодом**:
+  `install_gc_context_guard()` вызывается только из `hook::install_tick()`
+  (`raw/hook.rs:2150`). В stub-thread режиме `DllMain` идёт по ветке
+  `console_loop` и `install_tick()` не вызывает (`hromatite-dll/src/lib.rs:177-207`),
+  поэтому в свежем прогоне нет строки `inline GetThreadContext guard installed`.
+  Остался только опрос `reap()` каждые ~0.8 с (`lib.rs:80-92`), который по
+  определению проигрывает гонку уже начавшейся сборке.
+- Последний доступный dump `Crash_2026-11-15_031016139` независимо подтверждает
+  тот же класс: `0x80000003` на `GameAssembly+0xc41b65`, 107 потоков, histogram
+  `[(0,1),(1,86),(2,20)]`, нулевой SuspendCount только у аварийного GC-потока.
+  Для прогона 21:25 новый `crash.dmp` не создан, поэтому его выводы основаны на
+  GC/payload-логах, а не на приписывании ему старого дампа.
+- Следующий шаг: устанавливать `GetThreadContext`-guard и в stub-thread режиме,
+  независимо от QPC-tick. Критерий живой проверки: при загрузке есть
+  `inline GetThreadContext guard installed`; при следующей утечке —
+  `inline guard: stale record id=… unlinked inside GetThreadContext`, после чего
+  в `VRChat.gc.log` завершается очередной `GC #N` без `SuspendThread loop failed`.
