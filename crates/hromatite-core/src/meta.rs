@@ -535,8 +535,13 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     let (lo, hi) = (gbase, gbase + gsize);
     let ranges = Ranges::new();
     const WIN: usize = 128;
+    let mut scanned_words = 0usize;
+    let mut scanned_regions = 0usize;
     for r in procs::regions(65536) {
-        if r.base < lo || r.base >= hi || !readable_protect(r.protect) {
+        // `.data`/`.bss` only: class tables are written at runtime, and scanning
+        // the 250 MB of `.text` costs a minute and proves nothing.
+        let writable = matches!(r.protect & 0xff, 4 | 8 | 0x40 | 0x80);
+        if r.base < lo || r.base >= hi || !writable {
             continue;
         }
         let start = (r.base + 7) & !7usize;
@@ -544,6 +549,8 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         if words < WIN * 2 {
             continue;
         }
+        scanned_words += words;
+        scanned_regions += 1;
         let mut flags = vec![0u8; words];
         for i in 0..words {
             let v = match ranges.u64(start + i * 8) {
@@ -580,6 +587,17 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     }
     c.sort_by_key(|(a, _)| *a);
     c.dedup();
+    log::log_tag(
+        "meta",
+        &format!(
+            "class tables ({} region(s), {} words): {:?}",
+            scanned_regions,
+            scanned_words,
+            c.iter()
+                .map(|(a, n)| format!("{a:#x}+{n}w"))
+                .collect::<Vec<_>>()
+        ),
+    );
     log::log_tag(
         "meta",
         &format!(
