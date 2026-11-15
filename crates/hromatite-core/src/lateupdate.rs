@@ -1,4 +1,9 @@
 //! Selection of a concrete IL2CPP `LateUpdate` method.
+//!
+//! `HROMATITE_LATE_UPDATE=auto` accepts only `AUTO_CLASS`; `#index` and a raw
+//! class address remain explicit manual overrides. Failure never selects QPC.
+//! Being pre-original for the selected method does not reorder Unity's other
+//! scripts, and installation alone is not liveness: `late` must report hits > 0.
 
 #![forbid(unsafe_code)]
 
@@ -6,9 +11,20 @@ use crate::{log, m3};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Selector {
+    /// One fully-qualified class; arbitrary `LateUpdate` candidates are never a fallback.
+    Auto,
     Index(usize),
     Address(usize),
 }
+
+/// Chosen from the live candidate list for GameAssembly
+/// `648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b`.
+/// Its index is only a materialisation hint; resolution always re-checks the name.
+pub const AUTO_CLASS: &str = "VRC.SDK3.Components.VRCTweenPostLateUpdater";
+pub const AUTO_TYPE_INDEX: usize = 31_241;
+pub const AUTO_BUILD_SHA256: &str =
+    "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b";
+const AUTO_SCAN_LIMIT: usize = 120_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Candidate {
@@ -20,6 +36,9 @@ pub struct Candidate {
 
 pub fn parse_selector(text: &str) -> Option<Selector> {
     let text = text.trim();
+    if text.eq_ignore_ascii_case("auto") {
+        return Some(Selector::Auto);
+    }
     let (index, radix, digits) = match text.strip_prefix('#') {
         Some(rest) => (true, 10, rest),
         None if text.starts_with("0x") || text.starts_with("0X") => (false, 16, &text[2..]),
@@ -33,7 +52,11 @@ pub fn parse_selector(text: &str) -> Option<Selector> {
     if value == 0 {
         return None;
     }
-    Some(if index { Selector::Index(value) } else { Selector::Address(value) })
+    Some(if index {
+        Selector::Index(value)
+    } else {
+        Selector::Address(value)
+    })
 }
 
 pub fn candidate_from_methods(index: usize, class: usize, methods: &[m3::Method]) -> Option<Candidate> {
@@ -61,6 +84,7 @@ where
     let (index, key) = match selector {
         Selector::Index(i) => (Some(i), i),
         Selector::Address(a) => (None, a),
+        Selector::Auto => return None,
     };
     let class = at(key)?;
     let mut found = candidate_from_methods(index.unwrap_or(0), class, &methods(class))?;
@@ -68,8 +92,32 @@ where
     Some(found)
 }
 
+pub fn auto_candidate_from<I, M, N>(classes: I, methods: M, full_name: N) -> Option<Candidate>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+    M: Fn(usize) -> Vec<m3::Method>,
+    N: Fn(usize) -> String,
+{
+    let mut found = classes
+        .into_iter()
+        .filter(|(_, class)| full_name(*class) == AUTO_CLASS)
+        .filter_map(|(index, class)| candidate_from_methods(index, class, &methods(class)));
+    let candidate = found.next()?;
+    // Two same-named implementations are ambiguous: guessing would make the
+    // tick source depend on table order rather than evidence.
+    if found.next().is_some() {
+        return None;
+    }
+    Some(candidate)
+}
+
 pub fn resolve(selector: Selector) -> Option<Candidate> {
     match selector {
+        Selector::Auto => auto_candidate_from(
+            m3::classes(AUTO_SCAN_LIMIT),
+            m3::methods,
+            m3::class_full_name,
+        ),
         Selector::Index(index) => resolve_with(selector, m3::class_at, m3::methods)
             .or_else(|| {
                 log::log_tag("late", &format!("class index {index} is not materialised"));
@@ -114,7 +162,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_from_methods, candidates_from, parse_selector, resolve_with, retry_bounded, Selector};
+    use super::{
+        AUTO_CLASS, Selector, auto_candidate_from, candidate_from_methods, candidates_from,
+        parse_selector, resolve_with, retry_bounded,
+    };
     use crate::m3::Method;
 
     fn method(name: &str, entry: usize) -> Method {
@@ -130,12 +181,53 @@ mod tests {
 
     #[test]
     fn selector_distinguishes_type_indices_from_addresses() {
+        assert_eq!(parse_selector("auto"), Some(Selector::Auto));
+        assert_eq!(parse_selector(" AUTO "), Some(Selector::Auto));
         assert_eq!(parse_selector("#21033"), Some(Selector::Index(21033)));
         assert_eq!(parse_selector("0x30344d10"), Some(Selector::Address(0x30344d10)));
         assert_eq!(parse_selector("21033"), Some(Selector::Address(21033)));
         assert_eq!(parse_selector(""), None);
         assert_eq!(parse_selector("#"), None);
         assert_eq!(parse_selector("0x0"), None);
+    }
+
+    #[test]
+    fn auto_resolver_requires_one_exact_named_valid_class() {
+        let classes = vec![(1, 0x1000), (2, 0x2000), (3, 0x3000)];
+        let methods = |class| vec![method("LateUpdate", class + 0x100)];
+        let name = |class| match class {
+            0x1000 => AUTO_CLASS.to_string(),
+            0x2000 => "Other.VRCTweenPostLateUpdater".to_string(),
+            _ => "VRC.SDK3.Components.Other".to_string(),
+        };
+        let found =
+            auto_candidate_from(classes, methods, name).expect("exact auto class must resolve");
+        assert_eq!(found.index, Some(1));
+        assert_eq!(found.class, 0x1000);
+        assert_eq!(found.entry, 0x1100);
+    }
+
+    #[test]
+    fn auto_resolver_rejects_duplicates_and_never_picks_an_arbitrary_candidate() {
+        let duplicate_classes = vec![(1, 0x1000), (2, 0x2000)];
+        assert!(auto_candidate_from(
+            duplicate_classes,
+            |class| vec![method("LateUpdate", class + 0x100)],
+            |_| AUTO_CLASS.to_string(),
+        )
+        .is_none());
+        assert!(auto_candidate_from(
+            vec![(3, 0x3000)],
+            |class| vec![method("LateUpdate", class + 0x100)],
+            |_| "Other.Class".to_string(),
+        )
+        .is_none());
+        assert!(auto_candidate_from(
+            vec![(1, 0x1000)],
+            |_| vec![method("Update", 0x1100)],
+            |_| AUTO_CLASS.to_string(),
+        )
+        .is_none());
     }
 
     #[test]
