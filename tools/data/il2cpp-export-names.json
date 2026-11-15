@@ -1,0 +1,2559 @@
+{
+ "schema": "hromatite/il2cpp-export-names/1",
+ "source": "Ghidra 12.1.2, GameAssembly.dll project (analysis + per-export decompilation)",
+ "gameassembly_sha256": "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b",
+ "unity_version": "6000.0.67f1",
+ "image_base": "0x180000000",
+ "export_count": 251,
+ "distinct_addresses": 225,
+ "named_addresses": 218,
+ "canonical_api_names": 232,
+ "canonical_names_not_located": [
+  "il2cpp_assembly_get_image",
+  "il2cpp_class_get_element_class",
+  "il2cpp_class_get_declaring_type",
+  "il2cpp_class_is_valuetype",
+  "il2cpp_class_is_blittable",
+  "il2cpp_class_array_element_size",
+  "il2cpp_class_get_image",
+  "il2cpp_class_get_bitmap_size",
+  "il2cpp_class_get_bitmap",
+  "il2cpp_field_get_name",
+  "il2cpp_field_get_type",
+  "il2cpp_gc_set_external_allocation_tracker",
+  "il2cpp_gc_set_external_wbarrier_tracker",
+  "il2cpp_offset_of_array_bounds_in_array_object_header",
+  "il2cpp_allocation_granularity",
+  "il2cpp_method_get_declaring_type",
+  "il2cpp_method_get_name",
+  "il2cpp_method_get_from_reflection",
+  "il2cpp_method_get_class",
+  "il2cpp_method_has_attribute",
+  "il2cpp_property_get_flags",
+  "il2cpp_property_get_get_method",
+  "il2cpp_property_get_set_method",
+  "il2cpp_property_get_name",
+  "il2cpp_property_get_parent",
+  "il2cpp_object_new",
+  "il2cpp_runtime_unhandled_exception_policy_set",
+  "il2cpp_string_new_wrapper",
+  "il2cpp_thread_get_all_attached_threads",
+  "il2cpp_image_get_assembly",
+  "il2cpp_image_get_class_count",
+  "il2cpp_debugger_set_agent_options",
+  "il2cpp_register_debugger_agent_transport",
+  "il2cpp_debug_get_method_info",
+  "il2cpp_unity_install_unitytls_interface",
+  "il2cpp_custom_attrs_free",
+  "il2cpp_set_default_thread_affinity",
+  "il2cpp_unity_set_android_network_up_state_func"
+ ],
+ "validation": {
+  "method": "232 lazy resolver stubs in UnityPlayer.dll were aligned against the canonical API list; 191 of them land on an address whose resolved name equals the aligned canonical name (191/191 exact).",
+  "icf_alias_groups": "Several exports share one address because the linker folded identical bodies (e.g. 0x3540 has 5 export names, 0x3dc0 has 8); those canonical APIs have no distinct address, which is why 38 canonical names stay unlocated while only 5 addresses remain unnamed.",
+  "renames_applied": 218
+ },
+ "entries": [
+  {
+   "addr": "0x180003540",
+   "rva": "0x3540",
+   "exports": [
+    "LLWkkZiEtMJ",
+    "RbQknQAPgfp",
+    "gzogdWyjsnA",
+    "noqAlcCSLKn",
+    "wfhIaQGYSlR"
+   ],
+   "real_name": "il2cpp_object_get_class",
+   "confidence": "shape/alias-group",
+   "evidence": "mov (%rcx),%rax; ret = одна загрузка поля +0x00. ICF слил 5 одинаковых аксессоров: object.klass, class.image, image.assembly, assembly.image, property.parent — все читают +0x00. Имя выбрано по главной функции.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180003570",
+   "rva": "0x3570",
+   "exports": [
+    "EJxwjxcdJFI"
+   ],
+   "real_name": "il2cpp_class_get_static_field_data",
+   "confidence": "inferred",
+   "evidence": "mov 0xb8(%rcx),%rax; ret — единственная 64-битная загрузка одного поля. Кластер мелких API-геттеров этого билда даёт согласованную раскладку Il2CppClass: +0xb0 vtable, +0xb8 static_fields (блок статики), +0xc0 rgctx_data, +0xc8 interfaceOffsets, +0xd0 unity_user_data (см. соседний 0x15ce20 = const 0xd0). Ни одна другая необъявленная функция API не возвращает поле класса на высоком смещении; rgctx_data наружу не экспортируется. Не противоречит il2cpp_class_get_data_size (static_fields_size=+0x10c, 0xc28520).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180003dc0",
+   "rva": "0x3dc0",
+   "exports": [
+    "CKGxbSmwFNG",
+    "NCfKQRBIfnc",
+    "NeejPGprCyi",
+    "OfE_ocJyppr",
+    "ZCLNevEtMeE",
+    "_FIrcCNPZQe",
+    "pkzVawzsbBl",
+    "qvRstxdOE_c"
+   ],
+   "real_name": null,
+   "confidence": "non-il2cpp (already named)",
+   "evidence": "ret 0 (no-op). Ghidra и сама таблица экспорта уже дают настоящее имя _guard_check_icall (CFG guard stub); остальные 7 имён — ICF-алиасы пустых стабов.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180019ea0",
+   "rva": "0x19ea0",
+   "exports": [
+    "BCRJGBPPWJb"
+   ],
+   "real_name": "il2cpp_array_length",
+   "confidence": "strong",
+   "evidence": "mov 0x18(%rcx),%eax; ret = Il2CppArray.max_length (32-бит). Подтверждено константным якорем il2cpp_offset_of_array_length_in_array_object_header = 0x18 (0xc29160). il2cpp_field_get_offset отпадает: Field::GetOffset имеет ветку на kIl2CppInvalidOffset, т.е. это не 4-байтовая функция.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800291f0",
+   "rva": "0x291f0",
+   "exports": [
+    "AssufKjqFwY",
+    "mGLGidnWnAd"
+   ],
+   "real_name": "il2cpp_method_get_return_type",
+   "confidence": "strong",
+   "evidence": "mov 0x28(%rcx),%rax; ret = MethodInfo.return_type (+0x28 по снятому лейауту). 2-й алиас не расшифрован.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180029200",
+   "rva": "0x29200",
+   "exports": [
+    "cwLJCAgSefb",
+    "fyYotFvyyHP",
+    "srfJGLpAkRi",
+    "yO_MabyZEBJ"
+   ],
+   "real_name": "il2cpp_class_get_namespace",
+   "confidence": "shape/alias-group",
+   "evidence": "mov 0x18(%rcx),%rax; ret — 4 алиаса: Il2CppClass.namespaze (+0x18), MethodInfo.name (+0x18) и 2 неустановленных.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180029240",
+   "rva": "0x29240",
+   "exports": [
+    "rpFKtN_bEkp",
+    "xKzlgFXdtCP"
+   ],
+   "real_name": "il2cpp_field_get_parent",
+   "confidence": "shape/alias-group",
+   "evidence": "mov 0x20(%rcx),%rax; ret — 2 алиаса: FieldInfo.parent (+0x20) и MethodInfo.klass (+0x20).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18008a6e0",
+   "rva": "0x8a6e0",
+   "exports": [
+    "RAPrkmOgKZQ"
+   ],
+   "real_name": "il2cpp_string_length",
+   "confidence": "strong",
+   "evidence": "mov 0x10(%rcx),%eax; ret = Il2CppString.length (int32 по +0x10; chars по +0x14 подтверждает соседняя il2cpp_string_chars).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18008acd0",
+   "rva": "0x8acd0",
+   "exports": [
+    "AGCaWfHWjly",
+    "PkFtjKtvjDx",
+    "_yzpyJYBEyM",
+    "klLKdYZlPHh"
+   ],
+   "real_name": "il2cpp_class_get_parent",
+   "confidence": "shape/alias-group",
+   "evidence": "mov 0x10(%rcx),%rax; ret — 4 алиаса: Il2CppClass.parent (+0x10), FieldInfo.name (+0x10) и 2 неустановленных.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800a3950",
+   "rva": "0xa3950",
+   "exports": [
+    "BnYHgflEdyk"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov 0x20(%rcx),%eax; ret — 32-битное поле по +0x20. У Il2CppClass +0x20 это byval_arg (указатель, 64 бита), у MethodInfo +0x20 — klass. Ни один оставшийся геттер с телом 'u32 [p+0x20]' не подтверждается (у il2cpp_property_get_flags поле attrs на +0x10 при stride 0x28). Внутренних вызовов нет, только EAT. Кандидат без доказательства: il2cpp_image_get_class_count (если typeCount у Il2CppImage на +0x20 — противоречит тому, что +0x20 используется как указатель на дефиницию в il2cpp_image_get_class/entry_point).",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800af7a0",
+   "rva": "0xaf7a0",
+   "exports": [
+    "UhbBdKTPMrS"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov 0x1c(%rcx),%eax; ret — 32-битное поле по +0x1c. Наиболее вероятный кандидат — il2cpp_image_get_class_count (typeCount рядом с typeStart=+0x14 по раскладке BRIEF, т.е. +0x18/+0x1c), но подтвердить нечем: il2cpp_image_get_class получает typeStart не из +0x14, а через *(int**)(image+0x20), значит раскладка Il2CppImage в BRIEF как минимум частично неверна. Внутренних вызовов нет. Не назван.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800bf620",
+   "rva": "0xbf620",
+   "exports": [
+    "jYFjsAGTaMG"
+   ],
+   "real_name": "il2cpp_method_get_token",
+   "confidence": "strong",
+   "evidence": "mov 0x48(%rcx),%eax; ret — 32-битное чтение по +0x48 у MethodInfo. Лейаут MethodInfo сходится: name=+0x18 и param_count=+0x52 видны в il2cpp_class_get_method_from_name (0xc28360), return_type=+0x28 в 0x1800291f0. +0x48 = token; единственная альтернатива (flags) лежит в +0x4c (u16), и il2cpp_method_get_flags уже назван. ПЕРЕИМЕНОВАТЬ НЕ УДАЛОСЬ: у Ghidra по этому адресу нет ни функции, ни символа (get_function_info → 'Function not found', rename data → 'Could not resolve data/global symbol'), т.е. 8-байтовый стаб не распознан и лежит в undefined-байтах; нужен create_function/label тем, кому это разрешено. ОТДЕЛЬНО: при первой попытке я по опечатке отправил адрес '0x180bf620' (на разряд короче) — Ghidra создала там мусорную метку il2cpp_method_get_token; её надо снести (адрес вне образа).",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800c4740",
+   "rva": "0xc4740",
+   "exports": [
+    "Ptz_CXoxkdy"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov 0x58(%rcx),%rax; ret — указатель по +0x58. Слот +0x58 не подтверждён ни в Il2CppClass (там +0x50 methods, +0x80 fields), ни в Il2CppImage (там +0x40 filename, +0x30 codegenModule). Кандидаты: il2cpp_class_get_declaring_type (klass->declaringType) либо il2cpp_image_get_filename, если filename в этом билде на +0x58. Вызовов внутри модуля нет (только EAT) → по форме не развести. Не назван, чтобы не портить карту символов.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800c47b0",
+   "rva": "0xc47b0",
+   "exports": [
+    "ERCPySwaUov",
+    "LDoqVncbZPW",
+    "bjHeKfeeSaZ"
+   ],
+   "real_name": "il2cpp_image_get_filename",
+   "confidence": "strong",
+   "evidence": "mov 0x40(%rcx) = image->filename ('<name>.dll')",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800c4a10",
+   "rva": "0xc4a10",
+   "exports": [
+    "rljpYcbSOcw"
+   ],
+   "real_name": "il2cpp_class_get_name",
+   "confidence": "strong",
+   "evidence": "mov 0x98(%rcx),%rax; ret = Il2CppClass.name — тот же офсет +0x98, что в снятом лейауте BRIEF.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18015ce20",
+   "rva": "0x15ce20",
+   "exports": [
+    "AVcdKYduGNz"
+   ],
+   "real_name": "il2cpp_class_get_userdata_offset",
+   "confidence": "inferred",
+   "evidence": "mov $0xd0,%eax; ret — константа 0xd0 = 208. Из оставшихся имён единственная функция, возвращающая константу-смещение внутри Il2CppClass, — il2cpp_class_get_userdata_offset (offsetof(Il2CppClass, unity_user_data)). Раскладка согласуется: vtable=+0xb0, static_fields=+0xb8, rgctx=+0xc0, interfaceOffsets=+0xc8, unity_user_data=+0xd0. Соседи по адресам: 0x191870 = il2cpp_object_header_size (0x10), 0x29150 (0x20), 0x29160 (0x18) — это тот же кластер констант-геттеров.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180161ec0",
+   "rva": "0x161ec0",
+   "exports": [
+    "qWhBeRHDYwz"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov 0x28(%rcx),%eax; shr $0x1f,%eax; ret — так компилятор читает ОДНОБИТНОЕ поле в старшем бите dword'а по +0x28. Ни один оставшийся предикат API не подтверждается: bool-предикаты класса в этом билде читают битовые флаги у +0x135 (0xc28000/0xc28010) или сравнивают поле с нулём (0xc28020). Если rcx=Il2CppClass, +0x28 — это flags-слово byval_arg (+0x20+0x08), старший бит = pinned; API 'is pinned' не существует. Внутренних вызовов нет. Не назван.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180191870",
+   "rva": "0x191870",
+   "exports": [
+    "CftFZLoPgxc",
+    "TlPrwWnLqbn",
+    "ulW_YkZyJK_"
+   ],
+   "real_name": "il2cpp_object_header_size",
+   "confidence": "strong",
+   "evidence": "mov $0x10,%eax; ret — единственная константа 0x10 в бинаре: sizeof(Il2CppObject)=0x10 и kIl2CppOffsetOfArrayBounds=0x10. 3 алиаса ICF.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18023cd40",
+   "rva": "0x23cd40",
+   "exports": [
+    "InqqFqSPRvd"
+   ],
+   "real_name": "il2cpp_gc_has_strict_wbarriers",
+   "confidence": "inferred",
+   "evidence": "xor %al,%al; ret — булева функция, всегда false (обнуляет только AL, старшие биты RAX мусорные → оптимизация под bool). В этом билде GC — Boehm без strict-write-barrier режима, поэтому il2cpp_gc_has_strict_wbarriers = false. Альтернативы (il2cpp_gc_set_external_*_tracker, *_policy_set, debugger_set_agent_options, set_default_thread_affinity, install_unitytls_interface, android_network_up_state_func) — void-сеттеры, у них тело 'mov %rcx, glob; ret', а не возврат bool.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1804cbd70",
+   "rva": "0x4cbd70",
+   "exports": [
+    "ijENXZEahgC",
+    "mqUUXnPaueu"
+   ],
+   "real_name": "il2cpp_image_get_name",
+   "confidence": "strong",
+   "evidence": "mov 0x08(%rcx) = image->name (short name)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a532f0",
+   "rva": "0xa532f0",
+   "exports": [
+    "FjuHenkoZCV"
+   ],
+   "real_name": "il2cpp_string_chars",
+   "confidence": "strong",
+   "evidence": "lea 0x14(%rcx),%rax; ret = &Il2CppString.chars (length +0x10, chars +0x14).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a5ed00",
+   "rva": "0xa5ed00",
+   "exports": [
+    "WEQiAvTetEY"
+   ],
+   "real_name": "il2cpp_object_unbox",
+   "confidence": "strong",
+   "evidence": "lea 0x10(%rcx),%rax; ret = (char*)obj + sizeof(Il2CppObject) — ровно Object::Unbox.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a60c10",
+   "rva": "0xa60c10",
+   "exports": [
+    "ywdzHgbMyMN"
+   ],
+   "real_name": "il2cpp_class_get_type",
+   "confidence": "strong",
+   "evidence": "lea 0x20(%rcx),%rax; ret — возвращает интерьерный указатель &klass->byval_arg. Смещение byval_arg=+0x20 подтверждено независимо: parent=+0x10 и namespaze=+0x18 (29200), а get_method_from_name обходит klass+0x10 как parent. Только il2cpp_class_get_type возвращает адрес поля класса.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bba740",
+   "rva": "0xbba740",
+   "exports": [
+    "YdTENtzWXcd"
+   ],
+   "real_name": "il2cpp_value_box",
+   "confidence": "strong",
+   "evidence": "thunk -> 0xc0e0d0: аллокация объекта класса (instance size из +0xF8), memcpy значения и GC card write barrier (0xe701c60) — Object::Box, т.е. il2cpp_value_box.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bba940",
+   "rva": "0xbba940",
+   "exports": [
+    "AuwndpOQwyc"
+   ],
+   "real_name": "il2cpp_get_exception_argument_null",
+   "confidence": "strong",
+   "evidence": "jmp 0x180bc6980; декомпиляция цели: il2cpp_class_from_name(mscorlib, \"System\", \"ArgumentNullException\") → object_new → ctor(obj,NULL) → если arg!=NULL: strlen+il2cpp_string_new_len(arg,len) и запись результата в exc+0x90 (поле message) с write barrier. Один параметр const char*. Ничего общего с созданием строки. il2cpp_string_new остаётся на 0xc298e0 (проверено: strlen → utf8→utf16 → NewLen → копия в +0x14). il2cpp_string_new_wrapper на 0xbba940 НЕ находится — имя по-прежнему свободно.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbb190",
+   "rva": "0xbbb190",
+   "exports": [
+    "ouyFXKlsqYf"
+   ],
+   "real_name": "il2cpp_class_is_assignable_from",
+   "confidence": "strong",
+   "evidence": "thunk -> 0xc16a80: рекурсивная проверка совместимости классов — обход interfaces (+0x48), generic-аргументов и parent-цепочки, самовызов — Class::IsAssignableFrom.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbc580",
+   "rva": "0xbbc580",
+   "exports": [
+    "VHHoG_BKZEr"
+   ],
+   "real_name": "il2cpp_field_set_value",
+   "confidence": "strong",
+   "evidence": "Декомпиляция: f(obj, FieldInfo* field, void* value) — rsi=*(field)=field->type, адрес = obj + (int)field->offset(+0x08), затем switch по Il2CppType.type(+0x0a): string-ветка через class_from_il2cpp_type/value_size+memcpy, отдельные ветки для 1/2/4/8 байт с записью нуля при value==NULL, GC-указатель пишется через write barrier. Это ровно il2cpp_field_set_value (сигнатура obj,field,value). il2cpp_gc_wbarrier_set_field уже занят 0xc290e0, а il2cpp_field_static_set_value — 0xc28d60; тело им не соответствует.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bc4e50",
+   "rva": "0xbc4e50",
+   "exports": [
+    "DllGetActivationFactory"
+   ],
+   "real_name": null,
+   "confidence": "non-il2cpp (already named)",
+   "evidence": "DllGetActivationFactory — имя пережило обфускацию, настоящая COM/WinRT-точка входа (пролог с home space rcx/rdx).",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bc5250",
+   "rva": "0xbc5250",
+   "exports": [
+    "DllCanUnloadNow"
+   ],
+   "real_name": null,
+   "confidence": "non-il2cpp (already named)",
+   "evidence": "DllCanUnloadNow — имя пережило обфускацию: xor eax,eax; cmp al,[0xe66ba58]; setne al — DllCanUnloadNow по глобалу «модуль занят».",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bde100",
+   "rva": "0xbde100",
+   "exports": [
+    "il2cpp_free"
+   ],
+   "real_name": "il2cpp_free",
+   "confidence": "proven",
+   "evidence": "имя пережило обфускацию; тело: jmp qword [0xe6689a8] = 2-й/3-й слот таблицы memory-callbacks (free_func)",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180beed30",
+   "rva": "0xbeed30",
+   "exports": [
+    "CreateZStream"
+   ],
+   "real_name": "CreateZStream",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: zlib-обёртка Unity (имя не обфусцировано), форма совпадает с zlib CreateZStream",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180beee30",
+   "rva": "0xbeee30",
+   "exports": [
+    "CloseZStream"
+   ],
+   "real_name": "CloseZStream",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: zlib-обёртка (NULL → -10), имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180beef30",
+   "rva": "0xbeef30",
+   "exports": [
+    "Flush"
+   ],
+   "real_name": "Flush",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: zlib Flush (проверка байта +0x20, вызов через указатель), имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180beef80",
+   "rva": "0xbeef80",
+   "exports": [
+    "ReadZStream"
+   ],
+   "real_name": "ReadZStream",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: zlib ReadZStream, имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bef070",
+   "rva": "0xbef070",
+   "exports": [
+    "WriteZStream"
+   ],
+   "real_name": "WriteZStream",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: zlib WriteZStream, имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bef120",
+   "rva": "0xbef120",
+   "exports": [
+    "CreateNLSocket"
+   ],
+   "real_name": "CreateNLSocket",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: Unity NL-socket (создаёт объект из 0xd19a7d0), имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bef140",
+   "rva": "0xbef140",
+   "exports": [
+    "ReadEvents"
+   ],
+   "real_name": "ReadEvents",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: Unity NL-socket, имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bef160",
+   "rva": "0xbef160",
+   "exports": [
+    "CloseNLSocket"
+   ],
+   "real_name": "CloseNLSocket",
+   "confidence": "n/a",
+   "evidence": "не il2cpp: Unity NL-socket, имя не обфусцировано",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c0d730",
+   "rva": "0xc0d730",
+   "exports": [
+    "dMrtQkCakMh"
+   ],
+   "real_name": "il2cpp_array_get_byte_length",
+   "confidence": "strong",
+   "evidence": "байты: cmp qword[rcx+0x10],0 (array->bounds) / если NULL: return max_length[+0x18] * klass->element_size[+0x104]; иначе произведение klass->rank[+0x132] длин Il2CppArrayBounds (stride 0x10) * element_size → полный размер в байтах",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c16a20",
+   "rva": "0xc16a20",
+   "exports": [
+    "tDZpXVrCwXU"
+   ],
+   "real_name": "il2cpp_class_has_parent",
+   "confidence": "strong",
+   "evidence": "Class::Init(klass),Class::Init(parent); if (parent->idepth[+0x130] <= klass->idepth && klass->typeHierarchy[+0xc8][parent->idepth-1]==parent) return true; ровно 2 аргумента (нет checkInterfaces) → has_parent, не is_subclass_of",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c21c60",
+   "rva": "0xc21c60",
+   "exports": [
+    "hMZWkJzNOFA"
+   ],
+   "real_name": "il2cpp_alloc",
+   "confidence": "strong",
+   "evidence": "jmp qword [0xe668998] — 0-й слот Il2CppMemoryCallbacks (malloc_func, дефолт 0x180c21b80); чистая передача size в аллокатор",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27990",
+   "rva": "0xc27990",
+   "exports": [
+    "odpQbmiivkT"
+   ],
+   "real_name": "il2cpp_init",
+   "confidence": "strong",
+   "evidence": "принимает const char* domain_name (rcx), зовёт FUN_180c58b08(0,\"\") и FUN_180bbd3b0(domain) = Runtime/GlobalMetadata::Init (тот загружает mscorlib.dll/__Generated/System, заполняет 0xe66b720 = образ corlib); возвращает int (заголовок Unity: DO_API(int, il2cpp_init,...))",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c279c0",
+   "rva": "0xc279c0",
+   "exports": [
+    "gYxqMftDDXL"
+   ],
+   "real_name": "il2cpp_init_utf16",
+   "confidence": "strong",
+   "evidence": "Il2CppChar* → strlen по 2-байтным юнитам → UTF-16→UTF-8 std::string → тот же FUN_180bbd3b0(utf8) что и il2cpp_init; один в один init_utf16",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27ac0",
+   "rva": "0xc27ac0",
+   "exports": [
+    "rBgACxuSNQG"
+   ],
+   "real_name": "il2cpp_shutdown",
+   "confidence": "strong",
+   "evidence": "тонкий thunk jmp 0xbbf960 (vm::Runtime::Shutdown), стоит ровно после init/init_utf16 — 3-я запись канона",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27ad0",
+   "rva": "0xc27ad0",
+   "exports": [
+    "duYMPTYRTRX"
+   ],
+   "real_name": "il2cpp_set_config_dir",
+   "confidence": "order",
+   "evidence": "strlen(path) → std::string::assign(rcx=&s_ConfigDirectory[0xe668ca8], path, len); три идентичных тела различаются только глобалом, порядок = порядок заголовка (config_dir, data_dir, temp_dir) — подтверждён 12 соседями блока, идущими строго по заголовку",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27b00",
+   "rva": "0xc27b00",
+   "exports": [
+    "wqyUlLcaMtX"
+   ],
+   "real_name": "il2cpp_set_data_dir",
+   "confidence": "order",
+   "evidence": "то же assign в &s_DataDirectory[0xe669180]; имя по позиции в заголовке (группа доказана, порядок внутри группы — по канону)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27b30",
+   "rva": "0xc27b30",
+   "exports": [
+    "nunRSWUfakk"
+   ],
+   "real_name": "il2cpp_set_temp_dir",
+   "confidence": "order",
+   "evidence": "то же assign в &s_TempDirectory[0xe668c88]; имя по позиции в заголовке",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27b60",
+   "rva": "0xc27b60",
+   "exports": [
+    "hCHCbecvPgN"
+   ],
+   "real_name": "il2cpp_set_commandline_arguments",
+   "confidence": "strong",
+   "evidence": "(int argc, const char* const argv[]): пишет argc в g[0xe66c8c8], resize вектора строк [0xe66bdc8], затем strlen(char*) + std::string ctor на каждый argv[i] → UTF-8 вариант",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27b70",
+   "rva": "0xc27b70",
+   "exports": [
+    "qlyoRtBJ_vB"
+   ],
+   "real_name": "il2cpp_set_commandline_arguments_utf16",
+   "confidence": "strong",
+   "evidence": "то же, но читает юниты по 2 байта (short*) и копирует их без конвертации → Il2CppChar** (UTF-16) вариант",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27d30",
+   "rva": "0xc27d30",
+   "exports": [
+    "MTbxyeCLibt"
+   ],
+   "real_name": "il2cpp_set_config_utf16",
+   "confidence": "strong",
+   "evidence": "Il2CppChar* → UTF-16→UTF-8 в std::string → FUN_180bc0040(str), тот же приёмник, что у 0xc27e10 (char* вариант)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27e10",
+   "rva": "0xc27e10",
+   "exports": [
+    "bTLTGrdemCj"
+   ],
+   "real_name": "il2cpp_set_config",
+   "confidence": "strong",
+   "evidence": "const char* → std::string ctor → FUN_180bc0040(str); парная к 0xc27d30, но без UTF-16 (заголовок: set_config_utf16 затем set_config)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27eb0",
+   "rva": "0xc27eb0",
+   "exports": [
+    "gjKyaXuYoBi"
+   ],
+   "real_name": "il2cpp_set_memory_callbacks",
+   "confidence": "strong",
+   "evidence": "копирует 0x38 байт (7 указателей) из *callbacks в статики 0xe668998..0xe6689c8 = Il2CppMemoryCallbacks; слот free этой таблицы использует доказанный il2cpp_free, слот malloc — il2cpp_alloc (0xc21c60)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27ee0",
+   "rva": "0xc27ee0",
+   "exports": [
+    "JmVXoDbGYJI"
+   ],
+   "real_name": "pool_chunk_size_set",
+   "confidence": "inferred",
+   "evidence": "Одиночный store: *(u64*)0xe6689d0 = rcx; ret. Глобал 0xe6689d0 в .data статически инициализирован 0x10000 (64 KiB) — то есть это НЕ указатель на структуру, а число. Единственный внутренний потребитель 0xe6689d0 — 0x180c22220 (в области Memory/аллокатора рядом с il2cpp_alloc 0xc21c60), где значение трактуется как размер/лимит блока: chunk_cap < G>>4 => вырасти, buf = alloc(max(G,·)), в дескриптор пишутся size=max(G,·) в +0x10 и +0x18. Пара set(0xc27ee0)/get(0xc27ef0) стоит в api.cpp-TU между il2cpp_set_memory_callbacks (0xc27eb0) и il2cpp_get_corlib (0xc27f00); в canonical.txt (232 имени) единственная пара set/get — il2cpp_gc_{get,set}_max_time_slice_ns, и она уже занята на 0xc28f50/0xc28f60, значит это добавление Unity 6, канонического имени нет. ГИПОТЕЗА il2cpp_unity_install_unitytls_interface ОТВЕРГНУТА: интерфейс unitytls — это таблица указателей, её читатель обязан разыменовывать (call [ptr+off]); ни одного разыменования 0xe6689d0 в файле нет, а value>>4/alloc(value) для адреса интерфейса дали бы мусорные 25 МБ.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27ef0",
+   "rva": "0xc27ef0",
+   "exports": [
+    "zrUNgtwbjgD"
+   ],
+   "real_name": "pool_chunk_size_get",
+   "confidence": "inferred",
+   "evidence": "mov rax,[0xe6689d0]; ret — парный getter к 0xc27ee0, отдаёт тот же 64-битный размер блока (default 0x10000). Внутри GameAssembly не вызывается вообще (экспорт только наружу), поэтому семантика выведена из сеттера и единственного потребителя.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f00",
+   "rva": "0xc27f00",
+   "exports": [
+    "wYRnnMQuvvH"
+   ],
+   "real_name": "il2cpp_get_corlib",
+   "confidence": "proven",
+   "evidence": "return *(Il2CppImage**)0xe66b720; проверено вызовом в игре (возвращает Il2CppImage mscorlib); этот же глобал заполняет il2cpp_init из образа mscorlib.dll",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f10",
+   "rva": "0xc27f10",
+   "exports": [
+    "TUSBAQBSIwC"
+   ],
+   "real_name": "il2cpp_add_internal_call",
+   "confidence": "strong",
+   "evidence": "thunk → 0xbc7f80: std::string(name) → поиск в std::map[0xe66bb78] → вставка узла и запись method в узел[8]; resolve_icall (0xbc81e0) только читает тот же map",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f20",
+   "rva": "0xc27f20",
+   "exports": [
+    "zRCxIytmyrR"
+   ],
+   "real_name": "il2cpp_resolve_icall",
+   "confidence": "strong",
+   "evidence": "thunk → 0xbc81e0: lookup по имени в std::map[0xe66bb78] (таблица internal calls) с запасной попыткой после точки; ничего не пишет",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f30",
+   "rva": "0xc27f30",
+   "exports": [
+    "WI__adqu__A"
+   ],
+   "real_name": "il2cpp_array_class_get",
+   "confidence": "strong",
+   "evidence": "xor r8d,r8d; jmp 0xc023f0 = GetBoundedArrayClass(element_class, rank, bounded=false); тело строит класс массива: rank<2 → SZARRAY, иначе MdArray с bounds-массивом",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f40",
+   "rva": "0xc27f40",
+   "exports": [
+    "KwlUjtlTkjZ"
+   ],
+   "real_name": "il2cpp_array_new",
+   "confidence": "strong",
+   "evidence": "FUN_180c023f0(klass,1,0)=GetBoundedArrayClass(el,rank=1,bounded=0), затем inline Array::NewSpecific: alloc elem_size(@0x104)*len+0x20, *obj=arrayklass, [3]=len",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f70",
+   "rva": "0xc27f70",
+   "exports": [
+    "ledjPrndIXM"
+   ],
+   "real_name": "il2cpp_array_new_specific",
+   "confidence": "strong",
+   "evidence": "thunk -> 0xc0d7a0: Array::NewSpecific(klass,len): flags@0x135&0x20 -> обычный путь + memset, иначе GC-путь с element_size(@0x104)*len",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f80",
+   "rva": "0xc27f80",
+   "exports": [
+    "KLllTHMIPMA"
+   ],
+   "real_name": "il2cpp_array_new_full",
+   "confidence": "strong",
+   "evidence": "thunk -> 0xc0d9d0: multidim: rank@0x132, произведение lengths, bounds[] копируются попарно, total*element_size(@0x104)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27f90",
+   "rva": "0xc27f90",
+   "exports": [
+    "HNodT_MFSFB"
+   ],
+   "real_name": "il2cpp_bounded_array_class_get",
+   "confidence": "strong",
+   "evidence": "прямой thunk на Class::GetBoundedArrayClass(element,rank,bounded)=0xc023f0 (3 аргумента; вызов из array_new идёт как (el,1,0))",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27fa0",
+   "rva": "0xc27fa0",
+   "exports": [
+    "kxGcjFtoOzc"
+   ],
+   "real_name": "il2cpp_array_element_size",
+   "confidence": "strong",
+   "evidence": "mov 0x104(%rcx),eax; ret — 0x104 доказано = element_size: обе array_new-функции умножают длину на это поле",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27fb0",
+   "rva": "0xc27fb0",
+   "exports": [
+    "FjuTVhvYTve"
+   ],
+   "real_name": "il2cpp_class_enum_basetype",
+   "confidence": "strong",
+   "evidence": "cmp %rcx,0x40(%rcx) — element_class(@0x40) != klass ? &element_class->byval_arg(+0x20) : NULL",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c27fd0",
+   "rva": "0xc27fd0",
+   "exports": [
+    "ynhUcVbeNeb"
+   ],
+   "real_name": "il2cpp_class_from_system_type",
+   "confidence": "strong",
+   "evidence": "arg+0x10 = Il2CppType* внутри Il2CppReflectionType -> Class::FromIl2CppType(t,1)=0xc15a20 (switch по t->type@0x0a) -> Class::Init",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28000",
+   "rva": "0xc28000",
+   "exports": [
+    "xeCGOZfmsrF"
+   ],
+   "real_name": "il2cpp_class_is_inited",
+   "confidence": "strong",
+   "evidence": "return (*(u8*)(klass+0x135) >> 1) & 1 — бит 1 байта флагов. Раскладка битов подтверждена эмпирически на этом билде: bit2 = enumtype (il2cpp_class_is_enum @0xc284f0 = shr 2), bit5 = has_references (0xc02759: and ~0x20 при пересчёте размеров + orl $1,0x136 = size_inited), bit6 = init_pending (0xc19ab7: and ~0x40, or 0x02 при завершении инициализации) — это в точности новая раскладка il2cpp-class-internals.h (initialized_and_no_error bit0, initialized bit1, enumtype bit2, nullabletype bit3, is_generic bit4, has_references bit5, init_pending bit6, size_init_pending bit7; size_inited/is_blittable — в байте 0x136). Плюс позиция: в il2cpp-api-functions.h il2cpp_class_is_inited стоит непосредственно ПЕРЕД il2cpp_class_is_generic, и в бинаре 0xc28000 стоит непосредственно перед 0xc28010/0xc28020 сразу после il2cpp_class_from_system_type (0xc27fd0). Имя есть в missing-canonical.txt.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28010",
+   "rva": "0xc28010",
+   "exports": [
+    "rkpEpILkigR"
+   ],
+   "real_name": "il2cpp_class_is_generic",
+   "confidence": "strong",
+   "evidence": "klass+0x135 bit4 = is_generic bitflag (bit2=enumtype anchored at 0xc284f0)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28020",
+   "rva": "0xc28020",
+   "exports": [
+    "uDYmnsHkulj"
+   ],
+   "real_name": "il2cpp_class_is_inflated",
+   "confidence": "strong",
+   "evidence": "cmpq $0,0x60(%rcx) = generic_class != NULL -> IsInflated (IsGeneric is the bit at +0x135 bit4)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28030",
+   "rva": "0xc28030",
+   "exports": [
+    "cTf_pFcPuio"
+   ],
+   "real_name": "il2cpp_class_is_subclass_of",
+   "confidence": "strong",
+   "evidence": "jmp Class::IsSubclassOf: Init(klass); Init(klassc); SetupInterfaces(klass); обход interfaces(@0x48/count@0x12c) при check_interfaces(3-й арг), затем interfaceOffsets(@0xc8)+typeHierarchyDepth(@0x130), в конце klassc==object_class",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28040",
+   "rva": "0xc28040",
+   "exports": [
+    "JZSlzqbpxFq",
+    "MPFJsWHQYjf"
+   ],
+   "real_name": "il2cpp_class_from_il2cpp_type",
+   "confidence": "strong",
+   "evidence": "mov $1,%dl; jmp Class::FromIl2CppType(type,true) — Il2CppType* -> Il2CppClass* (alias-группа: 2 экспорта на 1 код)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28050",
+   "rva": "0xc28050",
+   "exports": [
+    "HToJgvthiQt"
+   ],
+   "real_name": "il2cpp_class_from_name",
+   "confidence": "proven",
+   "evidence": "якорь из брифа (thunk -> 0xc07560), подтверждено вызовом в игре",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28060",
+   "rva": "0xc28060",
+   "exports": [
+    "aKsEyyZcTDQ"
+   ],
+   "real_name": "il2cpp_class_get_events",
+   "confidence": "strong",
+   "evidence": "0xc16360: iter по events(@0x88, stride 0x38 = sizeof(Il2CppEventInfo)), count uint16 @0x126; иначе *iter+0x38 до events+count*0x38",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28070",
+   "rva": "0xc28070",
+   "exports": [
+    "aBiYIKpprNc"
+   ],
+   "real_name": "il2cpp_class_get_fields",
+   "confidence": "proven",
+   "evidence": "якорь из брифа; тело 0xc28070 идёт по fields(@0x80, stride 0x28)/count@0x124",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28100",
+   "rva": "0xc28100",
+   "exports": [
+    "fLnmpyEfNqm"
+   ],
+   "real_name": "il2cpp_class_get_nested_types",
+   "confidence": "strong",
+   "evidence": "0xc16600: массив указателей @0xa8, count uint16 @0x128, возвращает разыменованный элемент; interfaces заняты 0x48/0x12c -> остаётся nested_types",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28110",
+   "rva": "0xc28110",
+   "exports": [
+    "MPPSJRukiZK"
+   ],
+   "real_name": "il2cpp_class_get_interfaces",
+   "confidence": "strong",
+   "evidence": "SetupInterfaces(0xc193f0) + массив @0x48, count @0x12c, stride 8, возврат *elem — тот же набор полей, что и в is_subclass_of",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28190",
+   "rva": "0xc28190",
+   "exports": [
+    "aJJevKKzHdw"
+   ],
+   "real_name": "il2cpp_class_get_properties",
+   "confidence": "strong",
+   "evidence": "0xc16720: properties @0x90, stride 0x28 (sizeof(Il2CppPropertyInfo)), count @0x122; другая setup-функция (0xc19000)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c281a0",
+   "rva": "0xc281a0",
+   "exports": [
+    "PUvPaJCvxAM"
+   ],
+   "real_name": "il2cpp_class_get_property_from_name",
+   "confidence": "strong",
+   "evidence": "итератор по properties(@0x90)+strcmp по name(@+0x00 элемента), затем переход к parent(@0x10) — property_from_name",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c282d0",
+   "rva": "0xc282d0",
+   "exports": [
+    "rugRyoSzWlE"
+   ],
+   "real_name": "il2cpp_class_get_field_from_name",
+   "confidence": "strong",
+   "evidence": "0xc16450: обход fields(@0x80), stride 0x28, сравнение name(@+0x10), затем parent(@0x10)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c282e0",
+   "rva": "0xc282e0",
+   "exports": [
+    "TvtrfZGtdAr"
+   ],
+   "real_name": "il2cpp_class_get_methods",
+   "confidence": "strong",
+   "evidence": "скелет итератора, setup = 0xc18650 (та же функция, что зовёт method_from_name) -> methods(@0x50)/count@0x120, stride 8",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28360",
+   "rva": "0xc28360",
+   "exports": [
+    "pjDgQOinsZE"
+   ],
+   "real_name": "il2cpp_class_get_method_from_name",
+   "confidence": "strong",
+   "evidence": "xor %r9d,%r9d; jmp 0xc16510 — обход methods(@0x50), name(@+0x18), param_count(@0x52), flags(@0x4c)&r9d; публичная 3-арг версия передаёт flags=0",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28370",
+   "rva": "0xc28370",
+   "exports": [
+    "OxcYMOEBWoI"
+   ],
+   "real_name": "il2cpp_class_instance_size",
+   "confidence": "strong",
+   "evidence": "mov 0xf8(%rcx),eax; ret — 0xf8 доказано: value_size(0xc283a0) возвращает [0xf8]-0x10",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28380",
+   "rva": "0xc28380",
+   "exports": [
+    "ZaLCenMSqvX"
+   ],
+   "real_name": "il2cpp_class_num_fields",
+   "confidence": "strong",
+   "evidence": "movzwl 0x124(%rcx) — uint16 fieldsCount, тот же счётчик, по которому идёт get_fields",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28390",
+   "rva": "0xc28390",
+   "exports": [
+    "sjzVAQyuqcK"
+   ],
+   "real_name": "class_bitflag_136_bit3",
+   "confidence": "inferred",
+   "evidence": "klass+0x136 bit3; not is_valuetype (that reads byval_arg.type)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c283a0",
+   "rva": "0xc283a0",
+   "exports": [
+    "TpkP_hcHmFC"
+   ],
+   "real_name": "il2cpp_class_value_size",
+   "confidence": "strong",
+   "evidence": "0xc16810: Init при !initialized(0x135 bit7), бросает TypeLoadException 'Could not load type', возвращает instance_size(@0xf8)-0x10 и пишет *align = minimumAlignment(@0x133)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c283b0",
+   "rva": "0xc283b0",
+   "exports": [
+    "LOhhJjkUOXt"
+   ],
+   "real_name": "il2cpp_class_get_flags",
+   "confidence": "strong",
+   "evidence": "mov 0x118(%rcx),eax — uint32 TypeAttributes; рядом is_abstract/is_interface проверяют биты 0x80/0x20 именно этого поля",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c283c0",
+   "rva": "0xc283c0",
+   "exports": [
+    "HnjIgBtjzva"
+   ],
+   "real_name": "il2cpp_class_is_abstract",
+   "confidence": "strong",
+   "evidence": "(flags@0x118 >> 7) & 1 = TypeAttributes.ABSTRACT (0x80)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c283d0",
+   "rva": "0xc283d0",
+   "exports": [
+    "mIUeqxrPzjU"
+   ],
+   "real_name": "il2cpp_class_is_interface",
+   "confidence": "strong",
+   "evidence": "flags@0x118 & 0x20 (TypeAttributes.INTERFACE) ИЛИ byval_arg.type(@0x2a)==VAR(0x13)/MVAR(0x1e) -> true; ровно тот предикат, что inline используется в is_subclass_of",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c283f0",
+   "rva": "0xc283f0",
+   "exports": [
+    "PaFaXrmNwLn"
+   ],
+   "real_name": "il2cpp_cand_class_array_element_size",
+   "confidence": "order",
+   "evidence": "bare jmp -> 0xc19ae0; switch on Il2CppClass.byval_arg.type (+0x2a): VOID->0, BOOLEAN/I1/U1->1, CHAR/I2/U2->2, I4/U4/R4->4, default->8, BYREF/TYPEDBYREF/FNPTR->-1, VALUETYPE->instance_size@+0xf8 minus 0x10, GENERICINST->element class. 1 arg only (no align out) => array/value size helper; value_size(2 args) excluded, so name left as cand_ by order",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28400",
+   "rva": "0xc28400",
+   "exports": [
+    "UMDedmfsfNq"
+   ],
+   "real_name": "il2cpp_class_get_type_token",
+   "confidence": "proven",
+   "evidence": "return *(uint32*)(klass+0x11c) == klass->token; same field is used as the metadata index in il2cpp_class_has_attribute (0xc28410) => 0x11c is token, not flags",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28410",
+   "rva": "0xc28410",
+   "exports": [
+    "kQATUujYQZR"
+   ],
+   "real_name": "il2cpp_class_has_attribute",
+   "confidence": "strong",
+   "evidence": "(klass, attrClass): builds Il2CppCustomAttributeDataRange from image(*klass)+image->+0x20 metadata handle and klass->token(+0x11c), then scans attribute type indices (uint32 table) resolving each via 0xbcc470 and checking assignability; = class_has_attribute",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c284b0",
+   "rva": "0xc284b0",
+   "exports": [
+    "RaTmJhzdtKZ"
+   ],
+   "real_name": "il2cpp_class_has_references",
+   "confidence": "strong",
+   "evidence": "checks bit0 of klass+0x136 (class initialized); if not -> ClassInit; then returns bit5 of klass+0x135 (has_references bitfield). Order 64",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c284f0",
+   "rva": "0xc284f0",
+   "exports": [
+    "TpewApNcKY_"
+   ],
+   "real_name": "il2cpp_class_is_enum",
+   "confidence": "strong",
+   "evidence": "return (klass->bitfield_1(+0x135) >> 2) & 1 = enumtype bit, no class init. Order 65",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28500",
+   "rva": "0xc28500",
+   "exports": [
+    "BQxMKaDqGNT"
+   ],
+   "real_name": "il2cpp_class_get_assemblyname",
+   "confidence": "strong",
+   "evidence": "mov (%rcx),%rax; mov 0x8(%rax),%rax; ret = klass->image->name (Il2CppImage+0x08 = name)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28510",
+   "rva": "0xc28510",
+   "exports": [
+    "mSgrGbcCnig"
+   ],
+   "real_name": "il2cpp_class_get_rank",
+   "confidence": "strong",
+   "evidence": "return *(uint8*)(klass+0x132) (rank is uint8). Order 68",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28520",
+   "rva": "0xc28520",
+   "exports": [
+    "dPOmXIsfrBD"
+   ],
+   "real_name": "il2cpp_class_get_data_size",
+   "confidence": "strong",
+   "evidence": "return *(uint32*)(klass+0x10c) = static_fields_size (data_size). instance_size lives at +0xf8, so +0x10c is data_size. Order 69",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28530",
+   "rva": "0xc28530",
+   "exports": [
+    "hHYPwvdUTSF"
+   ],
+   "real_name": "il2cpp_stats_dump_to_file",
+   "confidence": "strong",
+   "evidence": "(path): builds std::string of all stat counters (globals 0xe66c978/980/988/990/998/9a0/9a8/9b0 with labels), opens FILE (0xc2da30), returns 1; = stats_dump_to_file. Order 73",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28850",
+   "rva": "0xc28850",
+   "exports": [
+    "f_XQxFKPjML"
+   ],
+   "real_name": "il2cpp_stats_get_value",
+   "confidence": "strong",
+   "evidence": "cmp $7 / jump-table switch over StatId, returns one of the 8 stat globals 0xe66c978.. (il2cpp_stats_get_value)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c288e0",
+   "rva": "0xc288e0",
+   "exports": [
+    "FxHcMMPZbaN"
+   ],
+   "real_name": "il2cpp_domain_get",
+   "confidence": "strong",
+   "evidence": "lazy singleton: if s_domain(0xe66c868)==0 -> alloc 0x40 (sizeof Il2CppDomain), *domain = helper(0xe66b730); returns s_domain",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c288f0",
+   "rva": "0xc288f0",
+   "exports": [
+    "pvexFRbaLjk"
+   ],
+   "real_name": "il2cpp_domain_assembly_open",
+   "confidence": "strong",
+   "evidence": "(domain, name): linear scan of assembly vector (0xe66c308..0xe66c310) by assembly name; if not found builds '<name>.dll' then '.exe' and calls Assembly::Load; returns const Il2CppAssembly*",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28900",
+   "rva": "0xc28900",
+   "exports": [
+    "zqRfzDVwsfD"
+   ],
+   "real_name": "il2cpp_domain_get_assemblies",
+   "confidence": "strong",
+   "evidence": "(domain, size_t* size): *size = (end-begin)>>3 from 0xe66c308/0xe66c310, returns begin pointer => assembly pointer array",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28920",
+   "rva": "0xc28920",
+   "exports": [
+    "sfQxpbipqfi"
+   ],
+   "real_name": "il2cpp_raise_exception",
+   "confidence": "strong",
+   "evidence": "(ex) -> noreturn call Exception::Raise(ex, NULL) [0xbc5ad0(ex,0)]",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28930",
+   "rva": "0xc28930",
+   "exports": [
+    "RZpmlJDWpZq"
+   ],
+   "real_name": "il2cpp_exception_from_name_msg",
+   "confidence": "strong",
+   "evidence": "(image, namespaze, name, msg): builds std::string from msg then calls 0xbc6720(image,ns,name,&string) => Exception::FromNameMsg",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28940",
+   "rva": "0xc28940",
+   "exports": [
+    "tvrPEybYHmp"
+   ],
+   "real_name": "il2cpp_format_exception",
+   "confidence": "strong",
+   "evidence": "(ex, char* output, size): Exception::FormatException(ex) -> std::string (0xc213f0), then copy into output buffer (0xc548e0)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c289e0",
+   "rva": "0xc289e0",
+   "exports": [
+    "eFQCNiqjuuG"
+   ],
+   "real_name": "il2cpp_format_stack_trace",
+   "confidence": "strong",
+   "evidence": "(ex, output, size): if ex+0x40 (stack_trace Il2CppString*) != 0, converts its UTF-16 chars (starting +0x14) to std::string and copies to output; else empty",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28b00",
+   "rva": "0xc28b00",
+   "exports": [
+    "VLvPt_vHhQj"
+   ],
+   "real_name": "il2cpp_unhandled_exception",
+   "confidence": "proven",
+   "evidence": "bare jmp to 0xbc0830: Domain::Get + Exception::FromNameMsg with class name string at 0x18d146df0 which is literally 'UnhandledException'",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28b10",
+   "rva": "0xc28b10",
+   "exports": [
+    "il2cpp_native_stack_trace"
+   ],
+   "real_name": "il2cpp_native_stack_trace",
+   "confidence": "proven",
+   "evidence": "export name survived obfuscation (given anchor)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c00",
+   "rva": "0xc28c00",
+   "exports": [
+    "QSdqKjsUOeT"
+   ],
+   "real_name": "il2cpp_field_get_flags",
+   "confidence": "strong",
+   "evidence": "return *(uint16*)(field->type + 8) = Il2CppType.attrs (FieldInfo+0x00 = type*)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c10",
+   "rva": "0xc28c10",
+   "exports": [
+    "HeDFYp_UfNv"
+   ],
+   "real_name": "field_get_object",
+   "confidence": "inferred",
+   "evidence": "Тонкий thunk: xchg rcx,rdx; jmp 0xc0f590 (единственный вход в 0xc0f590 — ни call, ни других jmp в файле нет). Тело 0xc0f590 — кэш reflective-объектов под SRWLock: ключ (field, klass), на промахе создаётся объект {+0x10=arg2, +0x18=arg1, +0x20=Il2CppString из field->name (+0x10, через strlen), +0x28=reflection Type для field->type (+0x00, attrs читаются как u16 из type+8), +0x30=attrs} — это точная раскладка Il2CppReflectionField (klass/field/name/type/attrs), т.е. фабрика System.Reflection.RuntimeFieldInfo (Field::GetFieldObject). Проверка «не get_value_object ли это»: 0xc28c40 (уже назван il2cpp_field_get_value_object) ведёт на 0xbbc450 — другой код, который через FUN_180c15a20/бокс возвращает ЗНАЧЕНИЕ поля (obj,field порядок сохранён, свопа нет), а 0xc28c30 -> 0xbbc240 = Field::GetValue(obj, field, out) тоже без свопа. Значит 0xc28c10 — отдельная API-точка входа в фабрику Field-объектов с перестановкой аргументов. В canonical.txt (232 имени) такой функции нет (есть il2cpp_method_get_object и il2cpp_type_get_object, но не field), поэтому имя внутреннее, по указанию брифа.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c20",
+   "rva": "0xc28c20",
+   "exports": [
+    "yXqOHZsYbUB"
+   ],
+   "real_name": "il2cpp_field_get_offset",
+   "confidence": "strong",
+   "evidence": "return (int64)(int32)*(field+0x08) => field->offset is int32 at +0x08 (also used as offset by field_get_value/set_value)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c30",
+   "rva": "0xc28c30",
+   "exports": [
+    "uQTGmzALVxH"
+   ],
+   "real_name": "il2cpp_field_get_value",
+   "confidence": "strong",
+   "evidence": "(field, obj, void* out): value address = obj + field->offset(+0x08); switch on type code: refs stored directly, value types memcpy'd size-of-type into out buffer (exact Field::GetValue)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c40",
+   "rva": "0xc28c40",
+   "exports": [
+    "DromfyAagAF"
+   ],
+   "real_name": "il2cpp_field_get_value_object",
+   "confidence": "strong",
+   "evidence": "(field, obj): resolves class via Class::FromIl2CppType(field->type), handles static(-1) / instance offsets, then boxes the value (0xc0e0d0) and returns Il2CppObject*",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28c50",
+   "rva": "0xc28c50",
+   "exports": [
+    "twtODTJaydx"
+   ],
+   "real_name": "il2cpp_field_has_attribute",
+   "confidence": "strong",
+   "evidence": "(field, attrClass): custom-attribute range from field->parent->image + field->token(+0x18) via per-image metadata table, then shared has-attr scan (same helper as 0xc28410/0xc11040)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28cf0",
+   "rva": "0xc28cf0",
+   "exports": [
+    "cYAIRwTDVFY"
+   ],
+   "real_name": "il2cpp_field_set_value_object",
+   "confidence": "strong",
+   "evidence": "(instance, field, value): *(void**)(instance + field->offset) = value followed by generational write barrier (0xe66cdec/0xe701c60); no memcpy => reference-only store",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28d50",
+   "rva": "0xc28d50",
+   "exports": [
+    "WeoIkwPhmIQ"
+   ],
+   "real_name": "il2cpp_field_static_get_value",
+   "confidence": "strong",
+   "evidence": "jmp 0xbbc7f0: resolves value address (static base via class init / instance offset) then memcpy into caller buffer (dst=out, src=field addr) => read",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28d60",
+   "rva": "0xc28d60",
+   "exports": [
+    "nhLyA__hWnm"
+   ],
+   "real_name": "il2cpp_field_static_set_value",
+   "confidence": "strong",
+   "evidence": "jmp 0xbbcb40: resolves static storage (TLS via TlsGetValue(0xe66bc48), klass+0x114 static index) and memcpy FROM caller buffer INTO field storage + write barrier => write",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28d70",
+   "rva": "0xc28d70",
+   "exports": [
+    "VQwSvDCPxOy"
+   ],
+   "real_name": "il2cpp_field_is_literal",
+   "confidence": "strong",
+   "evidence": "return (*(uint32*)(field->type+8) >> 6) & 1 = FIELD_ATTRIBUTE_LITERAL (0x40)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28d80",
+   "rva": "0xc28d80",
+   "exports": [
+    "iKmCjgAPwXM"
+   ],
+   "real_name": "il2cpp_gc_collect",
+   "confidence": "strong",
+   "evidence": "entry calls FUN_180c38150 = Boehm collect core (GC_collect_or_expand/FUN_180c36940, finalizer callback 0xe66d060, lock 0xe6bb100), then post-collect reclaim loop over freed-block list 0xe66cf00/0xe66ccc0 calling FUN_180c34760 + GC_free; no args",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28da0",
+   "rva": "0xc28da0",
+   "exports": [
+    "oZnwUXmgcLk"
+   ],
+   "real_name": "il2cpp_gc_collect_a_little",
+   "confidence": "strong",
+   "evidence": "pure thunk jmp 0xc36e50 (GC_maybe_gc: under lock, if GC_dont_gc==0 -> FUN_180c36bd0(1), returns finalizer-pending flag 0xe66d048); identified by elimination between confirmed gc_collect and start_incremental_collection",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28db0",
+   "rva": "0xc28db0",
+   "exports": [
+    "vTKxbHbOEJW"
+   ],
+   "real_name": "il2cpp_gc_start_incremental_collection",
+   "confidence": "strong",
+   "evidence": "no-arg; does nothing unless incremental flag 0xe66cdec!=0, then sets collection-requested flag 0xe66cd38=1, calls FUN_180c36bd0(1) only when GC_dont_gc(0xe66ccb8)==0, returns finalizer-pending 0xe66d048",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28dd0",
+   "rva": "0xc28dd0",
+   "exports": [
+    "fsIGAyZrbcy"
+   ],
+   "real_name": "il2cpp_gc_enable",
+   "confidence": "strong",
+   "evidence": "under lock 0xe6bb100: decl GC_dont_gc (0xe66ccb8) -- Boehm GC_enable; paired with next function which incls it",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28e20",
+   "rva": "0xc28e20",
+   "exports": [
+    "A_AAmLfOAFc"
+   ],
+   "real_name": "il2cpp_gc_disable",
+   "confidence": "strong",
+   "evidence": "under lock: incl GC_dont_gc (0xe66ccb8) -- Boehm GC_disable",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28e70",
+   "rva": "0xc28e70",
+   "exports": [
+    "COvcwWnZEbP"
+   ],
+   "real_name": "il2cpp_gc_is_disabled",
+   "confidence": "proven",
+   "evidence": "cmpl $0,0xe66ccb8 (GC_dont_gc); setne %al; ret",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28e80",
+   "rva": "0xc28e80",
+   "exports": [
+    "dDeczApCHyT"
+   ],
+   "real_name": "il2cpp_gc_set_mode",
+   "confidence": "proven",
+   "evidence": "void f(int mode): 0->calls A_AAmLfOAFc (gc_disable) if enabled; 1->calls fsIGAyZrbcy (gc_enable) if disabled; 2->enable + manual flag 0xe66ca6c=1; stores mode in 0xe668988, wakes futex = GCMode{Disabled,Enabled,Manual}",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f40",
+   "rva": "0xc28f40",
+   "exports": [
+    "tOmACcYxPPN"
+   ],
+   "real_name": "il2cpp_gc_is_incremental",
+   "confidence": "strong",
+   "evidence": "cmpl $0,0xe66cdec; setne %al; ret -- same flag that gates start_incremental_collection and the card-table write barrier",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f50",
+   "rva": "0xc28f50",
+   "exports": [
+    "hwyFQMqtopx"
+   ],
+   "real_name": "il2cpp_gc_get_max_time_slice_ns",
+   "confidence": "strong",
+   "evidence": "mov 0xe668c70,%rax; ret (int64 getter of the value the next function stores)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f60",
+   "rva": "0xc28f60",
+   "exports": [
+    "AYZZCwQFvHi"
+   ],
+   "real_name": "il2cpp_gc_set_max_time_slice_ns",
+   "confidence": "strong",
+   "evidence": "mov %rcx,0xe668c70; ret (int64 setter of the same global)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f70",
+   "rva": "0xc28f70",
+   "exports": [
+    "gN_zbtxsGLD"
+   ],
+   "real_name": "il2cpp_gc_get_used_size",
+   "confidence": "strong",
+   "evidence": "mov 0xe6bb980,%rax; sub 0xe6bb9a0,%rax; ret = heapsize - free_bytes (GC_get_used_size); canonical order also fits (108 < 109)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f80",
+   "rva": "0xc28f80",
+   "exports": [
+    "pJiHGHbZlOI"
+   ],
+   "real_name": "il2cpp_gc_get_heap_size",
+   "confidence": "strong",
+   "evidence": "mov 0xe6bb980,%rax; sub 0xe6bba20,%rax; ret = heapsize - unmapped_bytes (GC_get_heap_size variant, bigger subtrahend than used_size)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28f90",
+   "rva": "0xc28f90",
+   "exports": [
+    "FbgZTGBMqet"
+   ],
+   "real_name": "il2cpp_gc_foreach_heap",
+   "confidence": "proven",
+   "evidence": "(rcx=callback, rdx=userData) -> closure {fn=FUN_180bcedb0, userData} -> FUN_180c40e90 (run under alloc lock); FUN_180bcedb0(start,end) calls fn(&{ptr,size}, userData) = heap-section visitor",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c28fd0",
+   "rva": "0xc28fd0",
+   "exports": [
+    "qwWIhDPUkat"
+   ],
+   "real_name": "il2cpp_stop_gc_world",
+   "confidence": "proven",
+   "evidence": "if GC lock initialized: EnterCriticalSection(0xe6bb100); jmp 0xc41a20 = GC_suspend_all (known anchor)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29000",
+   "rva": "0xc29000",
+   "exports": [
+    "_yQebpEgKLv"
+   ],
+   "real_name": "il2cpp_start_gc_world",
+   "confidence": "proven",
+   "evidence": "call 0xc41cb0 = GC_resume_all (known anchor, BRIEF), then if lock initialized jmp IAT 0xb709188 = LeaveCriticalSection(0xe6bb100)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29030",
+   "rva": "0xc29030",
+   "exports": [
+    "RbGKtlicDQi"
+   ],
+   "real_name": "il2cpp_gc_alloc_fixed",
+   "confidence": "strong",
+   "evidence": "jmp 0xc3aed0: allocator that pops from size-classed free lists (0x18e6bc850 class table, 0x18e668aa0 heads, <0x800 path) or falls back to FUN_180c3ac20 -> GC_alloc family, i.e. AllocateFixed; next export is its GC_free counterpart",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29040",
+   "rva": "0xc29040",
+   "exports": [
+    "XylyYAMspnp"
+   ],
+   "real_name": "il2cpp_gc_free_fixed",
+   "confidence": "proven",
+   "evidence": "jmp 0xc3b000: chunk header off (ptr&~0xfff)+0x18, adds size to free counter 0xe6bb9d8, zeroes payload, pushes chunk onto free list 0x18e668a60[sizeclass] (or unmaps large chunk) = Boehm GC_free",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29050",
+   "rva": "0xc29050",
+   "exports": [
+    "pZXELbHTTlt"
+   ],
+   "real_name": "il2cpp_gchandle_new",
+   "confidence": "proven",
+   "evidence": "(obj, bool pinned) -> kind = 2 + pinned; jmp 0xbfb6b0 = HandleTable allocate for kind>=2 (strong handle, stores obj raw + card-table wbarrier) -> GCHandle::New",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29070",
+   "rva": "0xc29070",
+   "exports": [
+    "Uck_d_LMsJa"
+   ],
+   "real_name": "il2cpp_gchandle_new_weakref",
+   "confidence": "proven",
+   "evidence": "(obj, bool trackResurrection) -> 0xbfba40 -> 0xbfb6b0(kind=0/1, stores ~obj); for kind!=0 builds ArgumentException text 'IL2CPP does not support resurrection for weak references. Pass the trackResurrection with a value of false.'",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c290a0",
+   "rva": "0xc290a0",
+   "exports": [
+    "il2cpp_gchandle_get_target"
+   ],
+   "real_name": "il2cpp_gchandle_get_target",
+   "confidence": "proven",
+   "evidence": "already named in Ghidra (name survived obfuscation, BRIEF anchor); thunk jmp 0xbfbbb0 which reads the handle slot back",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c290b0",
+   "rva": "0xc290b0",
+   "exports": [
+    "UvucLTbzbLI"
+   ],
+   "real_name": "il2cpp_gchandle_foreach_get_target",
+   "confidence": "proven",
+   "evidence": "(callback, userData) -> FUN_180bfc100(fn, data) walks every handle table (0x18e66c608/0x18e66c610, count +0x1c) and calls callback(slot_value, userData) for each non-null slot",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c290e0",
+   "rva": "0xc290e0",
+   "exports": [
+    "XPl_AhzgAgx"
+   ],
+   "real_name": "il2cpp_gc_wbarrier_set_field",
+   "confidence": "proven",
+   "evidence": "(obj, void** targetAddress, value): *targetAddress = value, then if incremental flag 0xe66cdec: mark card bit (addr>>12 & 0x1fffff)>>6 in card table 0xe701c60, bit addr>>12&0x3f",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29140",
+   "rva": "0xc29140",
+   "exports": [
+    "FqtScPkLsWW"
+   ],
+   "real_name": "il2cpp_gchandle_free",
+   "confidence": "proven",
+   "evidence": "jmp 0xbfbd20: single handle arg, locates its table by (handle&~0x1fff), decrements count, clears bitmap bit, unlinks emptied table, releases weak slot via 0xbfad70",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29150",
+   "rva": "0xc29150",
+   "exports": [
+    "jFuHAxtwGVb"
+   ],
+   "real_name": "il2cpp_array_object_header_size",
+   "confidence": "proven",
+   "evidence": "mov $0x20,%eax; ret = kIl2CppSizeOfArray (Il2CppObject 0x10 + bounds ptr 0x8 + length 0x8)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29160",
+   "rva": "0xc29160",
+   "exports": [
+    "oBXmDm_lFbs"
+   ],
+   "real_name": "il2cpp_offset_of_array_length_in_array_object_header",
+   "confidence": "proven",
+   "evidence": "mov $0x18,%eax; ret = offset of max_length in Il2CppArray (right after bounds pointer at 0x10)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29170",
+   "rva": "0xc29170",
+   "exports": [
+    "QmRWbPotnDW"
+   ],
+   "real_name": "il2cpp_unity_liveness_allocate_struct",
+   "confidence": "strong",
+   "evidence": "allocates 0x38 struct (FUN_180c479a8), stores filterClasses(+0x08), callback(+0x18), userData(+0x20) and two tree iterators built with FUN_180bc86b0 -- layout matches the liveness structs consumed by the two calculation functions below",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29220",
+   "rva": "0xc29220",
+   "exports": [
+    "YHQtyZxbTgw"
+   ],
+   "real_name": "il2cpp_unity_liveness_calculation_from_root",
+   "confidence": "strong",
+   "evidence": "(root, liveness): marks root, walks reachable object tree, filters by class (+0x130 depth check) and by optional filter class liveness[1], batches 0x40 targets into liveness[4](items,n,liveness[3])",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29280",
+   "rva": "0xc29280",
+   "exports": [
+    "TyVSdywsmSi"
+   ],
+   "real_name": "il2cpp_unity_liveness_calculation_from_statics",
+   "confidence": "strong",
+   "evidence": "thunk jmp 0xbc9000: same reachability walk but sources roots from all classes (0x18e66c928) static field data -- skips static(0x10)/literal(0x40) and non-reference types, reads statics via FUN_180bbc7f0, marks then invokes the same callback",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29290",
+   "rva": "0xc29290",
+   "exports": [
+    "VagxtKERHdB"
+   ],
+   "real_name": "il2cpp_unity_liveness_finalize",
+   "confidence": "strong",
+   "evidence": "(liveness): resets both tree iterators to the head of the reached list and clears the low mark bit (*node &= ~1) for every collected object = end-of-calculation unmark pass",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29350",
+   "rva": "0xc29350",
+   "exports": [
+    "SSkQmThrHTu"
+   ],
+   "real_name": "il2cpp_unity_liveness_free_struct",
+   "confidence": "strong",
+   "evidence": "deb(arr), AND-сверка владельца, затем destructor_0x38: free(*(o),o); free(*(o+0x10),o); free(o,0x38). Структура 0x38 с двумя 0x18-объектами по +0x00 и +0x10 создаётся ровно в 0x180c29170 (il2cpp_unity_liveness_allocate_struct: mov $0x38,%ecx / call alloc, две аллокации 0x18 и записи в (*o) и 0x10(o)). Стоит сразу после il2cpp_unity_liveness_finalize (0x180c29290), в порядке хедера liveness: allocate_struct → from_root → from_statics → finalize → free_struct.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29390",
+   "rva": "0xc29390",
+   "exports": [
+    "gkBrJiiixvY"
+   ],
+   "real_name": "il2cpp_method_get_object",
+   "confidence": "strong",
+   "evidence": "jmp 0xc0f830 = Reflection::GetMethodObject: под AcquireSRWLockShared ищет в кэше по ключу (method* , refclass*) [param_2 по умолчанию = *(method+0x28)], при промахе сравнивает method->name (+0x18) с '.ctor' (6 байт, DAT_18d146de4) и '.cctor' (7 байт, UNK_18d19a534) — выбор класса ConstructorInfo/MethodInfo, затем создаёт объект отражения и кладёт method* в +0x10, а refclass-производное в +0x20; GC write barrier.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c293a0",
+   "rva": "0xc293a0",
+   "exports": [
+    "uLafRqRaeHM"
+   ],
+   "real_name": "il2cpp_method_is_generic",
+   "confidence": "strong",
+   "evidence": "movzbl 0x53(%rcx),%eax; and $0x1,%al; ret = бит 0 байта битовых флагов MethodInfo (+0x53) = is_generic",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c293b0",
+   "rva": "0xc293b0",
+   "exports": [
+    "NEPQQKkYoOO"
+   ],
+   "real_name": "il2cpp_method_is_inflated",
+   "confidence": "strong",
+   "evidence": "movzbl 0x53(%rcx); shr $1; and $0x1; ret = бит 1 байта +0x53 = is_inflated (рядом с is_generic в той же битовой карте MethodInfo)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c293c0",
+   "rva": "0xc293c0",
+   "exports": [
+    "SbnGprzCbil"
+   ],
+   "real_name": "il2cpp_method_is_instance",
+   "confidence": "proven",
+   "evidence": "movzbl 0x4c(%rcx),%eax; shr $0x4; not; and $1 = !(MethodInfo.flags & 0x10 /*METHOD_ATTRIBUTE_STATIC*/); точно совпадает с ожидаемым «флаг 0x10 в +0x4c»",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c293d0",
+   "rva": "0xc293d0",
+   "exports": [
+    "TBCWuMbsuFP"
+   ],
+   "real_name": "il2cpp_method_get_param_count",
+   "confidence": "proven",
+   "evidence": "movzbl 0x52(%rcx),%eax; ret = uint8 parameters_count",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c293e0",
+   "rva": "0xc293e0",
+   "exports": [
+    "BmK_fKKJWpE"
+   ],
+   "real_name": "il2cpp_method_get_param",
+   "confidence": "proven",
+   "evidence": "сверка index (edx) с byte +0x52; mov 0x30(%rcx),%rax; mov (%rax,%rdx,8),%rax = parameters[index] (массив ParameterInfo* по +0x30), иначе NULL",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29400",
+   "rva": "0xc29400",
+   "exports": [
+    "_OihTjYLeOg"
+   ],
+   "real_name": "unity_member_type_name_chunked",
+   "confidence": "inferred",
+   "evidence": "fn(X, chunk_writer): берёт [X+0x28] (Il2CppType*), [X+0x48] (token), через (*type).data → klass → klass->image (image+0x14 typeStart, image+0x20 metadata — оба поля Il2CppImage сходятся), тянет строку из metadata (0x180c53f7c), пакует (0x180bcd7f0) и отдаёт в chunk-писатель 0x180c11040. Сестра-близнец 0x180c28c50 (там [X+0x20] klass и [X+0x18] token — FieldInfo, названа il2cpp_field_has_attribute): тот же кернел, но offset'ы MethodInfo/родителя другие. Канонического имени с такой формой нет; по полям это MethodInfo-вариант token→name/resolve. Требует доп. проверки, если понадобится точное имя.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c294a0",
+   "rva": "0xc294a0",
+   "exports": [
+    "CfvuNfWiXGY"
+   ],
+   "real_name": "il2cpp_method_get_flags",
+   "confidence": "proven",
+   "evidence": "test rdx; je; movzwl 0x4e(%rcx) → *(uint32*)rdx (iflags); movzwl 0x4c(%rcx) → возврат flags. Ровно Il2CppMethodFlags iflags@+0x4e / flags@+0x4c",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c294b0",
+   "rva": "0xc294b0",
+   "exports": [
+    "FvKqSTdsiWJ"
+   ],
+   "real_name": "il2cpp_method_get_param_name",
+   "confidence": "proven",
+   "evidence": "index < +0x52; при is_inflated (byte +0x53 & 2) разыменовывает +0x40; берёт methodMetadataHandle (+0x38), parameterStart (+0x10) + index, stride 0xc (Il2CppParameterDefinition) и возвращает char* из metadata string heap (0x18e66c590)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29500",
+   "rva": "0xc29500",
+   "exports": [
+    "sU_ZvGpHM_q"
+   ],
+   "real_name": "il2cpp_profiler_install",
+   "confidence": "strong",
+   "evidence": "(a1=ctx/Il2CppProfiler, a2=shutdown): lazy-init глобального вектора 0xe66c840 (24 байта: begin/size/cap, элементы — указатели на записи 0x58), аллокация через memory-колбэки il2cpp (0xe6689b8=alloc, 0xe6689c8=realloc), push_back. В записи пишет +0x00=ctx, +0x10=teardown(ctx) — именно +0x10 вызывается при unregister (0x180bbfab0: cmp rdi,0x10(rec) / call *0x10(rec) с rcx=*rec) и запись освобождается. Ни одного внутреннего вызова → экспорт. Ровно форма il2cpp_profiler_install(Il2CppProfiler*, Il2CppProfileFunc shutdown).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29630",
+   "rva": "0xc29630",
+   "exports": [
+    "HfLJKHJBe_W"
+   ],
+   "real_name": "il2cpp_profiler_set_events",
+   "confidence": "strong",
+   "evidence": "(a1=flags): mov %ecx,0x8(back()) — 32-битная маска событий в последнюю запись, затем цикл `or 0x8(rec),r8d` по всем записям и запись агрегата в глобал 0xe66ba20. Все 4 диспетчера событий делают `testb/testl bit,0xe66ba20` перед обходом вектора (0x180c0d98c: testb $0x80; 0x180bfaeb3: testl $0x100; 0x180bd0843: testl $0x200; 0x180bc9463: testl $0x100000). Форма = il2cpp_profiler_set_events(Il2CppProfileFlags).",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29680",
+   "rva": "0xc29680",
+   "exports": [
+    "ddPqaeZggSK"
+   ],
+   "real_name": "il2cpp_profiler_install_enter_leave",
+   "confidence": "inferred",
+   "evidence": "(a1,a2) → back()->{+0x18=a1, +0x20=a2}: единственная пара слотов, оставшаяся после однозначного разбора остальных пяти install_* (см. соседей). Диспетчера enter/leave в этом билде по глобалу 0xe66ba20 не найдено (все 26 ссылок на 0xe66c840 посчитаны: 2 init, 2 unregister, 1 shutdown, 4+4 диспетчера, 12 сеттеров/геттеров) — площадка enter/leave, видимо, инлайнится иначе. Имя выведено исключением из набора il2cpp_profiler_install_*, а не по сигнатуре.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c296b0",
+   "rva": "0xc296b0",
+   "exports": [
+    "NcqlCPcaVWJ"
+   ],
+   "real_name": "il2cpp_profiler_install_allocation",
+   "confidence": "strong",
+   "evidence": "(a1) → back()->+0x28. Единственный диспетчер с битом 0x80 (0x180bc93b0) читает rec+0x28 и зовёт cb(rec->0x00 /*ctx*/, rsi, rdi). Вызовы: 0x180c0d9a4 (сразу после создания объекта: rcx=obj, rdx=klass/type — аллокация), 0x180c0db55 (объект + klass, у klass 0x132=rank). Сигнатура cb(Il2CppObject*, Il2CppClass*) = Il2CppProfileAllocFunc.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c296d0",
+   "rva": "0xc296d0",
+   "exports": [
+    "yb_KWdUgwby"
+   ],
+   "real_name": "il2cpp_profiler_install_gc",
+   "confidence": "inferred",
+   "evidence": "(a1,a2) → back()->{+0x30=a1, +0x38=a2}. Бит 0x100: 0x180bfae80 зовёт cb30(ctx, edi /*событие GC*/, 0) и 0x180bfaf00 зовёт cb38(ctx, rdi /*ptr/размер*/) — пара «gc / gc-heap-resize». Имя по соответствию il2cpp_profiler_install_gc(Il2CppProfileGCFunc, Il2CppProfileGCResizeFunc); порядок пары (callback, resizeCallback) принят по порядку слотов.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29700",
+   "rva": "0xc29700",
+   "exports": [
+    "nvXiPtYialT"
+   ],
+   "real_name": "il2cpp_profiler_install_fileio",
+   "confidence": "strong",
+   "evidence": "(a1) → back()->+0x40. Диспетчер 0x180bc9430 при бите 0x100000: cb(ctx, edx=esi /*int*/, r8d=edi /*int*/) — ровно Il2CppProfileFileIOFunc(int fd, int count). Единственный оставшийся одиночный слот, не занятый alloc/enter-leave.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29720",
+   "rva": "0xc29720",
+   "exports": [
+    "BJIjCnjuBoJ"
+   ],
+   "real_name": "il2cpp_profiler_install_thread",
+   "confidence": "strong",
+   "evidence": "(a1,a2) → back()->{+0x48=a1, +0x50=a2}. Бит 0x200: 0x180bd0850 зовёт +0x48(ctx, tid=edi) при attach, 0x180bd0a40 зовёт +0x50(ctx, tid) на пути detach — там же вызывается 0x180c41920 (GC_unregister_my_thread, ср. AGENTS.md). Пара start/end с одним аргументом tid = Il2CppProfileThreadFunc.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29750",
+   "rva": "0xc29750",
+   "exports": [
+    "KqFDRMzcfll"
+   ],
+   "real_name": "il2cpp_object_get_size",
+   "confidence": "strong",
+   "evidence": "obj->klass = *(rcx); для String (klass == 0x18e66b7b0) размер = 0x1a + 2*len (+0x10) — точная раскладка строки VRChat (0x10 заголовок + длина + 2 байта nul); иначе ветка для value-type/массивов: +0x132 (is_valuetype), +0x104 и imul по +0x18",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c297b0",
+   "rva": "0xc297b0",
+   "exports": [
+    "CsCFDBrvHFX"
+   ],
+   "real_name": "il2cpp_object_get_virtual_method",
+   "confidence": "strong",
+   "evidence": "jmp 0xc0e2d0 = Object::GetVirtualMethod: (obj, method); early-return при flags&0x20 (Final) или !(flags&0x40) (не Virtual); иначе vtable класса объекта (+0xb0, vtable_count +0x12e) по slot (+0x50), учёт is_inflated (+0x53&3) и generic-инстанцирования через 0xc02f10",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c297c0",
+   "rva": "0xc297c0",
+   "exports": [
+    "GWcICDanLrg"
+   ],
+   "real_name": "il2cpp_class_from_type",
+   "confidence": "strong",
+   "evidence": "тонкая обёртка с пробросом rcx в 0xc0e480 (Class::FromIl2CppType). Имя il2cpp_class_from_il2cpp_type уже занято другой группой на другом адресе — это второй из пары идентичных forwarder'ов канона (33/60), поэтому взят il2cpp_class_from_type.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c297e0",
+   "rva": "0xc297e0",
+   "exports": [
+    "SMRKGsbTTmr"
+   ],
+   "real_name": "il2cpp_monitor_enter",
+   "confidence": "strong",
+   "evidence": "mov $0xffffffff,%edx; jmp 0xbcfc30 = Lock::Enter(obj, INFINITE). Тело 0xbcfc30 (см. FUN_180bd0050, который зовёт его как Enter(obj,0xffffffff) для повторного входа) — захват lock-данных (+0x8 owner tid, +0x14 recursion, кондвары), возврат bool",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c297f0",
+   "rva": "0xc297f0",
+   "exports": [
+    "EJDdttTjrao"
+   ],
+   "real_name": "il2cpp_monitor_try_enter",
+   "confidence": "strong",
+   "evidence": "чистый jmp 0xbcfc30 с пробросом edx (timeout) — парный к 0xc297e0, который жёстко ставит INFINITE",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29800",
+   "rva": "0xc29800",
+   "exports": [
+    "AopbJwKYHHH"
+   ],
+   "real_name": "il2cpp_monitor_exit",
+   "confidence": "strong",
+   "evidence": "jmp 0xbcff10 = Monitor::Exit: декремент recursion (+0x14), при >0 выход; иначе сброс owner (+0x8), пробуждение ожидающих (Baselib futex notify)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29810",
+   "rva": "0xc29810",
+   "exports": [
+    "qIyiQcCcKRZ"
+   ],
+   "real_name": "il2cpp_monitor_pulse",
+   "confidence": "strong",
+   "evidence": "jmp 0xbcfff0: снимает ОДИН элемент из списка ожидающих (+0x30) и сигналит condvar (0xbf4750) — Pulse",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29820",
+   "rva": "0xc29820",
+   "exports": [
+    "Qaikeu_RfDC"
+   ],
+   "real_name": "il2cpp_monitor_pulse_all",
+   "confidence": "strong",
+   "evidence": "тот же код, что 0xc29810, но в цикле while по всему списку ожидающих (+0x30) — PulseAll",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29870",
+   "rva": "0xc29870",
+   "exports": [
+    "EBFMgcUtMqg"
+   ],
+   "real_name": "il2cpp_monitor_wait",
+   "confidence": "strong",
+   "evidence": "mov $0xffffffff,%edx; jmp 0xbd0050 = Monitor::Wait(obj, INFINITE). Тело 0xbd0050: ставит recursion=1, регистрирует waiter в списке, Monitor::Exit, ждёт condvar с таймаутом (0xc2f850), затем повторный Enter(obj,0xffffffff)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29880",
+   "rva": "0xc29880",
+   "exports": [
+    "TuwYyxCKLxr"
+   ],
+   "real_name": "il2cpp_monitor_try_wait",
+   "confidence": "strong",
+   "evidence": "чистый jmp 0xbd0050 с пробросом edx (timeout) — парный к 0xc29870, где таймаут жёстко INFINITE",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29890",
+   "rva": "0xc29890",
+   "exports": [
+    "fjmyBijTCly"
+   ],
+   "real_name": "il2cpp_runtime_invoke_convert_args",
+   "confidence": "strong",
+   "evidence": "jmp 0xbc0a50: (method, obj, Il2CppObject** params, int paramCount(r9d), exc). Цикл по paramCount: по типу параметра (method+0x30, Il2CppType.type +0x2a/attrs) распаковывает managed-объект в сырое значение на стеке (0xc15a20/0xc0e480/0xc78580), затем вызов 0xbc08b0 и упаковка результата в объект (Class::FromIl2CppType + Object::New, GC write barrier) — ровно ConvertArgs-семантика",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298a0",
+   "rva": "0xc298a0",
+   "exports": [
+    "bCtHuEsYoiT"
+   ],
+   "real_name": "il2cpp_runtime_invoke",
+   "confidence": "strong",
+   "evidence": "jmp 0xbc0580 = Runtime::Invoke: обнуляет *exc (4-й аргумент), при static-методе (flags&0x10) и ненулевом return_type инициализирует тип (0xbc1140) и вызывает 0xbc05f0(method, obj, params)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298b0",
+   "rva": "0xc298b0",
+   "exports": [
+    "GslOUahosCF"
+   ],
+   "real_name": "il2cpp_runtime_class_init",
+   "confidence": "strong",
+   "evidence": "thunk -> 0xbc1140 = Class::Init: guard *(int*)(klass+0xe4)==0, walks klass+0x50 method table (count *(ushort*)(klass+0x120)) searching name \".cctor\" (7 bytes incl NUL, flags &0x800 SpecialName), then pushes klass/thread init",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298c0",
+   "rva": "0xc298c0",
+   "exports": [
+    "MZgmLNvMikx"
+   ],
+   "real_name": "il2cpp_runtime_object_init",
+   "confidence": "strong",
+   "evidence": "xor edx,edx + jmp 0xbc0730 = Object::Init(obj, exception=NULL): obj->klass=*obj, finds \".ctor\" (6 bytes incl NUL, *(byte*)(mi+0x52)==0 i.e. 0 params), Class::Init(parent) when static, invoke ctor",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298d0",
+   "rva": "0xc298d0",
+   "exports": [
+    "bXoTXVPqXas"
+   ],
+   "real_name": "il2cpp_runtime_object_init_exception",
+   "confidence": "strong",
+   "evidence": "jmp 0xbc0730 with 2nd arg passthrough; body sets *out_exception = 0 then same .ctor lookup as c298c0 — the exception-returning twin",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298e0",
+   "rva": "0xc298e0",
+   "exports": [
+    "KuaC_WgMdrJ",
+    "SDqtXWVyjsI"
+   ],
+   "real_name": "il2cpp_string_new",
+   "confidence": "strong",
+   "evidence": "strlen loop, std::u16string from utf8 (0xbf3930), alloc via 0xbb8100(len), memcpy (chars, len*2) into str+0x14; two exports alias => il2cpp_string_new == il2cpp_string_new_wrapper in this build",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29900",
+   "rva": "0xc29900",
+   "exports": [
+    "RxbHYrTjcJF"
+   ],
+   "real_name": "il2cpp_string_new_utf16",
+   "confidence": "strong",
+   "evidence": "(Il2CppChar* s, int len): lVar = alloc(len); memcpy(lVar+0x14, s, len*2) — utf16 copy, no conversion",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29950",
+   "rva": "0xc29950",
+   "exports": [
+    "SsEPtZlhzcf"
+   ],
+   "real_name": "il2cpp_string_new_len",
+   "confidence": "strong",
+   "evidence": "(char* s, uint32 len): utf8->utf16 of explicit length (no strlen) then alloc+copy; thunk to 0xbb8080",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29960",
+   "rva": "0xc29960",
+   "exports": [
+    "PsojEqZaGdv"
+   ],
+   "real_name": "il2cpp_string_intern",
+   "confidence": "strong",
+   "evidence": "thunk to 0xbb8190 = interned-string table: lazy init of table at 0xe66c530 + SRWLock at +0x90, key = (len@+0x10, chars@+0x14), on miss FUN_180bb8580 inserts and returns string",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29970",
+   "rva": "0xc29970",
+   "exports": [
+    "zcqxQXzUQuO"
+   ],
+   "real_name": "il2cpp_string_is_interned",
+   "confidence": "strong",
+   "evidence": "same table/SRWLock lookup but lookup-only: returns cached string or 0 without inserting (inlined copy of the intern lookup path)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29a60",
+   "rva": "0xc29a60",
+   "exports": [
+    "dyhofDfedLY"
+   ],
+   "real_name": "il2cpp_thread_current",
+   "confidence": "proof",
+   "evidence": "longlong f(void){ return TlsGetValue(*_DAT_18e66bc40); } — per-thread current-thread slot, no args",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29a90",
+   "rva": "0xc29a90",
+   "exports": [
+    "StlulWcMgAz"
+   ],
+   "real_name": "il2cpp_thread_attach",
+   "confidence": "strong",
+   "evidence": "(domain): TLS hit -> return; else GC_register_my_thread(0xc41850)<2, create Il2CppThread from domain 0xe66b820, SetInternalThread, zero +0x38, attach domain",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29aa0",
+   "rva": "0xc29aa0",
+   "exports": [
+    "erWPqBwVVkk"
+   ],
+   "real_name": "il2cpp_thread_detach",
+   "confidence": "strong",
+   "evidence": "calls unregister path 0xbd09e0(thread), frees per-thread frame vector (TLS 0xe66bab0) and second TLS (0xe66bab8), TlsSetValue(...,0) — full thread teardown",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29ac0",
+   "rva": "0xc29ac0",
+   "exports": [
+    "EdhoFFJb_yl"
+   ],
+   "real_name": "il2cpp_is_vm_thread",
+   "confidence": "strong",
+   "evidence": "8 bytes: return *(longlong*)(_DAT_18e66c8f8+0x10) != arg — identity test of a thread against the runtime's current IL2CPP thread record (only thread-comparison in the block)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29ad0",
+   "rva": "0xc29ad0",
+   "exports": [
+    "rwUSJWQpIyC"
+   ],
+   "real_name": "il2cpp_current_thread_walk_frame_stack",
+   "confidence": "strong",
+   "evidence": "(Il2CppFrameWalkFunc func, void* user_data): frames = 0xbc1b60() (TLS, no thread arg); for each 0x20-byte record between [begin,end): (*func)(frame, user_data)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29b30",
+   "rva": "0xc29b30",
+   "exports": [
+    "gKGQxgDyCJv"
+   ],
+   "real_name": "il2cpp_thread_walk_frame_stack",
+   "confidence": "strong",
+   "evidence": "(thread, func, user_data): allocates 0x68 walk-context {func,user_data}, registers lambda 0xbc2250 on the target thread's frame queue (internal thread = *(*(thread+0x10)+0x18)+8), releases its semaphore, drains, frees",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c70",
+   "rva": "0xc29c70",
+   "exports": [
+    "TgnUaeIfKBz"
+   ],
+   "real_name": "il2cpp_current_thread_get_top_frame",
+   "confidence": "strong",
+   "evidence": "thunk 'mov rcx,rdx; xor ecx,ecx; jmp 0xbc20b0' => helper(skip=0, out): RtlCaptureStackBackTrace (or user override via 0xe66c948), resolve first IL2CPP method, *out = method",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c80",
+   "rva": "0xc29c80",
+   "exports": [
+    "mJxizemnmMD"
+   ],
+   "real_name": "il2cpp_thread_get_top_frame",
+   "confidence": "strong",
+   "evidence": "(thread): 0x68 context + lambda 0xbc22f0 which calls 0xbc20b0(0, out) — top frame taken on the *target* thread, same cross-thread mechanism as c29b30",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29db0",
+   "rva": "0xc29db0",
+   "exports": [
+    "ffShOXmFeLN"
+   ],
+   "real_name": "il2cpp_current_thread_get_frame_at",
+   "confidence": "strong",
+   "evidence": "thunk jmp 0xbc20b0 passthrough (skip=offset, out): same native backtrace walk as c29c70 but with explicit skip count",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29dc0",
+   "rva": "0xc29dc0",
+   "exports": [
+    "tTNhWXmXqGp"
+   ],
+   "real_name": "il2cpp_thread_get_frame_at",
+   "confidence": "strong",
+   "evidence": "(thread, offset, ...): 0x68 context carrying the offset (uStack_20 = param_2), lambda 0xbc21d0 registered on target thread's frame queue",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29f00",
+   "rva": "0xc29f00",
+   "exports": [
+    "kscadwqqMIL"
+   ],
+   "real_name": "il2cpp_current_thread_get_stack_depth",
+   "confidence": "proof",
+   "evidence": "19 bytes, no args: v = 0xbc1b60() (TLS frames); return (v[1]-v[0]) >> 5 — 0x20-byte frame records => depth",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29f20",
+   "rva": "0xc29f20",
+   "exports": [
+    "TQSMKoObVEJ"
+   ],
+   "real_name": "il2cpp_thread_get_stack_depth",
+   "confidence": "proof",
+   "evidence": "(thread): lambda 0xbc22c0 does *(int*)(ctx+8) = (frames.end-frames.begin) >> 5 on the target thread — depth, cross-thread",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a040",
+   "rva": "0xc2a040",
+   "exports": [
+    "gRcufbfZOZj"
+   ],
+   "real_name": "il2cpp_override_stack_backtrace",
+   "confidence": "proof",
+   "evidence": "8 bytes: _DAT_18e66c948 = arg; that global is exactly the override hook read by 0xbc1b60/0xbc20b0 backtrace walkers (*_DAT_18e66c948)(buf,0x80)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a050",
+   "rva": "0xc2a050",
+   "exports": [
+    "SltNPTOLPqZ"
+   ],
+   "real_name": "il2cpp_type_get_object",
+   "confidence": "strong",
+   "evidence": "thunk 0xc100c0: cache probe FUN_180c13d30(type,&type,&out) then lazily create reflection object of class _DAT_18e66b8c0 with *(obj+0x10)=type, FUN_180c13e80 — Il2CppReflectionType for the Il2CppType",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a060",
+   "rva": "0xc2a060",
+   "exports": [
+    "BAPMWKTArfY"
+   ],
+   "real_name": "il2cpp_type_get_type",
+   "confidence": "proof",
+   "evidence": "int f(type){ return (int)*(char*)(type+10); } = Il2CppType.type (int8 IL2CPP_TYPE_*)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a070",
+   "rva": "0xc2a070",
+   "exports": [
+    "OvwspmUPOxr"
+   ],
+   "real_name": "il2cpp_type_get_class_or_element_class",
+   "confidence": "strong",
+   "evidence": "unwraps ARRAY (0x14, data->eklass) and SZARRAY (0x1d, data) to the element type, then Class::FromIl2CppType switch: CLASS/VALUETYPE index -> class, VAR/MVAR, GENERICINST, PTR/other -> 0",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a0a0",
+   "rva": "0xc2a0a0",
+   "exports": [
+    "MmmNpmukeGY"
+   ],
+   "real_name": "il2cpp_type_get_name",
+   "confidence": "strong",
+   "evidence": "Type::GetName(type, format=0 = IL) into std::string (0xc0ab40 -> 0xc09fe0), then malloc(len+1)+memcpy => char*; IL format prints generics as '<...>'",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a150",
+   "rva": "0xc2a150",
+   "exports": [
+    "dWr__pEsDyf"
+   ],
+   "real_name": "il2cpp_type_get_assembly_qualified_name",
+   "confidence": "strong",
+   "evidence": "identical wrapper with format=3; in 0xc09fe0 the branch 'param_3 == 3' appends the assembly name (class*->assembly*->+0x18) for pointer/array/class => assembly-qualified",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a200",
+   "rva": "0xc2a200",
+   "exports": [
+    "xbTVAaonfst"
+   ],
+   "real_name": "il2cpp_type_get_reflection_name",
+   "confidence": "strong",
+   "evidence": "identical wrapper with format=4; 0xc09fe0 branch 'param_3 == 4' appends a 2-char separator + declaring class name (nested-type reflection form), not the assembly name => remaining name variant",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a2b0",
+   "rva": "0xc2a2b0",
+   "exports": [
+    "vlfsmmohqsj"
+   ],
+   "real_name": "il2cpp_type_is_byref",
+   "confidence": "proof",
+   "evidence": "9 bytes: (*(uint*)(type+8) >> 0x1d) & 1 — single bit of the Il2CppType bitfield word at +0x08 (attrs:16 | type:8 | num_mods | byref:1 | pinned:1)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a2c0",
+   "rva": "0xc2a2c0",
+   "exports": [
+    "ygKXjpwXIho"
+   ],
+   "real_name": "il2cpp_type_get_attrs",
+   "confidence": "proof",
+   "evidence": "5 bytes: return *(uint16*)(type+8) — full attrs field",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a2d0",
+   "rva": "0xc2a2d0",
+   "exports": [
+    "yQJStjYtcOe"
+   ],
+   "real_name": "il2cpp_type_equals",
+   "confidence": "proven",
+   "evidence": "call 0x180c036c0 (recursive Il2CppType comparator: compares type byte +0xa, byref bit 29, data by kind, returns -1/0/1) then test/sete -> bool; (type1,type2)->equal",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a2f0",
+   "rva": "0xc2a2f0",
+   "exports": [
+    "wplcQAtJtiq"
+   ],
+   "real_name": "il2cpp_type_is_static",
+   "confidence": "proven",
+   "evidence": "mov 0x8(%rcx),%eax; shr $4; and $1 -> (Il2CppType.attrs & 0x10) == FIELD_ATTRIBUTE_STATIC",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a300",
+   "rva": "0xc2a300",
+   "exports": [
+    "asJRPIwueAr"
+   ],
+   "real_name": "il2cpp_type_is_pointer_type",
+   "confidence": "proven",
+   "evidence": "cmpb $0xf,0xa(%rcx); sete %al -> Il2CppType.type == IL2CPP_TYPE_PTR (0x0f)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a310",
+   "rva": "0xc2a310",
+   "exports": [
+    "VGznFwev__O"
+   ],
+   "real_name": "il2cpp_image_get_entry_point",
+   "confidence": "strong",
+   "evidence": "image->[+0x20] (image definition); entryPointIndex at +0xc compared with 0xffffffff (kIl2CppInvalidIndex) -> tail jmp 0xbcc470(index)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a330",
+   "rva": "0xc2a330",
+   "exports": [
+    "GEsTfKaEfsh"
+   ],
+   "real_name": "il2cpp_image_get_class",
+   "confidence": "proven",
+   "evidence": "anchor kept: typeStart at image->[+0x20]+0x0 plus class index, bounds-checked; already proven in game ((image,167) -> Camera)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a370",
+   "rva": "0xc2a370",
+   "exports": [
+    "YnqI_tngIoj"
+   ],
+   "real_name": "il2cpp_capture_memory_snapshot",
+   "confidence": "proven",
+   "evidence": "thunk -> 0xbcedf0: allocates 0x60-byte snapshot, GC_suspend_all (0xc41a20) + resume, enum of GC heaps/sections, writes objectHeaderSize=8, arrayHeaderSize=0x10, arrayBoundsOffset=0x20, arraySizeOffset=0x18, allocationGranularity=0x10",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a380",
+   "rva": "0xc2a380",
+   "exports": [
+    "nTwguYYgzCo"
+   ],
+   "real_name": "il2cpp_free_captured_memory_snapshot",
+   "confidence": "proven",
+   "evidence": "takes the same 0x60 layout: frees per-heap 0x18-stride entries, sections (0x48 stride, conditional on flag bit 2) and the struct itself via il2cpp_free",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a450",
+   "rva": "0xc2a450",
+   "exports": [
+    "UcNinTtIqIg"
+   ],
+   "real_name": "il2cpp_set_find_plugin_callback",
+   "confidence": "strong",
+   "evidence": "stores rcx to global 0xe66c8d8; the only reader (0x180bf4a60) calls that callback on the native library path and uses the RETURNED string as the name to load (dynamic-library open) -> plugin-name rewriter",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a460",
+   "rva": "0xc2a460",
+   "exports": [
+    "Bqe_IENUYXx"
+   ],
+   "real_name": "il2cpp_register_log_callback",
+   "confidence": "proven",
+   "evidence": "stores rcx to global 0xe668990; reader 0x180c21bf0 formats \"[libil2cpp] ...\" (immediates 0x63326c6962696c5b/0x205d7070) and invokes the callback with just the message",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a470",
+   "rva": "0xc2a470",
+   "exports": [
+    "RqMDHgTUZLv"
+   ],
+   "real_name": "il2cpp_is_debugger_attached",
+   "confidence": "proven",
+   "evidence": "call *IAT 0xb709170 = IsDebuggerPresent; test eax; setne al",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a490",
+   "rva": "0xc2a490",
+   "exports": [
+    "yNSavFDXpTY"
+   ],
+   "real_name": "gc_heap_section_foreach_chunked",
+   "confidence": "inferred",
+   "evidence": "(a1=cb, a2=userdata): если глобал 0xe66bb68 (счётчик) != 0, обходит таблицу 0xe66bb60 из 0x10-байтных записей {addr, tokenish}; по (запись[i].1 - 0xe66c5b8) через magic 0xe38e38e38e38e39 ищет строку metadata (0x180bcc470: строки по 36 байт), режет диапазон соседних addr на куски <= 0x1388 и для каждого зовёт a1(prev_addr, &{start,size,int64,int}, a2); хвост — последний незакрытый диапазон, ограниченный 0xe66c938/0xe66c940. Канонического имени в 232-списке нет (формы il2cpp_gc_foreach_heap у 0x180c28f90 иная) → описательное имя, префикс как в брифе.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a670",
+   "rva": "0xc2a670",
+   "exports": [
+    "PfFPFPJfKwr"
+   ],
+   "real_name": "gc_heap_section_range_contains",
+   "confidence": "inferred",
+   "evidence": "(rcx=&{..., addr@+0x08}, rdx=out): если заданы оба глобала 0xe66c938 (lo) и 0xe66c940 (hi), то адрес вне [lo,hi] → return 0; иначе *out={addr,0,0} и return 1. Тот же диапазон проверяется в 0x180bc4130 (атрибуция адреса по образу) и в хвосте 0x180c2a490 → это границы кучи Boehm, а не секций образа. Канонического соответствия нет.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a6b0",
+   "rva": "0xc2a6b0",
+   "exports": [
+    "peZWnEYwMKb"
+   ],
+   "real_name": "unity_set_global_ptr_e66c828",
+   "confidence": "unknown",
+   "evidence": "Чистый сеттер: mov %rcx, глобал 0xe66c828; ret. Потребителей ровно два, оба в секции il2cpp: геттер 0x187b8d650 (возвращает глобал) и ленивая инициализация 0x187b8d680 (rbp=глобал; if(!rbp) skip; затем 0x180bd7190(rbp, member) — поиск метода по имени в типе через klass->methods/+0x120 method_count, результат кладётся в статическое поле класса). Форма допускает минимум четыре канонических кандидата (register_debugger_agent_transport, unity_install_unitytls_interface, set_default_thread_affinity, unity_set_android_network_up_state_func) — по правилу «два имени → не выбирай» каноническое имя не присвоено.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a6c0",
+   "rva": "0xc2a6c0",
+   "exports": [
+    "yXQtyHA_v_v"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_class",
+   "confidence": "strong",
+   "evidence": "klass->image at +0x00, token klass+0x11c; binary search (0x180c53f7c) over the metadata custom-attribute range table (image->[+0x20], count image+0x14, 8-byte entries, comparator 0xbcd7e0) -> attr info pointer",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a730",
+   "rva": "0xc2a730",
+   "exports": [
+    "wpcXVBeHayj"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_method",
+   "confidence": "strong",
+   "evidence": "same bsearch, but klass taken from method+0x28 and token from method+0x48 (MethodInfo token slot, right before uint16 flags @0x4c)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a7a0",
+   "rva": "0xc2a7a0",
+   "exports": [
+    "CpkQbVvshTZ"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_field",
+   "confidence": "strong",
+   "evidence": "same bsearch, klass from field+0x20 (FieldInfo.parent per measured layout) and token field+0x18",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a810",
+   "rva": "0xc2a810",
+   "exports": [
+    "DxtVHBnLzsI"
+   ],
+   "real_name": "il2cpp_custom_attrs_has_attr",
+   "confidence": "strong",
+   "evidence": "(attrInfo, attrClass) -> 0x180c11040 which iterates the attr data indices and returns bool on match (virtual ICall to the attribute type's ctor check)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a8b0",
+   "rva": "0xc2a8b0",
+   "exports": [
+    "yzgYpnfGPMJ"
+   ],
+   "real_name": "il2cpp_custom_attrs_get_attr",
+   "confidence": "strong",
+   "evidence": "thunk -> 0x180c11160: (attrInfo, attrClass) -> constructs ONE attribute object via the attribute class' ICall and returns it (Il2CppObject*)",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a8c0",
+   "rva": "0xc2a8c0",
+   "exports": [
+    "uPmFPOaJPOR"
+   ],
+   "real_name": "il2cpp_custom_attrs_construct",
+   "confidence": "strong",
+   "evidence": "(attrInfo) -> 0x180c10b90: counts matching attribute types, allocates an Il2CppArray (0x180c0d7a0), instantiates each, sets GC write barrier, returns the array",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a960",
+   "rva": "0xc2a960",
+   "exports": [
+    "hJgJAN_fRmH"
+   ],
+   "real_name": "il2cpp_type_get_name_chunked",
+   "confidence": "proven",
+   "evidence": "(type, chunkFunc, userData) -> 0x180c0ab90(type, 0, 0, chunkFunc, userData), the recursive type-name emitter that streams ',', '[', ']', '&', '*', '<', '>' through the callback",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a980",
+   "rva": "0xc2a980",
+   "exports": [
+    "cWxQAPdnUWn"
+   ],
+   "real_name": "il2cpp_class_set_userdata",
+   "confidence": "strong",
+   "evidence": "mov %rdx,0xd0(%rcx); ret -> stores the userdata pointer into Il2CppClass at the fixed userdata offset 0xd0",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a990",
+   "rva": "0xc2a990",
+   "exports": [
+    "JrdvryHeLla"
+   ],
+   "real_name": "il2cpp_class_for_each",
+   "confidence": "strong",
+   "evidence": "(klassCallback, userData): iterates all domain assemblies (0xe66c308..0xe66c310), each typeStart/typeCount array, maps TypeDefinition (0x58 stride) -> Il2CppClass, filters klass+0x135 & 2, invokes callback(klass, userData); then drains generic/array-instance queues",
+   "renamed_in_ghidra": true
+  }
+ ]
+}

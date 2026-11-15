@@ -2395,3 +2395,44 @@ il2cpp одними чтениями памяти (без единого выз�
   -C link-arg=<glibc>/lib/Scrt1.o -C link-arg=<glibc>/lib/crti.o
   -C link-arg=<glibc>/lib/crtn.o -C link-arg=--dynamic-linker=<glibc>/lib/ld-linux-x86-64.so.2"`
   плюс `LD_LIBRARY_PATH=<gcc-lib>:<glibc>/lib` на время запуска тестов.
+
+### 2026-11-15 — Ghidra: 218 из 225 адресов экспортов GameAssembly получили настоящие имена
+
+- Коммит: этот (`docs(ghidra): real names for the obfuscated il2cpp exports`).
+- **Что сделано.** В базе Ghidra `GameAssembly.dll` (sha256 `648f61b1…`) переименовано
+  **218 из 225 различных адресов** экспорта: 35 `proven`, 147 `strong`, 12 `inferred`,
+  7 `proof`, 4 алиас-группы, 4 `order`; не опознано 5 адресов. Карта —
+  `tools/data/il2cpp-export-names.json` (адрес, RVA, экспортные имена, настоящее имя,
+  уверенность, доказательство), методика и раскладки — `docs/IL2CPP-EXPORT-NAMES.md`.
+- **Как сделано.** 251 экспорт разложен на 225 адресов (остальное — ICF-алиасы одного кода),
+  разбит на 8 непересекающихся диапазонов и обработан 8 + 3 субагентами в Ghidra;
+  194 из 232 канонических имён API привязаны к адресу.
+- **Чем подтверждено.** (1) Якоря проверены ранее вызовом в живой игре (`get_corlib`,
+  `image_get_class`, `class_from_name`, `class_get_fields`, `free`, `gchandle_get_target`,
+  `native_stack_trace`). (2) Независимая проверка порядком: 232 ленивых стаба
+  `UnityPlayer.dll` выровнены по каноническому списку, и **191 из 191** сопоставленного стаба
+  указывает на адрес, чьё восстановленное имя совпадает с каноническим (0 расхождений).
+  (3) Переименования прочитаны обратно `get_function_info` (выборочно 8 адресов).
+- **Попутно вскрытые факты о билде.** `Il2CppClass`: `byval_arg@0x20`, `declaringType@0x30`,
+  `element_class@0x40`, `interfaces@0x48/0x12c`, `methods@0x50/0x120`, `fields@0x80/0x124`,
+  `events@0x88/0x126`, `properties@0x90/0x122`, `name@0x98`, `nested@0xa8/0x128`,
+  `vtable@0xb0/0x12e`, `static_fields@0xb8`, `interfaceOffsets@0xc8`, `userdata@0xd0`,
+  `token@0x11c`, биты `+0x135` (1 initialized, 2 enumtype, 4 is_generic, 5 has_references) и
+  `+0x136` (0 initialized_and_no_error, 3 import/windows-runtime). `MethodInfo`: `klass@0x20`,
+  `parameters@0x30`, `token@0x48`, `iflags@0x4e`, `slot@0x50`. `FieldInfo`: `offset@0x08`
+  (int32), `token@0x18` — **прежняя запись была перевёрнута**. `Il2CppImage`: `+0x08` короткое
+  имя, `+0x40` имя файла. `pool_chunk_size` = `0x10000` (глобал `0xe6689d0`), это не unitytls.
+- **Отрицательные результаты (не переоткрывать).** Порядок стабов — не доказательство
+  (сдвиг скачет: 12/11, 16/15, 83/84, 122/121, 211/211). `get_xrefs_to` в этой базе даёт
+  0 ссылок на rip-relative и абсолютные `lea` — дискриминировать по глобалам можно только
+  псевдокодом. `create_function` на неразобранных байтах создаёт функцию в 1 байт —
+  адрес остаётся без тела; экспорт `0xc2a330` (`image_get_class`) так и остался 1-байтовым,
+  имя при этом верное.
+- **Осталось.** 5 адресов без имени (`0xc4740`, `0xa3950`, `0xaf7a0`, `0x161ec0`, `0xc2a6b0` —
+  форма допускает 2+ канонических варианта); 38 канонических имён без своего адреса
+  (ICF-склейка с соседним кодом, см. док). Внутренние цели thunk'ов (`Class::FromName`
+  `0xc07560`, `Class::FromIl2CppType` `0xc15a20`, `SetupInterfaces` `0xc193f0`,
+  `SetupMethods` `0xc18650`, `GC_suspend_all` `0xc41a20`, `GC_resume_all` `0xc41cb0`)
+  пока не переименованы — отдельный проход. `save_project` Ghidra не дал выполнить
+  («A Ghidra tool is running a command»), изменения живут в открытом проекте: сохранить
+  вручную (Ctrl+S) или переименовать повторно после перезапуска.
