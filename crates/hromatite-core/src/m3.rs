@@ -12,9 +12,9 @@
 //!            +0x98              → const char* name
 //!            +0x124             → uint16 fieldsCount
 //! FieldInfo  +0x00              → const Il2CppType*
-//!            +0x08              → uint32 token
+//!            +0x08              → int32 offset
 //!            +0x10              → const char* name
-//!            +0x18              → uint32 metadata offset/index
+//!            +0x18              → uint32 token
 //!            +0x20              → Il2CppClass* parent        (stride 0x28)
 //! MethodInfo +0x00              → methodPointer
 //!            +0x18              → const char* name
@@ -56,7 +56,9 @@ pub const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
 pub const FIELD_STRIDE: usize = 0x28;
 const FIELD_TYPE_OFF: usize = 0x00;
 const FIELD_NAME_OFF: usize = 0x10;
-const FIELD_OFFSET_OFF: usize = 0x18;
+// Verified by il2cpp_field_get_offset/value/set_value (tools/data/
+// il2cpp-export-names.json): offset is int32 at +0x08; token is at +0x18.
+const FIELD_OFFSET_OFF: usize = 0x08;
 const FIELD_PARENT_OFF: usize = 0x20;
 
 const METHOD_NAME_OFF: usize = 0x18;
@@ -145,7 +147,11 @@ pub fn class_namespace(class: usize) -> Option<String> {
 pub fn class_full_name(class: usize) -> String {
     let n = class_name(class).unwrap_or_default();
     let ns = class_namespace(class).unwrap_or_default();
-    if ns.is_empty() { n } else { format!("{ns}.{n}") }
+    if ns.is_empty() {
+        n
+    } else {
+        format!("{ns}.{n}")
+    }
 }
 
 /// Every materialised class, in table order (index = typeDefinitionIndex).
@@ -206,6 +212,11 @@ pub struct Field {
     pub parent: usize,
 }
 
+fn field_offset(record: &[u8]) -> Option<u32> {
+    let bytes = record.get(FIELD_OFFSET_OFF..FIELD_OFFSET_OFF + size_of::<u32>())?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 /// Fields of a class through the verified Unity 6 `FieldInfo` record.
 pub fn fields(class: usize) -> Vec<Field> {
     let mut out = Vec::new();
@@ -220,7 +231,10 @@ pub fn fields(class: usize) -> Vec<Field> {
         let name = safe::read_usize(e + FIELD_NAME_OFF)
             .and_then(name_at)
             .unwrap_or_default();
-        let off = safe::read_u32(e + FIELD_OFFSET_OFF).unwrap_or(0);
+        let off = safe::read_bytes(e, FIELD_STRIDE)
+            .as_deref()
+            .and_then(field_offset)
+            .unwrap_or(0);
         let parent = safe::read_usize(e + FIELD_PARENT_OFF).unwrap_or(0);
         out.push(Field {
             name,
@@ -271,7 +285,14 @@ pub fn methods(class: usize) -> Vec<Method> {
             .unwrap_or(u32::MAX);
         let parameters_count = safe::read_u8(mi + 0x52).unwrap_or(u8::MAX);
         let flags = safe::read_u16(mi + 0x4c).unwrap_or(u16::MAX);
-        out.push(Method { name, entry, info: mi, return_kind, parameters_count, flags });
+        out.push(Method {
+            name,
+            entry,
+            info: mi,
+            return_kind,
+            parameters_count,
+            flags,
+        });
     }
     out
 }
@@ -307,4 +328,18 @@ pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
         None
     };
     scan(true).or_else(|| scan(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIELD_STRIDE, field_offset};
+
+    #[test]
+    fn field_offset_comes_before_name_and_token_comes_after_it() {
+        let mut record = [0u8; FIELD_STRIDE];
+        record[0x08..0x0c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        record[0x18..0x1c].copy_from_slice(&0x0400_002au32.to_le_bytes());
+        assert_eq!(field_offset(&record), Some(0x1234_5678));
+        assert_eq!(field_offset(&record[..0x0b]), None);
+    }
 }
