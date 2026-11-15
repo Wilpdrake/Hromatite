@@ -9,7 +9,6 @@
 //! callers therefore retain the existing VEH guard around scans. `Option` and
 //! `Result` remain the only contract for rejected addresses and OS failures.
 
-pub mod api;
 pub mod console;
 pub mod context;
 pub mod ffi;

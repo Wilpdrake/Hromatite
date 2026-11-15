@@ -17,7 +17,7 @@
 set -u
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CONSOLE="$HERE/hromatite-console.sh"
+CONSOLE="$HERE/hromatite-tui.sh"
 MARKER="${HROMATITE_MARKER:-$HOME/.hromatite-live}"
 PREFIX="${HROMATITE_PREFIX:-$HOME/.local/share/Steam/steamapps/compatdata/438100/pfx}"
 LOGF="$HOME/.hromatite-autoconsole.log"
@@ -51,8 +51,8 @@ borrow_env() {
 }
 
 console_running() {
-    # именно наша интерактивная консоль (а не одиночный --send/--status вызов)
-    pgrep -f "hromatite-console.sh[^|]*--shell" >/dev/null 2>&1
+    # Either the native TUI binary or its launcher already owns the console.
+    pgrep -f '[h]romatite-console([[:space:]]|$)|[h]romatite-tui[.]sh' >/dev/null 2>&1
 }
 
 open_console() {
@@ -65,11 +65,11 @@ open_console() {
     log "opening $term with $CONSOLE"
     case "$term" in
         *konsole) setsid -f "$term" --hold -p tabtitle="hromatite · VRChat" \
-                      -e sh -c "$CONSOLE --shell" >/dev/null 2>&1 ;;
+                      -e "$CONSOLE" >/dev/null 2>&1 ;;
         *gnome-terminal) setsid -f "$term" --title "hromatite · VRChat" -- \
-                      sh -c "$CONSOLE --shell" >/dev/null 2>&1 ;;
+                      "$CONSOLE" >/dev/null 2>&1 ;;
         *) setsid -f "$term" -T "hromatite · VRChat" -e \
-                      sh -c "$CONSOLE --shell" >/dev/null 2>&1 ;;
+                      "$CONSOLE" >/dev/null 2>&1 ;;
     esac
     sleep 2
     if console_running; then log "console started"; else log "console did not start"; fi

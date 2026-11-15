@@ -40,35 +40,22 @@ EXE="$BIN/Hromatite.exe"
 # The DLL to inject always comes from *this* checkout (so a worktree build can
 # be tested by pointing Steam at that worktree's copy of this script).
 DLL_WIN="${HROMATITE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/release/hromatite.dll" | tr '/' '\\\\')}"
-# L2 (seal): after the payload returns, the injector XORs the whole mapping and
-# leaves it RW. HROMATITE_SEAL=0 disables it for an A/B run.
-#
-# Plan 3 (HROMATITE_FRAME_HOOK=1) makes DllMain return immediately, so the seal
-# fires at once and XORs the detour along with the payload. Plan 4 (L2b) moves
-# the tick into a shim page outside the image, which decrypts the image only for
-# the duration of the call — the pair is usable now, but only when asked for:
-#
-#   HROMATITE_FRAME_HOOK=1  HROMATITE_L2B=1     frame hook + cipher at rest
-#
-# Both variables must reach the *game* process (it is the payload's environment),
-# hence the export: the payload reads them to decide how to install the tick.
-if [ "${HROMATITE_FRAME_HOOK:-0}" = "1" ] && [ "${HROMATITE_L2B:-0}" != "1" ]; then
-    # frame hook without L2b: the seal would kill the detour, so it stays off
-    HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
-fi
-HROMATITE_SEAL="${HROMATITE_SEAL:-1}"
+# Managed LateUpdate is the only supported runtime. Its detour and the GC guard
+# live in the payload image, so every kind of full seal must stay disabled.
+HROMATITE_FRAME_HOOK="${HROMATITE_FRAME_HOOK:-1}"
+HROMATITE_LATE_UPDATE="${HROMATITE_LATE_UPDATE:-auto}"
+HROMATITE_LIVE="${HROMATITE_LIVE:-0}"
+HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
 HROMATITE_L2B="${HROMATITE_L2B:-0}"
-export HROMATITE_SEAL HROMATITE_L2B
-INJECT_ARGS="inject --dll $DLL_WIN"
-if [ "${HROMATITE_SEAL:-1}" = "1" ]; then
-    INJECT_ARGS="$INJECT_ARGS --seal"
+export HROMATITE_FRAME_HOOK HROMATITE_LATE_UPDATE HROMATITE_LIVE HROMATITE_SEAL HROMATITE_L2B
+if [ "$HROMATITE_FRAME_HOOK" != "1" ] || [ "$HROMATITE_LIVE" != "0" ] ||
+    [ "$HROMATITE_SEAL" != "0" ] || [ "$HROMATITE_L2B" != "0" ]; then
+    echo "[hromatite] unsupported legacy runtime mode: require FRAME_HOOK=1 LATE_UPDATE=auto/manual LIVE=0 SEAL=0 L2B=0" >&2
+    exit 2
 fi
-# Payload-is-live markers: the stub-thread console in one, the frame hook (which
-# has no console_loop at all) in the other.
-LIVE_PAT='console ready|tick hook installed|pages XORed'
-# Интерактивное окно консоли (секунды). 0 = one-shot, ровно как раньше.
-# Пока окно открыто, payload читает hromatite-cmd.txt тем же стаб-потоком.
-export HROMATITE_LIVE="${HROMATITE_LIVE:-1800}"
+INJECT_ARGS="inject --dll $DLL_WIN"
+# Emitted only after both the managed hook and inline GC guard are installed.
+LIVE_PAT='LateUpdate runtime ready: hooked entry .* inline GC guard installed'
 LOG="$HOME/.hromatite-launch.log"
 GAME_LOG="$HOME/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/hromatite.log"
 
@@ -135,10 +122,8 @@ find_game_pid() {
             echo "[hromatite] live marker written" >>"$LOG"
     }
 
-    # Инжектор живёт столько же, сколько открыто окно консоли (HROMATITE_LIVE),
-    # поэтому ждать его выхода бессмысленно: сигналом служит строка payload'а
-    # в логе игры ("console ready"). Смотрим только НОВЫЙ хвост файла, иначе
-    # совпадёт с прошлым запуском.
+    # Сигнал готовности — успешный managed hook с уже установленным GC guard.
+    # Смотрим только НОВЫЙ хвост файла, иначе совпадёт с прошлым запуском.
     SZ0=$(wc -c <"$GAME_LOG" 2>/dev/null || echo 0)
     new_tail() { tail -c +$((SZ0 + 1)) "$GAME_LOG" 2>/dev/null; }
 
