@@ -5,7 +5,7 @@
 > «проверено» — подтверждено реальным запуском на этой машине, а не выведено
 > логически. Всё, что не проверено, помечено явно.
 
-Дата последнего обновления: 2026-11-14 (MSK), последний коммит `0717d6a`.
+Дата последнего обновления: 2026-11-16 (MSK), runtime коммит `cf8908d`.
 Хост: NixOS 26.11, kernel 6.18.x, Intel i5-11300H, 15 GB RAM.
 Пользователь пишет по-русски; предпочитает: сначала план → согласование → код.
 Коммитить **каждое** изменение (просьба пользователя).
@@ -30,7 +30,7 @@
 | L3: без своих потоков (inline `DllMain`) | ✅ в коде; ✅ `--frame-hook`: тик в потоке игры, консоль отвечает при `HROMATITE_LIVE=0` |
 | Паника/AV в payload не убивают игру | ✅ VEH-longjmp (проверено в живой игре: `panic`, `guard 0x1`) |
 | L1.5a: `--mode loadlib` (file-backed, не анонимная память) | ✅ реализовано, `DllMain` исполняется |
-| L1.5b: PEB unlink (вычерк из Ldr-списка) | ⚠️ реализовано, оффсеты исправлены; успех ещё не подтверждён логом |
+| L1.5b: PEB unlink (вычерк из Ldr-списка) | ✅ подтверждено на подставном exe 2026-11-16: `peb unlink: true` |
 | Module stomp | ⚠️ реализован через slack; slack у всех модулей 2–4 КБ → нужен release+strip или перезапись мёртвой секции |
 | Резолв таблицы экспортов il2cpp в рантайме | ⚠️ скан теперь по всем регионам процесса (235/251 имён, 236 указателей на имена найдены в куче), но поле с адресом рядом не лежит → layout неизвестен |
 | L2 «шифр в покое» (`--seal`) | ✅ проверено в живой игре: регион `rw-p`, ни одной exec-страницы, содержимое — шифр |
@@ -2485,3 +2485,49 @@ il2cpp одними чтениями памяти (без единого выз�
   — три байт-в-байт одинаковых тела, различимые только по целевому глобалу); 5 адресов без
   имени (`0xc4740`, `0xa3950`, `0xaf7a0`, `0x161ec0`, `0xc2a6b0`); 24 канонических имени —
   ICF-алиасы. `save_project` по-прежнему блокирован (сохраняет пользователь).
+
+### 2026-11-16 — LateUpdate-only runtime, GC exact call-site guard, интерактивная TUI
+
+- Коммиты агентов `72198e7`, `b8b1c75`, `55f3e0f`, `f683873`, `54bf0ca`,
+  `4a7d2e4`, `43f48f0`; merge `8beb566`, `a63dc06`, `bfe6773`, `df9f697`,
+  `063da85`, `80862eb`; cleanup `f7c2492`; финальный **`cf8908d`**.
+- **Runtime.** QPC/D3D/stub console/tick-L2b и автоматический recon удалены.
+  Единственный tick — `HROMATITE_LATE_UPDATE=auto` на однозначно разрешённом
+  `VRC.SDK3.Components.VRCTweenPostLateUpdater`; собственный `instance void
+  LateUpdate()` проверяется по ABI. Tick идёт **до** original, а original
+  вызывается даже при ошибке guarded instrumentation. Это приоритет только над
+  выбранным методом: порядок других Unity-скриптов НЕ гарантируется; рабочий
+  native PlayerLoop hook не выдумывался. Default `LIVE=0`, `SEAL=0`, `L2B=0`;
+  legacy-режимы отклоняются, silent QPC fallback нет.
+- **GC.** Глобальный `kernel32!GetThreadContext` заменён build-gated exact
+  call-site `GameAssembly+0xc41ad2` (`call; test; jne`, 14 байт). Synthetic
+  return идёт через trampoline+6 с `EAX=1`, включая already-absent. Hot path
+  делает только zero-timeout wait, bounded raw unlink и атомики: нет VM
+  queries/RPM/WPM/Toolhelp/allocation/Mutex/file I/O. `CONTEXT` ровно `0x4d0`,
+  `ContextFlags` сохраняются. Последнее независимое ревью поймало потерю
+  RCX/RDX между router и copied OS call; naked wrapper теперь хранит их в
+  отдельных slots, `RSP` выровнен и восстановлен. Runtime guard обязателен и
+  устанавливается до LateUpdate, startup без него отклоняется.
+- **TUI.** Новый host-only `crates/hromatite-console` пишет команды в тот же
+  append-файл и следит за логом: history/completion, search, scroll/follow,
+  filters, palette, telemetry. `unicode-width` используется для CJK/emoji.
+  Исправлены split ESC, unknown escape sequences, truncate+regrow через
+  256-byte overlap, termios restore. Autoconsole открывает `tools/hromatite-tui.sh`.
+- **Cleanup.** Из payload удалены старые brute-force API, нерабочий metadata
+  bridge, старые layout-scanners и recon commands — `+716/−6695` строк в
+  основном merge плюс 36 строк orphan watchdog. Marker-based попытка
+  дополнительного GC-cleanup дала дубли и была полностью откачена перед
+  финальными тестами; её незакоммиченные дубли в результат не входят.
+- **Проверки фактами.** `50/50` core, `4/4` DLL, `27/27` TUI; Clippy для
+  Windows workspace и Linux TUI; release обеих целей; `sh -n`; TUI snapshot;
+  `tools/test_gc_detour_abi.py` RED на старом wrapper и GREEN на текущем;
+  финальные независимые review `passed=true`. Smoke под Proton на подставном
+  exe: `DllMain` выполнен, **`peb unlink: true`**, loadlib mapped at
+  `0xfd9c0000`, отсутствие Unity корректно прервало startup; процессы стенда
+  остановлены явными pid.
+- **Осталось только live acceptance.** Живую игру агент не запускал. После
+  запуска пользователем нужны `late` → `hits>0`, `last tid!=0`, ответы TUI,
+  затем строка `inline guard: N stale record(s) reaped` и следующая успешная
+  сборка без `SuspendThread loop failed` / `ResumeThread failed`. До этого
+  фактическая активность auto-anchor и продолжительная стабильность GC не
+  подтверждены.
