@@ -1955,3 +1955,34 @@ il2cpp одними чтениями памяти (без единого выз�
   независимая проверка, что оба пути читают одно и то же место сцены.
 - Сборка release OK. Осталось: имя игрока (displayName в SDK нет — нужен
   `VRCPlayer`/`VRCPlayerApi.GetPlayerTag` или обфусцированный класс), M4.
+
+### 2026-11-15 — M4 (внешний X11-оверлей): виджеты, драг, привязка к окну игры
+
+- Коммит: `feat(overlay): x11 control panel — widgets, drag, attach to the game window`.
+- Новый хост-бинарник `crates/hromatite-overlay` (собственный workspace, только
+  `X11`/`Xext` через ручные FFI, никаких внешних крейтов). В игру по-прежнему
+  ничего не добавляется: читает `hromatite.log`, пишет команды в
+  `hromatite-cmd.txt`, рисует в своём окне.
+- Что умеет:
+  * **панель с виджетами**: чекбоксы `player list`, `camera readout`,
+    `attach to the VRChat window`, `interactive`; слайдеры `box distance`
+    (5..200 м) и `opacity` (0.2..1.0) — состояние в
+    `~/.config/hromatite-overlay.conf`;
+  * **драг**: тянем за заголовок, позиция запоминается;
+  * **F8** (XGrabKey на root) — переключение «клики насквозь / интерактив»
+    через пустой/полный `ShapeInput`;
+  * **attach**: находит окно `VRChat` через `_NET_CLIENT_LIST` + `XFetchName`
+    и следует за его геометрией (`XGetGeometry` + `XTranslateCoordinates`);
+  * `_NET_WM_WINDOW_OPACITY` для прозрачности, `_NET_WM_STATE_ABOVE` —
+    поверх игры.
+- Запуск: `tools/hromatite-overlay.sh` (сам находит `DISPLAY=:0` и
+  `XAUTHORITY=/run/user/1000/xauth_*` у Xwayland и подставляет
+  `LD_LIBRARY_PATH` из `nix-shell -p xorg.libX11 xorg.libXext`).
+- **Проверено на живой игре** (скриншот 18:29): панель отрисована поверх окна,
+  в ней `player list [x]`, `camera readout [x]`, `box distance 30 m`,
+  `opacity 0.85`, `attach…`, `interactive…`, строки `CAM -0.80 2.59 -5.63`,
+  `P1 -1.05 -0.01 -9.16`, внизу `age 0.0s · up 1s · 1 player(s)`.
+  Телеметрия идёт: payload отвечает на `pos`/`who` (26+ ответов за прогон).
+- Ограничение: подсветка объектов (боксы над игроками) пока не рисуется —
+  для неё нужен `Camera.WorldToScreenPoint` (вызов из payload) и
+  преобразование координат окна; задел — `box distance` уже в конфиге.
