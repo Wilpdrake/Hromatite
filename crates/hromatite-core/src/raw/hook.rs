@@ -1117,6 +1117,8 @@ unsafe fn unlink_by_handle_raw(base: usize, handle: usize) -> Option<u32> {
         // SAFETY: the caller supplies all 256 writable bucket pointers.
         let link = base.wrapping_add(bucket * core::mem::size_of::<usize>());
         let mut previous = 0usize;
+        // SAFETY: The caller supplies all 256 writable bucket pointers; link is
+        // one complete pointer-sized cell in that table.
         let mut current = unsafe { core::ptr::read_unaligned(link as *const usize) };
         for _ in 0..8 {
             if current == 0 {
@@ -1126,6 +1128,8 @@ unsafe fn unlink_by_handle_raw(base: usize, handle: usize) -> Option<u32> {
             // live record memory; unaligned loads avoid imposing Rust alignment
             // on Boehm's allocator.
             let id = unsafe { core::ptr::read_unaligned(current.wrapping_add(8) as *const u32) };
+            // SAFETY: current is a traversed live GC record under the caller's
+            // stop-world contract, and 0x10 is its complete handle field.
             let record_handle =
                 unsafe { core::ptr::read_unaligned(current.wrapping_add(0x10) as *const usize) };
             if id != 0 && record_handle == handle {
@@ -1209,11 +1213,16 @@ unsafe extern "system" fn gc_context_route(thread: *mut u8, context: *mut u8) ->
 #[unsafe(naked)]
 pub unsafe extern "system" fn gc_context_detour() -> ! {
     core::arch::naked_asm!(
-        // Unlike an exported-function detour, entry RSP is 16-byte aligned:
-        // Boehm was about to issue a call. Reserve a fresh Win64 shadow area.
-        "sub rsp, 0x20",
+        // Entry RSP is 16-byte aligned. Reserve the Win64 shadow area plus two
+        // slots for the original arguments: the router is allowed to clobber
+        // both RCX and RDX under the same ABI as GetThreadContext itself.
+        "sub rsp, 0x30",
+        "mov [rsp + 0x20], rcx",
+        "mov [rsp + 0x28], rdx",
         "call {route}",
-        "add rsp, 0x20",
+        "mov rcx, [rsp + 0x20]",
+        "mov rdx, [rsp + 0x28]",
+        "add rsp, 0x30",
         "mov r11, rax",
         "mov eax, 1",
         "jmp r11",
