@@ -309,6 +309,17 @@ fn core_image() -> Option<usize> {
     crate::api::image_of("UnityEngine.CoreModule").or_else(|| crate::api::image_of("mscorlib"))
 }
 
+/// Class lookup that does not depend on the image walk: Unity 6 keeps no class
+/// table in the codegen module, so fall back to the global class arrays.
+fn lookup_class(ns: &str, name: &str) -> Option<crate::meta::Class> {
+    if let Some(img) = core_image() {
+        if let Some(c) = crate::meta::find_class(img, ns, name) {
+            return Some(c);
+        }
+    }
+    crate::meta::find_class_global(ns, name)
+}
+
 /// Vector3 out of three little-endian floats.
 fn vec3(bits: [u64; 2]) -> (f32, f32, f32) {
     (
@@ -331,7 +342,7 @@ fn pos_probe() -> Vec<String> {
         Some(i) => i,
         None => return vec!["pos: no UnityEngine.CoreModule image".into()],
     };
-    let cam = match crate::meta::find_class(image, "UnityEngine", "Camera") {
+    let cam = match lookup_class("UnityEngine", "Camera") {
         Some(c) => c,
         None => return vec![format!("pos: Camera not found in image {image:#x}")],
     };
@@ -367,7 +378,7 @@ fn pos_probe() -> Vec<String> {
     let mut get_transform = crate::meta::method_entry(cam.addr, "get_transform");
     if get_transform.is_none() {
         for (ns, name) in [("UnityEngine", "Component"), ("UnityEngine", "Transform")] {
-            if let Some(c) = crate::meta::find_class(image, ns, name) {
+            if let Some(c) = lookup_class(ns, name) {
                 get_transform = crate::meta::method_entry(c.addr, "get_transform");
                 if get_transform.is_some() {
                     break;
@@ -395,7 +406,7 @@ fn pos_probe() -> Vec<String> {
     }
 
     // 3. `Transform.position` (struct return: hidden buffer in rcx)
-    let trc = match crate::meta::find_class(image, "UnityEngine", "Transform") {
+    let trc = match lookup_class("UnityEngine", "Transform") {
         Some(c) => c,
         None => {
             out.push("pos: Transform class not found".into());
@@ -1211,6 +1222,34 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     None => out.push(format!("Camera not found in image {img:#x}")),
                 },
                 None => out.push("no image".into()),
+            }
+            (out, Action::None)
+        }
+        // `tbl <module> [maxofs]` — layout vote in the open: every qword slot of
+        // a codegen module that holds a pointer, with how many of the entries it
+        // points at look like `Il2CppClass`. Empty `types` is then explained.
+        "tbl" => {
+            let m = match parse_addr(a1) {
+                Some(m) => m,
+                None => return (vec!["usage: tbl <moduleaddr> [maxofs]".into()], Action::None),
+            };
+            let max = parse_addr(a2).unwrap_or(0x400).min(0x4000);
+            let mut out = vec![format!("tbl {m:#x} .. +{max:#x}")];
+            out.extend(crate::meta::probe_module(m, max));
+            (out, Action::None)
+        }
+        // `ctab` — find the runtime's global class arrays (Unity 6 keeps them
+        // outside the codegen module) and report what was found.
+        "ctab" => {
+            let t = crate::meta::class_tables();
+            let mut out = vec![format!("ctab: {} table(s)", t.len())];
+            for (a, n) in t.iter().take(20) {
+                out.push(format!("  {a:#x}  {n} entries"));
+            }
+            let classes = crate::meta::global_classes();
+            out.push(format!("ctab: {} class(es) readable", classes.len()));
+            for c in classes.iter().take(parse_addr(a1).unwrap_or(12)) {
+                out.push(format!("  {:#x}  {}", c.addr, c.full()));
             }
             (out, Action::None)
         }

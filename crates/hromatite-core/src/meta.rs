@@ -19,6 +19,7 @@
 //! between Unity versions — and why it needs no guarded calls at all: it only
 //! reads memory that a previous validation already proved readable.
 
+use crate::log;
 use crate::procs;
 use crate::safe;
 
@@ -34,8 +35,12 @@ const FIELD_NAME_OFF: usize = 0x00;
 const FIELD_PARENT_OFF: usize = 0x10;
 const FIELD_OFFSET_OFF: usize = 0x18;
 /// Where a runtime `MethodInfo` keeps its compiled entry point and its name.
+/// Unity 6 inserted `virtualMethodPointer` after `methodPointer`, so the name
+/// moved from `+0x10` to `+0x18` (`il2cpp-class-internals.h`, 6000.0.x):
+/// `methodPointer@0x00, virtualMethodPointer@0x08, invoker_method@0x10,
+/// name@0x18, klass@0x20, return_type@0x28, parameters@0x30`.
 const METHOD_PTR_OFF: usize = 0x00;
-const METHOD_NAME_OFF: usize = 0x10;
+const METHOD_NAME_OFF: usize = 0x18;
 
 #[derive(Clone, Debug)]
 pub struct Class {
@@ -54,21 +59,43 @@ impl Class {
     }
 }
 
-/// A class pointer is trusted only when its first word is the image we asked
-/// for and its name is a real string: heap garbage passes neither test.
-pub fn is_class_of(p: usize, image: usize) -> bool {
+fn ident_like(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 80
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '<' | '>' | '`' | '+' | '=' | ',' | '@'))
+}
+
+/// Structural test for an `Il2CppClass`: `name` at `+0x10` is an identifier and
+/// `namespaze` at `+0x18` is either NULL or an identifier. Deliberately does not
+/// compare the image pointer — the caller usually cannot know it (the pointer we
+/// reach from an assembly record is the *codegen module*, not the image).
+pub fn class_like(p: usize) -> bool {
     if p < 0x10000 || !safe::readable_at(p) {
         return false;
-    }
-    match safe::read_usize(p + CLASS_IMAGE_OFF) {
-        Some(img) if img == image => {}
-        _ => return false,
     }
     let name_ptr = match safe::read_usize(p + CLASS_NAME_OFF) {
         Some(v) => v,
         None => return false,
     };
-    matches!(safe::ascii_at(name_ptr, 64), Some(s) if !s.is_empty())
+    match safe::ascii_at(name_ptr, 96) {
+        Some(s) if ident_like(&s) => {}
+        _ => return false,
+    }
+    match safe::read_usize(p + CLASS_NS_OFF) {
+        Some(0) => true,
+        Some(ns) => matches!(safe::ascii_at(ns, 96), Some(s) if ident_like(&s)),
+        None => false,
+    }
+}
+
+/// A class pointer is trusted when its first word is the image we asked for and
+/// its name is a real identifier: heap garbage passes neither test.
+pub fn is_class_of(p: usize, image: usize) -> bool {
+    if !class_like(p) {
+        return false;
+    }
+    matches!(safe::read_usize(p + CLASS_IMAGE_OFF), Some(img) if img == image)
 }
 
 pub fn class_name(p: usize) -> Option<String> {
@@ -92,26 +119,27 @@ pub fn class_namespace(p: usize) -> Option<String> {
 pub fn classes_of_image(image: usize, max: usize) -> (usize, usize, Vec<Class>) {
     let module = image;
     let mut best: Option<(usize, usize, usize)> = None; // (class_ofs, table, votes)
-    let mut ofs = 0x20usize;
-    while ofs <= 0x200 {
+    let mut ofs = 0x00usize;
+    while ofs <= 0x1000 {
         let slot = match safe::read_usize(module + ofs) {
             Some(v) => v,
             None => break,
         };
         if slot >= 0x10000 && safe::readable_at(slot) {
             let mut votes = 0usize;
-            for i in 0..8 {
+            for i in 0..12 {
                 let p = match safe::read_usize(slot + i * 8) {
                     Some(p) => p,
                     None => break,
                 };
-                if is_class_of(p, image) {
+                // prefer exact image match, accept structural match
+                if is_class_of(p, image) || class_like(p) {
                     votes += 1;
                 } else {
                     break;
                 }
             }
-            if votes >= 4 && best.map(|b| votes > b.2).unwrap_or(true) {
+            if votes >= 6 && best.map(|b| votes > b.2).unwrap_or(true) {
                 best = Some((ofs, slot, votes));
             }
         }
@@ -128,7 +156,7 @@ pub fn classes_of_image(image: usize, max: usize) -> (usize, usize, Vec<Class>) 
             Some(p) => p,
             None => break,
         };
-        if !is_class_of(p, image) {
+        if !class_like(p) {
             break;
         }
         let name = match class_name(p) {
@@ -140,6 +168,49 @@ pub fn classes_of_image(image: usize, max: usize) -> (usize, usize, Vec<Class>) 
         i += 1;
     }
     (class_ofs, table, out)
+}
+
+/// Diagnostic dump of every qword slot in `module` that holds a readable
+/// pointer, annotated with how many of its entries look like classes. Used when
+/// the layout vote finds nothing: it shows *which* offset failed and what it
+/// points at.
+pub fn probe_module(module: usize, max_ofs: usize) -> Vec<String> {
+    let ga = procs::own_module(crate::GAME_ASSEMBLY);
+    let mut out = Vec::new();
+    let mut ofs = 0usize;
+    while ofs <= max_ofs {
+        let v = match safe::read_usize(module + ofs) {
+            Some(v) => v,
+            None => break,
+        };
+        if v >= 0x10000 && safe::readable_at(v) {
+            let in_ga = ga.map(|(b, s)| v >= b && v < b + s).unwrap_or(false);
+            let mut votes = 0usize;
+            for i in 0..8 {
+                let p = match safe::read_usize(v + i * 8) {
+                    Some(p) => p,
+                    None => break,
+                };
+                if class_like(p) {
+                    votes += 1;
+                } else {
+                    break;
+                }
+            }
+            let first = safe::read_usize(v).unwrap_or(0);
+            let tag = safe::ascii_at(first, 40)
+                .map(|s| format!(" '{s}'"))
+                .unwrap_or_default();
+            if votes > 0 || in_ga {
+                out.push(format!(
+                    "  +{ofs:#04x} = {v:#x}{} votes={votes}{tag}",
+                    if in_ga { " GA" } else { "" }
+                ));
+            }
+        }
+        ofs += 8;
+    }
+    out
 }
 
 /// `classes_of_image` behind a cache: a console session re-reads the same image
@@ -184,6 +255,13 @@ pub fn find_class_anywhere(want_ns: &str, name: &str) -> Vec<(String, Class)> {
             if out.len() >= 8 {
                 break;
             }
+        }
+    }
+    if out.is_empty() {
+        // Unity 6: the per-image walk has no table to read, so fall back to the
+        // global class arrays found by scanning GameAssembly's `.data`.
+        if let Some(c) = find_class_global(want_ns, name) {
+            out.push(("(global table)".to_string(), c));
         }
     }
     out
@@ -355,6 +433,131 @@ pub fn field_offset(class: usize, name: &str) -> Option<i32> {
         .into_iter()
         .find(|(n, _)| n == name)
         .map(|(_, off)| off)
+}
+
+// ---- global class tables ---------------------------------------------------
+//
+// Unity 6 has *no* `typeInfoTable` inside `Il2CppCodeGenModule` (see
+// `il2cpp-class-internals.h`, 6000.0.x: the module ends with
+// `metadataRegistration`/`codeRegistaration`). `Il2CppClass` objects are kept
+// by the runtime in a global array indexed by type definition, so the only
+// layout-agnostic way in is to *find* that array: a long run of aligned
+// pointers inside GameAssembly's own `.data`, most of which lead to records
+// whose `+0x10` is an identifier.
+//
+// Everything here is scanned once and cached; the scan reads `.data` directly
+// (the regions come from `VirtualQuery`, so no per-word syscall).
+
+fn readable_protect(p: u32) -> bool {
+    matches!(p & 0xff, 2 | 4 | 8 | 0x20 | 0x40 | 0x80)
+}
+
+pub fn class_tables() -> Vec<(usize, usize)> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    let mut c = match CACHE.lock() {
+        Ok(c) => c,
+        Err(p) => p.into_inner(),
+    };
+    if !c.is_empty() {
+        return c.clone();
+    }
+    let (gbase, gsize) = match procs::own_module(crate::GAME_ASSEMBLY) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    let (lo, hi) = (gbase, gbase + gsize);
+    for r in procs::regions(65536) {
+        if r.base < lo || r.base >= hi || !readable_protect(r.protect) {
+            continue;
+        }
+        let start = (r.base + 7) & !7usize;
+        let end = r.base + r.size;
+        let mut a = start;
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        let mut flush = |run_start: usize, run_len: usize, c: &mut Vec<(usize, usize)>| {
+            if run_len < 512 {
+                return;
+            }
+            // vote on a spread sample: consecutive class records are what tells
+            // a class table from a table of `Il2CppType` or of code pointers
+            let step = (run_len / 48).max(1);
+            let mut votes = 0usize;
+            let mut total = 0usize;
+            let mut i = 0usize;
+            while i < run_len {
+                let p = unsafe { *((run_start + i * 8) as *const u64) } as usize;
+                total += 1;
+                if class_like(p) {
+                    votes += 1;
+                }
+                i += step;
+            }
+            if total > 0 && votes * 4 >= total * 3 {
+                c.push((run_start, run_len));
+            }
+        };
+        while a + 8 <= end {
+            let v = unsafe { *(a as *const u64) } as usize;
+            let plausible = v >= 0x10000 && v < 0x0000_7FFF_FFFF_0000 && v & 3 == 0;
+            if plausible {
+                if run_len == 0 {
+                    run_start = a;
+                }
+                run_len += 1;
+            } else {
+                flush(run_start, run_len, &mut c);
+                run_len = 0;
+            }
+            a += 8;
+        }
+        flush(run_start, run_len, &mut c);
+    }
+    c.sort_by_key(|(a, _)| *a);
+    c.dedup();
+    log::log_tag(
+        "meta",
+        &format!("class tables detected: {:?}", c.iter().map(|(a, n)| format!("{a:#x}+{n}")).collect::<Vec<_>>()),
+    );
+    c.clone()
+}
+
+/// Every class in every detected table.
+pub fn global_classes() -> Vec<Class> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<Class>> = Mutex::new(Vec::new());
+    let mut c = match CACHE.lock() {
+        Ok(c) => c,
+        Err(p) => p.into_inner(),
+    };
+    if !c.is_empty() {
+        return c.clone();
+    }
+    for (start, count) in class_tables() {
+        for i in 0..count.min(300_000) {
+            let p = match safe::read_usize(start + i * 8) {
+                Some(p) => p,
+                None => break,
+            };
+            if !class_like(p) {
+                continue;
+            }
+            if let (Some(name), Some(ns)) = (class_name(p), class_namespace(p)) {
+                c.push(Class { addr: p, name, ns });
+            }
+        }
+    }
+    log::log_tag("meta", &format!("global class cache: {} classes", c.len()));
+    c.clone()
+}
+
+/// Structural class lookup that ignores images (used when the per-image walk is
+/// unavailable — Unity 6 keeps no class table in the codegen module).
+pub fn find_class_global(ns: &str, name: &str) -> Option<Class> {
+    global_classes()
+        .into_iter()
+        .find(|c| c.name == name && (ns.is_empty() || c.ns == ns))
 }
 
 /// One-line summary of the discovered layout, for the console.
