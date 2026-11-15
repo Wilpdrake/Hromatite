@@ -376,47 +376,6 @@ fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
     false
 }
 
-/// Resolve the primary table once, on the installation path. The GC detour must
-/// not call GetModuleHandleW or allocate a UTF-16 module name while other
-/// threads are suspended (one of them may own the loader lock).
-pub fn primary_table_base() -> Option<usize> {
-    let ga = procs::own_module(GAME_ASSEMBLY)?.0;
-    Some(ga.wrapping_add(CANDIDATE_RVAS[0] as usize))
-}
-
-pub fn thread_fully_terminated(handle: u64) -> bool {
-    alive_by_handle(handle) == Some(false)
-}
-
-/// Atomic counterpart of `reap()` for the GC's own `GetThreadContext` call.
-/// Return the id only if Boehm's handle matches a record and the thread object
-/// is signalled. `WAIT_TIMEOUT` means alive, so a suspended thread is *never*
-/// unlinked. This closes the race that any periodic reap necessarily misses:
-/// the same dying thread may already sit inside `GC_suspend` before the next
-/// tick. The caller must still return a valid (synthetic) CONTEXT because the
-/// loop is already executing; the removal also keeps `GC_resume_all` safe.
-///
-/// `base` comes from `primary_table_base()` at installation time. Keeping all
-/// module discovery out of this function makes the hot path allocation-free.
-pub fn unlink_if_dead_at(base: usize, handle: u64) -> Option<u32> {
-    if base == 0 || alive_by_handle(handle) != Some(false) {
-        return None;
-    }
-    for bucket in 0..BUCKETS {
-        let mut p = safe::read_usize(base + bucket * 8).unwrap_or(0);
-        let mut depth = 0;
-        while p != 0 && depth < 8 {
-            let id = safe::read_u32(p + OFF_ID).unwrap_or(0);
-            if id != 0 && safe::read_u64(p + OFF_HANDLE) == Some(handle) {
-                return unlink_at(base, bucket, p).then_some(id);
-            }
-            p = safe::read_usize(p + OFF_NEXT).unwrap_or(0);
-            depth += 1;
-        }
-    }
-    None
-}
-
 /// **The fix that races the collector.** Read the table and unlink any record
 /// whose own handle reports an exited thread (`GetExitCodeThread != 0x103`) —
 /// the game's threads die on a schedule of seconds and `GC_suspend_all` then
