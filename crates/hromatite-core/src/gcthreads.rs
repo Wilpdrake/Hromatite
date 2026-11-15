@@ -339,10 +339,15 @@ fn alive_by_handle(handle: u64) -> Option<bool> {
         // 0 = none, -1 = pseudo "current thread" sentinels
         return None;
     }
-    let rc = crate::raw::sys::wait_handle(handle, 0)?;
-    match rc {
-        WAIT_OBJECT_0 => Some(false), // signalled: the thread has fully exited
-        WAIT_TIMEOUT => Some(true),   // still running (even if merely suspended)
+    let rc = crate::raw::sys::wait_handle(handle, 0);
+    alive_from_wait_result(rc)
+}
+
+/// Some(is_alive), or None when the wait itself was not authoritative.
+fn alive_from_wait_result(result: Option<u32>) -> Option<bool> {
+    match result {
+        Some(WAIT_OBJECT_0) => Some(false), // fully terminated; unregister has returned
+        Some(WAIT_TIMEOUT) => Some(true),   // alive, including a suspended thread
         _ => None,
     }
 }
@@ -371,6 +376,18 @@ fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
     false
 }
 
+/// Resolve the primary table once, on the installation path. The GC detour must
+/// not call GetModuleHandleW or allocate a UTF-16 module name while other
+/// threads are suspended (one of them may own the loader lock).
+pub fn primary_table_base() -> Option<usize> {
+    let ga = procs::own_module(GAME_ASSEMBLY)?.0;
+    Some(ga.wrapping_add(CANDIDATE_RVAS[0] as usize))
+}
+
+pub fn thread_fully_terminated(handle: u64) -> bool {
+    alive_by_handle(handle) == Some(false)
+}
+
 /// Atomic counterpart of `reap()` for the GC's own `GetThreadContext` call.
 /// Return the id only if Boehm's handle matches a record and the thread object
 /// is signalled. `WAIT_TIMEOUT` means alive, so a suspended thread is *never*
@@ -378,12 +395,13 @@ fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
 /// the same dying thread may already sit inside `GC_suspend` before the next
 /// tick. The caller must still return a valid (synthetic) CONTEXT because the
 /// loop is already executing; the removal also keeps `GC_resume_all` safe.
-pub fn unlink_if_dead(handle: u64) -> Option<u32> {
-    if alive_by_handle(handle) != Some(false) {
+///
+/// `base` comes from `primary_table_base()` at installation time. Keeping all
+/// module discovery out of this function makes the hot path allocation-free.
+pub fn unlink_if_dead_at(base: usize, handle: u64) -> Option<u32> {
+    if base == 0 || alive_by_handle(handle) != Some(false) {
         return None;
     }
-    let ga = procs::own_module(GAME_ASSEMBLY)?.0;
-    let base = ga.wrapping_add(CANDIDATE_RVAS[0] as usize);
     for bucket in 0..BUCKETS {
         let mut p = safe::read_usize(base + bucket * 8).unwrap_or(0);
         let mut depth = 0;
@@ -903,5 +921,16 @@ mod tests {
         assert_eq!(worker_exit_via(tid).as_deref(), Some("ExitThread(0x0)"));
         prune_worker_bodies(&[], &[]);
         assert_eq!(worker_exit_via(tid), None);
+    }
+
+    #[test]
+    fn only_a_signalled_thread_object_is_safe_to_reap() {
+        use super::{alive_from_wait_result, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+        assert_eq!(alive_from_wait_result(Some(WAIT_OBJECT_0)), Some(false));
+        assert_eq!(alive_from_wait_result(Some(WAIT_TIMEOUT)), Some(true));
+        assert_eq!(alive_from_wait_result(Some(0x80)), None);
+        assert_eq!(alive_from_wait_result(Some(u32::MAX)), None);
+        assert_eq!(alive_from_wait_result(None), None);
     }
 }
