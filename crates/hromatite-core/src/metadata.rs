@@ -198,7 +198,7 @@ impl Meta {
         if size == 0 {
             return Ok((0, 0));
         }
-        if size < 0 || stride == 0 || size as usize % stride != 0 {
+        if size < 0 || stride == 0 || !(size as usize).is_multiple_of(stride) {
             return Err(format!("{what}: invalid table offset={off:#x}, size={size:#x}, stride={stride}"));
         }
         let start = off as usize;
@@ -466,7 +466,7 @@ fn parse_header(data: &[u8], require_magic: bool) -> Result<Header, String> {
             return Err(format!("invalid header section {index}: {off:#x}/{size:#x}"));
         }
         if size == 0 { continue; }
-        if off as usize % 4 != 0 { return Err(format!("misaligned metadata section {index}: {off:#x}")); }
+        if !(off as usize).is_multiple_of(4) { return Err(format!("misaligned metadata section {index}: {off:#x}")); }
         let end = (off as usize).checked_add(size as usize).ok_or_else(|| "metadata section overflow".to_string())?;
         if end > MAX_METADATA_SIZE { return Err(format!("metadata section {index} ends at {end:#x}, over safety cap")); }
         block_size = block_size.max(end);
@@ -488,12 +488,13 @@ fn parse_header(data: &[u8], require_magic: bool) -> Result<Header, String> {
     if h.strings.1 <= 0 || h.type_definitions.1 <= 0 || h.images.1 <= 0 || h.assemblies.1 <= 0 {
         return Err("metadata lacks string/type/image/assembly tables".into());
     }
-    if h.type_definitions.1 as usize % TYPE_DEF_SIZE != 0 ||
-        h.images.1 as usize % IMAGE_DEF_SIZE != 0 ||
-        h.assemblies.1 as usize % ASSEMBLY_DEF_SIZE != 0 ||
-        h.methods.1 as usize % h.method_def_size() != 0 ||
-        h.fields.1 as usize % FIELD_DEF_SIZE != 0 ||
-        h.properties.1 as usize % PROPERTY_DEF_SIZE != 0 {
+    if !(h.type_definitions.1 as usize).is_multiple_of(TYPE_DEF_SIZE)
+        || !(h.images.1 as usize).is_multiple_of(IMAGE_DEF_SIZE)
+        || !(h.assemblies.1 as usize).is_multiple_of(ASSEMBLY_DEF_SIZE)
+        || !(h.methods.1 as usize).is_multiple_of(h.method_def_size())
+        || !(h.fields.1 as usize).is_multiple_of(FIELD_DEF_SIZE)
+        || !(h.properties.1 as usize).is_multiple_of(PROPERTY_DEF_SIZE)
+    {
         return Err("metadata table size is not a whole number of records".into());
     }
     Ok(h)

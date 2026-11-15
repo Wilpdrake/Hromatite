@@ -6,7 +6,7 @@ fn main() {
     let mut n: u64 = 0;
     loop {
         n += 1;
-        if n % 10 == 0 {
+        if n.is_multiple_of(10) {
             println!("tick {n}");
         }
         std::thread::sleep(std::time::Duration::from_millis(500));

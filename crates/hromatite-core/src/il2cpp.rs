@@ -39,19 +39,14 @@ pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let first = needle[0];
     let mut i = 0usize;
     while i + needle.len() <= hay.len() {
-        match hay[i..hay.len() - needle.len() + 1]
+        let p = hay[i..hay.len() - needle.len() + 1]
             .iter()
-            .position(|&b| b == first)
-        {
-            Some(p) => {
-                let at = i + p;
-                if &hay[at..at + needle.len()] == needle {
-                    return Some(at);
-                }
-                i = at + 1;
-            }
-            None => return None,
+            .position(|&b| b == first)?;
+        let at = i + p;
+        if &hay[at..at + needle.len()] == needle {
+            return Some(at);
         }
+        i = at + 1;
     }
     None
 }
@@ -77,15 +72,14 @@ fn locate_names(mem: &[u8], cap: usize) -> Vec<(&'static str, usize)> {
             i += 1;
         }
         let len = i - start;
-        if (4..=32).contains(&len) {
-            if let Ok(s) = core::str::from_utf8(&mem[start..i]) {
-                if let Some((k, _)) = wanted.get_key_value(s) {
-                    let c = count.entry(k).or_insert(0);
-                    if *c < cap {
-                        *c += 1;
-                        out.push((k, start));
-                    }
-                }
+        if (4..=32).contains(&len)
+            && let Ok(s) = core::str::from_utf8(&mem[start..i])
+            && let Some((k, _)) = wanted.get_key_value(s)
+        {
+            let c = count.entry(k).or_insert(0);
+            if *c < cap {
+                out.push((k, start));
+                *c += 1;
             }
         }
     }
@@ -218,26 +212,27 @@ fn scan_process(
 
             // name string lives inside UnityPlayer's image, so a cheap range
             // test removes almost every word before the hash lookup
-            if w >= up_base && w < up_base + up_size {
-                if let Some(name) = targets.get(&(w as u64)) {
-                    hits.push((addr, name));
-                    stats.name_ptrs += 1;
-                    for (idx, d) in DELTAS.iter().enumerate() {
-                        let cand = addr as i64 + d;
-                        if cand < 0 {
-                            continue;
-                        }
-                        let cand = cand as usize;
-                        // ±0x80 around a slot can leave the validated region
-                        // (page boundary, end of heap block): ask `safe`, the
-                        // range test alone does not make the word readable.
-                        let v = match crate::safe::read_u64(cand) {
-                            Some(v) => v as usize,
-                            None => continue,
-                        };
-                        if v >= ga_lo && v < ga_hi {
-                            stats.votes[idx] += 1;
-                        }
+            if w >= up_base
+                && w < up_base + up_size
+                && let Some(name) = targets.get(&(w as u64))
+            {
+                hits.push((addr, name));
+                stats.name_ptrs += 1;
+                for (idx, d) in DELTAS.iter().enumerate() {
+                    let cand = addr as i64 + d;
+                    if cand < 0 {
+                        continue;
+                    }
+                    let cand = cand as usize;
+                    // ±0x80 around a slot can leave the validated region
+                    // (page boundary, end of heap block): ask `safe`, the
+                    // range test alone does not make the word readable.
+                    let v = match crate::safe::read_u64(cand) {
+                        Some(v) => v as usize,
+                        None => continue,
+                    };
+                    if v >= ga_lo && v < ga_hi {
+                        stats.votes[idx] += 1;
                     }
                 }
             }

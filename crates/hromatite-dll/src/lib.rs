@@ -81,7 +81,7 @@ fn console_loop(secs: u32) -> bool {
         // its 1e6-iteration loop on it (gc.log: "SuspendThread loop failed:
         // thread id= 0x37c, errcode= 0x5" = ACCESS_DENIED for a terminated
         // thread). `reap()` asks Boehm's own handle, so it is 40 cheap syscalls.
-        if polls % 2 == 0 {
+        if polls.is_multiple_of(2) {
             let reaped = log::guard("gct reap", hromatite_core::gcthreads::reap)
                 .unwrap_or_default();
             for l in reaped {
@@ -92,7 +92,7 @@ fn console_loop(secs: u32) -> bool {
         // table. The line we are hunting is "thread 0xNNN exited" immediately
         // followed by "Boehm STILL holds it" — that record is what makes
         // GC_suspend spin 1e6 times and abort the game a few seconds later.
-        if polls % 20 == 0 {
+        if polls.is_multiple_of(20) {
             let lines = log::guard("gct watch", hromatite_core::gcthreads::watch)
                 .unwrap_or_else(|| vec!["guard".to_string()]);
             for l in lines {

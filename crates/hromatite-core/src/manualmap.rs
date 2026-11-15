@@ -42,11 +42,11 @@ fn seal_image(
     while off < size {
         let n = (size - off).min(PAGE);
         let addr = base + off;
-        if let Some((k_lo, k_hi)) = keep {
-            if addr >= k_lo && addr < k_hi {
-                off += n;
-                continue;
-            }
+        if let Some((k_lo, k_hi)) = keep
+            && addr >= k_lo && addr < k_hi
+        {
+            off += n;
+            continue;
         }
         if !r.protect(addr, n, crate::ffi::PAGE_READWRITE) {
             failed += 1;

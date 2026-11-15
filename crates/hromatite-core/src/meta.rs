@@ -368,10 +368,10 @@ fn reads_as_methods(p: usize, ga: Option<(usize, usize)>) -> bool {
             Some(v) => v,
             None => return false,
         };
-        if let Some((base, size)) = ga {
-            if fp < base || fp >= base + size {
-                return false;
-            }
+        if let Some((base, size)) = ga
+            && (fp < base || fp >= base + size)
+        {
+            return false;
         }
         let name = match safe::read_usize(mi + METHOD_NAME_OFF) {
             Some(v) => v,
@@ -842,8 +842,7 @@ pub fn scan_classes_by_image(max: usize) -> Vec<(usize, String, String)> {
                     if let Some(img) = image_backref(&ranges, v) {
                         let nm = ranges
                             .u64(v + CLASS_NAME_OFF)
-                            .map(|q| ranges.cstr(q as usize, 96))
-                            .flatten()
+                            .and_then(|q| ranges.cstr(q as usize, 96))
                             .unwrap_or_default();
                         hit.push((v, img, nm));
                     }
@@ -1006,11 +1005,11 @@ pub fn find_method_by_name(mname: &str) -> Vec<(usize, usize, usize)> {
                 // a class-shaped record.
                 let mut klass = 0usize;
                 for koff in [0x20usize, 0x18] {
-                    if let Some(k) = ranges.u64(mi + koff) {
-                        if class_like_in(&ranges, k as usize) {
-                            klass = k as usize;
-                            break;
-                        }
+                    if let Some(k) = ranges.u64(mi + koff)
+                        && class_like_in(&ranges, k as usize)
+                    {
+                        klass = k as usize;
+                        break;
                     }
                 }
                 if klass != 0 {
@@ -1073,15 +1072,14 @@ pub fn find_class_by_scan(ns: &str, name: &str) -> Vec<(usize, String)> {
                     Some(p) => p as usize,
                     None => continue,
                 };
-                if let Some(s) = ranges.cstr(np, 96) {
-                    if s == name {
-                        let nsv = ranges
-                            .u64(v + CLASS_NS_OFF)
-                            .map(|q| ranges.cstr(q as usize, 96))
-                            .flatten()
-                            .unwrap_or_default();
-                        hit.push((v, nsv));
-                    }
+                if let Some(s) = ranges.cstr(np, 96)
+                    && s == name
+                {
+                    let nsv = ranges
+                        .u64(v + CLASS_NS_OFF)
+                        .and_then(|q| ranges.cstr(q as usize, 96))
+                        .unwrap_or_default();
+                    hit.push((v, nsv));
                 }
             }
             hit

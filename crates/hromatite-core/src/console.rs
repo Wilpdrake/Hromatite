@@ -81,6 +81,12 @@ impl Reader {
     }
 }
 
+impl Default for Reader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(PartialEq)]
 pub enum Action {
     None,
@@ -150,15 +156,17 @@ fn utf16(addr: usize, max: usize) -> String {
 fn tag_of(v: usize) -> &'static str {
     let ga = procs::own_module(crate::GAME_ASSEMBLY);
     let up = procs::own_module(crate::UNITY_PLAYER);
-    if let Some((b, s)) = ga {
-        if v >= b && v < b + s {
-            return "GA";
-        }
+    if let Some((b, s)) = ga
+        && v >= b
+        && v < b + s
+    {
+        return "GA";
     }
-    if let Some((b, s)) = up {
-        if v >= b && v < b + s {
-            return "UP";
-        }
+    if let Some((b, s)) = up
+        && v >= b
+        && v < b + s
+    {
+        return "UP";
     }
     ""
 }
@@ -312,10 +320,10 @@ fn core_image() -> Option<usize> {
 /// Class lookup that does not depend on the image walk: Unity 6 keeps no class
 /// table in the codegen module, so fall back to the global class arrays.
 fn lookup_class(ns: &str, name: &str) -> Option<crate::meta::Class> {
-    if let Some(img) = core_image() {
-        if let Some(c) = crate::meta::find_class(img, ns, name) {
-            return Some(c);
-        }
+    if let Some(img) = core_image()
+        && let Some(c) = crate::meta::find_class(img, ns, name)
+    {
+        return Some(c);
     }
     if let Some(c) = crate::meta::find_class_global(ns, name) {
         return Some(c);
@@ -534,7 +542,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         },
         "findb" | "findw" => {
             // сырой остаток строки — чтобы искать пробелы и точки
-            let rest = line.splitn(2, char::is_whitespace).nth(1).unwrap_or("");
+            let rest = line.split_once(char::is_whitespace).map_or("", |x| x.1);
             if rest.is_empty() {
                 return (vec!["usage: findb <ascii text>".into()], Action::None);
             }
@@ -722,14 +730,12 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         "wb" => match (parse_addr(a1), rest.trim()) {
             (Some(addr), hex) if !hex.is_empty() => {
                 let cleaned: String = hex.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
-                let bytes: Option<Vec<u8>> = (cleaned.len() % 2 == 0)
-                    .then(|| {
-                        (0..cleaned.len())
-                            .step_by(2)
-                            .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
-                            .collect::<Option<Vec<u8>>>()
-                    })
-                    .flatten();
+                let bytes: Option<Vec<u8>> = cleaned.len().is_multiple_of(2).then(|| {
+                    (0..cleaned.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
+                        .collect::<Option<Vec<u8>>>()
+                }).flatten();
                 match bytes {
                     Some(b) => {
                         let ok = crate::safe::write_bytes(addr, &b);
@@ -923,10 +929,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     out.push(format!("  -> {r:#x}"));
                     if r >= 0x10000 && crate::safe::readable_at(r) {
                         for d in (0..0x40).step_by(8) {
-                            if let Some(p) = crate::safe::read_u64(r + d) {
-                                if let Some(s) = crate::safe::ascii_at(p as usize, 48) {
-                                    out.push(format!("     [{d:#x}] -> '{s}'"));
-                                }
+                            if let Some(p) = crate::safe::read_u64(r + d)
+                                && let Some(s) = crate::safe::ascii_at(p as usize, 48)
+                            {
+                                out.push(format!("     [{d:#x}] -> '{s}'"));
                             }
                         }
                     }
@@ -1025,21 +1031,20 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 match crate::veh::call2(f, image, i) {
                     Ok(r) if r >= 0x10000 && crate::safe::readable_at(r) => {
                         for d in (0..0x60).step_by(8) {
-                            if let Some(p) = crate::safe::read_u64(r + d) {
-                                if let Some(s) = crate::safe::ascii_at(p as usize, 64) {
-                                    if s == want {
-                                        hits += 1;
-                                        out.push(format!(
-                                            "  [{i}] class {r:#x} name@+{d:#x} ns@{:?}",
-                                            {
-                                                // рядом обычно лежит namespace
-                                                crate::safe::read_u64(r + d - 8)
-                                                    .and_then(|q| crate::safe::ascii_at(q as usize, 64))
-                                            }
-                                        ));
-                                        break;
+                            if let Some(p) = crate::safe::read_u64(r + d)
+                                && let Some(s) = crate::safe::ascii_at(p as usize, 64)
+                                && s == want
+                            {
+                                hits += 1;
+                                out.push(format!(
+                                    "  [{i}] class {r:#x} name@+{d:#x} ns@{:?}",
+                                    {
+                                        // рядом обычно лежит namespace
+                                        crate::safe::read_u64(r + d - 8)
+                                            .and_then(|q| crate::safe::ascii_at(q as usize, 64))
                                     }
-                                }
+                                ));
+                                break;
                             }
                         }
                     }
@@ -1429,9 +1434,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // kill the game; the session continues with the next command.
         "panic" => {
             let msg = line
-                .splitn(2, char::is_whitespace)
-                .nth(1)
-                .unwrap_or("console panic test")
+                .split_once(char::is_whitespace)
+                .map_or("console panic test", |x| x.1)
                 .trim();
             let msg = if msg.is_empty() { "console panic test" } else { msg };
             crate::log::log_tag("con", &format!("panic test: about to panic with '{msg}'"));

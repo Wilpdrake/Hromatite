@@ -122,8 +122,10 @@ pub fn live_tids() -> Vec<u32> {
             return out;
         }
         let me = ffi::GetCurrentProcessId();
-        let mut e = THREADENTRY32::default();
-        e.dwSize = core::mem::size_of::<THREADENTRY32>() as u32;
+        let mut e = THREADENTRY32 {
+            dwSize: core::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
         if ffi::Thread32First(snap, &mut e) != 0 {
             loop {
                 if e.th32OwnerProcessID == me && e.th32ThreadID != 0 {
@@ -360,9 +362,8 @@ pub fn repair(table: &Table) -> Vec<String> {
     out
 }
 
-/// `GetExitCodeThread` on a running thread answers this.
-const STILL_ACTIVE: u32 = 0x103;
-
+/// A running thread can still answer `STILL_ACTIVE` (`0x103`) while it is in
+/// its exit path, so liveness is decided by the wait below, not by that code.
 /// Is the thread behind this handle still running? `None` = the query itself
 /// failed (a handle we do not own, or a recycled one).
 ///
@@ -602,7 +603,7 @@ pub fn watch() -> Vec<String> {
         };
         if *last == sig {
             let n = IDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n % 5 == 0 {
+            if n.is_multiple_of(5) {
                 out.push(format!(
                     "counts idle for ~{} s (quiet menu looks the same as a freeze — cross-check the Unity log mtime)",
                     n * 8
@@ -622,9 +623,7 @@ pub fn watch() -> Vec<String> {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                let m = g.get_or_insert_with(std::collections::HashMap::new);
-                let s = m.remove(gone);
-                s
+                g.get_or_insert_with(std::collections::HashMap::new).remove(gone)
             };
             match start {
                 Some(a) => out.push(format!(
@@ -686,7 +685,7 @@ pub fn resume_all(table: &Table) -> Vec<String> {
             out.push("resume: kernel32 not found".to_string());
             return out;
         }
-        ffi::GetProcAddress(k, ffi::cstr("ResumeThread").as_ptr() as *const u8)
+        ffi::GetProcAddress(k, ffi::cstr("ResumeThread").as_ptr())
     };
     if addr.is_null() {
         out.push("resume: ResumeThread not resolved".to_string());

@@ -215,10 +215,10 @@ pub fn write_bytes(addr: usize, data: &[u8]) -> bool {
 }
 
 fn span_of(cur: &mut Option<Span>, p: usize) -> Option<Span> {
-    if let Some(s) = *cur {
-        if s.contains(p, 1) {
-            return Some(s);
-        }
+    if let Some(s) = *cur
+        && s.contains(p, 1)
+    {
+        return Some(s);
     }
     let s = span_at(p)?;
     *cur = Some(s);
@@ -297,7 +297,9 @@ pub fn utf16_lossy(p: usize, max: usize) -> String {
 /// The caller passes a validated `Span`, so the loop itself does no per-word
 /// `VirtualQuery`.
 pub fn find_qword_in_span(span: &Span, want: u64, max: usize, out: &mut Vec<usize>) {
-    let mut a = (span.base + 7) & !7usize;
+    let Some(mut a) = span.base.checked_add(7).map(|v| v & !7usize) else {
+        return;
+    };
     let end = span.end().saturating_sub(8);
     while a <= end && out.len() < max {
         if unsafe { *(a as *const u64) } == want {

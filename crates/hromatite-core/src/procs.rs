@@ -9,8 +9,10 @@ pub fn find_pid(name: &str) -> Option<u32> {
         if snap == INVALID_HANDLE_VALUE {
             return None;
         }
-        let mut e = PROCESSENTRY32W::default();
-        e.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut e = PROCESSENTRY32W {
+            dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut ok = Process32FirstW(snap, &mut e);
         let mut found = None;
         while ok != 0 {
@@ -32,8 +34,10 @@ pub fn all_pids() -> Vec<(u32, String)> {
         if snap == INVALID_HANDLE_VALUE {
             return out;
         }
-        let mut e = PROCESSENTRY32W::default();
-        e.dwSize = core::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut e = PROCESSENTRY32W {
+            dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut ok = Process32FirstW(snap, &mut e);
         while ok != 0 {
             out.push((e.th32ProcessID, wide_to_string(&e.szExeFile)));
@@ -51,8 +55,10 @@ pub fn modules(pid: u32) -> Vec<(String, usize, usize)> {
         if snap == INVALID_HANDLE_VALUE {
             return out;
         }
-        let mut e = MODULEENTRY32W::default();
-        e.dwSize = core::mem::size_of::<MODULEENTRY32W>() as u32;
+        let mut e = MODULEENTRY32W {
+            dwSize: core::mem::size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut ok = Module32FirstW(snap, &mut e);
         while ok != 0 {
             out.push((

@@ -1687,3 +1687,23 @@ il2cpp одними чтениями памяти (без единого выз�
   metadata fallback работает только как header parser, но runtime registration
   в текущем прогоне не готов; `typedump` не подтверждён.
 
+### 2026-11-15 — Очистка Rust перед выделением unsafe-границы
+
+- Коммит: этот (`chore(rust): clean up lint findings without behavior changes`).
+- По запросу пользователя начат рефакторинг: очистка → изоляция `unsafe` →
+  lint-защита → независимое ревью. Изменены 14 Rust-файлов, 196+/190- строк.
+- Удалены мёртвые `STILL_ACTIVE` и `hook::note`; упрощены вложенные условия,
+  split/range/modulo-проверки, инициализация Win32-структур; добавлен
+  `Default for console::Reader`, `# Safety` у двух shim-detour функций;
+  `safe::find_qword_in_span` теперь не переполняется при `base + 7`.
+- База: 20/20 host-тестов и release build проходили, Clippy `-D warnings`
+  имел 51 ошибку. После очистки: `cargo clippy --workspace --all-targets
+  --release -- -D warnings` — OK; host-тесты 20/20;
+  `cargo build --workspace --release` — OK; `git diff --check` — OK.
+- Независимый reviewer проверил diff: `passed=true`, ошибок логики/security
+  и замечаний нет; отдельно проверены `locate_names`, XOR-страницы,
+  checked-арифметика и parser-упрощения. Живая игра не запускалась.
+- Осталось: физически выделить `raw/` и перевести верхнеуровневые модули на
+  безопасные facade-функции; включить `unsafe_op_in_unsafe_fn` и
+  `undocumented_unsafe_blocks`; отдельно проверить TOCTOU чтения и запись.
+

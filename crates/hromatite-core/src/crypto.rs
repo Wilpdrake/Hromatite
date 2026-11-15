@@ -75,10 +75,8 @@ pub fn xor_page(page: u64, buf: &mut [u8]) {
 
 /// XOR `len` bytes starting at `page` — the tail of the last page included.
 pub fn xor_range(start_page: u64, buf: &mut [u8]) {
-    let mut page = start_page;
-    for chunk in buf.chunks_mut(PAGE) {
+    for (page, chunk) in (start_page..).zip(buf.chunks_mut(PAGE)) {
         xor_page(page, chunk);
-        page += 1;
     }
 }
 

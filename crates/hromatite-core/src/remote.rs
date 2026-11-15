@@ -133,21 +133,21 @@ impl Remote {
         let ords = self.u32(dir + 36)? as usize;
         for i in 0..n_names.min(8192) {
             let nrva = self.u32(module_base + names + i * 4)? as usize;
-            if let Some(s) = self.read_string(module_base + nrva, 96) {
-                if s == name {
-                    let ord = self.u16(module_base + ords + i * 2)? as usize;
-                    let frva = self.u32(module_base + funcs + ord * 4)? as usize;
-                    let in_dir = frva >= exp_rva && frva < exp_rva + exp_size;
-                    if !in_dir {
-                        return Some(module_base + frva);
-                    }
-                    let fwd = self.read_string(module_base + frva, 128)?;
-                    let (mdll, func) = fwd.split_once('.')?;
-                    let mb = crate::procs::module(self.pid, &format!("{mdll}.dll"))
-                        .map(|(b, _)| b)
-                        .or_else(|| crate::procs::module(self.pid, mdll).map(|(b, _)| b))?;
-                    return self.export_in(mb, func, depth + 1);
+            if let Some(s) = self.read_string(module_base + nrva, 96)
+                && s == name
+            {
+                let ord = self.u16(module_base + ords + i * 2)? as usize;
+                let frva = self.u32(module_base + funcs + ord * 4)? as usize;
+                let in_dir = frva >= exp_rva && frva < exp_rva + exp_size;
+                if !in_dir {
+                    return Some(module_base + frva);
                 }
+                let fwd = self.read_string(module_base + frva, 128)?;
+                let (mdll, func) = fwd.split_once('.')?;
+                let mb = crate::procs::module(self.pid, &format!("{mdll}.dll"))
+                    .map(|(b, _)| b)
+                    .or_else(|| crate::procs::module(self.pid, mdll).map(|(b, _)| b))?;
+                return self.export_in(mb, func, depth + 1);
             }
         }
         None

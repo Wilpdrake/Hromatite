@@ -50,8 +50,10 @@ const RSS_BUDGET_MB: usize = 96;
 /// Current working set of this process (watched around calls into unknown code).
 fn rss_mb() -> usize {
     unsafe {
-        let mut c = ffi::PROCESS_MEMORY_COUNTERS::default();
-        c.cb = core::mem::size_of::<ffi::PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut c = ffi::PROCESS_MEMORY_COUNTERS {
+            cb: core::mem::size_of::<ffi::PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
         let ok = ffi::K32GetProcessMemoryInfo(
             ffi::GetCurrentProcess(),
             &mut c,
@@ -128,10 +130,11 @@ static REPORT: Mutex<Option<Report>> = Mutex::new(None);
 /// is retried (the previous attempt may have run before the game was ready).
 pub fn identify() -> Report {
     let mut slot = REPORT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(r) = slot.as_ref() {
-        if r.assemblies_fn.is_some() && r.class_fn.is_some() {
-            return r.clone();
-        }
+    if let Some(r) = slot.as_ref()
+        && r.assemblies_fn.is_some()
+        && r.class_fn.is_some()
+    {
+        return r.clone();
     }
     let r = run_identify(0);
     *slot = Some(r.clone());
@@ -205,9 +208,9 @@ fn reads_arg2_or_3(bytes: &[u8]) -> bool {
     while i + 2 <= bytes.len() {
         let b = bytes[i];
         // mov r64/r32, [rdx(+disp)] / [r8(+disp)] incl. REX forms
-        if b == 0x8B || (b >= 0x40 && b <= 0x4F) {
+        if b == 0x8B || (0x40..=0x4F).contains(&b) {
             let mut j = i;
-            if b >= 0x40 && b <= 0x4F {
+            if (0x40..=0x4F).contains(&b) {
                 j += 1;
             }
             if j + 1 < bytes.len() {
@@ -528,17 +531,15 @@ pub fn class_probe(r: usize) -> Option<ClassLayout> {
     let mut ns_off: Option<i64> = None;
     let mut d: i64 = -0x40;
     while d <= 0x40 {
-        if let Some(p) = (r as i64).checked_add(d) {
-            if p > 0 {
-                if let Some(ptr) = safe::read_u64(p as usize) {
-                    if let Some(s) = safe::ascii_at(ptr as usize, 32) {
-                        if s == "Camera" && name_off.is_none() {
-                            name_off = Some(d);
-                        } else if s == "UnityEngine" && ns_off.is_none() {
-                            ns_off = Some(d);
-                        }
-                    }
-                }
+        if let Some(p) = (r as i64).checked_add(d)
+            && p > 0
+            && let Some(ptr) = safe::read_u64(p as usize)
+            && let Some(s) = safe::ascii_at(ptr as usize, 32)
+        {
+            if s == "Camera" && name_off.is_none() {
+                name_off = Some(d);
+            } else if s == "UnityEngine" && ns_off.is_none() {
+                ns_off = Some(d);
             }
         }
         d += 8;
