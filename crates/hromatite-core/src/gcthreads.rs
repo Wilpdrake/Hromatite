@@ -321,6 +321,16 @@ pub const OFF_SUSPENDED: usize = 0x3b;
 pub fn repair(table: &Table) -> Vec<String> {
     let mut out = Vec::new();
     for e in table.entries.iter().filter(|e| !e.live) {
+        // A record may only be removed once its thread object is signalled:
+        // while the thread is still running its `GC_unregister_my_thread`, the
+        // lookup walks the bucket by id and has no NULL check.
+        if alive_by_handle(e.handle) != Some(false) {
+            out.push(format!(
+                "record id={:#x}: thread object not signalled yet — kept",
+                e.id
+            ));
+            continue;
+        }
         // find the predecessor in this bucket (the chain is short: 1-2 nodes)
         let mut prev = 0usize;
         let mut cur = safe::read_usize(table.base + e.bucket as usize * 8).unwrap_or(0);
@@ -355,17 +365,34 @@ const STILL_ACTIVE: u32 = 0x103;
 
 /// Is the thread behind this handle still running? `None` = the query itself
 /// failed (a handle we do not own, or a recycled one).
+///
+/// Two questions are asked, and only a thread that is **fully terminated** may
+/// be reported dead:
+///   * `GetExitCodeThread` — cheap, but under wine it can still answer
+///     `STILL_ACTIVE` for a thread that is in its exit path;
+///   * `WaitForSingleObject(handle, 0)` — the thread object is signalled only
+///     once the thread has completely finished, including its
+///     `GC_unregister_my_thread` call.
+///
+/// That distinction matters: unlinking a record while its thread is still inside
+/// `GC_lookup_thread_inner` makes the walk run off the end of the bucket
+/// (`cmp %ecx,0x8(%rbx)` with `rbx == NULL`, measured: AV at
+/// `GameAssembly+0xc417dc` in thread `0x378` right after we reaped it).
 fn alive_by_handle(handle: u64) -> Option<bool> {
-    if handle == 0 || handle == u64::MAX {
+    if handle == 0 || handle == u64::MAX || handle == u64::MAX - 1 {
+        // 0 = none, -1 = pseudo "current thread" sentinels
         return None;
     }
-    let mut code: u32 = 0;
-    let ok = unsafe { ffi::GetExitCodeThread(handle as ffi::HANDLE, &mut code) };
-    if ok == 0 {
-        return None;
+    let rc = unsafe { ffi::WaitForSingleObject(handle as ffi::HANDLE, 0) };
+    match rc {
+        WAIT_OBJECT_0 => Some(false), // signalled: the thread has fully exited
+        WAIT_TIMEOUT => Some(true),   // still running (even if merely suspended)
+        _ => None,
     }
-    Some(code == STILL_ACTIVE)
 }
+
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x102;
 
 /// Unlink one record, given its bucket and pointer. Returns true on success.
 fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
