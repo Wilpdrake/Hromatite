@@ -8,6 +8,7 @@
 pub mod api_symbols;
 pub mod crypto;
 pub mod gcthreads;
+pub mod lateupdate;
 pub mod log;
 pub mod m3;
 pub mod manualmap;

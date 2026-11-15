@@ -144,6 +144,35 @@ fn should_install_console_gc_guard(frame_hook: bool, live: u32, sealing: bool) -
     !frame_hook && live > 0 && !sealing
 }
 
+fn late_update_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
+}
+
+fn install_late_update_with_retry(
+    selector: hromatite_core::lateupdate::Selector,
+) -> Result<hromatite_core::lateupdate::Candidate, String> {
+    let wait_ms = std::env::var("HROMATITE_LATE_UPDATE_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .min(120_000);
+    let attempts = (wait_ms / 250).max(1) as u32;
+    hromatite_core::lateupdate::retry_bounded(
+        attempts,
+        std::time::Duration::from_millis(250),
+        |attempt| {
+            if !hook::materialise_late_class(selector) {
+                if attempt % 20 == 0 {
+                    log::log_tag("late", &format!("waiting for class: attempt {attempt}/{attempts}"));
+                }
+                return None;
+            }
+            Some(hook::install_late_update(selector))
+        },
+    )
+    .unwrap_or_else(|| Err(format!("class/method did not become available within {wait_ms}ms")))
+}
+
 fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
     // The injector's stub passes `r8 = &{base, size}`: the payload cannot read its
     // own PE header (erased) and `VirtualQuery` reports the section split, so L2b
@@ -206,10 +235,42 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
         // Install the tick *before* any recon: the full diagnose() scan takes
         // seconds and must not delay getting off the stub thread. `diag` stays
         // available as a console command for the same reason.
-        let ok = log::guard("install_tick", hook::install_tick).unwrap_or(false);
+        let late_selector = std::env::var("HROMATITE_LATE_UPDATE").ok();
+        let late_anchor = late_update_requested(late_selector.as_deref());
+        let ok = if late_anchor {
+            let selector = late_selector
+                .as_deref()
+                .and_then(hromatite_core::lateupdate::parse_selector);
+            match selector {
+                Some(selector) => match log::guard("install_late_update_with_retry", || {
+                    install_late_update_with_retry(selector)
+                }) {
+                    Some(Ok(candidate)) => {
+                        let gc_guard = log::guard("install_late_gc_guard", hook::install_gc_context_guard)
+                            .unwrap_or(false);
+                        log::log_tag(
+                            "late",
+                            &format!("config {} -> entry {:#x}, inline GC guard={gc_guard}", late_selector.as_deref().unwrap_or(""), candidate.entry),
+                        );
+                        true
+                    }
+                    Some(Err(error)) => {
+                        log::log_tag("late", &format!("configured LateUpdate failed: {error}; QPC fallback is off"));
+                        false
+                    }
+                    None => false,
+                },
+                None => {
+                    log::log_tag("late", "HROMATITE_LATE_UPDATE is not a valid #index/address");
+                    false
+                }
+            }
+        } else {
+            log::guard("install_tick", hook::install_tick).unwrap_or(false)
+        };
         log::log_tag(
             "dll",
-            &format!("FRAME_HOOK: tick hook installed={ok}, returning from DllMain (no console_loop)"),
+            &format!("FRAME_HOOK: source={}, installed={ok}, returning from DllMain (no console_loop)", if late_anchor { "LateUpdate" } else { "QPC" }),
         );
         log::log_tag("dll", "recon done, returning from DllMain");
         return;
@@ -266,7 +327,16 @@ pub extern "system" fn DllMain(
 
 #[cfg(test)]
 mod tests {
-    use super::should_install_console_gc_guard;
+    use super::{late_update_requested, should_install_console_gc_guard};
+
+    #[test]
+    fn late_update_anchor_is_explicit_opt_in() {
+        assert!(late_update_requested(Some("#31241")));
+        assert!(late_update_requested(Some("0x3238aca0")));
+        assert!(!late_update_requested(None));
+        assert!(!late_update_requested(Some("")));
+        assert!(!late_update_requested(Some("0")));
+    }
 
     #[test]
     fn live_stub_console_requires_the_synchronous_gc_guard() {

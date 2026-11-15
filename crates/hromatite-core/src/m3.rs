@@ -236,6 +236,11 @@ pub struct Method {
     pub name: String,
     pub entry: usize,
     pub info: usize,
+    /// Il2CppType.type from the return descriptor (1 = IL2CPP_TYPE_VOID).
+    pub return_kind: u32,
+    pub parameters_count: u8,
+    /// Mono method attributes; 0x10 = METHOD_ATTRIBUTE_STATIC.
+    pub flags: u16,
 }
 
 /// Methods of a class (`class+0x50` is an array of `MethodInfo*`).
@@ -260,7 +265,13 @@ pub fn methods(class: usize) -> Vec<Method> {
             break;
         }
         let entry = safe::read_usize(mi).unwrap_or(0);
-        out.push(Method { name, entry, info: mi });
+        let return_kind = safe::read_usize(mi + 0x28)
+            .and_then(|ty| safe::read_u32(ty + 0x08))
+            .map(|bits| (bits >> 16) & 0xff)
+            .unwrap_or(u32::MAX);
+        let parameters_count = safe::read_u8(mi + 0x52).unwrap_or(u8::MAX);
+        let flags = safe::read_u16(mi + 0x4c).unwrap_or(u16::MAX);
+        out.push(Method { name, entry, info: mi, return_kind, parameters_count, flags });
     }
     out
 }

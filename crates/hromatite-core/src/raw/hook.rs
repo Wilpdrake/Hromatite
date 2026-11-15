@@ -1961,6 +1961,184 @@ pub unsafe extern "system" fn d3d_detour(
     ret
 }
 
+// ---- concrete IL2CPP LateUpdate -------------------------------------------
+
+static LATE_ORIG: AtomicUsize = AtomicUsize::new(0);
+static LATE_ENTRY: AtomicUsize = AtomicUsize::new(0);
+static LATE_ATTACHED: AtomicBool = AtomicBool::new(false);
+static LATE_CLASS: AtomicUsize = AtomicUsize::new(0);
+static LATE_INFO: AtomicUsize = AtomicUsize::new(0);
+static LATE_HITS: AtomicU64 = AtomicU64::new(0);
+static LATE_TID: AtomicU64 = AtomicU64::new(0);
+
+fn managed_entry_in_module(entry: usize, module: Option<(usize, usize)>) -> bool {
+    let Some((base, size)) = module else {
+        return false;
+    };
+    entry >= base && entry < base.saturating_add(size)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LateInstallAction {
+    Patch,
+    AlreadyAttached,
+}
+
+fn late_install_action(last_entry: usize, attached: bool, candidate: usize) -> Result<LateInstallAction, String> {
+    if attached && last_entry == candidate {
+        return Ok(LateInstallAction::AlreadyAttached);
+    }
+    if last_entry == 0 || (!attached && last_entry == candidate) {
+        return Ok(LateInstallAction::Patch);
+    }
+    Err("another LateUpdate target is configured; restart before changing it".into())
+}
+
+/// IL2CPP instance-method ABI: `this` in rcx and hidden `MethodInfo*` in rdx.
+/// The real LateUpdate runs first; our throttled work happens after it.
+///
+/// # Safety
+/// Both arguments are forwarded unchanged to the trampoline for the exact
+/// managed method selected by `install_late_update`.
+pub unsafe extern "system" fn late_update_detour(
+    this: *mut core::ffi::c_void,
+    method: *mut core::ffi::c_void,
+) {
+    let original = LATE_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return;
+    }
+    // SAFETY: install_late_update publishes the trampoline for the same
+    // two-argument IL2CPP method before patching the target.
+    let f: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) =
+        unsafe { core::mem::transmute(original) };
+    // SAFETY: the original arguments are opaque to us and are not modified.
+    unsafe { f(this, method) };
+    let hit = LATE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let tid = crate::gcthreads::own_tid() as u64;
+    LATE_TID.store(tid, Ordering::Relaxed);
+    if hit == 1 {
+        log::log_tag(
+            "late",
+            &format!("first LateUpdate hit: tid={tid:#x}, this={this:?}, MethodInfo={method:?}"),
+        );
+    }
+    tick();
+}
+
+/// Make a lazily-created class available to the startup installer. This calls
+/// IL2CPP and is therefore only for the injection stub thread, never a QPC hook.
+pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
+    use crate::lateupdate::Selector;
+    let index = match selector {
+        Selector::Address(_) => return crate::lateupdate::resolve(selector).is_some(),
+        Selector::Index(index) => index,
+    };
+    if crate::lateupdate::resolve(selector).is_some() {
+        return true;
+    }
+    let Some((ga, gasize)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+        return false;
+    };
+    let f = ga.wrapping_add(crate::m3::IMAGE_GET_CLASS_RVA as usize);
+    if f < ga || f >= ga.saturating_add(gasize) {
+        return false;
+    }
+    let Some(corlib) = crate::il2cpp::find_domain() else {
+        return false;
+    };
+    let Some(image) = crate::m3::image_of(corlib, "Assembly-CSharp") else {
+        return false;
+    };
+    // SAFETY: f is the build-measured il2cpp_image_get_class(image, index) and
+    // is called only from the injection stub. The class may initialize lazily,
+    // but no managed constructor is invoked here and VEH contains runtime faults.
+    let class = unsafe { crate::veh::call2(f, image, index) }.unwrap_or(0);
+    class >= 0x10000
+        && crate::safe::readable_at(class)
+        && crate::lateupdate::resolve(selector).is_some()
+}
+
+/// Resolve and hook one concrete class's own `LateUpdate` method.
+pub fn install_late_update(selector: crate::lateupdate::Selector) -> Result<crate::lateupdate::Candidate, String> {
+    if env_flag("HROMATITE_SEAL") || env_flag("HROMATITE_L2B") {
+        return Err("LateUpdate is an in-image detour; full sealing is not supported for it yet".into());
+    }
+    let candidate = crate::lateupdate::resolve(selector)
+        .ok_or_else(|| "class has no materialised own method named `LateUpdate`".to_string())?;
+    let ga = crate::procs::own_module(crate::GAME_ASSEMBLY);
+    if !managed_entry_in_module(candidate.entry, ga) {
+        return Err(format!("managed entry {:#x} is outside GameAssembly.dll", candidate.entry));
+    }
+    if late_install_action(
+        LATE_ENTRY.load(Ordering::Acquire),
+        LATE_ATTACHED.load(Ordering::Acquire),
+        candidate.entry,
+    )? == LateInstallAction::AlreadyAttached
+    {
+        return Ok(candidate);
+    }
+    let prep = prepare(candidate.entry)
+        .ok_or_else(|| format!("cannot prepare a trampoline at {:#x}", candidate.entry))?;
+    if let Some(interval) = std::env::var("HROMATITE_TICK_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        INTERVAL_MS.store(interval.max(1), Ordering::Relaxed);
+    }
+    let live = std::env::var("HROMATITE_LIVE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    LIVE_MODE.store(live, Ordering::Relaxed);
+    let _ = START_MS.compare_exchange(0, now_ms(), Ordering::AcqRel, Ordering::Relaxed);
+    LATE_HITS.store(0, Ordering::Relaxed);
+    LATE_CLASS.store(candidate.class, Ordering::Relaxed);
+    LATE_INFO.store(candidate.info, Ordering::Relaxed);
+    LATE_ORIG.store(prep.trampoline, Ordering::Release);
+    let installed = patch(&prep, late_update_detour as *const () as usize);
+    let Some(hook) = installed else {
+        LATE_ORIG.store(0, Ordering::Release);
+        LATE_ATTACHED.store(false, Ordering::Release);
+        LATE_CLASS.store(0, Ordering::Relaxed);
+        LATE_INFO.store(0, Ordering::Relaxed);
+        return Err("patch failed (prologue, atomic window or page protection)".into());
+    };
+    LATE_ENTRY.store(candidate.entry, Ordering::Release);
+    LATE_ATTACHED.store(true, Ordering::Release);
+    register(hook);
+    let class_name = crate::m3::class_full_name(candidate.class);
+    let rva = ga.map(|(base, _)| candidate.entry.saturating_sub(base)).unwrap_or(0);
+    log::log_tag(
+        "late",
+        &format!(
+            "hooked {class_name} ({:#x}) index={:?}, MethodInfo={:#x}, entry={:#x} (GA+{rva:#x})",
+            candidate.class, candidate.index, candidate.info, candidate.entry
+        ),
+    );
+    Ok(candidate)
+}
+
+fn late_attachment_present(entry: usize, hooks: &[(usize, bool)]) -> bool {
+    entry != 0 && hooks.iter().any(|(target, detached)| *target == entry && !*detached)
+}
+
+pub fn late_update_status() -> Vec<String> {
+    let entry = LATE_ENTRY.load(Ordering::Acquire);
+    if entry == 0 {
+        return vec!["LateUpdate: not hooked (use `latec`, then `latehook #index`)".into()];
+    }
+    if !LATE_ATTACHED.load(Ordering::Acquire) {
+        return vec![format!(
+            "LateUpdate: detached entry={entry:#x}; repeat `latehook` for the same target to reinstall"
+        )];
+    }
+    let hits = LATE_HITS.load(Ordering::Relaxed);
+    let uptime = now_ms().saturating_sub(START_MS.load(Ordering::Relaxed));
+    let rate = if uptime == 0 { 0.0 } else { hits as f64 * 1000.0 / uptime as f64 };
+    let class = LATE_CLASS.load(Ordering::Relaxed);
+    vec![format!(
+        "LateUpdate: class {class:#x} {}, MethodInfo={:#x}, entry={entry:#x}, hits={hits} ({rate:.1}/s), last tid={:#x}",
+        crate::m3::class_full_name(class),
+        LATE_INFO.load(Ordering::Relaxed),
+        LATE_TID.load(Ordering::Relaxed)
+    )]
+}
+
 // `hookat` slot: one diagnostic hook at a time (a generic detour cannot tell
 // which target it belongs to, and per-hook thunks are not worth the asm yet).
 static HOOKAT_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -2375,6 +2553,37 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             out.push(format!("  ticks={} installed={}", TICKS.load(Ordering::Relaxed), INSTALLED.load(Ordering::Relaxed)));
             Some(out)
         }
+        "latec" => {
+            let found = crate::lateupdate::candidates(120_000);
+            let ga = crate::procs::own_module(crate::GAME_ASSEMBLY);
+            let mut out = vec![format!("LateUpdate candidates: {} (materialised classes only)", found.len())];
+            for candidate in found.iter().take(128) {
+                let index = candidate.index.map(|i| format!("#{i}")).unwrap_or_else(|| "-".into());
+                let rva = ga.map(|(base, _)| candidate.entry.saturating_sub(base)).unwrap_or(0);
+                out.push(format!(
+                    "  {index:>10} class={:#x} {}, entry={:#x} (GA+{rva:#x})",
+                    candidate.class,
+                    crate::m3::class_full_name(candidate.class),
+                    candidate.entry
+                ));
+            }
+            if found.len() > 128 {
+                out.push(format!("  … {} more", found.len() - 128));
+            }
+            Some(out)
+        }
+        "latehook" => {
+            let Some(selector) = crate::lateupdate::parse_selector(a1) else {
+                return Some(vec!["usage: latehook #<type-index> | <class-address>".into()]);
+            };
+            let result = log::guard("latehook", || install_late_update(selector))
+                .unwrap_or_else(|| Err("installer panicked (see PANIC line)".into()));
+            Some(vec![match result {
+                Ok(candidate) => format!("LateUpdate hook installed at {:#x}; use `late` for hits/tid", candidate.entry),
+                Err(error) => format!("latehook: {error}"),
+            }])
+        }
+        "late" => Some(late_update_status()),
         "hook" => {
             let ok = log::guard("hook::install", install_tick).unwrap_or(false);
             Some(vec![format!(
@@ -2394,6 +2603,11 @@ pub fn command(line: &str) -> Option<Vec<String>> {
                     n += 1;
                 }
             }
+            let installed: Vec<(usize, bool)> = g.iter().map(|h| (h.target, h.detached)).collect();
+            LATE_ATTACHED.store(
+                late_attachment_present(LATE_ENTRY.load(Ordering::Acquire), &installed),
+                Ordering::Release,
+            );
             Some(vec![format!("{n} hook(s) detached ({} still listed)", g.len())])
         }
         "hooks" => {
@@ -2692,6 +2906,36 @@ mod tests {
         assert!(branch_into_prologue(0x2000, 5, 0, 2, -1)); // backward to 0x2001
         assert!(!branch_into_prologue(0x2000, 5, 0, 2, 0x100)); // external target
         assert!(!branch_into_prologue(0x2000, 5, 0, 2, 3)); // original continuation
+    }
+
+    // Console command wiring is covered by the live integration check: running
+    // `command()` in a host test would pull the Win32-only tick/link symbols in.
+    #[test]
+    fn detached_history_does_not_mask_a_still_attached_late_update() {
+        let entry = 0x1000;
+        assert!(late_attachment_present(entry, &[(entry, true), (entry, false)]));
+        assert!(!late_attachment_present(entry, &[(entry, true)]));
+        assert!(!late_attachment_present(entry, &[(0x2000, false)]));
+    }
+
+    #[test]
+    fn late_update_lifecycle_distinguishes_attached_from_retained_trampoline() {
+        use LateInstallAction::{AlreadyAttached, Patch};
+        assert_eq!(late_install_action(0, false, 0x1000), Ok(Patch));
+        assert_eq!(late_install_action(0x1000, true, 0x1000), Ok(AlreadyAttached));
+        assert_eq!(late_install_action(0x1000, false, 0x1000), Ok(Patch));
+        assert!(late_install_action(0x1000, true, 0x2000).is_err());
+        assert!(late_install_action(0x1000, false, 0x2000).is_err());
+    }
+
+    #[test]
+    fn late_update_entry_is_limited_to_game_assembly() {
+        let module = (0x6fff_0000, 0x0f44_0000);
+        assert!(managed_entry_in_module(0x6fff_1000, Some(module)));
+        assert!(managed_entry_in_module(0x6fff_0000 + 0x0f44_0000 - 1, Some(module)));
+        assert!(!managed_entry_in_module(0x6fff_0000 + 0x0f44_0000, Some(module)));
+        assert!(!managed_entry_in_module(0x1000, Some(module)));
+        assert!(!managed_entry_in_module(0x6fff_1000, None));
     }
 
     #[test]
