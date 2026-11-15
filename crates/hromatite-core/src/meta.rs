@@ -781,7 +781,21 @@ pub fn class_by_name_string(ns: &str, name: &str) -> Option<Class> {
         &format!("'{}' string: {} occurrence(s)", name, ptrs.len()),
     );
     for sp in ptrs {
-        for slot in find_qword(sp as u64, 256) {
+        let holders = find_qword(sp as u64, 256);
+        log::log_tag(
+            "meta",
+            &format!(
+                "  str {sp:#x}: {} holder(s){}",
+                holders.len(),
+                holders
+                    .iter()
+                    .take(3)
+                    .map(|h| format!(" {h:#x}"))
+                    .collect::<Vec<_>>()
+                    .join("")
+            ),
+        );
+        for slot in holders {
             // `name` lives at class+0x10
             let c = slot.wrapping_sub(CLASS_NAME_OFF);
             if !class_like(c) {
