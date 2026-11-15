@@ -415,6 +415,34 @@ fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
     false
 }
 
+/// Atomic counterpart of `reap()` for the GC's own `GetThreadContext` call.
+/// Return the id only if Boehm's handle matches a record and the thread object
+/// is signalled. `WAIT_TIMEOUT` means alive, so a suspended thread is *never*
+/// unlinked. This closes the race that any periodic reap necessarily misses:
+/// the same dying thread may already sit inside `GC_suspend` before the next
+/// tick. The caller must still return a valid (synthetic) CONTEXT because the
+/// loop is already executing; the removal also keeps `GC_resume_all` safe.
+pub fn unlink_if_dead(handle: u64) -> Option<u32> {
+    if alive_by_handle(handle) != Some(false) {
+        return None;
+    }
+    let ga = procs::own_module(GAME_ASSEMBLY)?.0;
+    let base = ga.wrapping_add(CANDIDATE_RVAS[0] as usize);
+    for bucket in 0..BUCKETS {
+        let mut p = safe::read_usize(base + bucket * 8).unwrap_or(0);
+        let mut depth = 0;
+        while p != 0 && depth < 8 {
+            let id = safe::read_u32(p + OFF_ID).unwrap_or(0);
+            if id != 0 && safe::read_u64(p + OFF_HANDLE) == Some(handle) {
+                return unlink_at(base, bucket, p).then_some(id);
+            }
+            p = safe::read_usize(p + OFF_NEXT).unwrap_or(0);
+            depth += 1;
+        }
+    }
+    None
+}
+
 /// **The fix that races the collector.** Read the table and unlink any record
 /// whose own handle reports an exited thread (`GetExitCodeThread != 0x103`) —
 /// the game's threads die on a schedule of seconds and `GC_suspend_all` then

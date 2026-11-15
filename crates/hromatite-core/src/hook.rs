@@ -1590,6 +1590,47 @@ fn work(n: u64, now: u64, dt: u64) {
 
 // ---- detours --------------------------------------------------------------
 
+static GC_CONTEXT_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+/// Atomic race repair *inside* Boehm's own GetThreadContext call.
+pub unsafe extern "system" fn gc_context_detour(thread: *mut u8, context: *mut u8) -> i32 {
+    if let Some(id) = crate::gcthreads::unlink_if_dead(thread as u64) {
+        if crate::safe::write_bytes(context as usize, &[0u8; 0x4f0]) {
+            log::log_tag("gct", &format!("inline guard: stale record id={id:#x} unlinked inside GetThreadContext"));
+            return 1;
+        }
+        log::log_tag("gct", &format!("inline guard: id={id:#x} has no writable CONTEXT buffer"));
+    }
+    let original = GC_CONTEXT_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    let f: unsafe extern "system" fn(*mut u8, *mut u8) -> i32 = unsafe { core::mem::transmute(original) };
+    unsafe { f(thread, context) }
+}
+
+pub fn install_gc_context_guard() -> bool {
+    let target = match try_resolve("kernel32.dll", "GetThreadContext") {
+        Some(addr) => addr,
+        None => {
+            log::log_tag("gct", "GetThreadContext was not resolved; inline guard disabled");
+            return false;
+        }
+    };
+    match hook_inline(target, gc_context_detour as *const () as usize) {
+        Some(h) => {
+            GC_CONTEXT_ORIG.store(h.trampoline, Ordering::Release);
+            register(h);
+            log::log_tag("gct", "inline GetThreadContext guard installed");
+            true
+        }
+        None => {
+            log::log_tag("gct", "inline GetThreadContext guard installation failed");
+            false
+        }
+    }
+}
+
 /// Detour for `kernel32!QueryPerformanceCounter` / `ntdll!RtlQueryPerformanceCounter`.
 ///
 /// The original is called *first*: the game's timing must not change, and a
@@ -1949,7 +1990,8 @@ pub fn install_tick() -> bool {
                 {
                     log::log_tag("hook", &format!("HROMATITE_HOOK_AT: counting hook at {o:#x}"));
                 }
-                log::log_tag("hook", "waiting for the game to call us (no thread of our own)");
+                let gc_guard = install_gc_context_guard();
+                log::log_tag("hook", &format!("inline GC guard installed={gc_guard}; waiting for the game to call us (no thread of our own)"));
                 return true;
             }
             None => {

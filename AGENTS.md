@@ -1634,3 +1634,33 @@ il2cpp одними чтениями памяти (без единого выз�
   на той игре не нашёл магию (`0 rejected candidates`), поэтому парсер метаданных
   требует структурного fallback, полный typedump ещё не подтверждён.
 
+### 2026-11-15 — Повторный GC-фатал после tick-fix: защита перенесена внутрь GC_suspend
+
+- Коммиты: `3b2cf60` (structural metadata fallback, не подтверждён живым поиском),
+  затем этот (`fix(gc): close the stale-thread race inside GetThreadContext`).
+- **Доказанное место проигрыша гонки.** Второй прогон `411934`:
+  `SuspendThread loop failed: thread id= 0x3c0, handle=059C, errcode 0x5`.
+  `/proc/411934/mem`: запись ещё существовала в `GC_threads[195]`, tick завис
+  вместе со всеми потоками. Cadence 250 ms не гарантирует repair до сборки:
+  репер мог вызваться до сигнала thread object либо уже после входа GC, и новых
+  `reaped dead record` перед fatal уже не будет. «Быстрее опрос» сам по себе
+  проблему не решает.
+- Офлайн-дизассемблер GameAssembly: `GC_suspend` @ `0xc41a20`; retry loop по handle
+  @ `0xc41ab2`, вызов `GetThreadContext` @ `0xc41ad2`; нулевой возврат @ `0xc41ada`,
+  лимит `0xf4240` @ `0xc41b27`, abort int3 @ `0xc41b65`.
+- `gcthreads::unlink_if_dead(handle)` теперь вычёркивает только запись, у которой
+  `WaitForSingleObject(handle,0) == WAIT_OBJECT_0`. Другие случаи (`WAIT_TIMEOUT`,
+  чужой handle, ещё работающий поток) не затрагиваются — это сохраняет обязательное
+  условие безопасности гонки с `GC_unregister_my_thread`.
+- `hook::gc_context_detour` поставлен inline на `kernel32!GetThreadContext`:
+  если Boehm спросил уже завершённый handle, detour вычёркивает его прямо во время
+  текущего `GC_suspend`, отдаёт нулевой `CONTEXT` (0x4f0 B) и `1`. Тогда текущий
+  сборочный цикл идёт дальше, а `GC_resume_all` уже не споткнётся о мёртвый handle.
+  Обычные вызовы возвращаются в trampoline той же Win32 функции.
+- Проверенное на этом этапе: `cargo test -p hromatite-core --target
+  x86_64-unknown-linux-gnu` — 20/20, release build OK. Живой запуск с новым
+  детуром только начинается; нужна строка
+  `inline guard: stale record id=… unlinked inside GetThreadContext`
+  и завершение сборки после неё. Случай, когда detached process уже начал
+  spin-loop, не использовался как claim — заменён чистым перезапуском.
+
