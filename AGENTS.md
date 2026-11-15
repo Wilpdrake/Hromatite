@@ -1469,3 +1469,90 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
   `GC_unregister_my_thread` (~`0xc41850`) есть assert-ветка с `int3` — второй
   потенциальный источник «int3 в GameAssembly», если unregister попадёт в момент,
   когда глобальный флаг `0xda2b1c0` не выставлен.
+
+### 2026-11-15 — Режим «тик в потоке игры» + первые шаги M3 без ил2cpp-API (new: meta.rs)
+
+Коммиты: `d17f4de`, `d30a39d`…`3c3c0ea` (серия `feat(meta)`/`fix(meta)`), итог —
+`feat(meta): linear heap pass for a class-record by name (cscan)`.
+
+**1. Режим для интерактивной разведки — `HROMATITE_FRAME_HOOK=1`, `LIVE=0`.**
+Файл `~/.hromatite-mode`:
+```
+HROMATITE_FRAME_HOOK=1
+HROMATITE_LIVE=0
+HROMATITE_SEAL=0
+HROMATITE_LOG_AV=1
+```
+`DllMain` ставит тик на QPC и сразу возвращается, командный канал читает сам тик,
+своего потока нет. **Проверено вживую**: за прогон ~05:19–05:27 прошло больше
+двадцати команд (`types`, `tbl`, `ctab`, `ccls`, `cscan`, `q`, `find`, `entry`,
+`methods`, `fields`, `cam`), консоль **не умерла ни разу** — то есть «смерть
+консольного потока через 1–2 команды» относится к stub-thread режиму
+(`LIVE>0`), а не к тику. Это же закрывает пункт «режим B»: игра живёт, окна
+нет, тик отвечает.
+Цена: тик работает на потоке игры, тяжёлая команда видна в логе как
+`dt=5751ms` (скан ~5.7 с подвешивает кадр).
+
+**2. Новый модуль `crates/hromatite-core/src/meta.rs`** — разбор метаданных
+il2cpp одними чтениями памяти (без единого вызова API):
+- `class_like`/`class_like_in` — структурный тест `Il2CppClass`
+  (`name@+0x10` — идентификатор, `namespaze@+0x18` — NULL/читаемый указатель);
+- `fields_ptr`/`fields_of` — поиск `FieldInfo[]` в теле класса: кандидат
+  принимается только если у всех записей `parent@+0x10 == класс`
+  (`FieldInfo`: `name@0x00, type@0x08, parent@0x10, offset@0x18`);
+- `methods_ptr`/`methods_of`/`method_entry`/`mcall` — `MethodInfo**` с проверкой
+  `methodPointer` внутри GameAssembly;
+- `probe_module`, `class_tables`, `global_classes`, `find_class_global`,
+  `find_string`, `find_qword`, `class_by_name_string`, `find_class_by_scan`.
+- Консоль: `types`, `tfind`, `fields`, `methods`, `mcall`, `pos`, `cam2`,
+  `tbl`, `ctab`, `ccls`, `cscan` (все — в `help`).
+
+**3. Что выяснено про Unity 6 (по заголовкам `il2cpp-class-internals.h`
+6000.0.x + живой дамп):**
+- `Il2CppCodeGenModule` **не содержит** `typeInfoTable`: поля кончаются
+  `staticConstructorTypeIndices@+0x70, metadataRegistration@+0x78,
+  codeRegistaration@+0x80`. Живой дамп `entry+0x28` совпал с этим один в один
+  (`methodPointerCount 0x1dc5`, `adjustorThunkCount 0x34c`, `rgctxRangesCount 0xe3`,
+  `rgctxsCount 0x345`). Поэтому `types <asm>` даёт 0 классов — таблицы там нет.
+- `MethodInfo` в Unity 6: `methodPointer@0x00, virtualMethodPointer@0x08,
+  invoker_method@0x10, name@0x18` — имя переехало с `+0x10` на `+0x18`.
+- `Il2CppClass` (6000.0.x): `image@0x00, gc_desc@0x08, name@0x10,
+  namespaze@0x18, byval_arg@0x20, this_arg@0x30, …, fields@0x80,
+  events@0x88, properties@0x90, methods@0x98`.
+- `s_TypeInfoTable` (`GlobalMetadata.cpp:341`) — `IL2CPP_CALLOC(typesCount*8)`,
+  то есть разреженный массив указателей, а **не** плотный.
+- `Il2CppCodeRegistration.codeGenModules` найдена живьём: таблица 216 указателей
+  на `Il2CppCodeGenModule` в GA `.data` (в прогоне `0x6ffff8830970…`).
+
+**4. Живые факты (05:19–05:27):** `cscan UnityEngine Camera` за один проход
+(≈19 млн тестов `class_like_in`, ~5 с) находит **77 записей**, у которых
+`+0x10` — строка `Camera`, но **ни у одной** нет ни таблицы полей, ни таблицы
+методов по раскладке 6000.0.x. Первая из них (`0x6ffffc431820`) — запись
+движкового реестра Unity: `{parent, код, name, handle, "Core"}`, шаг 0x50,
+цепочка `Camera → Behaviour → Component`; не `Il2CppClass`.
+Вывод: у **этого** билда (6000.0.67f1) `Il2CppClass` отличается от
+6000.0.3f1 — раскладку надо снимать эмпирически (см. «дальше»).
+
+**5. Найденный риск:** `cam`/`api` (идентификация `il2cpp_*` вызовами чужих
+экспортов) **изнутри QPC-детура** — прогон 05:22 умер после `api` (в логе
+`[api] identify …`, куча `caught 0xc0000005` и тишина; процесс исчез без
+дампа). Для интерактивной разведки в frame-hook режиме — только чтения;
+вызовы il2cpp делать в stub-thread режиме (`LIVE>0`).
+
+**6. Мелочи, которые уже стоили времени (не повторять):**
+- `procs::regions()` — снапшот; при сканировании страницы успевают исчезнуть →
+  AV рвёт весь регион. Сканы идут чанками по 8192 слова, каждый чанк под
+  `veh::call_with` (после этого `cscan` перестал терять регионы).
+- `PAGE_GUARD` (0x100) в регионе = `0xC00000FD` при чтении; такие регионы
+  обязаны исключаться и в снапшоте, и в фильтре.
+- `VEH` ловит и stack overflow, и guard page: команда не умирает, но и не
+  выполняется — в логе это `command panicked`.
+- Кэш `class_tables()` не должен кэшировать пустой результат «навсегда»
+  (сейчас кэширует только непустой — иначе после рестарта игры ответ «0» врёт).
+
+**Осталось (M3):** снять реальную раскладку `Il2CppClass` этого билда:
+`cscan UnityEngine Camera` → взять первую запись → `q <addr> 48` → искать
+смещение, где лежит указатель на таблицу, элементы которой снова указывают на
+строки `Camera`/поля (`m_LocalPosition`, `orthographic`) — по ним и опознать
+`fields`/`methods`. Затем `pos` (Camera.main → transform → position) должен
+заработать без единого вызова il2cpp-API.
