@@ -320,7 +320,15 @@ fn lookup_class(ns: &str, name: &str) -> Option<crate::meta::Class> {
     if let Some(c) = crate::meta::find_class_global(ns, name) {
         return Some(c);
     }
-    // Last resort (Unity 6): locate the record through its name string.
+    // Last resort (Unity 6): a linear pass over the heap looking for a record
+    // whose `+0x10` is exactly this name.
+    if let Some((addr, cns)) = crate::meta::find_class_by_scan(ns, name).first() {
+        return Some(crate::meta::Class {
+            addr: *addr,
+            name: name.to_string(),
+            ns: cns.clone(),
+        });
+    }
     crate::meta::class_by_name_string(ns, name)
 }
 
@@ -1259,6 +1267,22 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 ),
                 None => (vec![format!("{}.{}: not found", a1, a2)], Action::None),
             }
+        }
+        // `cscan <ns> <name>` — linear heap pass for a class record by its name
+        // (the fallback that works when no table layout is available).
+        "cscan" => {
+            if a1.is_empty() || a2.is_empty() {
+                return (vec!["usage: cscan <ns> <name>".into()], Action::None);
+            }
+            let hits = crate::meta::find_class_by_scan(a1, a2);
+            let mut out = vec![format!("cscan {}.{}: {} hit(s)", a1, a2, hits.len())];
+            for (addr, cns) in hits.iter().take(8) {
+                out.push(format!(
+                    "  {addr:#x}  ns='{cns}'  {}",
+                    crate::meta::layout_of(*addr)
+                ));
+            }
+            (out, Action::None)
         }
         // `ctab` — find the runtime's global class arrays (Unity 6 keeps them
         // outside the codegen module) and report what was found.

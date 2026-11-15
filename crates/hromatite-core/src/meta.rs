@@ -781,6 +781,75 @@ pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
     out
 }
 
+/// Directory scan for a class record: `+0x10` must be the exact name string.
+///
+/// Measured on this build: a full heap pass performs ~19 M `class_like_in` tests
+/// and finds ~300 k class-shaped records, but they are **not** laid out as one
+/// contiguous table (runs never form), so a table-shaped detector cannot see
+/// them. A linear filter can, and it costs the same single pass.
+pub fn find_class_by_scan(ns: &str, name: &str) -> Vec<(usize, String)> {
+    let ranges = Ranges::new();
+    let mut out = Vec::new();
+    let mut words_total = 0usize;
+    for r in procs::regions(65536) {
+        let writable = matches!(r.protect & 0xff, 4 | 8 | 0x40 | 0x80) && r.protect & 0x100 == 0;
+        if !writable || r.size < 0x1000 {
+            continue;
+        }
+        let start = (r.base + 7) & !7usize;
+        let words = (r.base + r.size).saturating_sub(start) / 8;
+        if words < 16 {
+            continue;
+        }
+        words_total += words;
+        if words_total > 120_000_000 {
+            break;
+        }
+        let found = crate::veh::call_with(|| {
+            let mut hit: Vec<(usize, String)> = Vec::new();
+            for i in 0..words {
+                let v = match ranges.u64(start + i * 8) {
+                    Some(v) => v as usize,
+                    None => continue,
+                };
+                if v < 0x10000 || !class_like_in(&ranges, v) {
+                    continue;
+                }
+                let np = match ranges.u64(v + CLASS_NAME_OFF) {
+                    Some(p) => p as usize,
+                    None => continue,
+                };
+                if let Some(s) = ranges.cstr(np, 96) {
+                    if s == name {
+                        let nsv = ranges
+                            .u64(v + CLASS_NS_OFF)
+                            .map(|q| ranges.cstr(q as usize, 96))
+                            .flatten()
+                            .unwrap_or_default();
+                        hit.push((v, nsv));
+                    }
+                }
+            }
+            hit
+        });
+        if let Ok(mut h) = found {
+            out.append(&mut h);
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    log::log_tag(
+        "meta",
+        &format!("class scan for '{name}': {} candidate(s)", out.len()),
+    );
+    let want_ns = ns.to_string();
+    if !want_ns.is_empty() {
+        out.retain(|(_, cns)| cns.is_empty() || *cns == want_ns);
+    }
+    out
+}
+
 /// `Il2CppClass*` for `ns.name`, found through the class-name string.
 pub fn class_by_name_string(ns: &str, name: &str) -> Option<Class> {
     let ptrs = find_string(name.as_bytes(), 16);
