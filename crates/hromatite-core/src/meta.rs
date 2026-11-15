@@ -678,6 +678,133 @@ pub fn global_classes() -> Vec<Class> {
     c.clone()
 }
 
+// ---- class by name string --------------------------------------------------
+//
+// When no dense table turns up, the *string* is the way in: an `Il2CppClass`
+// holds `name` at `+0x10`, so the 8-byte word equal to the string's address sits
+// at `class+0x10` and the record starts 0x10 bytes earlier. That is exactly the
+// `find <string-addr>` trick, just packaged and verified (the candidate must
+// pass `class_like` *and* re-read as the requested namespace/name).
+
+fn scan_budget_bytes() -> usize {
+    std::env::var("HROMATITE_SCAN_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512)
+        * 1024
+        * 1024
+}
+
+/// All readable, non-guard regions, modules first (their `.data` is warm).
+fn scan_regions() -> Vec<(usize, usize, u32)> {
+    let mut v: Vec<(usize, usize, u32)> = procs::regions(65536)
+        .into_iter()
+        .filter(|r| readable_protect(r.protect) && r.protect & 0x100 == 0 && r.size >= 0x1000)
+        .map(|r| (r.base, r.size, 1u32))
+        .collect();
+    // mark module regions first (lower key = scanned earlier)
+    let mods: Vec<(usize, usize)> = [crate::GAME_ASSEMBLY, crate::UNITY_PLAYER]
+        .iter()
+        .filter_map(|m| procs::own_module(m))
+        .collect();
+    for e in v.iter_mut() {
+        if mods.iter().any(|(b, s)| e.0 < b + s && e.0 + e.1 > *b) {
+            e.2 = 0;
+        }
+    }
+    v.sort_by_key(|(base, _, prio)| (*prio, *base));
+    v
+}
+
+/// Addresses of `pat` (NUL-terminated in memory) in readable memory.
+pub fn find_string(pat: &[u8], max: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    if pat.is_empty() {
+        return out;
+    }
+    let budget = scan_budget_bytes();
+    let mut spent = 0usize;
+    for (base, size, _) in scan_regions() {
+        spent += size;
+        if spent > budget || out.len() >= max {
+            break;
+        }
+        if size < pat.len() + 1 {
+            continue;
+        }
+        let last = base + size - pat.len() - 1;
+        let mut a = base;
+        while a <= last && out.len() < max {
+            if unsafe { *(a as *const u8) } == pat[0] {
+                let hit = unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
+                    && unsafe { *((a + pat.len()) as *const u8) } == 0;
+                if hit {
+                    out.push(a);
+                }
+            }
+            a += 1;
+        }
+    }
+    out
+}
+
+/// Addresses of the 8-byte word `want`.
+pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let budget = scan_budget_bytes();
+    let mut spent = 0usize;
+    for (base, size, _) in scan_regions() {
+        spent += size;
+        if spent > budget || out.len() >= max {
+            break;
+        }
+        if size < 16 {
+            continue;
+        }
+        let mut a = (base + 7) & !7usize;
+        let end = base + size - 8;
+        while a <= end && out.len() < max {
+            if unsafe { *(a as *const u64) } == want {
+                out.push(a);
+            }
+            a += 8;
+        }
+    }
+    out
+}
+
+/// `Il2CppClass*` for `ns.name`, found through the class-name string.
+pub fn class_by_name_string(ns: &str, name: &str) -> Option<Class> {
+    let ptrs = find_string(name.as_bytes(), 16);
+    log::log_tag(
+        "meta",
+        &format!("'{}' string: {} occurrence(s)", name, ptrs.len()),
+    );
+    for sp in ptrs {
+        for slot in find_qword(sp as u64, 256) {
+            // `name` lives at class+0x10
+            let c = slot.wrapping_sub(CLASS_NAME_OFF);
+            if !class_like(c) {
+                continue;
+            }
+            let n = class_name(c)?;
+            let cns = class_namespace(c).unwrap_or_default();
+            if n == name && (ns.is_empty() || cns == ns) {
+                log::log_tag(
+                    "meta",
+                    &format!("class {cns}.{n} = {c:#x} (via string {sp:#x}, slot {slot:#x})"),
+                );
+                return Some(Class {
+                    addr: c,
+                    name: n,
+                    ns: cns,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Structural class lookup that ignores images (used when the per-image walk is
 /// unavailable — Unity 6 keeps no class table in the codegen module).
 pub fn find_class_global(ns: &str, name: &str) -> Option<Class> {

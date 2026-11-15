@@ -317,7 +317,11 @@ fn lookup_class(ns: &str, name: &str) -> Option<crate::meta::Class> {
             return Some(c);
         }
     }
-    crate::meta::find_class_global(ns, name)
+    if let Some(c) = crate::meta::find_class_global(ns, name) {
+        return Some(c);
+    }
+    // Last resort (Unity 6): locate the record through its name string.
+    crate::meta::class_by_name_string(ns, name)
 }
 
 /// Vector3 out of three little-endian floats.
@@ -1237,6 +1241,24 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let mut out = vec![format!("tbl {m:#x} .. +{max:#x}")];
             out.extend(crate::meta::probe_module(m, max));
             (out, Action::None)
+        }
+        // `ccls <ns> <name>` — class lookup through the *name string* in memory
+        // (works when no class table can be found at all).
+        "ccls" => {
+            if a1.is_empty() || a2.is_empty() {
+                return (vec!["usage: ccls <ns> <name>".into()], Action::None);
+            }
+            match crate::meta::class_by_name_string(a1, a2) {
+                Some(c) => (
+                    vec![format!(
+                        "{}.{} = {:#x}  {}",
+                        a1, a2, c.addr,
+                        crate::meta::layout_of(c.addr)
+                    )],
+                    Action::None,
+                ),
+                None => (vec![format!("{}.{}: not found", a1, a2)], Action::None),
+            }
         }
         // `ctab` — find the runtime's global class arrays (Unity 6 keeps them
         // outside the codegen module) and report what was found.
