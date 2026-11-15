@@ -1,0 +1,28 @@
+[package]
+name = "hromatite-console"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Host-side interactive TUI for the Hromatite file console"
+
+[lib]
+name = "hromatite_console"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hromatite-console"
+path = "src/main.rs"
+
+# Independent host workspace: the parent cross-compiles for windows-gnu.
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+
+[profile.release]
+opt-level = 2
+strip = true
