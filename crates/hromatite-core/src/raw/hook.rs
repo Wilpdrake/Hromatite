@@ -2107,6 +2107,11 @@ static LATE_INFO: AtomicUsize = AtomicUsize::new(0);
 static LATE_HITS: AtomicU64 = AtomicU64::new(0);
 static LATE_TID: AtomicU64 = AtomicU64::new(0);
 
+fn reset_late_observation() {
+    LATE_HITS.store(0, Ordering::Relaxed);
+    LATE_TID.store(0, Ordering::Relaxed);
+}
+
 fn managed_entry_in_module(entry: usize, module: Option<(usize, usize)>) -> bool {
     let Some((base, size)) = module else {
         return false;
@@ -2130,8 +2135,20 @@ fn late_install_action(last_entry: usize, attached: bool, candidate: usize) -> R
     Err("another LateUpdate target is configured; restart before changing it".into())
 }
 
+fn tick_then_original<T, E>(
+    tick_fn: impl FnOnce() -> Result<(), E>,
+    original: impl FnOnce() -> T,
+) -> T {
+    // Instrumentation is explicitly best-effort; the managed body is mandatory.
+    let _ = tick_fn();
+    original()
+}
+
 /// IL2CPP instance-method ABI: `this` in rcx and hidden `MethodInfo*` in rdx.
-/// The real LateUpdate runs first; our throttled work happens after it.
+/// Our throttled work runs before this method's original body. This gives
+/// priority over the selected script only: Unity still owns ordering between
+/// different MonoBehaviours, so a LateUpdate hook cannot mean "before every
+/// script in the game".
 ///
 /// # Safety
 /// Both arguments are forwarded unchanged to the trampoline for the exact
@@ -2148,31 +2165,58 @@ pub unsafe extern "system" fn late_update_detour(
     // two-argument IL2CPP method before patching the target.
     let f: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) =
         unsafe { core::mem::transmute(original) };
-    // SAFETY: the original arguments are opaque to us and are not modified.
-    unsafe { f(this, method) };
-    let hit = LATE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
-    let tid = crate::gcthreads::own_tid() as u64;
-    LATE_TID.store(tid, Ordering::Relaxed);
-    if hit == 1 {
-        log::log_tag(
-            "late",
-            &format!("first LateUpdate hit: tid={tid:#x}, this={this:?}, MethodInfo={method:?}"),
-        );
-    }
-    tick();
+    tick_then_original(
+        || {
+            // A payload fault must not skip the game's method. The guard is
+            // inside the pre-original half, so the original call remains the
+            // next operation even when instrumentation fails.
+            log::guard("late_update_detour::pre", || {
+                let hit = LATE_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+                let tid = crate::gcthreads::own_tid() as u64;
+                LATE_TID.store(tid, Ordering::Relaxed);
+                if hit == 1 {
+                    log::log_tag(
+                        "late",
+                        &format!("first pre-original LateUpdate hit: tid={tid:#x}, this={this:?}, MethodInfo={method:?}"),
+                    );
+                }
+                tick();
+            })
+            .map(|_| ())
+            .ok_or(())
+        },
+        // SAFETY: the original arguments are opaque to us and are not modified.
+        || unsafe { f(this, method) },
+    );
 }
 
 /// Make a lazily-created class available to the startup installer. This calls
 /// IL2CPP and is therefore only for the injection stub thread, never a QPC hook.
 pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
     use crate::lateupdate::Selector;
-    let index = match selector {
-        Selector::Address(_) => return crate::lateupdate::resolve(selector).is_some(),
-        Selector::Index(index) => index,
-    };
     if crate::lateupdate::resolve(selector).is_some() {
         return true;
     }
+    let index = match selector {
+        Selector::Address(_) => return false,
+        Selector::Index(index) => index,
+        Selector::Auto => {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                log::log_tag(
+                    "late",
+                    &format!(
+                        "auto target is exactly {}; no arbitrary candidate or QPC fallback",
+                        crate::lateupdate::AUTO_CLASS
+                    ),
+                );
+            }
+            if crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256 {
+                return false;
+            }
+            crate::lateupdate::AUTO_TYPE_INDEX
+        }
+    };
     let Some((ga, gasize)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
         return false;
     };
@@ -2192,6 +2236,8 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
     let class = unsafe { crate::veh::call2(f, image, index) }.unwrap_or(0);
     class >= 0x10000
         && crate::safe::readable_at(class)
+        // In auto mode this re-checks the fully-qualified name. A changed type
+        // index must never turn into a hook on an unrelated method.
         && crate::lateupdate::resolve(selector).is_some()
 }
 
@@ -2200,8 +2246,13 @@ pub fn install_late_update(selector: crate::lateupdate::Selector) -> Result<crat
     if env_flag("HROMATITE_SEAL") || env_flag("HROMATITE_L2B") {
         return Err("LateUpdate is an in-image detour; full sealing is not supported for it yet".into());
     }
-    let candidate = crate::lateupdate::resolve(selector)
-        .ok_or_else(|| "class has no materialised own method named `LateUpdate`".to_string())?;
+    let candidate = crate::lateupdate::resolve(selector).ok_or_else(|| match selector {
+        crate::lateupdate::Selector::Auto => format!(
+            "auto target {} is absent/ambiguous or has no valid instance void LateUpdate()",
+            crate::lateupdate::AUTO_CLASS
+        ),
+        _ => "class has no materialised own method named `LateUpdate`".to_string(),
+    })?;
     let ga = crate::procs::own_module(crate::GAME_ASSEMBLY);
     if !managed_entry_in_module(candidate.entry, ga) {
         return Err(format!("managed entry {:#x} is outside GameAssembly.dll", candidate.entry));
@@ -2222,7 +2273,7 @@ pub fn install_late_update(selector: crate::lateupdate::Selector) -> Result<crat
     let live = std::env::var("HROMATITE_LIVE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     LIVE_MODE.store(live, Ordering::Relaxed);
     let _ = START_MS.compare_exchange(0, now_ms(), Ordering::AcqRel, Ordering::Relaxed);
-    LATE_HITS.store(0, Ordering::Relaxed);
+    reset_late_observation();
     LATE_CLASS.store(candidate.class, Ordering::Relaxed);
     LATE_INFO.store(candidate.info, Ordering::Relaxed);
     LATE_ORIG.store(prep.trampoline, Ordering::Release);
@@ -2268,7 +2319,7 @@ pub fn late_update_status() -> Vec<String> {
     let rate = if uptime == 0 { 0.0 } else { hits as f64 * 1000.0 / uptime as f64 };
     let class = LATE_CLASS.load(Ordering::Relaxed);
     vec![format!(
-        "LateUpdate: class {class:#x} {}, MethodInfo={:#x}, entry={entry:#x}, hits={hits} ({rate:.1}/s), last tid={:#x}",
+        "LateUpdate: pre-original (selected method only; Unity script order not guaranteed), class {class:#x} {}, MethodInfo={:#x}, entry={entry:#x}, hits={hits} ({rate:.1}/s), last tid={:#x}",
         crate::m3::class_full_name(class),
         LATE_INFO.load(Ordering::Relaxed),
         LATE_TID.load(Ordering::Relaxed)
@@ -2710,7 +2761,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
         }
         "latehook" => {
             let Some(selector) = crate::lateupdate::parse_selector(a1) else {
-                return Some(vec!["usage: latehook #<type-index> | <class-address>".into()]);
+                return Some(vec!["usage: latehook auto | #<type-index> | <class-address>".into()]);
             };
             let result = log::guard("latehook", || install_late_update(selector))
                 .unwrap_or_else(|| Err("installer panicked (see PANIC line)".into()));
@@ -3062,6 +3113,49 @@ mod tests {
         assert_eq!(late_install_action(0x1000, false, 0x1000), Ok(Patch));
         assert!(late_install_action(0x1000, true, 0x2000).is_err());
         assert!(late_install_action(0x1000, false, 0x2000).is_err());
+    }
+
+    #[test]
+    fn late_update_rearm_clears_hits_and_thread_identity() {
+        LATE_HITS.store(7, Ordering::Relaxed);
+        LATE_TID.store(0x1234, Ordering::Relaxed);
+        reset_late_observation();
+        assert_eq!(LATE_HITS.load(Ordering::Relaxed), 0);
+        assert_eq!(LATE_TID.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn late_update_tick_runs_before_the_original_method() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let returned = tick_then_original(
+            || {
+                events.borrow_mut().push("tick");
+                Ok::<_, ()>(())
+            },
+            || {
+                events.borrow_mut().push("original");
+                42
+            },
+        );
+        assert_eq!(returned, 42);
+        assert_eq!(events.into_inner(), ["tick", "original"]);
+    }
+
+    #[test]
+    fn late_update_original_survives_a_guarded_tick_failure() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let returned = tick_then_original(
+            || {
+                events.borrow_mut().push("guard failed");
+                Err::<(), _>("instrumentation fault")
+            },
+            || {
+                events.borrow_mut().push("original");
+                42
+            },
+        );
+        assert_eq!(returned, 42);
+        assert_eq!(events.into_inner(), ["guard failed", "original"]);
     }
 
     #[test]
