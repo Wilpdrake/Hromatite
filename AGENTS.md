@@ -2120,3 +2120,23 @@ il2cpp одними чтениями памяти (без единого выз�
   `inline GetThreadContext guard installed`; при следующей утечке —
   `inline guard: stale record id=… unlinked inside GetThreadContext`, после чего
   в `VRChat.gc.log` завершается очередной `GC #N` без `SuspendThread loop failed`.
+
+### 2026-11-15 — GC-guard подключён к stub-console; собран, живая проверка впереди
+
+- Коммит: этот (`fix(gc): arm GetThreadContext guard in stub console`).
+- `crates/hromatite-dll/src/lib.rs`: при `FRAME_HOOK=0`, `LIVE>0` и выключенном
+  seal `install_gc_context_guard()` теперь вызывается **до** `il2cpp::run_once`,
+  независимо от `install_tick()`. При seal in-image guard не устанавливается,
+  frame-hook по-прежнему использует собственную установку — двойного hook нет.
+- TDD: новый тест `live_stub_console_requires_the_synchronous_gc_guard` сначала
+  упал с `E0432` (функции/подключения не было), затем прошёл; второй тест
+  закрепил отказ для frame-hook, `LIVE=0` и seal. Host tests DLL **2/2**, core
+  **39/39**; release workspace build OK; scoped Clippy DLL `-D warnings` OK.
+- Общий `cargo clippy --workspace --all-targets --release -- -D warnings`
+  останавливается на пяти pre-existing ошибках в `raw/console.rs` (`lookup_class`,
+  `chunks_exact`, недостающий SAFETY comment, два style lint) — не относится к
+  этому изменению и не исправлялось в нём.
+- **Ещё не доказано вживую**: следующий запуск должен показать
+  `inline GetThreadContext guard installed` и `stub-thread GC guard installed=true`;
+  непосредственный критерий исправления — строка `inline guard: stale record…`
+  ДО `SuspendThread loop failed`, затем успешное завершение очередной сборки.

@@ -132,6 +132,12 @@ fn console_loop(secs: u32) -> bool {
     }
 }
 
+/// The stub console owns no tick, so it must install the GC guard itself. Do
+/// not leave an in-image detour behind when the injector is going to seal us.
+fn should_install_console_gc_guard(frame_hook: bool, live: u32, sealing: bool) -> bool {
+    !frame_hook && live > 0 && !sealing
+}
+
 fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
     // The injector's stub passes `r8 = &{base, size}`: the payload cannot read its
     // own PE header (erased) and `VirtualQuery` reports the section split, so L2b
@@ -172,6 +178,15 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
     let frame_hook = std::env::var("HROMATITE_FRAME_HOOK")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
+    let live: u32 = std::env::var("HROMATITE_LIVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let sealing = ["HROMATITE_SEAL", "HROMATITE_L2B"].iter().any(|name| {
+        std::env::var(name)
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    });
 
     let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
     if frame_hook {
@@ -193,16 +208,20 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
         log::log_tag("dll", "recon done, returning from DllMain");
         return;
     }
+    // A periodic reaper cannot interrupt a collection that already entered the
+    // GetThreadContext retry loop. Arm the inline guard before the recon too:
+    // this path used to rely on install_tick(), which is frame-hook-only.
+    if should_install_console_gc_guard(frame_hook, live, sealing) {
+        let ok = log::guard("install_gc_context_guard", hook::install_gc_context_guard)
+            .unwrap_or(false);
+        log::log_tag("dll", &format!("stub-thread GC guard installed={ok}"));
+    }
     if ready {
         // The recon walks unknown structures; a panic (index/Option arithmetic)
         // is expected there sooner or later and must stay contained.
         let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
     }
     // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
-    let live: u32 = std::env::var("HROMATITE_LIVE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
     if live > 0 {
         let _ = log::guard("console_loop", || console_loop(live));
     }
@@ -229,4 +248,21 @@ pub extern "system" fn DllMain(
         }
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_install_console_gc_guard;
+
+    #[test]
+    fn live_stub_console_requires_the_synchronous_gc_guard() {
+        assert!(should_install_console_gc_guard(false, 7200, false));
+    }
+
+    #[test]
+    fn tick_owned_and_sealed_modes_do_not_install_a_second_unsafe_guard() {
+        assert!(!should_install_console_gc_guard(true, 7200, false));
+        assert!(!should_install_console_gc_guard(false, 0, false));
+        assert!(!should_install_console_gc_guard(false, 7200, true));
+    }
 }
