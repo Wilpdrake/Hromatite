@@ -609,7 +609,7 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         }
         match crate::veh::call_with(|| scan_region(start, words, &ranges)) {
             Ok((found, best)) => {
-                if best >= 64 {
+                if best >= 4 {
                     log::log_tag(
                         "meta",
                         &format!(
