@@ -805,9 +805,15 @@ pub fn find_class_by_scan(ns: &str, name: &str) -> Vec<(usize, String)> {
         if words_total > 120_000_000 {
             break;
         }
-        let found = crate::veh::call_with(|| {
+        // chunks keep one stale page from costing a whole region: `procs::regions`
+        // is a snapshot and the game keeps mapping/unmapping while we scan
+        const CHUNK: usize = 8192;
+        let mut ci = 0usize;
+        while ci < words {
+            let n = CHUNK.min(words - ci);
+            let found = crate::veh::call_with(|| {
             let mut hit: Vec<(usize, String)> = Vec::new();
-            for i in 0..words {
+            for i in ci..ci + n {
                 let v = match ranges.u64(start + i * 8) {
                     Some(v) => v as usize,
                     None => continue,
@@ -831,9 +837,14 @@ pub fn find_class_by_scan(ns: &str, name: &str) -> Vec<(usize, String)> {
                 }
             }
             hit
-        });
-        if let Ok(mut h) = found {
-            out.append(&mut h);
+            });
+            if let Ok(mut h) = found {
+                out.append(&mut h);
+            }
+            ci += n;
+            if out.len() >= 64 {
+                break;
+            }
         }
         if out.len() >= 64 {
             break;
