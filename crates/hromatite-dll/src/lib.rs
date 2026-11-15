@@ -215,6 +215,14 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
         let ok = log::guard("install_gc_context_guard", hook::install_gc_context_guard)
             .unwrap_or(false);
         log::log_tag("dll", &format!("stub-thread GC guard installed={ok}"));
+        let trace = std::env::var("HROMATITE_GCT_TRACE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        if trace {
+            let ok = log::guard("install_gc_worker_trace", hook::install_gc_worker_trace)
+                .unwrap_or(false);
+            log::log_tag("dll", &format!("stub-thread GC worker trace installed={ok}"));
+        }
     }
     if ready {
         // The recon walks unknown structures; a panic (index/Option arithmetic)

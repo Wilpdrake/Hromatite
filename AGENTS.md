@@ -2140,3 +2140,32 @@ il2cpp одними чтениями памяти (без единого выз�
   `inline GetThreadContext guard installed` и `stub-thread GC guard installed=true`;
   непосредственный критерий исправления — строка `inline guard: stale record…`
   ДО `SuspendThread loop failed`, затем успешное завершение очередной сборки.
+
+### 2026-11-15 — Анатомия утечки: `tid → fn`, unregister trace и кандидат `0xbd1ca0`
+
+- Коммит: этот (`feat(gc): trace worker bodies and unregister attempts`).
+- Независимый статический разбор GameAssembly перепроверен по узким objdump-срезам
+  (`~/.hermes/cache/scratch/verify_gc_paths.py`). Важное исправление прежних записей:
+  **`0xc41850` — GC_register_my_thread**, а **`0xc41920` — unregister**. Общий
+  dispatcher `0xbf5ce0` берёт `fn=[inner+8]`, `arg=[inner+0x10]` и вызывает
+  `call rbp` в `0xbf5d8b`; unregister там отсутствует, он вызывается только из
+  detach-пути конкретного тела.
+- Найдены три прямых top-level тела: `0xbfc290` (`GC Finalizer`), `0xbd1ca0`,
+  `0xbe81a0`. Лучший статический кандидат — **`0xbd1ca0`**: успешная регистрация
+  в `0xbd1ce2`, cleanup-флаг ставится только в `0xbd1d10`; alternate/unwind-путь
+  `0xbd1d45 → cmp flag,0 → je 0xbd1d70` при нулевом флаге обходит unregister
+  (`0xbd1d68 → 0xbd09e0 → 0xc41920`) и продолжает обычный cleanup. У функции есть
+  `.pdata` с `EHANDLER|UHANDLER`. Это правдоподобное объяснение `exitcode=0`, но
+  до живого `tid → fn` остаётся ГИПОТЕЗОЙ, а не доказанной причиной.
+- В plaintext stub/live режиме флаг `HROMATITE_GCT_TRACE=1` подключает:
+  (1) `GameAssembly+0xbf5ce0` — сохраняет `tid → (fn,arg)` и печатает
+  `worker start tid=… body=…`; (2) `GameAssembly+0xc41920` — печатает
+  `unregister tid=… body=…`. RVA-gate по текущему SHA `648f61b1…`; full seal
+  запрещён. Reaper теперь добавляет `body=…` в `reaped dead record`; карта чистых
+  выходов периодически освобождается, мёртвые tid с живой GC-записью сохраняются.
+- TDD: registry-тест сначала упал с `E0432`, затем прошёл; core **40/40**, DLL
+  **2/2**, release workspace build OK, scoped Clippy DLL `-D warnings` OK.
+- Живой критерий: следующая утечка должна дать тройку строк
+  `worker start … body=<fn>` / наличие либо ОТСУТСТВИЕ `unregister tid=…` /
+  `reaped dead record … body=<тот же fn>`. Только это отделит доказанный пропуск
+  unregister от сбоя внутри самого unregister.

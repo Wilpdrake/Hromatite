@@ -1779,6 +1779,132 @@ pub fn install_gc_context_guard() -> bool {
     }
 }
 
+// ---- worker-body provenance (why did a GC record leak?) -------------------
+
+static GC_DISPATCH_ORIG: AtomicUsize = AtomicUsize::new(0);
+static GC_UNREGISTER_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+pub const WORKER_DISPATCH_RVA: u32 = 0xbf5ce0;
+pub const GC_UNREGISTER_RVA: u32 = 0xc41920;
+
+/// Record the real worker body before the shared OS trampoline can free its
+/// argument block. `RCX=inner`, with `{thread,fn,arg}` at offsets 0/8/16.
+///
+/// # Safety
+/// The generated detour preserves the dispatcher ABI. `inner` is forwarded from
+/// il2cpp and is read through the checked OS-backed reader; the trampoline must
+/// name the same function before it is published.
+pub unsafe extern "system" fn gc_worker_detour(inner: *mut u8) -> usize {
+    let tid = crate::gcthreads::own_tid();
+    if let Some([entry, arg]) = crate::safe::read_words::<2>((inner as usize).wrapping_add(8)) {
+        crate::gcthreads::note_worker_body(tid, entry, arg);
+        log::log_tag(
+            "gct",
+            &format!("worker start tid={tid:#x} body={}", crate::gcthreads::worker_body_label(tid)),
+        );
+    }
+    let original = GC_DISPATCH_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    // SAFETY: original is the trampoline for the one-argument worker dispatcher;
+    // forwarding preserves RAX even though il2cpp ignores it on this path.
+    let f: unsafe extern "system" fn(*mut u8) -> usize = unsafe { core::mem::transmute(original) };
+    // SAFETY: inner is the original, unmodified dispatcher argument.
+    unsafe { f(inner) }
+}
+
+/// Mark an actual unregister attempt for the same tid. The original returns
+/// zero in EAX on this build; usize is ABI-compatible and preserves it.
+///
+/// # Safety
+/// No arguments are invented and the original trampoline is called only after
+/// it has been published by the installer.
+pub unsafe extern "system" fn gc_unregister_detour() -> usize {
+    let tid = crate::gcthreads::own_tid();
+    log::log_tag(
+        "gct",
+        &format!("unregister tid={tid:#x} body={}", crate::gcthreads::worker_body_label(tid)),
+    );
+    let original = GC_UNREGISTER_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    // SAFETY: original is the trampoline for the no-argument, EAX-returning
+    // unregister function at GC_UNREGISTER_RVA.
+    let f: unsafe extern "system" fn() -> usize = unsafe { core::mem::transmute(original) };
+    // SAFETY: the no-argument trampoline supplies the original execution context.
+    unsafe { f() }
+}
+
+fn install_gc_trace_at(
+    ga: usize,
+    rva: u32,
+    original: &AtomicUsize,
+    detour: usize,
+    label: &str,
+) -> bool {
+    if original.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    let target = ga.wrapping_add(rva as usize);
+    let Some(prep) = prepare(target) else {
+        log::log_tag("gct", &format!("worker trace: prologue rejected at {label} ({target:#x})"));
+        return false;
+    };
+    original.store(prep.trampoline, Ordering::Release);
+    match patch(&prep, detour) {
+        Some(h) => {
+            register(h);
+            log::log_tag("gct", &format!("worker trace: {label} hooked at {target:#x}"));
+            true
+        }
+        None => {
+            original.store(0, Ordering::Release);
+            log::log_tag("gct", &format!("worker trace: patch failed at {label} ({target:#x})"));
+            false
+        }
+    }
+}
+
+/// Trace only in plaintext stub/live mode: these detours execute from the image
+/// and must not survive into a later full seal.
+pub fn install_gc_worker_trace() -> bool {
+    if seal_active() {
+        log::log_tag("gct", "worker trace disabled under full sealing");
+        return false;
+    }
+    if crate::symbols::GAMEASSEMBLY_SHA256
+        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
+    {
+        log::log_tag("gct", "worker trace disabled: RVA map belongs to another GameAssembly build");
+        return false;
+    }
+    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+        log::log_tag("gct", "worker trace disabled: GameAssembly is not loaded");
+        return false;
+    };
+    let dispatch = install_gc_trace_at(
+        ga,
+        WORKER_DISPATCH_RVA,
+        &GC_DISPATCH_ORIG,
+        gc_worker_detour as *const () as usize,
+        "worker dispatcher",
+    );
+    let unregister = install_gc_trace_at(
+        ga,
+        GC_UNREGISTER_RVA,
+        &GC_UNREGISTER_ORIG,
+        gc_unregister_detour as *const () as usize,
+        "GC unregister",
+    );
+    log::log_tag(
+        "gct",
+        &format!("worker trace installed: dispatcher={dispatch}, unregister={unregister}"),
+    );
+    dispatch && unregister
+}
+
 /// Detour for `kernel32!QueryPerformanceCounter` / `ntdll!RtlQueryPerformanceCounter`.
 ///
 /// The original is called *first*: the game's timing must not change, and a

@@ -453,6 +453,15 @@ pub fn reap() -> Vec<String> {
                     };
                     g.get_or_insert_with(std::collections::HashMap::new).get(&id).copied()
                 };
+                let body = worker_body_label(id);
+                let start = start
+                    .map(|a| format!("{a:#x} {}", module_of(a)))
+                    .unwrap_or_default();
+                let detail = if body.is_empty() {
+                    start
+                } else {
+                    format!("{start} body={body}")
+                };
                 let ok = unlink_at(base, bucket, p);
                 out.push(format!(
                     "reaped dead record id={:#x} handle={:#x} bucket={} exitcode={} start={} -> {ok}",
@@ -460,7 +469,7 @@ pub fn reap() -> Vec<String> {
                     handle,
                     bucket,
                     exit_code.map_or_else(|| "?".into(), |code| format!("{code:#x}")),
-                    start.map(|a| format!("{a:#x} {}", module_of(a))).unwrap_or_default(),
+                    detail,
                 ));
             }
             p = next;
@@ -485,6 +494,48 @@ static LAST_TIDS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(Non
 /// useless without knowing which engine entry point it was.
 static STARTS: std::sync::Mutex<Option<std::collections::HashMap<u32, usize>>> =
     std::sync::Mutex::new(None);
+
+/// Concrete worker body from the shared il2cpp dispatcher. The OS start address
+/// is always the same trampoline; `(entry, arg)` is what identifies the job.
+static WORKER_BODIES: std::sync::Mutex<
+    Option<std::collections::HashMap<u32, (usize, usize)>>,
+> = std::sync::Mutex::new(None);
+
+pub fn note_worker_body(tid: u32, entry: usize, arg: usize) {
+    let mut g = match WORKER_BODIES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .insert(tid, (entry, arg));
+}
+
+pub fn worker_body(tid: u32) -> Option<(usize, usize)> {
+    let mut g = match WORKER_BODIES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.as_mut()?.get(&tid).copied()
+}
+
+pub fn worker_body_label(tid: u32) -> String {
+    worker_body(tid)
+        .map(|(entry, arg)| format!("{entry:#x} {} arg={arg:#x}", module_of(entry)))
+        .unwrap_or_default()
+}
+
+/// Forget clean exits but preserve dead tids whose stale GC record still needs
+/// a diagnosis. Live threads are retained even before registration completes.
+pub fn prune_worker_bodies(live_tids: &[u32], gc_registered: &[u32]) {
+    let mut g = match WORKER_BODIES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(bodies) = g.as_mut() {
+        bodies.retain(|tid, _| live_tids.contains(tid) || gc_registered.contains(tid));
+    }
+}
+
 static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LAST_SIG: std::sync::Mutex<(usize, usize, usize)> = std::sync::Mutex::new((0, 0, 0));
@@ -503,6 +554,11 @@ pub fn watch() -> Vec<String> {
         g.replace(tids.clone())
     };
     let mut table = snapshot(None);
+    let registered: Vec<u32> = table
+        .as_ref()
+        .map(|t| t.entries.iter().map(|e| e.id).collect())
+        .unwrap_or_default();
+    prune_worker_bodies(&tids, &registered);
     // First scan: name every thread that already exists. A thread we never saw
     // start is otherwise anonymous when it dies thirty seconds later.
     if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -670,4 +726,20 @@ pub fn probe(forced_rva: Option<u32>) -> Vec<String> {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{note_worker_body, prune_worker_bodies, worker_body};
+
+    #[test]
+    fn worker_registry_resolves_a_reaped_tid_to_its_real_body() {
+        let tid = 0xf00d_0042;
+        note_worker_body(tid, 0xbd1ca0, 0x1234);
+        assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
+        prune_worker_bodies(&[], &[tid]);
+        assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
+        prune_worker_bodies(&[], &[]);
+        assert_eq!(worker_body(tid), None);
+    }
 }
