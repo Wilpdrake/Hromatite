@@ -430,16 +430,14 @@ pub fn reap() -> Vec<String> {
             let id = safe::read_u32(p + OFF_ID).unwrap_or(0);
             let handle = safe::read_u64(p + OFF_HANDLE).unwrap_or(0);
             if id != 0 && alive_by_handle(handle) == Some(false) {
-                // Second opinion before touching the table: unlinking a thread
-                // that is merely suspended (or whose handle got recycled) would
-                // drop its stack from the mark phase and free live objects.
-                if live_tids().contains(&id) {
-                    out.push(format!(
-                        "record id={:#x} looks dead to its handle but the thread is alive — kept",
-                        id
-                    ));
-                    continue;
-                }
+                // `WaitForSingleObject(handle, 0) == WAIT_OBJECT_0` is the only
+                // voice here on purpose. It is authoritative: a thread object is
+                // signalled only after the thread has completely finished, so a
+                // merely suspended thread, or one still inside
+                // `GC_unregister_my_thread`, can never be reported dead.
+                // The old second opinion (`live_tids()` = `CreateToolhelp32Snapshot`)
+                // was dropped: under wine that call can block for minutes (§12.1),
+                // and it runs on the stub thread — the one place a stall is fatal.
                 // What the thread "said" as it died: a plain `ret` gives 0, a
                 // `TerminateThread(code)` gives its code, and an uncaught
                 // exception usually leaves the OS code. This is the only way to
@@ -457,11 +455,16 @@ pub fn reap() -> Vec<String> {
                 let start = start
                     .map(|a| format!("{a:#x} {}", module_of(a)))
                     .unwrap_or_default();
-                let detail = if body.is_empty() {
+                let mut detail = if body.is_empty() {
                     start
                 } else {
                     format!("{start} body={body} unregister_called={}", worker_unregister_called(id))
                 };
+                // `exit_via=ExitThread(0x0)` closes the case: the thread never
+                // returned from its body, so no cleanup call could have run.
+                if let Some(via) = worker_exit_via(id) {
+                    detail.push_str(&format!(" exit_via={via}"));
+                }
                 let ok = unlink_at(base, bucket, p);
                 out.push(format!(
                     "reaped dead record id={:#x} handle={:#x} bucket={} exitcode={} start={} -> {ok}",
@@ -503,6 +506,13 @@ static WORKER_BODIES: std::sync::Mutex<
 
 static WORKER_UNREGISTERED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
+/// tid → how the thread left (`ExitThread(0x0)`, `_endthreadex(0x0)`). A thread
+/// that terminates through one of these never returns from its body, so the
+/// body's own `GC_unregister_my_thread` call is skipped — that is exactly the
+/// case we need to name when a record leaks.
+static WORKER_EXITS: std::sync::Mutex<
+    Option<std::collections::HashMap<u32, String>>,
+> = std::sync::Mutex::new(None);
 static WORKER_EVENTS: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
@@ -554,6 +564,44 @@ pub fn note_unregister(tid: u32) {
     push_worker_event(format!("unregister tid={tid:#x} body={body}"));
 }
 
+/// The real removal of a record (`FUN_180c417b0`, RVA `0xc417b0`): walks the
+/// bucket, `CloseHandle`s Boehm's duplicated handle and `GC_free`s the record.
+/// Hooking this instead of the wrapper tells us whether a record was actually
+/// deleted, not merely that some function was called.
+pub fn note_gc_remove(tid: u32) {
+    let body = worker_body_label(tid);
+    push_worker_event(format!("gc_remove tid={tid:#x} body={body}"));
+}
+
+/// A thread that leaves through `ExitThread`/`_endthreadex` never returns from
+/// its body, so that body's own `GC_unregister_my_thread` call is skipped. This
+/// is one of the two remaining explanations for a record that leaks with
+/// `exitcode=0x0`; the other is a broken hook, which `note_gc_remove` rules out.
+pub fn note_thread_exit(tid: u32, via: &str, code: u32) {
+    let body = worker_body_label(tid);
+    let how = format!("{via}({code:#x})");
+    {
+        let mut g = match WORKER_EXITS.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.get_or_insert_with(std::collections::HashMap::new)
+            .insert(tid, how.clone());
+    }
+    push_worker_event(format!(
+        "exit tid={tid:#x} via={via} code={code:#x} body={body}"
+    ));
+}
+
+/// How this tid left the process, if we watched it leave.
+pub fn worker_exit_via(tid: u32) -> Option<String> {
+    let g = match WORKER_EXITS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.as_ref()?.get(&tid).cloned()
+}
+
 pub fn worker_unregister_called(tid: u32) -> bool {
     let unregistered = match WORKER_UNREGISTERED.lock() {
         Ok(g) => g,
@@ -596,6 +644,14 @@ pub fn prune_worker_bodies(live_tids: &[u32], gc_registered: &[u32]) {
     };
     if let Some(set) = unregistered.as_mut() {
         set.retain(|tid| live_tids.contains(tid) || gc_registered.contains(tid));
+    }
+    drop(unregistered);
+    let mut exits = match WORKER_EXITS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(map) = exits.as_mut() {
+        map.retain(|tid, _| live_tids.contains(tid) || gc_registered.contains(tid));
     }
 }
 
@@ -794,8 +850,8 @@ pub fn probe(forced_rva: Option<u32>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_worker_events, note_unregister, note_worker_body, prune_worker_bodies,
-        worker_body, worker_unregister_called,
+        drain_worker_events, note_gc_remove, note_thread_exit, note_unregister, note_worker_body,
+        prune_worker_bodies, worker_body, worker_exit_via, worker_unregister_called,
     };
 
     #[test]
@@ -816,5 +872,36 @@ mod tests {
         prune_worker_bodies(&[], &[]);
         assert_eq!(worker_body(tid), None);
         assert!(!worker_unregister_called(tid));
+    }
+
+    #[test]
+    fn removal_and_exit_hooks_name_the_leaking_path() {
+        let tid = 0xf00d_0043;
+        note_worker_body(tid, 0xbe81a0, 0x55);
+        assert_eq!(worker_exit_via(tid), None);
+        note_gc_remove(tid);
+        let events = drain_worker_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("gc_remove") && e.contains("fn=0xbe81a0")),
+            "a record removal must name the body: {events:?}"
+        );
+
+        // ExitThread means the body never returned, so no cleanup call ran.
+        note_thread_exit(tid, "ExitThread", 0);
+        assert_eq!(worker_exit_via(tid).as_deref(), Some("ExitThread(0x0)"));
+        let events = drain_worker_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("exit") && e.contains("via=ExitThread")),
+            "an exit through ExitThread must be recorded: {events:?}"
+        );
+        // Retained while the record is still in the GC table, pruned after it goes.
+        prune_worker_bodies(&[], &[tid]);
+        assert_eq!(worker_exit_via(tid).as_deref(), Some("ExitThread(0x0)"));
+        prune_worker_bodies(&[], &[]);
+        assert_eq!(worker_exit_via(tid), None);
     }
 }

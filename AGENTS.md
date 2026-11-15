@@ -2350,3 +2350,48 @@ il2cpp одними чтениями памяти (без единого выз�
 - Побочное наблюдение для кода: `reap()` берёт «второе мнение» через `live_tids()`
   (`CreateToolhelp32Snapshot`), а он под wine умеет висеть минутами (§12.1) —
   кандидат на удаление, когда `WaitForSingleObject` останется единственным голосом.
+
+### 2026-11-15 — Трассировка реального удаления записи + выходов потока; Toolhelp убран из `reap()`
+
+- Коммит: `feat(gc): trace the real record removal and thread exits`.
+- **Что добавлено в trace (`HROMATITE_GCT_TRACE=1`, stub/LIVE, plaintext):**
+  * хук на **`FUN_180c417b0`** (RVA `0xc417b0`, `void remove_thread(DWORD tid)`) —
+    это и есть фактическое удаление записи (`CloseHandle` + `GC_free`), в отличие
+    от обёртки `GC_unregister_my_thread` (`0xc41920`), которая лишь доказывает,
+    что кто-то попросил. Событие в логе: `gc_remove tid=… body=…`;
+  * хуки на **`kernel32!ExitThread`** и **`_endthreadex`** (`ucrtbase.dll`, иначе
+    `msvcrt.dll`) — поток, ушедший через них, никогда не возвращается из тела,
+    поэтому его `GC_unregister_my_thread` физически не может выполниться.
+    Событие: `exit tid=… via=ExitThread code=… body=…`; факт запоминается в
+    `WORKER_EXITS` и подставляется в строку репера как `exit_via=ExitThread(0x0)`.
+  * новые `install_named()` (хук по экспорту модуля) и `note_gc_remove()` /
+    `note_thread_exit()` / `worker_exit_via()`; `prune_worker_bodies()` чистит и
+    карту выходов. Детуры по-прежнему только кладут событие в очередь (4096),
+    файл открывает исключительно stub-поток.
+  * `install_gc_worker_trace()` возвращает успех только при
+    `dispatcher && unregister && remove`; хуки выходов — бонус (wine может уводить
+    выход через ntdll), их отсутствие не фатально.
+- **Изменение поведения `reap()`**: убрано «второе мнение» через `live_tids()`
+  (`CreateToolhelp32Snapshot`). Единственный голос — `WaitForSingleObject(handle, 0)`:
+  объект потока сигнализируется только после полного завершения, поэтому ни
+  приостановленный поток, ни поток внутри `GC_unregister_my_thread` не могут быть
+  сочтены мёртвыми. Причина: `CreateToolhelp32Snapshot` под wine документированно
+  висит минутами (§12.1), а вызывается он на stub-потоке — там залипание фатально.
+- Проверено: host-тесты core **50/50** (включая новый
+  `removal_and_exit_hooks_name_the_leaking_path`), DLL **3/3**,
+  `cargo check --workspace --all-targets` — чисто, `cargo build --workspace --release`
+  (windows-gnu) — OK. Живой прогон с `HROMATITE_GCT_TRACE=1` ещё не делался.
+- Критерий следующего живого прогона (закрывает корень утечки): при утечке в логе
+  должна быть тройка `worker start … body=fn=…` → **отсутствие** `gc_remove tid=…`
+  → `reaped dead record … exit_via=ExitThread(0x0)`; если же `gc_remove` есть, а
+  запись всё равно осталась — виноват не путь выхода, а сам Boehm.
+- Окружение (важно для повторной сборки с хоста): в этой сессии PATH не содержал
+  ни `cargo`, ни coreutils, ни `cc`; рабочий рецепт —
+  `PATH=$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:<coreutils>` для
+  сборки Windows (`cargo build --workspace --release` + mingw-wrapper в PATH), а для
+  host-тестов линковка через `rust-lld`:
+  `RUSTFLAGS="-C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=no
+  -C link-arg=-L<glibc>/lib -C link-arg=-L<gcc-lib>/lib -C link-arg=-L<gcc>/lib/gcc/…/
+  -C link-arg=<glibc>/lib/Scrt1.o -C link-arg=<glibc>/lib/crti.o
+  -C link-arg=<glibc>/lib/crtn.o -C link-arg=--dynamic-linker=<glibc>/lib/ld-linux-x86-64.so.2"`
+  плюс `LD_LIBRARY_PATH=<gcc-lib>:<glibc>/lib` на время запуска тестов.

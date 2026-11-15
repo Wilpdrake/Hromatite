@@ -1830,6 +1830,109 @@ pub unsafe extern "system" fn gc_unregister_detour() -> usize {
     unsafe { f() }
 }
 
+static GC_REMOVE_ORIG: AtomicUsize = AtomicUsize::new(0);
+static EXIT_THREAD_ORIG: AtomicUsize = AtomicUsize::new(0);
+static END_THREAD_EX_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+pub const GC_REMOVE_RVA: u32 = 0xc417b0;
+
+/// The actual deletion of a Boehm record. `FUN_180c417b0(DWORD tid)`: it walks
+/// the bucket without a NULL check, `CloseHandle`s the duplicated handle and
+/// `GC_free`s the record. Hooking the wrapper `GC_unregister_my_thread` only
+/// proves somebody asked; this proves the record went away.
+///
+/// # Safety
+/// The detour preserves the one-DWORD argument in `ECX` and forwards the
+/// original return value; nothing is invented.
+pub unsafe extern "system" fn gc_remove_detour(tid: u32) -> usize {
+    crate::gcthreads::note_gc_remove(tid);
+    let original = GC_REMOVE_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return 0;
+    }
+    // SAFETY: original is the trampoline for the one-argument removal function
+    // at GC_REMOVE_RVA; the argument is forwarded unchanged.
+    let f: unsafe extern "system" fn(u32) -> usize = unsafe { core::mem::transmute(original) };
+    // SAFETY: as above — tid is the original caller's value.
+    unsafe { f(tid) }
+}
+
+/// A thread that dies through `ExitThread`/`_endthreadex` never returns from its
+/// body, so the body's `GC_unregister_my_thread` is skipped and Boehm keeps a
+/// record for a thread that no longer exists. Recording this names the leak.
+///
+/// # Safety
+/// Only the exit code / return address is read and both are forwarded unchanged.
+pub unsafe extern "system" fn exit_thread_detour(code: u32) {
+    crate::gcthreads::note_thread_exit(crate::gcthreads::own_tid(), "ExitThread", code);
+    let original = EXIT_THREAD_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return;
+    }
+    // SAFETY: original is the kernel32!ExitThread trampoline (one DWORD, no
+    // return); the code is forwarded unchanged and this call never returns.
+    let f: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(original) };
+    // SAFETY: as above.
+    unsafe { f(code) }
+}
+
+/// `_endthreadex` — the msvcrt counterpart of `ExitThread`, same leak.
+///
+/// # Safety
+/// Only the caller's code is forwarded unchanged.
+pub unsafe extern "system" fn endthreadex_detour(code: u32) {
+    crate::gcthreads::note_thread_exit(crate::gcthreads::own_tid(), "_endthreadex", code);
+    let original = END_THREAD_EX_ORIG.load(Ordering::Acquire);
+    if original == 0 {
+        return;
+    }
+    // SAFETY: original is the _endthreadex trampoline (one DWORD, no return).
+    let f: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(original) };
+    // SAFETY: as above.
+    unsafe { f(code) }
+}
+
+/// Install a detour on a named export of a loaded module.
+fn install_named(
+    module: &str,
+    func: &str,
+    original: &AtomicUsize,
+    detour: usize,
+    label: &str,
+) -> bool {
+    if original.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    let Some(target) = try_resolve(module, func) else {
+        log::log_tag("gct", &format!("{label}: {module}!{func} not found"));
+        return false;
+    };
+    let Some(prep) = prepare(target) else {
+        log::log_tag(
+            "gct",
+            &format!("{label}: prologue rejected at {module}!{func} ({target:#x})"),
+        );
+        return false;
+    };
+    // Publish before patching: a thread that enters in the gap calls the original.
+    original.store(prep.trampoline, Ordering::Release);
+    match patch(&prep, detour) {
+        Some(h) => {
+            register(h);
+            log::log_tag(
+                "gct",
+                &format!("{label}: hooked {module}!{func} at {target:#x}"),
+            );
+            true
+        }
+        None => {
+            original.store(0, Ordering::Release);
+            log::log_tag("gct", &format!("{label}: patch failed at {target:#x}"));
+            false
+        }
+    }
+}
+
 fn install_gc_trace_at(
     ga: usize,
     rva: u32,
@@ -1891,11 +1994,44 @@ pub fn install_gc_worker_trace() -> bool {
         gc_unregister_detour as *const () as usize,
         "GC unregister",
     );
+    // The wrapper only proves that somebody asked; the removal itself proves the
+    // record went away. Without it "no unregister line" cannot distinguish
+    // "the body skipped the call" from "our hook sat on the wrong wrapper".
+    let remove = install_gc_trace_at(
+        ga,
+        GC_REMOVE_RVA,
+        &GC_REMOVE_ORIG,
+        gc_remove_detour as *const () as usize,
+        "GC remove thread",
+    );
+    // Last piece of the puzzle: a thread that leaves through ExitThread never
+    // returns from its body, so its cleanup call cannot run. These are plain
+    // kernel32/msvcrt exports, not GameAssembly code, so they get their own
+    // installer; a missing one is not fatal.
+    let exit_thread = install_named(
+        "kernel32.dll",
+        "ExitThread",
+        &EXIT_THREAD_ORIG,
+        exit_thread_detour as *const () as usize,
+        "worker exit",
+    );
+    let end_thread_ex = install_named("ucrtbase.dll", "_endthreadex", &END_THREAD_EX_ORIG, endthreadex_detour as *const () as usize, "worker exit")
+        || install_named(
+            "msvcrt.dll",
+            "_endthreadex",
+            &END_THREAD_EX_ORIG,
+            endthreadex_detour as *const () as usize,
+            "worker exit",
+        );
     log::log_tag(
         "gct",
-        &format!("worker trace installed: dispatcher={dispatch}, unregister={unregister}"),
+        &format!(
+            "worker trace installed: dispatcher={dispatch}, unregister={unregister}, remove={remove}, ExitThread={exit_thread}, _endthreadex={end_thread_ex}"
+        ),
     );
-    dispatch && unregister
+    // `remove` and `unregister` are the diagnostics that matter; exit hooks are a
+    // bonus (wine may route exits through ntdll instead).
+    dispatch && unregister && remove
 }
 
 /// Detour for `kernel32!QueryPerformanceCounter` / `ntdll!RtlQueryPerformanceCounter`.
