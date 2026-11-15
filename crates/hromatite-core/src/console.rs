@@ -491,6 +491,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "mcall <class> <method> [a1..a3] — вызов метода по entry point под VEH".into(),
                 "pos                       — Camera.main -> transform -> position (M3)".into(),
                 "cam2                      — Camera через таблицу типов (без API)".into(),
+                "meta                      — version/счётчики расшифрованной metadata".into(),
+                "typelist <filter> [max]    — каталог типов из metadata".into(),
+                "typedump <ns.name>        — поля (тип+offset) и методы (RVA)".into(),
+                "meths / fields2 <ns.name> — только методы / только поля".into(),
+                "dumpmeta <Z:\\path>        — сохранить расшифрованный metadata blob".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
                 "av [addr]                 — safe-чтение + сырое разыменование (проверка VEH)".into(),
                 "seal | quit               — выйти из интерактива (инжектор запечатает образ)".into(),
@@ -1414,6 +1419,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 out.push(format!("  {:#x}  {}", c.addr, c.full()));
             }
             (out, Action::None)
+        }
+        // ---- immutable IL2CPP metadata and runtime catalog ---------------
+        "meta" | "typelist" | "typedump" | "meths" | "fields2" | "dumpmeta" => {
+            (crate::runtime::console(cmd.as_str(), a1, a2, rest).unwrap_or_default(), Action::None)
         }
         // ---- plan 5 self-tests: prove guard()/VEH actually hold -----------
         // `panic` must produce a `[dll] PANIC at file:line:` line and *not*
