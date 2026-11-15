@@ -265,20 +265,35 @@ pub fn methods(class: usize) -> Vec<Method> {
     out
 }
 
-/// `Il2CppImage*` of an assembly: images are `getter + i*0x48`, names at `+0x08`.
-pub fn image_of(corlib_or_first_image: usize, assembly: &str) -> Option<usize> {
+/// `Il2CppImage*` of an assembly. Images are packed with stride 0x48 and the
+/// `il2cpp_get_corlib` result is *not* the first one (Assembly-CSharp sits four
+/// entries earlier), so the search walks both directions. Exact short names win
+/// over prefixes (`Assembly-CSharp` must not resolve to `Assembly-CSharp-firstpass`).
+pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
     let want = assembly.to_ascii_lowercase();
-    for i in 0..512 {
-        let img = corlib_or_first_image + i * 0x48;
-        let name = match safe::read_usize(img + 0x08).and_then(name_at) {
-            Some(n) if !n.is_empty() => n,
-            _ => break,
-        };
-        if name.to_ascii_lowercase() == want
-            || name.to_ascii_lowercase().starts_with(&want)
-        {
-            return Some(img);
+    let scan = |exact: bool| -> Option<usize> {
+        for step in 0i64..768 {
+            for sign in [1i64, -1] {
+                let idx = step * sign;
+                let Some(img) = corlib_image.checked_add_signed((idx * 0x48) as isize) else {
+                    continue;
+                };
+                let name = match safe::read_usize(img + 0x08).and_then(name_at) {
+                    Some(n) if !n.is_empty() => n,
+                    _ => continue,
+                };
+                let low = name.to_ascii_lowercase();
+                let hit = if exact {
+                    low == want
+                } else {
+                    low.starts_with(&want)
+                };
+                if hit {
+                    return Some(img);
+                }
+            }
         }
-    }
-    None
+        None
+    };
+    scan(true).or_else(|| scan(false))
 }

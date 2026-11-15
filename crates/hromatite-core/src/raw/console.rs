@@ -480,6 +480,141 @@ fn pos_probe() -> Vec<String> {
     out
 }
 
+/// `Il2CppString*` → Rust string (length at +0x10, UTF-16 chars at +0x14).
+fn il2cpp_string(p: usize) -> Option<String> {
+    if p < 0x10000 {
+        return None;
+    }
+    let len = crate::safe::read_u32(p + 0x10)? as usize;
+    if len > 4096 {
+        return None;
+    }
+    let bytes = crate::safe::read_bytes(p + 0x14, len.checked_mul(2)?)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// `who` — every player in the instance, through the public SDK API
+/// (`VRC.SDKBase.VRCPlayerApi`): the list comes from `get_AllPlayers`
+/// (`List<VRCPlayerApi>`), id from `GetPlayerId(player)`, position from
+/// `GetPosition(player)` (Vector3 through a hidden output pointer).
+///
+/// This deliberately avoids VRChat's own obfuscated classes: the SDK surface is
+/// stable across builds and is what world scripts themselves use.
+/// Class by namespace/name; if the class table has not materialised it yet,
+/// walk the assembly's `image_get_class(image, i)` (which builds it on demand).
+fn class_or_materialise(ns: &str, name: &str, assembly: &str) -> Option<usize> {
+    if let Some((_, c)) = crate::m3::find(ns, name, 120_000).first() {
+        return Some(*c);
+    }
+    let (ga, gasize) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
+    let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
+    if f + 8 > ga + gasize {
+        return None;
+    }
+    let first = crate::il2cpp::find_domain()?;
+    let image = crate::m3::image_of(first, assembly)?;
+    for i in 0..40_000usize {
+        // SAFETY: image_get_class(image, i) with the measured ABI; VEH guards it.
+        let cls = unsafe { crate::veh::call2(f, image, i) }.ok()?;
+        if cls < 0x10000 || !crate::safe::readable_at(cls) {
+            continue;
+        }
+        if crate::m3::class_name(cls).as_deref() == Some(name)
+            && crate::m3::class_namespace(cls).as_deref() == Some(ns)
+        {
+            return Some(cls);
+        }
+    }
+    None
+}
+
+fn who_probe() -> Vec<String> {
+    let mut out = Vec::new();
+    let api = match class_or_materialise("VRC.SDKBase", "VRCPlayerApi", "VRCSDKBase") {
+        Some(c) => c,
+        None => return vec!["who: VRCPlayerApi class not found".into()],
+    };
+    let ms = crate::m3::methods(api);
+    let pick = |name: &str| ms.iter().find(|m| m.name == name).map(|m| m.entry);
+    let (Some(get_all), Some(get_id)) = (pick("get_AllPlayers"), pick("GetPlayerId")) else {
+        out.push("who: VRCPlayerApi has no get_AllPlayers/GetPlayerId".into());
+        return out;
+    };
+    let get_pos = pick("GetPosition");
+    let obj_name_fn = crate::m3::find("UnityEngine", "Object", 120_000)
+        .first()
+        .and_then(|(_, c)| {
+            crate::m3::methods(*c)
+                .into_iter()
+                .find(|m| m.name == "get_name")
+                .map(|m| m.entry)
+        });
+    out.push(format!("who: VRCPlayerApi {api:#x}, get_pos {:?}", get_pos.is_some()));
+
+    // SAFETY: get_AllPlayers is the SDK's static accessor (no arguments).
+    let list = match unsafe { crate::veh::call0(get_all) } {
+        Ok(v) if v >= 0x10000 => v,
+        Ok(v) => {
+            out.push(format!("who: empty player list ({v:#x})"));
+            return out;
+        }
+        Err(e) => {
+            out.push(format!("who: get_AllPlayers faulted: {e}"));
+            return out;
+        }
+    };
+    // List<T>: _items @+0x10, _size @+0x18; Il2CppArray: length @+0x18, data @+0x20.
+    let items = crate::safe::read_usize(list + 0x10).unwrap_or(0);
+    let size = crate::safe::read_u32(list + 0x18).unwrap_or(0) as usize;
+    let maxlen = crate::safe::read_usize(items + 0x18).unwrap_or(0) as usize;
+    out.push(format!("who: list {list:#x}, size {size}, items {items:#x}, cap {maxlen}"));
+    let n = size.min(maxlen).min(256);
+    for i in 0..n {
+        let p = crate::safe::read_usize(items + 0x20 + i * 8).unwrap_or(0);
+        if p < 0x10000 {
+            continue;
+        }
+        // SAFETY: GetPlayerId(VRCPlayerApi*) is a pure accessor on a live instance.
+        let id = unsafe { crate::veh::call1(get_id, p) }.unwrap_or(usize::MAX);
+        let mut pos = String::from("pos=?");
+        if let Some(f) = get_pos {
+            let mut buf = [0u64; 2];
+            // SAFETY: GetPosition returns Vector3 through a hidden output
+            // pointer (rcx) with `this` in rdx; buf is a live stack buffer.
+            if unsafe { crate::veh::call2(f, buf.as_mut_ptr() as usize, p) }.is_ok() {
+                let (x, y, z) = vec3(buf);
+                pos = format!("pos=({x:.2}, {y:.2}, {z:.2})");
+            }
+        }
+        // The player's GameObject name (avatar/root name) — handy for a human
+        // and read through UnityEngine.Object.get_name, nothing VRChat-specific.
+        let mut label = String::new();
+        if let Some(gpo) = pick("GetPlayerObjects")
+            && let Ok(arr) = unsafe { crate::veh::call1(gpo, p) }
+            && arr >= 0x10000
+        {
+            let len = crate::safe::read_usize(arr + 0x18).unwrap_or(0) as usize;
+            let first = crate::safe::read_usize(arr + 0x20).unwrap_or(0);
+            if len > 0 && first >= 0x10000 {
+                if let Some(obj_name) = obj_name_fn {
+                    if let Ok(s) = unsafe { crate::veh::call1(obj_name, first) } {
+                        if let Some(text) = il2cpp_string(s) {
+                            label = format!(" go=\"{text}\"");
+                        }
+                    }
+                }
+            }
+        }
+        out.push(format!("  player #{i}: api {p:#x} id={id} {pos}{label}"));
+    }
+    out.push(format!("who: {n} player(s)"));
+    out
+}
+
 /// Execute one command. Returns the answer lines and a control action.
 pub fn dispatch(line: &str) -> (Vec<String>, Action) {
     let mut it = line.splitn(4, char::is_whitespace);
@@ -524,6 +659,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "typelist <filter> [max]    — каталог типов из metadata".into(),
                 "typedump <ns.name>        — поля (тип+offset) и методы (RVA)".into(),
                 "meths / fields2 <ns.name> — только методы / только поля".into(),
+                "m3f <ns> [name]           — классы из таблицы классов (без вызовов)".into(),
+                "m3c <class>               — поля и методы класса (Unity 6 layout)".into(),
+                "m3l <asm> [substr] [max]  — перечислить классы образа (создаёт их)".into(),
+                "m3s <substr>              — поиск по уже созданным классам".into(),
+                "pos                       — Camera.main -> transform -> position".into(),
                 "imgset <image|reset>      — какой Il2CppImage* отдавать imgc/imgfind".into(),
                 "dumpmeta <Z:\\path>        — сохранить расшифрованный metadata blob".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
@@ -1057,6 +1197,90 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             }
             (out, Action::None)
         }
+        // `m3s <substr>` — search only the *materialised* class table (no calls).
+        "m3s" => {
+            let want = a1.to_ascii_lowercase();
+            let mut out = vec![format!("m3s {want:?}")];
+            let mut n = 0usize;
+            for (i, p) in crate::m3::classes(120_000) {
+                let nm = crate::m3::class_name(p).unwrap_or_default();
+                if want.is_empty() || nm.to_ascii_lowercase().contains(&want) {
+                    n += 1;
+                    if n <= 40 {
+                        out.push(format!(
+                            "  #{i} {p:#x}  {}",
+                            crate::m3::class_full_name(p)
+                        ));
+                    }
+                }
+            }
+            out.insert(1, format!("  {n} match(es)"));
+            (out, Action::None)
+        }
+        // `m3l <assembly> [substr] [max]` — enumerate an image's classes through
+        // `il2cpp_image_get_class`, which also *materialises* lazily-built
+        // classes (VRChat's own assembly is not in the table until touched).
+        "m3l" => {
+            let asm = if a1.is_empty() { "Assembly-CSharp" } else { a1 };
+            let filt = a2.to_ascii_lowercase();
+            let max = parse_addr(rest.trim()).unwrap_or(30_000).min(60_000);
+            let (ga, gasize) = match crate::procs::own_module(crate::GAME_ASSEMBLY) {
+                Some(v) => v,
+                None => return (vec!["m3l: GameAssembly.dll not loaded".into()], Action::None),
+            };
+            let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
+            if f + 8 > ga + gasize {
+                return (vec!["m3l: image_get_class outside the module".into()], Action::None);
+            }
+            let first = match crate::il2cpp::find_domain() {
+                Some(v) => v,
+                None => return (vec!["m3l: get_corlib getter not found".into()], Action::None),
+            };
+            let image = match crate::m3::image_of(first, asm) {
+                Some(i) => i,
+                None => return (vec![format!("m3l: no image for '{asm}'")], Action::None),
+            };
+            let mut out = vec![format!(
+                "m3l {asm}: image {image:#x}, fn {f:#x}, filter {filt:?}, max {max}"
+            )];
+            let mut seen = 0usize;
+            let mut shown = 0usize;
+            let mut faults = 0usize;
+            for i in 0..max {
+                // SAFETY: image_get_class(image, i) is the measured (image,index)
+                // ABI; i stays inside the caller's bound and VEH contains faults.
+                let cls = match unsafe { crate::veh::call2(f, image, i) } {
+                    Ok(v) => v,
+                    Err(_) => {
+                        faults += 1;
+                        if faults > 32 {
+                            out.push(format!("  stopped at {i}: too many faults"));
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if cls < 0x10000 || !crate::safe::readable_at(cls) {
+                    continue;
+                }
+                seen += 1;
+                let nm = crate::m3::class_name(cls).unwrap_or_default();
+                if nm.is_empty() {
+                    continue;
+                }
+                if filt.is_empty() || nm.to_ascii_lowercase().contains(&filt) {
+                    shown += 1;
+                    if shown <= 60 {
+                        out.push(format!(
+                            "  #{i} {cls:#x}  {}.{nm}",
+                            crate::m3::class_namespace(cls).unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            out.push(format!("  {seen} class(es) seen, {shown} match(es), {faults} fault(s)"));
+            (out, Action::None)
+        }
         // `m3c <class>` — fields and methods through the measured layout.
         "m3c" => match parse_addr(a1) {
             Some(c) if c >= 0x10000 => {
@@ -1352,6 +1576,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // real Vector3 read out of the running game with plain memory reads
         // plus three guarded method calls.
         "pos" => (pos_probe(), Action::None),
+        // `who` — players in the instance through the public SDK surface:
+        // VRCPlayerApi.get_AllPlayers → List<VRCPlayerApi> → GetPlayerId /
+        // GetPosition. Obfuscated VRChat classes are not needed at all.
+        "who" => (who_probe(), Action::None),
         // `cam2` — Camera class found through the type table (not through any
         // il2cpp export), as a sanity check for the whole metadata walk.
         "cam2" => {

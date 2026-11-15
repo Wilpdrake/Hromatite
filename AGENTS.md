@@ -1919,3 +1919,39 @@ il2cpp одними чтениями памяти (без единого выз�
   (старый путь `meta`, оставлен для сравнений).
 - Следующее: статические поля (`PlayerManager`/`VRCPlayerApi`) → список игроков;
   затем M4 (визуализация) — только чтение.
+
+### 2026-11-15 — M3 закрыт: список игроков и их позиции через публичный SDK-API
+
+- Коммит: `feat(m3): who — players and positions through VRCPlayerApi`.
+- **Почему через SDK, а не через классы VRChat**: собственные классы игры
+  переименованы BeeByte (в Assembly-CSharp 37 778 типов, но `VRC.Player` /
+  `PlayerManager` в таблице не встречаются — имён нет). Зато `VRC.SDKBase.
+  VRCPlayerApi` живёт в `VRCSDKBase` с нормальными именами и даёт всё нужное.
+- Новые команды:
+  * `m3l <asm> [substr] [max]` — перебор `il2cpp_image_get_class(image, i)`;
+    попутно **материализует** ленивые классы (в таблице они NULL, пока к ним
+    не обратились). 37 778 классов Assembly-CSharp за ~1 с.
+  * `m3s <substr>` — поиск только по уже материализованным классам.
+  * `who` — `VRCPlayerApi.get_AllPlayers` (это `List<VRCPlayerApi>`:
+    `_items@+0x10`, `_size@+0x18`, данные массива `@+0x20`) → для каждого
+    `GetPlayerId(player)` и `GetPosition(player)` (Vector3 через скрытый
+    указатель), плюс попытка `GetPlayerObjects` → `Object.get_name`.
+  * `class_or_materialise` — если класса нет в таблице, перебирает
+    `image_get_class` по его сборке.
+- Также исправлено: `m3::image_of` теперь ищет образы в обе стороны от
+  результата `il2cpp_get_corlib` (Assembly-CSharp лежит на 4 записи **раньше**
+  mscorlib, `0x3027c0a0` против `0x3027c1c0`) и предпочитает точное имя префиксу
+  (`Assembly-CSharp` больше не превращается в `Assembly-CSharp-firstpass`).
+- **Подтверждено в живой игре (pid 698238), один прогон подряд**:
+  ```
+  pos: Camera.main = 0x74832de0 → transform 0x74b15320
+  pos: get_position = (-0.934, 1.257, -5.309)
+  pos: get_localPosition = (0.003, 0.116, 0.137)
+  who: VRCPlayerApi 0xe0f46780, get_pos true
+  who: list size 1, items 0x12db827d0, cap 4
+  who:   player #0: api 0x12c18f8c0 id=1 pos=(-0.96, -0.00, -5.84)
+  ```
+  Позиция игрока и камера сходятся (камера над игроком на ~1.26 м) — это
+  независимая проверка, что оба пути читают одно и то же место сцены.
+- Сборка release OK. Осталось: имя игрока (displayName в SDK нет — нужен
+  `VRCPlayer`/`VRCPlayerApi.GetPlayerTag` или обфусцированный класс), M4.
