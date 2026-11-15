@@ -740,15 +740,16 @@ pub fn find_string(pat: &[u8], max: usize) -> Vec<usize> {
         if size < pat.len() + 1 {
             continue;
         }
-        let last = base + size - pat.len() - 1;
+        let last = base + size - pat.len();
         let mut a = base;
         while a <= last && out.len() < max {
-            if unsafe { *(a as *const u8) } == pat[0] {
-                let hit = unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
-                    && unsafe { *((a + pat.len()) as *const u8) } == 0;
-                if hit {
-                    out.push(a);
-                }
+            // substring match: metadata strings are NUL-terminated, but a method
+            // name may also appear inside a longer run, and requiring the NUL
+            // here made `mfind get_main` find nothing while `findb` found 4.
+            if unsafe { *(a as *const u8) } == pat[0]
+                && unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
+            {
+                out.push(a);
             }
             a += 1;
         }
