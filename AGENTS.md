@@ -2560,3 +2560,43 @@ il2cpp одними чтениями памяти (без единого выз�
   Критерий следующего прогона: отсутствие `0xc0000096`/`c41ad2`, установка
   GC-call-site guard, затем `late` с `hits>0`; продолжительная стабильность
   GC и работа auto-anchor всё ещё проверяются отдельно.
+
+### 2026-11-16 — LateUpdate найден: фильтр читал `klass` вместо `return_type`; 159 кандидатов
+
+- Коммит: этот (журнал живого read-only расследования; код ещё не менялся).
+- **Логи не подтверждают отсутствие класса.** Последний запуск (`pid 444`, Linux
+  pid 1114695) показывает `[late] waiting for class` и затем `class/method did
+  not become available`. При этом `GameAssembly.dll` остался прежним:
+  sha256 `648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b`.
+  В живой таблице `s_TypeInfoDefinitionTable` (`0x30583340`) запись
+  **#31241 уже материализована**: класс `0x31917430` =
+  `VRC.SDK3.Components.VRCTweenPostLateUpdater`, `LateUpdate` MethodInfo
+  `0x3196e7e8`, entry `GameAssembly+0xb57a4a0`.
+- **Корень доказан живыми структурами.** `m3::methods` читает return descriptor
+  из `MethodInfo+0x28`, но в этом Unity 6 `+0x28` — `klass`, а
+  **`return_type` находится `+0x20`**. Для `LateUpdate` `+0x20` указывает на
+  `0x6ffff8c62f60`, где `dword[+0x08]=0x80010000`, то есть
+  `((bits >> 16) & 0xff)=1` = `void`; по ошибочному `+0x28` получается 0.
+  `Camera.get_main` настолько же подтверждает раскладку: `+0x20` = Il2CppType
+  class (`0x12`), `+0x28` = `0x30344d10` = `UnityEngine.Camera`. Более ранняя
+  запись «klass@0x20 / return_type@0x28» в `docs/IL2CPP-EXPORT-NAMES.md`
+  поэтому неверна; `parameters@0x30` сам по себе её не доказывал.
+- **Полный host-скан без il2cpp-вызовов** (43 414 классов с методами,
+  622 762 MethodInfo, 6.55 с) с исправленным ABI дал **159** валидных
+  `instance void LateUpdate()` кандидатов, а не 66. JSON:
+  `~/.hermes/cache/scratch/lateupdate-live-candidates.json`. Прежний `latec`
+  терял кандидатов именно на return-kind, не на отсутствии метода.
+- **Запасные осмысленные точки** (сигнатура и entry подтверждены, hits ещё нет):
+  `#34575 VRC.Udon.UdonManager` @ `GA+0x8ebc500`, `#31581
+  VRC.Dynamics.PhysBoneManager` @ `GA+0x8dba3f0`, `#32496
+  DG.Tweening.Core.DOTweenComponent` @ `GA+0x2b78150`. У всех обычный
+  перемещаемый пролог. Не брать `#34553 PostLateUpdater` как fallback без новой
+  проверки: прежний живой прогон дал `hits=0`; `AsyncLateUpdateTrigger` тоже
+  может не иметь активного инстанса. `CinemachineBrain` хуже технически: метод
+  начинается коротким branch-stub. Активность любой замены доказывать только
+  `late` с `hits>0` и стабильным tid.
+- `30000ms` в текущем сообщении не является фактическим дедлайном: retry считает
+  120 попыток, каждая заново сканирует классы, поэтому 20 попыток заняли
+  ~115–124 с. Следующий план: исправить `+0x20` с regression-тестом на реальную
+  раскладку, сделать retry по `Instant`, затем проверить auto; альтернативы
+  нужны только если автоточка установится, но не даст hits.
