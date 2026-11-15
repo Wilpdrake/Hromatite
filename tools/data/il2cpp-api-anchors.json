@@ -1,12 +1,22 @@
 {
-  "il2cpp_domain_get": {
+  "il2cpp_get_corlib": {
     "obfuscated": "wYRnnMQuvvH",
     "rva": "0x0c27f00",
-    "evidence": "AGENTS.md §17: live getter returned the domain and 216 assembly records"
+    "evidence": "2026-11-15: the getter returns the corlib Il2CppImage (0x3027c1c0); the 'assembly array' is the contiguous Il2CppImage[] with stride 0x48"
   },
   "il2cpp_image_get_class": {
-    "obfuscated": "RxbHYrTjcJF",
-    "rva": "0x0c29900",
-    "evidence": "AGENTS.md §17: live (image,index) calls returned indexed class pointers"
+    "obfuscated": "GEsTfKaEfsh",
+    "rva": "0x0c2a330",
+    "evidence": "2026-11-15: disasm mov rax,[rcx+0x20]; mov r8d,[rax]; add r8d,edx; imul 0x58; live call (image 0x3027c448, 167) returned UnityEngine.Camera"
+  },
+  "il2cpp_class_get_fields": {
+    "obfuscated": "aBiYIKpprNc",
+    "rva": "0x0c28070",
+    "evidence": "2026-11-15: reads class+0x80 and the u16 count at class+0x124, matching the measured FieldInfo layout"
+  },
+  "il2cpp_class_from_name": {
+    "obfuscated": "HToJgvthiQt",
+    "rva": "0x0c28050",
+    "evidence": "2026-11-15: jmp thunk next to class_get_fields; identity from the canonical stub order (needs behavioural confirmation)"
   }
 }

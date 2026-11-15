@@ -1043,6 +1043,68 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 }
             }
         }
+        // ---- Unity 6 layout (verified live 2026-11-15, see m3.rs) ---------
+        // `m3f <ns> [name]` — search the class table directly (no API call).
+        "m3f" => {
+            let ns = a1;
+            let name = a2;
+            let hits = crate::m3::find(ns, name, 120_000);
+            let mut out = vec![format!(
+                "m3f {ns:?} {name:?}: {} class(es), table {:#x}",
+                hits.len(),
+                crate::m3::class_table().unwrap_or(0)
+            )];
+            for (i, p) in hits.iter().take(32) {
+                out.push(format!(
+                    "  #{i} {p:#x}  {}",
+                    crate::m3::class_full_name(*p)
+                ));
+            }
+            (out, Action::None)
+        }
+        // `m3c <class>` — fields and methods through the measured layout.
+        "m3c" => match parse_addr(a1) {
+            Some(c) if c >= 0x10000 => {
+                let mut out = vec![format!(
+                    "m3c {c:#x}  {}  (image {:#x})",
+                    crate::m3::class_full_name(c),
+                    crate::safe::read_usize(c).unwrap_or(0)
+                )];
+                let fld = crate::m3::fields(c);
+                out.push(format!("  fields: {}", fld.len()));
+                for f in fld.iter().take(40) {
+                    out.push(format!(
+                        "    +{:#06x}? {:<28} type {:#x} parent {:#x}",
+                        f.offset_or_index, f.name, f.ty, f.parent
+                    ));
+                }
+                let ms = crate::m3::methods(c);
+                out.push(format!("  methods: {}", ms.len()));
+                for m in ms.iter().take(60) {
+                    out.push(format!("    {:<36} entry {:#x}", m.name, m.entry));
+                }
+                (out, Action::None)
+            }
+            _ => (vec!["usage: m3c <classaddr>".into()], Action::None),
+        },
+        // `m3i <assembly>` — Il2CppImage* (images are getter+i*0x48).
+        "m3i" => match crate::il2cpp::find_domain() {
+            Some(first) => {
+                let mut out = vec![format!("m3i: corlib image {first:#x}")];
+                let want = if a1.is_empty() { "UnityEngine.CoreModule" } else { a1 };
+                match crate::m3::image_of(first, want) {
+                    Some(img) => {
+                        out.push(format!(
+                            "  {want}: image {img:#x}, il2cpp_image_get_class {:#x}",
+                            crate::m3::IMAGE_GET_CLASS_RVA
+                        ));
+                    }
+                    None => out.push(format!("  {want}: not found")),
+                }
+                (out, Action::None)
+            }
+            None => (vec!["m3i: get_corlib getter not found".into()], Action::None),
+        },
         // `imgc <fnaddr> <index>` — call a 1/2-arg image function under VEH and
         // dump what it returns. 0x4cbd70 is `mov rax,[rcx+8]; ret`, i.e. the
         // image's typeCount (0x1dc5); the same shape with an index argument is

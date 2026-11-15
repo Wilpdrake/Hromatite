@@ -557,10 +557,10 @@ pub fn domain() -> Option<usize> {
     il2cpp::find_domain()
 }
 
-fn image_of_in(domain: usize, assembly: &str) -> Option<usize> {
-    let (_, entry) = il2cpp::assembly(domain, assembly)?;
-    let img = safe::read_u64(entry + 0x28)? as usize;
-    (img > 0x10000).then_some(img)
+fn image_of_in(first_image: usize, assembly: &str) -> Option<usize> {
+    // `find_domain()` actually returns the corlib Il2CppImage (`il2cpp_get_corlib`),
+    // and the images of all assemblies are contiguous with stride 0x48 — see m3.rs.
+    crate::m3::image_of(first_image, assembly)
 }
 
 /// `Il2CppImage*` of an assembly ("UnityEngine.CoreModule", "mscorlib", …).

@@ -145,7 +145,7 @@
       "stub_rva": 7634089
     },
     {
-      "api": "il2cpp_domain_get",
+      "api": "il2cpp_get_corlib",
       "identity": "runtime-anchor",
       "index": 12,
       "name_rva": 28977104,
@@ -421,8 +421,8 @@
       "stub_rva": 7634963
     },
     {
-      "api": null,
-      "identity": null,
+      "api": "il2cpp_class_from_name",
+      "identity": "runtime-anchor",
       "index": 35,
       "name_rva": 28977928,
       "obfuscated": "HToJgvthiQt",
@@ -469,8 +469,8 @@
       "stub_rva": 7635115
     },
     {
-      "api": null,
-      "identity": null,
+      "api": "il2cpp_class_get_fields",
+      "identity": "runtime-anchor",
       "index": 39,
       "name_rva": 28980416,
       "obfuscated": "aBiYIKpprNc",
@@ -2137,8 +2137,8 @@
       "stub_rva": 7640397
     },
     {
-      "api": "il2cpp_image_get_class",
-      "identity": "runtime-anchor",
+      "api": null,
+      "identity": null,
       "index": 178,
       "name_rva": 28990840,
       "obfuscated": "RxbHYrTjcJF",
@@ -2533,8 +2533,8 @@
       "stub_rva": 7641651
     },
     {
-      "api": null,
-      "identity": null,
+      "api": "il2cpp_image_get_class",
+      "identity": "runtime-anchor",
       "index": 211,
       "name_rva": 28993648,
       "obfuscated": "GEsTfKaEfsh",
@@ -2788,7 +2788,7 @@
   "canonical_api_count": 232,
   "export_count": 251,
   "gameassembly_sha256": "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b",
-  "identified_api_count": 5,
+  "identified_api_count": 7,
   "named_stub_count": 232,
   "pattern_conflicts_against_anchors": [],
   "pattern_count": 0,
@@ -2798,6 +2798,6 @@
   "stub_count": 232,
   "stub_order_is_canonical": false,
   "stub_order_note": "Rejected by live anchor: domain_get is wYRnnMQuvvH at stub 12, not canonical API 75",
-  "unidentified_api_count": 227,
+  "unidentified_api_count": 225,
   "unityplayer_sha256": "6a6d6688aaaabcaad95f644075238e6ad5c092f1c2183debe20f2f07e1ceabb5"
 }

@@ -1833,3 +1833,63 @@ il2cpp одними чтениями памяти (без единого выз�
   затем `imgfind <fn> 8000 Camera` и поля/методы; решение по метадате —
   либо искать заголовок по оракулу `u32(B+24) == S − B`, либо вернуться к
   `Il2CppDumper`, когда (если) в памяти появится монолитный блоб.
+
+### 2026-11-15 — M3 ПРОБИТ: раскладка Unity 6 снята, классы/поля/методы и живой `Camera.main`
+
+- Коммит: этот (`feat(m3): Unity 6 class table, fields, methods — verified live`).
+- **Главная ошибка прежних сессий**: `wYRnnMQuvvH` (RVA `0xc27f00`) — это НЕ
+  `il2cpp_domain_get`, а **`il2cpp_get_corlib`**: он возвращает `Il2CppImage*`
+  mscorlib (`0x3027c1c0`), а «массив сборок» на самом деле — **массив
+  `Il2CppImage`**, лежащих подряд с шагом **0x48** (`image[i] = getter + i*0x48`).
+  Поэтому `entry+0x28` «не был образом»: это `codegenModule` образа, а сам образ —
+  начало записи. Раскладка записи (проверено на CoreModule):
+  `+0x00 assembly*`, `+0x08 "UnityEngine.CoreModule"` (короткое имя),
+  `+0x30 Il2CppCodeGenModule*`, `+0x40 "UnityEngine.CoreModule.dll"`.
+- **`il2cpp_image_get_class` = `GEsTfKaEfsh` @ RVA `0xc2a330`** (не `0xc29900`).
+  Дизасм: `mov rax,[rcx+0x20]; mov r8d,[rax]; add r8d,edx; ... imul 0x58`
+  (sizeof `Il2CppTypeDefinition` = 0x58) `; jmp MetadataCache::GetTypeInfo…`.
+  Проверено живым вызовом: `(image 0x3027c448, 167)` → класс `Camera`.
+  `0xc29900` — это `il2cpp_string_new_utf16` (`(str,len)` → `Il2CppString*`).
+- **Таблица классов найдена статически**: `s_TypeInfoDefinitionTable` =
+  GameAssembly `.data` RVA **`0xe66c870`** (массив `Il2CppClass*` по
+  `typeDefinitionIndex`, заполняется лениво). Никаких API-вызовов не нужно.
+- **Раскладка `Il2CppClass` (6000.0.67f1, измерена живьём)**:
+  `image@+0x00`, `namespaze@+0x18`, `methods (MethodInfo**)@+0x50`,
+  `fields (FieldInfo[])@+0x80`, `name@+0x98`, `fieldsCount (u16)@+0x124`.
+  `FieldInfo` — stride **0x28**: `type@+0x00`, `token@+0x08`, `name@+0x10`,
+  `offset/index@+0x18`, `parent@+0x20`. `MethodInfo` — `entry@+0x00`,
+  `name@+0x18`; массив `MethodInfo*` заканчивается нулём.
+- **Новый модуль `crates/hromatite-core/src/m3.rs`** (`forbid(unsafe_code)`):
+  `class_table`, `class_at`, `class_name/namespace`, `find(ns,name)`,
+  `fields(class)`, `methods(class)`, `image_of(corlib, asm)`, плюс RVA-константы
+  (`CLASS_TABLE_RVA`, `IMAGE_GET_CLASS_RVA`, `CLASS_GET_FIELDS_RVA`,
+  `CLASS_FROM_NAME_RVA`). Новые команды консоли: `m3f <ns> [name]`,
+  `m3c <class>`, `m3i <asm>`.
+- **Подтверждено в живой игре (pid 673257, режим `FRAME_HOOK=0`, `LIVE=7200`)**:
+  ```
+  [con] m3i: corlib image 0x3027c1c0
+  [con]   UnityEngine.CoreModule: image 0x3027c448, il2cpp_image_get_class 0xc2a330
+  [con] m3f "UnityEngine" "Camera": 1 class(es), table 0x30583340
+  [con]   #21033 0x30344d10  UnityEngine.Camera
+  [con] m3c 0x30344d10  UnityEngine.Camera  (image 0x3027c448)
+  [con]   fields: 8   (kMinAperture … onPostRender)
+  [con]   methods: 407 (get_nearClipPlane … get_fieldOfView …)
+  [con] call 0x6ffff30e0ca0   (get_main, entry из methods)
+  [con]   -> 0x71e629c0
+  ```
+  и с хоста: `klass` объекта `0x71e629c0` = `0x30344d10` = `UnityEngine.Camera`,
+  имя/namespace читаются. То есть **`Camera.main` получен и опознан** без
+  `class_from_name` и без знания имён API.
+- Побочно: `il2cpp_class_get_fields` = `0xc28070` (дизасм: читает `class+0x80`
+  и `u16 [class+0x124]`), `il2cpp_class_from_name` = `0xc28050` (thunk `jmp`);
+  порядок стабов UnityPlayer ≈ канонический список со сдвигом на 1 в начале
+  (`stub 12 → il2cpp_get_corlib`, canon 11; `stub 122 → gchandle_get_target`,
+  canon 121), но к концу списка сдвиг исчезает (`stub 211 → image_get_class`,
+  canon 211) — то есть в середине списка один элемент не совпадает; опираться
+  на порядок можно только с проверкой поведением.
+- Осторожно: `api 1` (перебор ВСЕХ 163 экспортов с `(domain, &count)`) **убивает
+  игру** (процесс исчез без дампа, `[veh]` крутил 0xc0000005 в цикле) — среди
+  экспортов есть `il2cpp_shutdown`/подобные. Безопасны только точечные вызовы
+  известных функций (`call`, `imgc`, `imgfind`) и чтения.
+- Осталось: `Camera.main → transform → position` (инстанс-методы `this` в rcx,
+  `Vector3` возвращается через скрытый указатель/по `rax`), затем M4.
