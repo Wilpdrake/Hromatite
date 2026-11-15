@@ -1737,3 +1737,42 @@ il2cpp одними чтениями памяти (без единого выз�
 - Осталось: стендовый runtime mapper/VEH/hook, затем длительное live A/B —
   отдельным этапом, не выдавая этот статический refactor за live-доказательство.
 
+
+### 2026-11-15 — Пайплайн «дамп из памяти → Il2CppDumper → карта методов»
+
+- Коммит `fcf0644` (`feat(dump): runtime metadata dump + Il2CppDumper host pipeline`).
+- **Идея взята у `Perfare/Zygisk-Il2CppDumper`** (дамп il2cpp-данных в рантайме,
+  обход шифрования), но адаптирована под Proton/Wine: сам Zygisk-модуль и его
+  `xdl_sym("il2cpp_*")` нам недоступны (у нас имена экспортов обфусцированы),
+  поэтому из процесса берём **только расшифрованную метадату**, а всё остальное
+  делает офлайн `Il2CppDumper`.
+- Добавлено: `tools/il2cppdump.sh` (скачивает `Il2CppDumper-net7-v6.7.46.zip` в
+  `~/.cache/hromatite/il2cppdumper`, выключает `RequireAnyKey`, находит `dotnet`
+  в `PATH` или через `nix build nixpkgs#dotnet-sdk_8`, дописывает магию
+  `AF 1B B1 FA` в копию метадаты, если её нет), `tools/il2cpp_methods.py`
+  (`script.json` → `methods-<sha12>.json`: `VA - ImageBase` = RVA; опционально
+  генерируемая Rust-таблица), `tools/test_il2cpp_methods.py` (11 тестов, OK),
+  `docs/IL2CPP-DUMP.md`. В git добавлены ранее неотслеживаемые
+  `tools/data/message.txt` и `tools/data/Il2CppKnownPatterns.inl`.
+- **Проверено на этой машине (без игры):** metadata v31 входит в поддерживаемые
+  `Il2CppDumper` (`Metadata.cs`: `version < 16 || version > 31`, коммит «支持v31»);
+  `Il2CppDumper` реально запускается (dotnet 8.0.427 + `DOTNET_ROLL_FORWARD=LatestMajor`)
+  и на файле игры отвечает ровно `ERROR: Metadata file not found or encrypted`;
+  `pe_image_base(GameAssembly.dll)` = `0x180000000`, Unity-версия из
+  `globalgamemanagers` = `6000.0.67f1`. Патч магии проверен на копии
+  (`magic a1d82814 → af1bb1fa`), после него dumper идёт дальше и падает уже на
+  версии (ожидаемо — файл целиком шифр).
+- **Уточнение к §1:** `global-metadata.dat` этого билда — **40 764 240 Б**
+  (в документе было 40 745 428), первые байты `a1 d8 28 14 d1 e3 13 12 …`.
+  `GameAssembly.dll` — прежний, sha256 `648f61b1…`.
+- **Замер по паттернам из `tools/data`** (`Il2CppKnownPatterns.inl`, 229 записей):
+  по `UnityPlayer.dll` полный байтовый паттерн даёт 11 уникальных попаданий,
+  23 неоднозначных и **195 нулевых** — то есть хвостовые байты паттернов
+  билд-специфичны (подтверждает предупреждение в скилле). Личность API по ним
+  не восстанавливается; офлайн-дамп от этого не зависит.
+- Осталось: (1) живой прогон — `dumpmeta Z:\home\…\global-metadata.dat` в
+  `HROMATITE_FRAME_HOOK=1` (сначала `meta`, чтобы увидеть, нашёлся ли заголовок);
+  (2) `tools/il2cppdump.sh`, снять `dump.cs`/`script.json`; (3) если авто-поиск
+  `Il2CppCodeRegistration` не сработает — указать адреса вручную (у нас уже есть
+  адрес таблицы `codeGenModules`, 216 указателей в `.data` GameAssembly);
+  (4) `tools/il2cpp_methods.py` → карта методов и переход к M3 без вызовов API.
