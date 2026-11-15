@@ -2436,3 +2436,47 @@ il2cpp одними чтениями памяти (без единого выз�
   пока не переименованы — отдельный проход. `save_project` Ghidra не дал выполнить
   («A Ghidra tool is running a command»), изменения живут в открытом проекте: сохранить
   вручную (Ctrl+S) или переименовать повторно после перезапуска.
+
+### 2026-11-16 — Второй проход: независимая перепроверка всех 218 имён (10 ревьюеров)
+
+- Коммит: этот (`docs(ghidra): independent re-verification of the export names`).
+- **Что сделано.** Все 218 названных адресов перепроверены заново десятью ревьюерами
+  (по 20–22 адреса, без пересечений), при этом имя в Ghidra считалось **гипотезой**:
+  доказательство искалось в коде — цель вызова, читаемые смещения структур, использование
+  аргументов, строковые литералы, IAT-слоты. Итог: **207 `confirm`, 7 `uncertain`, 4 `wrong`**.
+- **Исправлено 4 имени** (уже в Ghidra): `0xc28390` `class_bitflag_136_bit3` →
+  `il2cpp_class_is_blittable` (порядок битов снят с распаковки `Il2CppTypeDefinition.flags`
+  в `0xbcdbd0` и `Class::Init` `0xc19470`); `0xc283f0` → `il2cpp_class_array_element_size`
+  (switch по `byval_arg.type` + `Class::FromIl2CppType`); `0xc28c10` → `il2cpp_field_get_object`
+  (`(field, refclass) → 0xc0f590`, имя есть в шапке 2023.2+, в нашем `api-names.txt` его нет);
+  `0xc297c0` `il2cpp_class_from_type` → **`il2cpp_object_new`** (форвардер в `Object::New`
+  `0xc0e480`, `Il2CppType` не читается; настоящий `Class::FromIl2CppType` — `0xc15a20`).
+  Плюс переформулированы `0xc2a490` → `unity_method_code_range_foreach_chunked` (обходит
+  диапазоны кода методов, не секции GC-кучи) и `0xc29400` → `unity_member_name_chunked`
+  (эмитит имя члена, не типа).
+- **Уточнения раскладок (проверены по коду, не по заголовкам).** `MethodInfo`:
+  `klass@0x20`, `return_type@0x28`, `parameters@0x30` — версия «klass@0x28/return_type@0x20»
+  **опровергнута** телом `il2cpp_method_get_param` (`mov 0x30(%rcx)`). `Il2CppImage+0x14` —
+  счётчик диапазонов custom-атрибутов, **не** `typeStart` (он в `imageDef+0x00`, куда ведёт
+  `+0x20`). `Il2CppClass+0x136`: `bit3` = `is_blittable`, `bit4` = `import/windows-runtime`.
+  `get_top_frame`/`get_frame_at` в этом билде возвращают `bool` + out-параметр.
+  `CreateNLSocket`/`ReadEvents`/`CloseNLSocket` — **throw-заглушки**, не рабочие сокеты.
+- **ICF-алиасы разобраны по смещениям** (один адрес = несколько API): `0x3540` `mov (%rcx)` →
+  object_get_class / class_get_image / image_get_assembly / assembly_get_image /
+  property_get_parent; `0x191870` `mov $0x10` → object_header_size / allocation_granularity /
+  offset_of_array_bounds; `0x29200` → class_get_namespace + method_get_name; `0x29240` →
+  field_get_parent + method_get_class; `0x8acd0` → class_get_parent + field_get_name;
+  `0xc47b0` → image_get_filename + class_get_element_class; `0xc28040` → class_from_il2cpp_type +
+  class_from_type; `0xc298e0` → string_new + string_new_wrapper. Поэтому 24 канонических имени
+  не имеют своего адреса — это не ошибка карты.
+- **Чем подтверждено.** Вердикты ревьюеров лежат в `~/.hermes/cache/scratch/ghidra-review/review{1..10}.json`
+  (218 записей, поля `verdict`/`correct`/`evidence`); сводка — `review_summary.json`
+  (коллизий имён — 0). Примеры доказательств: `gc_enable`/`gc_disable` — уменьшение/увеличение
+  `GC_dont_gc` (`0xe66ccb8`) под одной CS и три согласованных свидетеля; `gchandle_new_weakref`
+  — дословная строка про resurrection; `is_debugger_attached` — импорт
+  `KERNEL32!IsDebuggerPresent` через IAT `0x18b709170`; `register_log_callback` — единственное
+  вхождение `"[libil2c"` в образе; `add_internal_call`/`resolve_icall` — одна map `0xe66bb78`.
+- **Осталось.** 7 адресов с `uncertain` (в т.ч. `set_config_dir`/`set_data_dir`/`set_temp_dir`
+  — три байт-в-байт одинаковых тела, различимые только по целевому глобалу); 5 адресов без
+  имени (`0xc4740`, `0xa3950`, `0xaf7a0`, `0x161ec0`, `0xc2a6b0`); 24 канонических имени —
+  ICF-алиасы. `save_project` по-прежнему блокирован (сохраняет пользователь).

@@ -13,8 +13,9 @@ sha256 `648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b` — п
 ## Что получилось на этом билде
 
 - 251 экспорт, **225 различных адресов** (остальное — алиасы одного кода).
-- **218 из 225 адресов** получили настоящие имена; 194 из 232 канонических имён API
-  привязаны к конкретному адресу.
+- **218 из 225 адресов** получили настоящие имена (после второго прохода — 214 подтверждены,
+  4 исправлены); 208 из 232 канонических имён API привязаны к конкретному адресу,
+  остальные 24 живут на тех же адресах через ICF-склейку (см. ниже).
 - Независимая проверка: 232 ленивых стаба в `UnityPlayer.dll` выстраиваются в канонический
   порядок API, и **191 из 191** сопоставленного стаба указывает на адрес, чьё восстановленное
   имя совпадает с каноническим (0 расхождений). Это подтверждает имена помимо формы тела.
@@ -83,14 +84,84 @@ Il2CppImage  +0x00 assembly, +0x08 short name, +0x14 typeStart, +0x20 metadata h
 `lea 0x20(%rcx),%rax` = `class_get_type`, `movsbl 0xa(%rcx)` = `type_get_type`,
 `movzwl 0x8(%rcx)` = `type_get_attrs`, `mov 0x48(%rcx),%eax` = `method_get_token`.
 
+## Второй проход: независимая проверка всех имён
+
+218 имён перепроверены заново десятью ревьюерами (по 20–22 адреса, без пересечений): имя в
+Ghidra считалось гипотезой, доказательство искалось в коде — во что уходит вызов, какие поля
+какой структуры читаются, как используются аргументы, а не «совпадает ли форма с прошлой
+записью».
+
+Итог: **207 `confirm`, 7 `uncertain`, 4 `wrong`** — то есть 95 % имён выдержали сильную
+проверку, а 4 оказались неверными и исправлены:
+
+| адрес | было | стало | почему |
+|---|---|---|---|
+| `0xc28390` | `class_bitflag_136_bit3` | `il2cpp_class_is_blittable` | бит `+0x136.3`; порядок битов снят с распаковки `Il2CppTypeDefinition.flags` в `0xbcdbd0` и `Class::Init` `0xc19470` |
+| `0xc283f0` | `il2cpp_cand_class_array_element_size` | `il2cpp_class_array_element_size` | switch по `byval_arg.type`, `Class::FromIl2CppType` `0xbcd7a0`, `-1` на недопустимом |
+| `0xc28c10` | `field_get_object` | `il2cpp_field_get_object` | `(field, refclass) → 0xc0f590` строит `Il2CppReflectionField`; имя есть в шапке 2023.2+ |
+| `0xc297c0` | `il2cpp_class_from_type` | `il2cpp_object_new` | форвардер в `Object::New` `0xc0e480`, `Il2CppType` не читается вовсе |
+
+Плюс два имени переформулированы после разбора (`0xc2a490` → `unity_method_code_range_foreach_chunked`,
+`0xc29400` → `unity_member_name_chunked`): прежние названия вводили в заблуждение — первое
+обходит диапазоны кода методов, а не секции GC-кучи, второе эмитит имя **члена**, а не типа.
+
+### Что проверка уточнила в раскладках
+
+- `MethodInfo`: `klass@0x20`, `return_type@0x28`, `parameters@0x30` — подтверждено телом
+  `il2cpp_method_get_param` (`mov 0x30(%rcx)`); версия «klass@0x28, return_type@0x20» из
+  промежуточного отчёта **опровергнута**.
+- `Il2CppImage+0x14` — это **не** `typeStart`, а счётчик диапазонов custom-атрибутов
+  (`typeStart` лежит в `imageDef+0x00`, куда ведёт `+0x20`).
+- `Il2CppClass+0x136`: `bit3` = `is_blittable`, `bit4` = `import/windows-runtime` (в прежней
+  записи они были сдвинуты).
+- `FieldInfo.get_flags`/`is_literal` читают `FieldInfo.type->attrs` (два разыменования) —
+  это проверено и осталось верным; `offset@0x08`, `token@0x18` не перепутаны.
+- `il2cpp_get_top_frame`/`get_frame_at` в этом билде возвращают `bool` и пишут кадр в
+  out-параметр (в шапке 2019 — указатель).
+- `CreateNLSocket`/`ReadEvents`/`CloseNLSocket` — **throw-заглушки** (стоят `__FILE__` и уходят
+  в конструктор исключения), не рабочие сокеты.
+
+### Протокол одного ревью (что реально смотрели)
+
+`add_internal_call`/`resolve_icall` — одна `std::map` (`0xe66bb78`), `resolve` при промахе
+обрезает имя по `'('`; `gc_enable`/`gc_disable` — уменьшение/увеличение счётчика `GC_dont_gc`
+(`0xe66ccb8`) под одной CS, третий голос — `gc_set_mode`, который зовёт ровно нужную из двух;
+`stop_gc_world`/`start_gc_world` — вход в тело `GC_suspend_all` (`0xc41a20`) против
+`GC_resume_all` (`0xc41cb0`); `gchandle_new_weakref` содержит дословную строку
+«IL2CPP does not support resurrection for weak references»; `is_debugger_attached` — вызов
+`KERNEL32!IsDebuggerPresent` через IAT `0x18b709170`; `register_log_callback` — единственное
+вхождение `"[libil2c"` в образе; `custom_attrs_from_class/method/field` — один и тот же
+bsearch `0xc53f7c` с токенами `+0x11c` / `+0x48` / `+0x18`.
+
 ## ICF: почему часть имён API не имеет отдельного адреса
 
-Линкер склеил идентичные тела, поэтому один адрес несёт несколько экспортных имён:
-`0x3540` — 5 имён, `0x3dc0` — 8, `0x29200` — 4, `0x8acd0` — 4, `0x191870` — 3, `0x4cbd70`,
-`0xc28040`, `0xc298e0`, `0x291f0`, `0x29240` — по 2. Из-за этого 38 канонических имён
-(`il2cpp_property_get_*`, `il2cpp_field_get_name/type`, `il2cpp_method_get_name`,
-`il2cpp_object_new` и др.) не имеют «своего» адреса: их код совпал с соседним.
-При обращении через `GetProcAddress` это неважно — имя резолвится в тот же адрес.
+Линкер склеил идентичные тела, поэтому один адрес несёт несколько экспортных имён, и один и
+тот же код обслуживает несколько разных API. Разобрано по коду (какие смещения читаются):
+
+| адрес | API, которые за ним стоят |
+|---|---|
+| `0x3540` (`mov (%rcx)`) | `object_get_class`, `class_get_image`, `image_get_assembly`, `assembly_get_image`, `property_get_parent` |
+| `0x191870` (`mov $0x10`) | `object_header_size`, `allocation_granularity`, `offset_of_array_bounds_in_array_object_header` |
+| `0x29200` (`mov 0x18`) | `class_get_namespace`, `method_get_name` |
+| `0x29240` (`mov 0x20`) | `field_get_parent`, `method_get_class` |
+| `0x8acd0` (`mov 0x10`) | `class_get_parent`, `field_get_name` |
+| `0xc47b0` (`mov 0x40`) | `image_get_filename`, `class_get_element_class` |
+| `0xc28040` (`mov $1,%dl; jmp 0xc15a20`) | `class_from_il2cpp_type`, `class_from_type` |
+| `0xc298e0` (strlen + utf8) | `string_new`, `string_new_wrapper` |
+| `0x3dc0` | `_guard_check_icall` (8 экспортных имён) |
+
+Из-за этого 24 канонических имени остаются без собственного адреса
+(`il2cpp_property_get_*` — 5, `method_get_declaring_type`, `method_get_from_reflection`,
+`method_has_attribute`, `field_get_type`, `class_get_declaring_type`, `class_is_valuetype`,
+`class_get_bitmap*`, `gc_set_external_*_tracker`, `custom_attrs_free`,
+`debug_get_method_info`, `debugger_set_agent_options`, `register_debugger_agent_transport`,
+`thread_get_all_attached_threads`, `image_get_class_count`, `set_default_thread_affinity`,
+`unity_install_unitytls_interface`, `unity_set_android_network_up_state_func`,
+`runtime_unhandled_exception_policy_set`). Для вызова через `GetProcAddress` это неважно —
+имя резолвится в тот же адрес.
+
+`tools/data/il2cpp-api-names.txt` при этом сам неполон: в нём нет `il2cpp_field_get_object`,
+`il2cpp_field_get_from_reflection` и семи `il2cpp_profiler_*`, которые в этом билде есть.
 
 ## Что не опознано (5 адресов)
 

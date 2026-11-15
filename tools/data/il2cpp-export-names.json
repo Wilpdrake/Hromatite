@@ -9,36 +9,22 @@
  "named_addresses": 218,
  "canonical_api_names": 232,
  "canonical_names_not_located": [
-  "il2cpp_assembly_get_image",
-  "il2cpp_class_get_element_class",
   "il2cpp_class_get_declaring_type",
   "il2cpp_class_is_valuetype",
-  "il2cpp_class_is_blittable",
-  "il2cpp_class_array_element_size",
-  "il2cpp_class_get_image",
   "il2cpp_class_get_bitmap_size",
   "il2cpp_class_get_bitmap",
-  "il2cpp_field_get_name",
   "il2cpp_field_get_type",
   "il2cpp_gc_set_external_allocation_tracker",
   "il2cpp_gc_set_external_wbarrier_tracker",
-  "il2cpp_offset_of_array_bounds_in_array_object_header",
-  "il2cpp_allocation_granularity",
   "il2cpp_method_get_declaring_type",
-  "il2cpp_method_get_name",
   "il2cpp_method_get_from_reflection",
-  "il2cpp_method_get_class",
   "il2cpp_method_has_attribute",
   "il2cpp_property_get_flags",
   "il2cpp_property_get_get_method",
   "il2cpp_property_get_set_method",
   "il2cpp_property_get_name",
-  "il2cpp_property_get_parent",
-  "il2cpp_object_new",
   "il2cpp_runtime_unhandled_exception_policy_set",
-  "il2cpp_string_new_wrapper",
   "il2cpp_thread_get_all_attached_threads",
-  "il2cpp_image_get_assembly",
   "il2cpp_image_get_class_count",
   "il2cpp_debugger_set_agent_options",
   "il2cpp_register_debugger_agent_transport",
@@ -67,7 +53,14 @@
    "real_name": "il2cpp_object_get_class",
    "confidence": "shape/alias-group",
    "evidence": "mov (%rcx),%rax; ret = одна загрузка поля +0x00. ICF слил 5 одинаковых аксессоров: object.klass, class.image, image.assembly, assembly.image, property.parent — все читают +0x00. Имя выбрано по главной функции.",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_object_get_class",
+    "il2cpp_class_get_image",
+    "il2cpp_image_get_assembly",
+    "il2cpp_assembly_get_image",
+    "il2cpp_property_get_parent"
+   ]
   },
   {
    "addr": "0x180003570",
@@ -133,7 +126,11 @@
    "real_name": "il2cpp_class_get_namespace",
    "confidence": "shape/alias-group",
    "evidence": "mov 0x18(%rcx),%rax; ret — 4 алиаса: Il2CppClass.namespaze (+0x18), MethodInfo.name (+0x18) и 2 неустановленных.",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_class_get_namespace",
+    "il2cpp_method_get_name"
+   ]
   },
   {
    "addr": "0x180029240",
@@ -145,7 +142,11 @@
    "real_name": "il2cpp_field_get_parent",
    "confidence": "shape/alias-group",
    "evidence": "mov 0x20(%rcx),%rax; ret — 2 алиаса: FieldInfo.parent (+0x20) и MethodInfo.klass (+0x20).",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_field_get_parent",
+    "il2cpp_method_get_class"
+   ]
   },
   {
    "addr": "0x18008a6e0",
@@ -170,7 +171,11 @@
    "real_name": "il2cpp_class_get_parent",
    "confidence": "shape/alias-group",
    "evidence": "mov 0x10(%rcx),%rax; ret — 4 алиаса: Il2CppClass.parent (+0x10), FieldInfo.name (+0x10) и 2 неустановленных.",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_class_get_parent",
+    "il2cpp_field_get_name"
+   ]
   },
   {
    "addr": "0x1800a3950",
@@ -227,7 +232,11 @@
    "real_name": "il2cpp_image_get_filename",
    "confidence": "strong",
    "evidence": "mov 0x40(%rcx) = image->filename ('<name>.dll')",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_image_get_filename",
+    "il2cpp_class_get_element_class"
+   ]
   },
   {
    "addr": "0x1800c4a10",
@@ -273,7 +282,12 @@
    "real_name": "il2cpp_object_header_size",
    "confidence": "strong",
    "evidence": "mov $0x10,%eax; ret — единственная константа 0x10 в бинаре: sizeof(Il2CppObject)=0x10 и kIl2CppOffsetOfArrayBounds=0x10. 3 алиаса ICF.",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_object_header_size",
+    "il2cpp_allocation_granularity",
+    "il2cpp_offset_of_array_bounds_in_array_object_header"
+   ]
   },
   {
    "addr": "0x18023cd40",
@@ -847,7 +861,11 @@
    "real_name": "il2cpp_class_from_il2cpp_type",
    "confidence": "strong",
    "evidence": "mov $1,%dl; jmp Class::FromIl2CppType(type,true) — Il2CppType* -> Il2CppClass* (alias-группа: 2 экспорта на 1 код)",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_class_from_il2cpp_type",
+    "il2cpp_class_from_type"
+   ]
   },
   {
    "addr": "0x180c28050",
@@ -987,9 +1005,9 @@
    "exports": [
     "sjzVAQyuqcK"
    ],
-   "real_name": "class_bitflag_136_bit3",
-   "confidence": "inferred",
-   "evidence": "klass+0x136 bit3; not is_valuetype (that reads byval_arg.type)",
+   "real_name": "il2cpp_class_is_blittable",
+   "confidence": "strong",
+   "evidence": "klass+0x136 bit3 = is_blittable; bit order proven from Il2CppTypeDefinition.flags unpacking at 0xbcdbd0 and Class::Init 0xc19470",
    "renamed_in_ghidra": true
   },
   {
@@ -1042,9 +1060,9 @@
    "exports": [
     "PaFaXrmNwLn"
    ],
-   "real_name": "il2cpp_cand_class_array_element_size",
-   "confidence": "order",
-   "evidence": "bare jmp -> 0xc19ae0; switch on Il2CppClass.byval_arg.type (+0x2a): VOID->0, BOOLEAN/I1/U1->1, CHAR/I2/U2->2, I4/U4/R4->4, default->8, BYREF/TYPEDBYREF/FNPTR->-1, VALUETYPE->instance_size@+0xf8 minus 0x10, GENERICINST->element class. 1 arg only (no align out) => array/value size helper; value_size(2 args) excluded, so name left as cand_ by order",
+   "real_name": "il2cpp_class_array_element_size",
+   "confidence": "strong",
+   "evidence": "switch on byval_arg.type, BYREF/ARRAY/GENERICINST via Class::FromIl2CppType 0xbcd7a0, -1 on invalid",
    "renamed_in_ghidra": true
   },
   {
@@ -1262,9 +1280,9 @@
    "exports": [
     "HeDFYp_UfNv"
    ],
-   "real_name": "field_get_object",
-   "confidence": "inferred",
-   "evidence": "Тонкий thunk: xchg rcx,rdx; jmp 0xc0f590 (единственный вход в 0xc0f590 — ни call, ни других jmp в файле нет). Тело 0xc0f590 — кэш reflective-объектов под SRWLock: ключ (field, klass), на промахе создаётся объект {+0x10=arg2, +0x18=arg1, +0x20=Il2CppString из field->name (+0x10, через strlen), +0x28=reflection Type для field->type (+0x00, attrs читаются как u16 из type+8), +0x30=attrs} — это точная раскладка Il2CppReflectionField (klass/field/name/type/attrs), т.е. фабрика System.Reflection.RuntimeFieldInfo (Field::GetFieldObject). Проверка «не get_value_object ли это»: 0xc28c40 (уже назван il2cpp_field_get_value_object) ведёт на 0xbbc450 — другой код, который через FUN_180c15a20/бокс возвращает ЗНАЧЕНИЕ поля (obj,field порядок сохранён, свопа нет), а 0xc28c30 -> 0xbbc240 = Field::GetValue(obj, field, out) тоже без свопа. Значит 0xc28c10 — отдельная API-точка входа в фабрику Field-объектов с перестановкой аргументов. В canonical.txt (232 имени) такой функции нет (есть il2cpp_method_get_object и il2cpp_type_get_object, но не field), поэтому имя внутреннее, по указанию брифа.",
+   "real_name": "il2cpp_field_get_object",
+   "confidence": "strong",
+   "evidence": "thunk (field, refclass) -> 0xc0f590 builds Il2CppReflectionField; signature matches il2cpp-api-functions.h 2023.2+",
    "renamed_in_ghidra": true
   },
   {
@@ -1757,9 +1775,9 @@
    "exports": [
     "_OihTjYLeOg"
    ],
-   "real_name": "unity_member_type_name_chunked",
+   "real_name": "unity_member_name_chunked",
    "confidence": "inferred",
-   "evidence": "fn(X, chunk_writer): берёт [X+0x28] (Il2CppType*), [X+0x48] (token), через (*type).data → klass → klass->image (image+0x14 typeStart, image+0x20 metadata — оба поля Il2CppImage сходятся), тянет строку из metadata (0x180c53f7c), пакует (0x180bcd7f0) и отдаёт в chunk-писатель 0x180c11040. Сестра-близнец 0x180c28c50 (там [X+0x20] klass и [X+0x18] token — FieldInfo, названа il2cpp_field_has_attribute): тот же кернел, но offset'ы MethodInfo/родителя другие. Канонического имени с такой формой нет; по полям это MethodInfo-вариант token→name/resolve. Требует доп. проверки, если понадобится точное имя.",
+   "evidence": "binary search of metadata member by token + chunked emit of the member name (not a type name)",
    "renamed_in_ghidra": true
   },
   {
@@ -1889,9 +1907,9 @@
    "exports": [
     "GWcICDanLrg"
    ],
-   "real_name": "il2cpp_class_from_type",
+   "real_name": "il2cpp_object_new",
    "confidence": "strong",
-   "evidence": "тонкая обёртка с пробросом rcx в 0xc0e480 (Class::FromIl2CppType). Имя il2cpp_class_from_il2cpp_type уже занято другой группой на другом адресе — это второй из пары идентичных forwarder'ов канона (33/60), поэтому взят il2cpp_class_from_type.",
+   "evidence": "forwarder to Object::New 0xc0e480 (GC alloc klass->instance_size, klass@obj+0, zeroing, inflated path); reads no Il2CppType",
    "renamed_in_ghidra": true
   },
   {
@@ -2036,7 +2054,11 @@
    "real_name": "il2cpp_string_new",
    "confidence": "strong",
    "evidence": "strlen loop, std::u16string from utf8 (0xbf3930), alloc via 0xbb8100(len), memcpy (chars, len*2) into str+0x14; two exports alias => il2cpp_string_new == il2cpp_string_new_wrapper in this build",
-   "renamed_in_ghidra": true
+   "renamed_in_ghidra": true,
+   "icf_aliases": [
+    "il2cpp_string_new",
+    "il2cpp_string_new_wrapper"
+   ]
   },
   {
    "addr": "0x180c29900",
@@ -2429,9 +2451,9 @@
    "exports": [
     "yNSavFDXpTY"
    ],
-   "real_name": "gc_heap_section_foreach_chunked",
+   "real_name": "unity_method_code_range_foreach_chunked",
    "confidence": "inferred",
-   "evidence": "(a1=cb, a2=userdata): если глобал 0xe66bb68 (счётчик) != 0, обходит таблицу 0xe66bb60 из 0x10-байтных записей {addr, tokenish}; по (запись[i].1 - 0xe66c5b8) через magic 0xe38e38e38e38e39 ищет строку metadata (0x180bcc470: строки по 36 байт), режет диапазон соседних addr на куски <= 0x1388 и для каждого зовёт a1(prev_addr, &{start,size,int64,int}, a2); хвост — последний незакрытый диапазон, ограниченный 0xe66c938/0xe66c940. Канонического имени в 232-списке нет (формы il2cpp_gc_foreach_heap у 0x180c28f90 иная) → описательное имя, префикс как в брифе.",
+   "evidence": "walk method code ranges via 0xbcc470 in chunks <=5000; not a GC heap walker",
    "renamed_in_ghidra": true
   },
   {
@@ -2555,5 +2577,22 @@
    "evidence": "(klassCallback, userData): iterates all domain assemblies (0xe66c308..0xe66c310), each typeStart/typeCount array, maps TypeDefinition (0x58 stride) -> Il2CppClass, filters klass+0x135 & 2, invokes callback(klass, userData); then drains generic/array-instance queues",
    "renamed_in_ghidra": true
   }
- ]
+ ],
+ "layout_notes": {
+  "MethodInfo": "methodPointer@0x00, virtualMethodPointer@0x08, invoker@0x10, name@0x18, klass@0x20, return_type@0x28, parameters@0x30 (proven: il2cpp_method_get_param reads [rcx+0x30]), metadataHandle/token@0x38/0x48, flags@0x4c, iflags@0x4e, slot@0x50, parameters_count@0x52",
+  "Il2CppImage": "assembly@0x00, short name@0x08, custom-attribute range count@0x14 (NOT typeStart), metadata handle@0x20 (typeStart at imageDef+0x00), codegenModule@0x30, filename@0x40",
+  "Il2CppClass": "+0x136 bit3 = is_blittable, bit4 = import/windows-runtime (bit order from Il2CppTypeDefinition.flags unpacking); +0x135 bit1 = initialized, bit2 = enumtype, bit4 = is_generic, bit5 = has_references",
+  "canonical_list_gaps": "tools/data/il2cpp-api-names.txt lacks il2cpp_field_get_object, il2cpp_field_get_from_reflection and the seven il2cpp_profiler_* entries present in this build"
+ },
+ "review": {
+  "reviewers": 10,
+  "reviewed_addresses": 218,
+  "verdicts": {
+   "confirm": 207,
+   "uncertain": 7,
+   "wrong": 4
+  },
+  "corrections_applied": 6,
+  "note": "every name re-derived from code (callees, structure offsets, argument use), not from the earlier evidence"
+ }
 }
