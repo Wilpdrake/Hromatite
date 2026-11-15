@@ -1,18 +1,12 @@
-//! The injected payload.
+//! Injected payload: one managed LateUpdate runtime, no payload-owned thread.
 //!
-//! Stealth constraint: the game must not gain extra threads or processes, so
-//! everything runs inline on the stub thread the injector already started.
-//! Waiting for il2cpp there is fine — that thread is ours, not the game's.
-//!
-//! Failure containment (plan 5): a Rust panic must never escape `DllMain`.
-//! Unwinding through an `extern "system"` frame is UB, and under Proton it shows
-//! up as "Fatal error in GC" rather than a message — so every stage is run
-//! through `log::guard`, and the whole body again at the entry point.
-//! (Access violations are *not* caught here: that is the VEH, plan 2.)
+//! Startup is deliberately linear: wait for Unity, install the inline GC guard,
+//! optionally install GC tracing, then hook the selected managed LateUpdate.
+//! A failed prerequisite never falls back to another tick source or recon loop.
 
 #![deny(unsafe_code)]
 
-use hromatite_core::{console, hook, il2cpp, log, procs, GAME_ASSEMBLY, UNITY_PLAYER};
+use hromatite_core::{GAME_ASSEMBLY, UNITY_PLAYER, hook, log, procs};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -38,114 +32,41 @@ fn wait_for_modules(max_secs: u32) -> bool {
     }
 }
 
-/// Poll `hromatite-cmd.txt` and log the answers. Same single stub thread — no
-/// new thread, no socket. Returns true when the host asked to finish (seal/quit).
-fn console_loop(secs: u32) -> bool {
-    let mut reader = console::Reader::new();
-    log::log_tag(
-        "con",
-        &format!(
-            "console ready for {secs}s; file {}, 'help' for commands",
-            console::cmd_path().display()
-        ),
-    );
-    // Our own thread id: the GC crash ("SuspendThread loop failed") is caused by
-    // a Boehm thread record whose OS thread is gone, so the log has to say which
-    // thread was ours before anything else can be blamed on it.
-    log::log_tag(
-        "con",
-        &format!(
-            "stub thread tid={:#x}, {} thread(s) in the process",
-            hromatite_core::gcthreads::own_tid(),
-            hromatite_core::gcthreads::live_tids().len()
-        ),
-    );
-    // Baseline of Boehm's own thread table: one line, cheap (256 reads).
-    log::log_tag(
-        "gct",
-        &log::guard("gct baseline", || {
-            hromatite_core::gcthreads::snapshot(None)
-                .map(|t| t.summary())
-                .unwrap_or_else(|| "table not found".to_string())
-        })
-        .unwrap_or_else(|| "guard".to_string()),
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs as u64);
-    let mut polls: u32 = 0;
-    loop {
-        // Every ~16 s: the state of the GC thread table. If the game dies of a
-        // "SuspendThread loop failed", the last line before the end of the log
-        // names the record that made the collector spin.
-        polls += 1;
-        // Every ~0.8 s: unlink records whose thread already exited. This is the
-        // only thing that runs fast enough — measured: a dead record was reaped
-        // 6 s after the death was noticed, and the collector had already started
-        // its 1e6-iteration loop on it (gc.log: "SuspendThread loop failed:
-        // thread id= 0x37c, errcode= 0x5" = ACCESS_DENIED for a terminated
-        // thread). `reap()` asks Boehm's own handle, so it is 40 cheap syscalls.
-        if polls.is_multiple_of(2) {
-            let reaped = log::guard("gct reap", hromatite_core::gcthreads::reap)
-                .unwrap_or_default();
-            for l in reaped {
-                log::log_tag("gct", &l);
-            }
-        }
-        // Every ~8 s: thread births/deaths plus the state of Boehm's own thread
-        // table. The line we are hunting is "thread 0xNNN exited" immediately
-        // followed by "Boehm STILL holds it" — that record is what makes
-        // GC_suspend spin 1e6 times and abort the game a few seconds later.
-        if polls.is_multiple_of(20) {
-            let lines = log::guard("gct watch", hromatite_core::gcthreads::watch)
-                .unwrap_or_else(|| vec!["guard".to_string()]);
-            for l in lines {
-                log::log_tag("gct", &l);
-            }
-        }
-        // Worker/unregister detours never open the log themselves: they only
-        // queue compact events. This stub owns every file open/close, so worker
-        // threads cannot block inside our logger while holding runtime locks.
-        for line in hromatite_core::gcthreads::drain_worker_events() {
-            log::log_tag("gct", &line);
-        }
-        // `poll()` is the one call in this loop that is not a `dispatch`: an AV
-        // there used to kill the payload thread silently (the log simply stops
-        // right after "console ready" and every command goes unanswered).
-        let lines = log::guard("reader.poll", || reader.poll()).unwrap_or_default();
-        for line in lines {
-            log::log_tag("con", &format!("> {line}"));
-            // One bad command (a panic in a scan loop) must not end the session.
-            let answered = log::guard("console::dispatch", || console::dispatch(&line));
-            let (out, action) = match answered {
-                Some(v) => v,
-                None => (vec!["command panicked (see PANIC line above)".to_string()], console::Action::None),
-            };
-            for l in out {
-                log::log_tag("con", &l);
-            }
-            match action {
-                console::Action::Seal | console::Action::Quit => {
-                    log::log_tag("con", "leaving interactive mode");
-                    return true;
-                }
-                console::Action::None => {}
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            log::log_tag("con", "console window closed");
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(400));
+fn select_late_update(value: Option<&str>) -> Result<hromatite_core::lateupdate::Selector, String> {
+    use hromatite_core::lateupdate::Selector;
+    let Some(value) = value else {
+        return Ok(Selector::Auto);
+    };
+    let value = value.trim();
+    hromatite_core::lateupdate::parse_selector(value).ok_or_else(|| {
+        format!("HROMATITE_LATE_UPDATE={value:?} is invalid; managed LateUpdate is required")
+    })
+}
+
+fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result<(), String> {
+    if frame_hook != "1" {
+        return Err(
+            "HROMATITE_FRAME_HOOK=0 is unsupported: managed LateUpdate is the only runtime".into(),
+        );
     }
+    if live != "0" {
+        return Err("HROMATITE_LIVE stub console was removed; set HROMATITE_LIVE=0".into());
+    }
+    if seal != "0" || l2b != "0" {
+        return Err(
+            "HROMATITE_SEAL/HROMATITE_L2B are incompatible with the in-image LateUpdate detour"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
-/// The stub console owns no tick, so it must install the GC guard itself. Do
-/// not leave an in-image detour behind when the injector is going to seal us.
-fn should_install_console_gc_guard(frame_hook: bool, live: u32, sealing: bool) -> bool {
-    !frame_hook && live > 0 && !sealing
-}
-
-fn late_update_requested(value: Option<&str>) -> bool {
-    value.is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
+fn require_gc_guard(installed: bool) -> Result<(), &'static str> {
+    if installed {
+        Ok(())
+    } else {
+        Err("refusing to install managed LateUpdate without the inline GC GetThreadContext guard")
+    }
 }
 
 fn install_late_update_with_retry(
@@ -163,144 +84,102 @@ fn install_late_update_with_retry(
         |attempt| {
             if !hook::materialise_late_class(selector) {
                 if attempt % 20 == 0 {
-                    log::log_tag("late", &format!("waiting for class: attempt {attempt}/{attempts}"));
+                    log::log_tag(
+                        "late",
+                        &format!("waiting for class: attempt {attempt}/{attempts}"),
+                    );
                 }
                 return None;
             }
             Some(hook::install_late_update(selector))
         },
     )
-    .unwrap_or_else(|| Err(format!("class/method did not become available within {wait_ms}ms")))
+    .unwrap_or_else(|| {
+        Err(format!(
+            "class/method did not become available within {wait_ms}ms"
+        ))
+    })
 }
 
-fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
-    // The injector's stub passes `r8 = &{base, size}`: the payload cannot read its
-    // own PE header (erased) and `VirtualQuery` reports the section split, so L2b
-    // needs the exact range the injector is going to seal.
-    if let Some([base, size, text_lo, text_hi, code_lo, code_hi]) =
-        hromatite_core::safe::read_words::<6>(reserved as usize)
-    {
-        if base > 0x10000 && size > 0 {
-            hook::set_image_range(base, size);
-        }
-        if text_lo > base && text_hi > text_lo {
-            hook::set_keep_range(text_lo, text_hi);
-        }
-        if code_lo > base && code_hi > code_lo {
-            hook::set_code_range(code_lo, code_hi);
-        }
-    }
-    // Boot marker: proves execution even if the logger itself is at fault.
-    let _ = std::fs::write("C:\\dllmain-probe.txt", b"reached DllMain\n");
-    log::log_tag("dll", "DllMain(PROCESS_ATTACH), inline (no extra thread)");
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
 
-    // LoadLibrary-style delivery leaves us in the PEB module list; drop the
-    // entry so a module sweep sees only the game's own files.
-    let unlinked = log::guard("peb-unlink", || procs::unlink_from_peb(hinst as usize))
-        .unwrap_or(false);
+fn attach(hinst: *mut core::ffi::c_void) {
+    log::log_tag("dll", "DllMain(PROCESS_ATTACH), managed LateUpdate runtime");
+
+    let unlinked =
+        log::guard("peb-unlink", || procs::unlink_from_peb(hinst as usize)).unwrap_or(false);
     log::log_tag("dll", &format!("peb unlink: {unlinked}"));
 
-    // Tests set HROMATITE_WAIT=2 so the stub thread returns quickly.
-    let budget: u32 = std::env::var("HROMATITE_WAIT")
+    let budget = std::env::var("HROMATITE_WAIT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(120);
-    // Plan 3: HROMATITE_FRAME_HOOK=1 replaces the long-lived stub thread with a
-    // tick inside a function the game already calls. DllMain returns right away,
-    // so there is no thread of ours left and the injector stops waiting for us.
-    // (Trade-off: `--seal` XORs the image the moment we return, which also
-    // destroys the detour — frame hook and seal are exclusive for now.)
-    let frame_hook = std::env::var("HROMATITE_FRAME_HOOK")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    let live: u32 = std::env::var("HROMATITE_LIVE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let sealing = ["HROMATITE_SEAL", "HROMATITE_L2B"].iter().any(|name| {
-        std::env::var(name)
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false)
-    });
-
-    let ready = log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false);
-    if frame_hook {
-        // Plan 4: same flow, no extra code path — `install_tick` sees
-        // HROMATITE_SEAL/HROMATITE_L2B and puts the tick behind a shim page
-        // that decrypts the image for the duration of the call. We still return
-        // immediately, which is what lets the injector seal us.
-        let seal = std::env::var("HROMATITE_SEAL").unwrap_or_else(|_| "-".into());
-        let l2b = std::env::var("HROMATITE_L2B").unwrap_or_else(|_| "-".into());
-        log::log_tag("dll", &format!("FRAME_HOOK: HROMATITE_SEAL={seal} HROMATITE_L2B={l2b}"));
-        // Install the tick *before* any recon: the full diagnose() scan takes
-        // seconds and must not delay getting off the stub thread. `diag` stays
-        // available as a console command for the same reason.
-        let late_selector = std::env::var("HROMATITE_LATE_UPDATE").ok();
-        let late_anchor = late_update_requested(late_selector.as_deref());
-        let ok = if late_anchor {
-            let selector = late_selector
-                .as_deref()
-                .and_then(hromatite_core::lateupdate::parse_selector);
-            match selector {
-                Some(selector) => match log::guard("install_late_update_with_retry", || {
-                    install_late_update_with_retry(selector)
-                }) {
-                    Some(Ok(candidate)) => {
-                        let gc_guard = log::guard("install_late_gc_guard", hook::install_gc_context_guard)
-                            .unwrap_or(false);
-                        log::log_tag(
-                            "late",
-                            &format!("config {} -> entry {:#x}, inline GC guard={gc_guard}", late_selector.as_deref().unwrap_or(""), candidate.entry),
-                        );
-                        true
-                    }
-                    Some(Err(error)) => {
-                        log::log_tag("late", &format!("configured LateUpdate failed: {error}; QPC fallback is off"));
-                        false
-                    }
-                    None => false,
-                },
-                None => {
-                    log::log_tag("late", "HROMATITE_LATE_UPDATE is not a valid #index/address");
-                    false
-                }
-            }
-        } else {
-            log::guard("install_tick", hook::install_tick).unwrap_or(false)
-        };
-        log::log_tag(
-            "dll",
-            &format!("FRAME_HOOK: source={}, installed={ok}, returning from DllMain (no console_loop)", if late_anchor { "LateUpdate" } else { "QPC" }),
-        );
-        log::log_tag("dll", "recon done, returning from DllMain");
+    if !log::guard("wait_for_modules", || wait_for_modules(budget)).unwrap_or(false) {
+        log::log_tag("dll", "startup aborted: Unity modules are unavailable");
         return;
     }
-    // A periodic reaper cannot interrupt a collection that already entered the
-    // GetThreadContext retry loop. Arm the inline guard before the recon too:
-    // this path used to rely on install_tick(), which is frame-hook-only.
-    if should_install_console_gc_guard(frame_hook, live, sealing) {
-        let ok = log::guard("install_gc_context_guard", hook::install_gc_context_guard)
-            .unwrap_or(false);
-        log::log_tag("dll", &format!("stub-thread GC guard installed={ok}"));
-        let trace = std::env::var("HROMATITE_GCT_TRACE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
-        if trace {
-            let ok = log::guard("install_gc_worker_trace", hook::install_gc_worker_trace)
-                .unwrap_or(false);
-            log::log_tag("dll", &format!("stub-thread GC worker trace installed={ok}"));
+
+    if let Err(error) = validate_modes(
+        &env_or("HROMATITE_FRAME_HOOK", "1"),
+        &env_or("HROMATITE_LIVE", "0"),
+        &env_or("HROMATITE_SEAL", "0"),
+        &env_or("HROMATITE_L2B", "0"),
+    ) {
+        log::log_tag("dll", &format!("startup rejected: {error}"));
+        return;
+    }
+    let selector = match select_late_update(std::env::var("HROMATITE_LATE_UPDATE").ok().as_deref())
+    {
+        Ok(selector) => selector,
+        Err(error) => {
+            log::log_tag("late", &format!("startup rejected: {error}"));
+            return;
         }
+    };
+
+    let gc_guard =
+        log::guard("install_gc_context_guard", hook::install_gc_context_guard).unwrap_or(false);
+    if let Err(error) = require_gc_guard(gc_guard) {
+        log::log_tag("dll", &format!("startup aborted: {error}"));
+        return;
     }
-    if ready {
-        // The recon walks unknown structures; a panic (index/Option arithmetic)
-        // is expected there sooner or later and must stay contained.
-        let _ = log::guard("il2cpp::run_once", il2cpp::run_once);
+
+    let trace = std::env::var("HROMATITE_GCT_TRACE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if trace {
+        let traced =
+            log::guard("install_gc_worker_trace", hook::install_gc_worker_trace).unwrap_or(false);
+        log::log_tag("dll", &format!("GC worker trace installed={traced}"));
     }
-    // HROMATITE_LIVE=0 (default) keeps the one-shot stealth behaviour.
-    if live > 0 {
-        let _ = log::guard("console_loop", || console_loop(live));
+
+    match log::guard("install_late_update_with_retry", || {
+        install_late_update_with_retry(selector)
+    }) {
+        Some(Ok(candidate)) => {
+            log::log_tag(
+                "late",
+                &format!(
+                    "LateUpdate runtime ready: hooked entry {:#x}, inline GC guard installed",
+                    candidate.entry
+                ),
+            );
+        }
+        Some(Err(error)) => {
+            log::log_tag(
+                "late",
+                &format!(
+                    "LateUpdate installation failed: {error}; no alternative tick source was started"
+                ),
+            );
+        }
+        None => log::log_tag(
+            "late",
+            "LateUpdate installer panicked; no alternative tick source was started",
+        ),
     }
-    log::log_tag("dll", "recon done, returning from DllMain");
 }
 
 #[allow(unsafe_code)]
@@ -308,18 +187,16 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
 pub extern "system" fn DllMain(
     hinst: *mut core::ffi::c_void,
     reason: u32,
-    reserved: *mut core::ffi::c_void,
+    _reserved: *mut core::ffi::c_void,
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
-        // Install before anything can panic, then run the body under a guard:
-        // unwinding out of `extern "system"` is UB, returning 1 always is not.
         log::install_panic_hook();
-        // Plan 2: the vectored handler is process-wide and inert until a guard
-        // is armed (`veh::call_*`), so installing it at attach costs nothing and
-        // guarantees the very first guarded call is already covered.
         hromatite_core::veh::install();
-        if log::guard("dllmain", || attach(hinst, reserved)).is_none() {
-            log::log_tag("dll", "DllMain: panic escaped the attach phase, returning 1 anyway");
+        if log::guard("dllmain", || attach(hinst)).is_none() {
+            log::log_tag(
+                "dll",
+                "DllMain: panic escaped the attach phase, returning 1 anyway",
+            );
         }
     }
     1
@@ -327,26 +204,49 @@ pub extern "system" fn DllMain(
 
 #[cfg(test)]
 mod tests {
-    use super::{late_update_requested, should_install_console_gc_guard};
+    use super::{require_gc_guard, select_late_update, validate_modes};
+    use hromatite_core::lateupdate::Selector;
 
     #[test]
-    fn late_update_anchor_is_explicit_opt_in() {
-        assert!(late_update_requested(Some("#31241")));
-        assert!(late_update_requested(Some("0x3238aca0")));
-        assert!(!late_update_requested(None));
-        assert!(!late_update_requested(Some("")));
-        assert!(!late_update_requested(Some("0")));
+    fn late_update_auto_is_the_only_default_tick_source() {
+        assert_eq!(select_late_update(None), Ok(Selector::Auto));
+        assert_eq!(select_late_update(Some("auto")), Ok(Selector::Auto));
+        assert_eq!(select_late_update(Some(" AUTO ")), Ok(Selector::Auto));
     }
 
     #[test]
-    fn live_stub_console_requires_the_synchronous_gc_guard() {
-        assert!(should_install_console_gc_guard(false, 7200, false));
+    fn explicit_late_update_selection_remains_available() {
+        assert_eq!(
+            select_late_update(Some("#31241")),
+            Ok(Selector::Index(31_241))
+        );
+        assert_eq!(
+            select_late_update(Some("0x3238aca0")),
+            Ok(Selector::Address(0x3238aca0))
+        );
+        assert!(select_late_update(Some("0")).is_err());
+        assert!(select_late_update(Some("not-a-class")).is_err());
     }
 
     #[test]
-    fn tick_owned_and_sealed_modes_do_not_install_a_second_unsafe_guard() {
-        assert!(!should_install_console_gc_guard(true, 7200, false));
-        assert!(!should_install_console_gc_guard(false, 0, false));
-        assert!(!should_install_console_gc_guard(false, 7200, true));
+    fn removed_qpc_stub_and_sealing_modes_fail_fast() {
+        assert!(validate_modes("1", "0", "0", "0").is_ok());
+        for modes in [
+            ("0", "0", "0", "0"),
+            ("1", "1800", "0", "0"),
+            ("1", "0", "1", "0"),
+            ("1", "0", "0", "1"),
+        ] {
+            assert!(
+                validate_modes(modes.0, modes.1, modes.2, modes.3).is_err(),
+                "accepted removed mode {modes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_tick_requires_a_successful_gc_guard() {
+        assert!(require_gc_guard(false).is_err());
+        assert!(require_gc_guard(true).is_ok());
     }
 }
