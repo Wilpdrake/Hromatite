@@ -4,6 +4,7 @@
 //! the injected dll are Windows binaries, even though the host is Linux.
 
 pub mod api;
+pub mod api_symbols;
 pub mod console;
 pub mod crypto;
 pub mod ffi;

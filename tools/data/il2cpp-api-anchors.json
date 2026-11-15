@@ -1,0 +1,12 @@
+{
+  "il2cpp_domain_get": {
+    "obfuscated": "wYRnnMQuvvH",
+    "rva": "0x0c27f00",
+    "evidence": "AGENTS.md §17: live getter returned the domain and 216 assembly records"
+  },
+  "il2cpp_image_get_class": {
+    "obfuscated": "RxbHYrTjcJF",
+    "rva": "0x0c29900",
+    "evidence": "AGENTS.md §17: live (image,index) calls returned indexed class pointers"
+  }
+}

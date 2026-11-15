@@ -1556,3 +1556,29 @@ il2cpp одними чтениями памяти (без единого выз�
 строки `Camera`/поля (`m_LocalPosition`, `orthographic`) — по ним и опознать
 `fields`/`methods`. Затем `pos` (Camera.main → transform → position) должен
 заработать без единого вызова il2cpp-API.
+
+### 2026-11-15 — База IL2CPP, этап 1: офлайн-карта стабов и опровержение порядка API
+
+- Коммит: этот (`feat(api): offline stub map, keep identities evidence-based`).
+- Добавлены `tools/api_map.py`, `tools/test_api_map.py`, канонический список и
+  явные runtime-anchors в `tools/data/`, сгенерированные `api_symbols.rs` и
+  `api_map.json`; `hromatite-core` подключает `api_symbols`.
+- **Факт, исправляющий прежние записи «46 имён»:** после преобразования
+  `file_offset -> RVA` по PE-секциям и RIP-относительного `lea` имена читаются
+  у **232/232** стабов, все 232 обфусцированных имени дают RVA из экспортов
+  GameAssembly. В `tools/resolve_api.py` file offset ошибочно использовался как
+  RVA; пропущенные `.text: raw 0x400 -> VA 0x1000` как раз объясняют «пустые» имена.
+- **Предпосылка «порядок стабов = канонический список API» опровергнута**:
+  стаб 12 указывает на живой доказанный `wYRnnMQuvvH = il2cpp_domain_get`,
+  а канонический список на этом месте содержит `add_internal_call`. Точно так же
+  стаб доказанного `RxbHYrTjcJF = il2cpp_image_get_class` (RVA `0xc29900`)
+  не стоит на месте `image_get_class`. Старые `Il2CppKnownPatterns.inl` дают
+  кандидатов и конфликты с якорями → в генерируемую таблицу попадают только 5
+  доказанных личностей (`domain_get`, `image_get_class`, `free`,
+  `gchandle_get_target`, `native_stack_trace`), остальные остаются `null` в JSON.
+- REA `inspect_native_exports` независимо подтвердил 251 экспорт и sha256
+  `648f61b13e4f…`; `cargo check --workspace` — OK; Python 5/5, включая
+  интеграционный тест текущих PE (`HROMATITE_TEST_GAME=1`) и синтетический PE,
+  доказывающий необходимость `file_offset -> RVA`; `api_map.py --check` — OK.
+  `--require-complete` ожидаемо завершается кодом 2 (неполные личности не
+  выдумываются). Следующий этап — parser расшифрованной метадаты.
