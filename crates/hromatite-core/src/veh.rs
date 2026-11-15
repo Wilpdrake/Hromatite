@@ -165,7 +165,21 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
             Ordering::Relaxed,
         );
     }
-    if !ON.load(Ordering::Relaxed) || SEEN.load(Ordering::Relaxed) >= 16 {
+    // 16 was too few: a thread that dies of an uncaught exception is the thing
+    // we are looking for, and the game raises plenty of benign SEH in between.
+    static CAP: AtomicUsize = AtomicUsize::new(0);
+    let cap = match CAP.load(Ordering::Relaxed) {
+        0 => {
+            let v = std::env::var("HROMATITE_LOG_AV_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500usize);
+            CAP.store(v, Ordering::Relaxed);
+            v
+        }
+        v => v,
+    };
+    if !ON.load(Ordering::Relaxed) || SEEN.load(Ordering::Relaxed) >= cap {
         return;
     }
     let (mut code, mut addr) = (0u32, 0usize);
@@ -176,8 +190,25 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
             addr = unsafe { (*rec).ExceptionAddress };
         }
     }
-    if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
-        log::log_tag("veh", &format!("passing exception {code:#010x} at {addr:#x} (unguarded)"));
+    // The thread id is the whole point: a thread that dies without unregistering
+    // from Boehm shows up here first if its exit was an uncaught exception.
+    if SEEN.fetch_add(1, Ordering::Relaxed) < cap {
+        let tid = unsafe { ffi::GetCurrentThreadId() };
+        let mut extra = String::new();
+        if !info.is_null() {
+            let rec = unsafe { (*info).ExceptionRecord };
+            if !rec.is_null() {
+                let n = unsafe { (*rec).NumberParameters } as usize;
+                if n > 0 {
+                    let a = unsafe { (*rec).ExceptionInformation[0] };
+                    extra = format!(" info0={a:#x}");
+                }
+            }
+        }
+        log::log_tag(
+            "veh",
+            &format!("passing exception {code:#010x} at {addr:#x} tid={tid:#x}{extra} (unguarded)"),
+        );
     }
 }
 

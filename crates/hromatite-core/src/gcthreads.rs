@@ -456,10 +456,28 @@ pub fn reap() -> Vec<String> {
                     ));
                     continue;
                 }
+                // What the thread "said" as it died: a plain `ret` gives 0, a
+                // `TerminateThread(code)` gives its code, and an uncaught
+                // exception usually leaves the OS code. This is the only way to
+                // tell "exited normally but skipped GC_unregister_my_thread"
+                // from "was killed".
+                let mut code: u32 = 0xDEAD_BEEF;
+                let have_code = unsafe { ffi::GetExitCodeThread(handle as ffi::HANDLE, &mut code) } != 0;
+                let start = {
+                    let mut g = match STARTS.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    g.get_or_insert_with(std::collections::HashMap::new).get(&id).copied()
+                };
                 let ok = unlink_at(base, bucket, p);
                 out.push(format!(
-                    "reaped dead record id={:#x} handle={:#x} bucket={} -> {ok}",
-                    id, handle, bucket
+                    "reaped dead record id={:#x} handle={:#x} bucket={} exitcode={} start={} -> {ok}",
+                    id,
+                    handle,
+                    bucket,
+                    if have_code { format!("{code:#x}") } else { "?".into() },
+                    start.map(|a| format!("{a:#x} {}", module_of(a))).unwrap_or_default(),
                 ));
             }
             p = next;
@@ -479,6 +497,11 @@ fn auto_fix() -> bool {
 }
 
 static LAST_TIDS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+/// tid → start address, remembered from the moment the thread appeared. The
+/// address is unreadable once the thread is gone, and "thread 0x3a0 exited" is
+/// useless without knowing which engine entry point it was.
+static STARTS: std::sync::Mutex<Option<std::collections::HashMap<u32, usize>>> =
+    std::sync::Mutex::new(None);
 static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LAST_SIG: std::sync::Mutex<(usize, usize, usize)> = std::sync::Mutex::new((0, 0, 0));
@@ -502,6 +525,17 @@ pub fn watch() -> Vec<String> {
     if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
         out.push("first scan — naming every thread".to_string());
         out.extend(thread_rows(table.as_ref()));
+        // Remember them all: a thread that dies later must still have a name.
+        let mut g = match STARTS.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let m = g.get_or_insert_with(std::collections::HashMap::new);
+        for tid in &tids {
+            if let Some(a) = thread_start_address(*tid) {
+                m.insert(*tid, a);
+            }
+        }
     }
     if let Some(t) = table.as_ref() {
         out.push(t.summary());
@@ -555,7 +589,22 @@ pub fn watch() -> Vec<String> {
         let now: std::collections::HashSet<u32> = tids.iter().copied().collect();
         let before: std::collections::HashSet<u32> = prev.iter().copied().collect();
         for gone in before.difference(&now) {
-            out.push(format!("thread {gone:#x} exited (was alive at the previous poll)"));
+            let start = {
+                let mut g = match STARTS.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let m = g.get_or_insert_with(std::collections::HashMap::new);
+                let s = m.remove(gone);
+                s
+            };
+            match start {
+                Some(a) => out.push(format!(
+                    "thread {gone:#x} exited (start was {a:#x} {})",
+                    module_of(a)
+                )),
+                None => out.push(format!("thread {gone:#x} exited (was alive at the previous poll)")),
+            }
             if let Some(t) = table.as_ref() {
                 for e in t.entries.iter().filter(|e| e.id == *gone) {
                     out.push(format!(
@@ -570,6 +619,13 @@ pub fn watch() -> Vec<String> {
         // later, and by then the address is gone.
         for new in now.difference(&before) {
             let start = thread_start_address(*new);
+            if let Some(a) = start {
+                let mut g = match STARTS.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                g.get_or_insert_with(std::collections::HashMap::new).insert(*new, a);
+            }
             let who = start.map(module_of).unwrap_or_default();
             match start {
                 Some(a) => out.push(format!(
