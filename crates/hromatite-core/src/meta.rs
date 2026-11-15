@@ -458,7 +458,9 @@ impl Ranges {
     fn new() -> Self {
         let mut v: Vec<(usize, usize)> = procs::regions(1 << 20)
             .into_iter()
-            .filter(|r| readable_protect(r.protect))
+            // PAGE_GUARD pages raise 0xC00000FD when touched — the scan runs on
+            // the game thread, so a "readable" stack guard page must be skipped.
+            .filter(|r| readable_protect(r.protect) && r.protect & 0x100 == 0)
             .map(|r| (r.base, r.base + r.size))
             .collect();
         v.sort_unstable();
@@ -518,6 +520,47 @@ fn class_like_in(r: &Ranges, p: usize) -> bool {
     }
 }
 
+/// Density scan of one region: returns merged `(start, words)` stretches where
+/// at least 75% of a 128-word window looks like class pointers.
+fn scan_region(start: usize, words: usize, ranges: &Ranges) -> Vec<(usize, usize)> {
+    const WIN: usize = 128;
+    let mut out = Vec::new();
+    let mut flags = vec![0u8; words];
+    for i in 0..words {
+        let v = match ranges.u64(start + i * 8) {
+            Some(v) => v as usize,
+            None => continue,
+        };
+        if v >= 0x10000 && class_like_in(ranges, v) {
+            flags[i] = 1;
+        }
+    }
+    let mut prefix = vec![0u32; words + 1];
+    for i in 0..words {
+        prefix[i + 1] = prefix[i] + flags[i] as u32;
+    }
+    let mut marked: Vec<usize> = Vec::new();
+    for i in 0..=(words - WIN) {
+        let d = prefix[i + WIN] - prefix[i];
+        if d as usize * 4 >= WIN * 3 {
+            marked.push(i);
+        }
+    }
+    if marked.is_empty() {
+        return out;
+    }
+    let (mut a, mut prev) = (marked[0], marked[0]);
+    for &m in marked.iter().skip(1) {
+        if m > prev + 1 {
+            out.push((start + a * 8, prev + WIN - a));
+            a = m;
+        }
+        prev = m;
+    }
+    out.push((start + a * 8, prev + WIN - a));
+    out
+}
+
 pub fn class_tables() -> Vec<(usize, usize)> {
     use std::sync::Mutex;
     static CACHE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
@@ -553,39 +596,12 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         }
         scanned_words += words;
         scanned_regions += 1;
-        let mut flags = vec![0u8; words];
-        for i in 0..words {
-            let v = match ranges.u64(start + i * 8) {
-                Some(v) => v as usize,
-                None => continue,
-            };
-            if v >= 0x10000 && class_like_in(&ranges, v) {
-                flags[i] = 1;
-            }
+        // A stale page snapshot can still fault; the scan runs on the game's own
+        // thread, so one guarded call per region keeps a bad page from costing
+        // the whole command (and the game).
+        if let Ok(found) = crate::veh::call_with(|| scan_region(start, words, &ranges)) {
+            c.extend(found);
         }
-        let mut prefix = vec![0u32; words + 1];
-        for i in 0..words {
-            prefix[i + 1] = prefix[i] + flags[i] as u32;
-        }
-        let mut marked: Vec<usize> = Vec::new();
-        for i in 0..=words - WIN {
-            let d = prefix[i + WIN] - prefix[i];
-            if d as usize * 4 >= WIN * 3 {
-                marked.push(i);
-            }
-        }
-        if marked.is_empty() {
-            continue;
-        }
-        let (mut a, mut prev) = (marked[0], marked[0]);
-        for &m in marked.iter().skip(1) {
-            if m > prev + 1 {
-                c.push((start + a * 8, prev + WIN - a));
-                a = m;
-            }
-            prev = m;
-        }
-        c.push((start + a * 8, prev + WIN - a));
     }
     c.sort_by_key(|(a, _)| *a);
     c.dedup();
