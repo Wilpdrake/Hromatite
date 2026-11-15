@@ -304,6 +304,130 @@ fn cls2_lookup(ns: &str, name: &str, asm_hint: &str) -> Vec<String> {
     out
 }
 
+/// The image every Unity type lives in (fallback: mscorlib).
+fn core_image() -> Option<usize> {
+    crate::api::image_of("UnityEngine.CoreModule").or_else(|| crate::api::image_of("mscorlib"))
+}
+
+/// Vector3 out of three little-endian floats.
+fn vec3(bits: [u64; 2]) -> (f32, f32, f32) {
+    (
+        f32::from_bits(bits[0] as u32),
+        f32::from_bits((bits[0] >> 32) as u32),
+        f32::from_bits(bits[1] as u32),
+    )
+}
+
+/// M3 end-to-end proof: `Camera.main` → `transform` → `position`.
+///
+/// Nothing here needs an identified il2cpp export: the classes come from the
+/// image's own type table, and a method is called through the entry point that
+/// sits at `MethodInfo+0x00`. The Vector3 comes back through the hidden return
+/// pointer that Win64 uses for structs larger than 8 bytes (`rcx` = buffer,
+/// `rdx` = this).
+fn pos_probe() -> Vec<String> {
+    let mut out = Vec::new();
+    let image = match core_image() {
+        Some(i) => i,
+        None => return vec!["pos: no UnityEngine.CoreModule image".into()],
+    };
+    let cam = match crate::meta::find_class(image, "UnityEngine", "Camera") {
+        Some(c) => c,
+        None => return vec![format!("pos: Camera not found in image {image:#x}")],
+    };
+    out.push(format!(
+        "pos: Camera class {:#x} ({}), {} field(s)",
+        cam.addr,
+        crate::meta::layout_of(cam.addr),
+        crate::meta::fields_of(cam.addr).len()
+    ));
+
+    // 1. static Camera.main
+    let main = match crate::meta::method_entry(cam.addr, "get_main") {
+        Some(f) => f,
+        None => return {
+            out.push("pos: no Camera.get_main".into());
+            out
+        },
+    };
+    let cam_inst = match crate::veh::call0(main) {
+        Ok(v) => v,
+        Err(e) => {
+            out.push(format!("pos: Camera.main faulted: {e}"));
+            return out;
+        }
+    };
+    out.push(format!("pos: Camera.main = {cam_inst:#x}"));
+    if cam_inst < 0x10000 {
+        out.push("pos: no main camera in this world".into());
+        return out;
+    }
+
+    // 2. instance transform — Camera overrides it, Component declares it
+    let mut get_transform = crate::meta::method_entry(cam.addr, "get_transform");
+    if get_transform.is_none() {
+        for (ns, name) in [("UnityEngine", "Component"), ("UnityEngine", "Transform")] {
+            if let Some(c) = crate::meta::find_class(image, ns, name) {
+                get_transform = crate::meta::method_entry(c.addr, "get_transform");
+                if get_transform.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let get_transform = match get_transform {
+        Some(f) => f,
+        None => {
+            out.push("pos: no get_transform anywhere".into());
+            return out;
+        }
+    };
+    let tr = match crate::veh::call1(get_transform, cam_inst) {
+        Ok(v) => v,
+        Err(e) => {
+            out.push(format!("pos: get_transform faulted: {e}"));
+            return out;
+        }
+    };
+    out.push(format!("pos: transform = {tr:#x}"));
+    if tr < 0x10000 {
+        return out;
+    }
+
+    // 3. `Transform.position` (struct return: hidden buffer in rcx)
+    let trc = match crate::meta::find_class(image, "UnityEngine", "Transform") {
+        Some(c) => c,
+        None => {
+            out.push("pos: Transform class not found".into());
+            return out;
+        }
+    };
+    out.push(format!(
+        "pos: Transform class {:#x}, {} method(s)",
+        trc.addr,
+        crate::meta::methods_of(trc.addr).len()
+    ));
+    let get_pos = match crate::meta::method_entry(trc.addr, "get_position") {
+        Some(f) => f,
+        None => {
+            out.push("pos: no Transform.get_position".into());
+            return out;
+        }
+    };
+    let mut buf = [0u64; 2];
+    match crate::veh::call2(get_pos, buf.as_mut_ptr() as usize, tr) {
+        Ok(_) => {
+            let (x, y, z) = vec3(buf);
+            out.push(format!(
+                "pos: world position = ({x:.3}, {y:.3}, {z:.3})  [raw {:#x} {:#x}]",
+                buf[0], buf[1]
+            ));
+        }
+        Err(e) => out.push(format!("pos: get_position faulted: {e}")),
+    }
+    out
+}
+
 /// Execute one command. Returns the answer lines and a control action.
 pub fn dispatch(line: &str) -> (Vec<String>, Action) {
     let mut it = line.splitn(4, char::is_whitespace);
@@ -337,6 +461,13 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "api [1|2|reset]           — идентифицировать il2cpp API (1=assemblies, 2=class)".into(),
                 "cls2 <ns> <name> [asm]    — класс через il2cpp_class_from_name".into(),
                 "cam                       — короткий тест: UnityEngine.Camera".into(),
+                "types [asm] [max]         — классы образа через typeInfoTable (без API-вызовов)".into(),
+                "tfind <ns> <name> [asm]   — найти класс по имени (без asm — по всем образам)".into(),
+                "fields <class>            — поля класса и их смещения".into(),
+                "methods <class> [фильтр]   — методы класса: имя, entry point, RVA".into(),
+                "mcall <class> <method> [a1..a3] — вызов метода по entry point под VEH".into(),
+                "pos                       — Camera.main -> transform -> position (M3)".into(),
+                "cam2                      — Camera через таблицу типов (без API)".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
                 "av [addr]                 — safe-чтение + сырое разыменование (проверка VEH)".into(),
                 "seal | quit               — выйти из интерактива (инжектор запечатает образ)".into(),
@@ -912,6 +1043,175 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         "cam" => {
             let mut out = vec!["probe: UnityEngine.Camera".to_string()];
             out.extend(cls2_lookup("UnityEngine", "Camera", ""));
+            (out, Action::None)
+        }
+        // ---- M3: memory-only metadata walk --------------------------------
+        // `types [assembly] [max]` — enumerate the image's classes through its
+        // own codegen module (`typeInfoTable`). This needs *no* identified
+        // il2cpp export: the whole class table is plain pointers in memory.
+        "types" => {
+            let asm = if a1.is_empty() { "UnityEngine.CoreModule" } else { a1 };
+            let max = parse_addr(a2).unwrap_or(40).min(500);
+            let image = match crate::api::image_of(asm) {
+                Some(i) => i,
+                None => return (vec![format!("no image for '{asm}'")], Action::None),
+            };
+            let (cofs, table, list) = crate::meta::classes_of_image(image, 40000);
+            let mut out = vec![format!(
+                "types: {asm} image {image:#x}, typeInfoTable {table:#x} (@+{cofs:#x}), {} class(es)",
+                list.len()
+            )];
+            for c in list.iter().take(max) {
+                out.push(format!("  {:#x}  {}", c.addr, c.full()));
+            }
+            (out, Action::None)
+        }
+        // `tfind <ns> <name> [assembly]` — exact class lookup; without an
+        // assembly it walks every loaded image (VRChat types live in
+        // Assembly-CSharp, Unity types in UnityEngine.CoreModule).
+        "tfind" => {
+            if a1.is_empty() || a2.is_empty() {
+                return (vec!["usage: tfind <ns> <name> [assembly]".into()], Action::None);
+            }
+            let (ns, name) = (a1, a2);
+            let mut out = Vec::new();
+            if rest.trim().is_empty() {
+                let hits = crate::meta::find_class_anywhere(ns, name);
+                if hits.is_empty() {
+                    out.push(format!("{ns}.{name}: not found in any image"));
+                }
+                for (asm, c) in hits {
+                    out.push(format!(
+                        "{ns}.{name} = {:#x} (assembly {asm})  {}",
+                        c.addr,
+                        crate::meta::layout_of(c.addr)
+                    ));
+                    for (n, off) in crate::meta::fields_of(c.addr).iter().take(12) {
+                        out.push(format!("     field {n} @ +{off:#x}"));
+                    }
+                }
+            } else {
+                let asm = rest.trim();
+                match crate::api::image_of(asm).and_then(|i| {
+                    crate::meta::find_class(i, ns, name).map(|c| (i, c))
+                }) {
+                    Some((img, c)) => {
+                        out.push(format!(
+                            "{ns}.{name} = {:#x} (assembly {asm}, image {img:#x})  {}",
+                            c.addr,
+                            crate::meta::layout_of(c.addr)
+                        ));
+                        for (n, off) in crate::meta::fields_of(c.addr).iter().take(24) {
+                            out.push(format!("     field {n} @ +{off:#x}"));
+                        }
+                    }
+                    None => out.push(format!("{ns}.{name}: not found in {asm}")),
+                }
+            }
+            (out, Action::None)
+        }
+        // `fields <class>` — every field with its instance offset.
+        "fields" => {
+            let c = match parse_addr(a1) {
+                Some(c) => c,
+                None => return (vec!["usage: fields <classaddr>".into()], Action::None),
+            };
+            let f = crate::meta::fields_of(c);
+            let mut out = vec![format!(
+                "{}: {} field(s) via {}",
+                crate::meta::class_name(c).unwrap_or_else(|| "?".into()),
+                f.len(),
+                crate::meta::fields_ptr(c)
+                    .map(|(o, p)| format!("+{o:#x} -> {p:#x}"))
+                    .unwrap_or_else(|| "no field table".into())
+            )];
+            for (n, off) in f {
+                out.push(format!("  {n:32} @ +{off:#x}"));
+            }
+            (out, Action::None)
+        }
+        // `methods <class> [substr]` — method names with their compiled entry
+        // points (GameAssembly RVA included, so they can be called directly).
+        "methods" => {
+            let c = match parse_addr(a1) {
+                Some(c) => c,
+                None => return (vec!["usage: methods <classaddr> [filter]".into()], Action::None),
+            };
+            let filter = rest.trim().to_string();
+            let ga = procs::own_module(crate::GAME_ASSEMBLY);
+            let m = crate::meta::methods_of(c);
+            let mut out = vec![format!(
+                "{}: {} method(s) via {}",
+                crate::meta::class_name(c).unwrap_or_else(|| "?".into()),
+                m.len(),
+                crate::meta::methods_ptr(c)
+                    .map(|(o, p)| format!("+{o:#x} -> {p:#x}"))
+                    .unwrap_or_else(|| "no method table".into())
+            )];
+            for (n, fp, _) in m.iter() {
+                if !filter.is_empty() && !n.contains(&filter) {
+                    continue;
+                }
+                let tag = match ga {
+                    Some((b, _)) if *fp >= b => format!("GA+{:#x}", fp - b),
+                    _ => tag_of(*fp).to_string(),
+                };
+                out.push(format!("  {n:44} {fp:#x} ({tag})"));
+                if out.len() > 200 {
+                    out.push("  … (truncated)".into());
+                    break;
+                }
+            }
+            (out, Action::None)
+        }
+        // `mcall <class> <method> [a1..a3]` — call a method's compiled entry
+        // point under the VEH. Static getters need no args, instance methods
+        // take `this` as a1; a struct return would need a hidden pointer, so
+        // `pos` below is the ready-made example of that case.
+        "mcall" => {
+            let (c, mname) = match (parse_addr(a1), a2) {
+                (Some(c), m) if !m.is_empty() => (c, m),
+                _ => return (vec!["usage: mcall <classaddr> <method> [a1..a3]".into()], Action::None),
+            };
+            let entry = match crate::meta::method_entry(c, mname) {
+                Some(e) => e,
+                None => return (vec![format!("no method '{mname}' in {c:#x}")], Action::None),
+            };
+            let a: Vec<usize> = rest.split_whitespace().filter_map(parse_addr).collect();
+            let g = |i: usize| a.get(i).copied().unwrap_or(0);
+            let mut out = vec![format!("mcall {mname} @ {entry:#x}({:#x}, {:#x}, {:#x})", g(0), g(1), g(2))];
+            match crate::veh::call3(entry, g(0), g(1), g(2)) {
+                Ok(r) => {
+                    out.push(format!("  -> {r:#x}"));
+                    if r >= 0x10000 && crate::safe::readable_at(r) {
+                        out.extend(dump_qwords(r, 6));
+                    }
+                }
+                Err(e) => out.push(format!("  fault: {e}")),
+            }
+            (out, Action::None)
+        }
+        // `pos` — the M3 proof: Camera.main -> transform -> position, i.e. a
+        // real Vector3 read out of the running game with plain memory reads
+        // plus three guarded method calls.
+        "pos" => (pos_probe(), Action::None),
+        // `cam2` — Camera class found through the type table (not through any
+        // il2cpp export), as a sanity check for the whole metadata walk.
+        "cam2" => {
+            let mut out = Vec::new();
+            match core_image() {
+                Some(img) => match crate::meta::find_class(img, "UnityEngine", "Camera") {
+                    Some(c) => {
+                        out.push(format!("Camera = {:#x} (image {img:#x})", c.addr));
+                        out.push(format!("  {}", crate::meta::layout_of(c.addr)));
+                        for (n, off) in crate::meta::fields_of(c.addr) {
+                            out.push(format!("  field {n} @ +{off:#x}"));
+                        }
+                    }
+                    None => out.push(format!("Camera not found in image {img:#x}")),
+                },
+                None => out.push("no image".into()),
+            }
             (out, Action::None)
         }
         // ---- plan 5 self-tests: prove guard()/VEH actually hold -----------

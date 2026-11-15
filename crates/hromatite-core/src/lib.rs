@@ -12,6 +12,7 @@ pub mod hook;
 pub mod il2cpp;
 pub mod log;
 pub mod manualmap;
+pub mod meta;
 pub mod pe;
 pub mod procs;
 pub mod remote;
