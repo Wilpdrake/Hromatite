@@ -441,15 +441,81 @@ pub fn field_offset(class: usize, name: &str) -> Option<i32> {
 // `il2cpp-class-internals.h`, 6000.0.x: the module ends with
 // `metadataRegistration`/`codeRegistaration`). `Il2CppClass` objects are kept
 // by the runtime in a global array indexed by type definition, so the only
-// layout-agnostic way in is to *find* that array: a long run of aligned
+// layout-agnostic way in is to *find* that array: a dense stretch of aligned
 // pointers inside GameAssembly's own `.data`, most of which lead to records
-// whose `+0x10` is an identifier.
-//
-// Everything here is scanned once and cached; the scan reads `.data` directly
-// (the regions come from `VirtualQuery`, so no per-word syscall).
+// whose `+0x10` is an identifier. Holes are expected (unloaded types are NULL),
+// so the test is a *density* window, not a strict run.
 
 fn readable_protect(p: u32) -> bool {
     matches!(p & 0xff, 2 | 4 | 8 | 0x20 | 0x40 | 0x80)
+}
+
+/// Cheap readable-range index: the scan touches millions of words, and a
+/// `VirtualQuery` per word would take minutes. Regions come from one snapshot.
+struct Ranges(Vec<(usize, usize)>);
+
+impl Ranges {
+    fn new() -> Self {
+        let mut v: Vec<(usize, usize)> = procs::regions(1 << 20)
+            .into_iter()
+            .filter(|r| readable_protect(r.protect))
+            .map(|r| (r.base, r.base + r.size))
+            .collect();
+        v.sort_unstable();
+        Self(v)
+    }
+
+    fn readable(&self, a: usize, len: usize) -> bool {
+        let i = match self.0.binary_search_by(|(base, _)| base.cmp(&a)) {
+            Ok(i) => i,
+            Err(0) => return false,
+            Err(i) => i - 1,
+        };
+        a.saturating_add(len) <= self.0[i].1
+    }
+
+    fn u64(&self, a: usize) -> Option<u64> {
+        self.readable(a, 8).then(|| unsafe { *(a as *const u64) })
+    }
+
+    fn cstr(&self, a: usize, max: usize) -> Option<String> {
+        if a < 0x10000 || !self.readable(a, 1) {
+            return None;
+        }
+        let mut s = String::with_capacity(32);
+        for i in 0..max {
+            if !self.readable(a + i, 1) {
+                return None;
+            }
+            let b = unsafe { *((a + i) as *const u8) };
+            if b == 0 {
+                return (!s.is_empty()).then_some(s);
+            }
+            if !(33..127).contains(&b) {
+                return None;
+            }
+            s.push(b as char);
+        }
+        None
+    }
+}
+
+fn class_like_in(r: &Ranges, p: usize) -> bool {
+    if p < 0x10000 || !r.readable(p, 0x20) {
+        return false;
+    }
+    let name_ptr = match r.u64(p + CLASS_NAME_OFF) {
+        Some(v) => v as usize,
+        None => return false,
+    };
+    match r.cstr(name_ptr, 96) {
+        Some(s) if ident_like(&s) => {}
+        _ => return false,
+    }
+    match r.u64(p + CLASS_NS_OFF).unwrap_or(0) as usize {
+        0 => true,
+        ns => matches!(r.cstr(ns, 96), Some(s) if ident_like(&s)),
+    }
 }
 
 pub fn class_tables() -> Vec<(usize, usize)> {
@@ -467,58 +533,61 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         None => return Vec::new(),
     };
     let (lo, hi) = (gbase, gbase + gsize);
+    let ranges = Ranges::new();
+    const WIN: usize = 128;
     for r in procs::regions(65536) {
         if r.base < lo || r.base >= hi || !readable_protect(r.protect) {
             continue;
         }
         let start = (r.base + 7) & !7usize;
-        let end = r.base + r.size;
-        let mut a = start;
-        let mut run_start = 0usize;
-        let mut run_len = 0usize;
-        let mut flush = |run_start: usize, run_len: usize, c: &mut Vec<(usize, usize)>| {
-            if run_len < 512 {
-                return;
-            }
-            // vote on a spread sample: consecutive class records are what tells
-            // a class table from a table of `Il2CppType` or of code pointers
-            let step = (run_len / 48).max(1);
-            let mut votes = 0usize;
-            let mut total = 0usize;
-            let mut i = 0usize;
-            while i < run_len {
-                let p = unsafe { *((run_start + i * 8) as *const u64) } as usize;
-                total += 1;
-                if class_like(p) {
-                    votes += 1;
-                }
-                i += step;
-            }
-            if total > 0 && votes * 4 >= total * 3 {
-                c.push((run_start, run_len));
-            }
-        };
-        while a + 8 <= end {
-            let v = unsafe { *(a as *const u64) } as usize;
-            let plausible = v >= 0x10000 && v < 0x0000_7FFF_FFFF_0000 && v & 3 == 0;
-            if plausible {
-                if run_len == 0 {
-                    run_start = a;
-                }
-                run_len += 1;
-            } else {
-                flush(run_start, run_len, &mut c);
-                run_len = 0;
-            }
-            a += 8;
+        let words = (r.base + r.size).saturating_sub(start) / 8;
+        if words < WIN * 2 {
+            continue;
         }
-        flush(run_start, run_len, &mut c);
+        let mut flags = vec![0u8; words];
+        for i in 0..words {
+            let v = match ranges.u64(start + i * 8) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            if v >= 0x10000 && class_like_in(&ranges, v) {
+                flags[i] = 1;
+            }
+        }
+        let mut prefix = vec![0u32; words + 1];
+        for i in 0..words {
+            prefix[i + 1] = prefix[i] + flags[i] as u32;
+        }
+        let mut marked: Vec<usize> = Vec::new();
+        for i in 0..=words - WIN {
+            let d = prefix[i + WIN] - prefix[i];
+            if d as usize * 4 >= WIN * 3 {
+                marked.push(i);
+            }
+        }
+        if marked.is_empty() {
+            continue;
+        }
+        let (mut a, mut prev) = (marked[0], marked[0]);
+        for &m in marked.iter().skip(1) {
+            if m > prev + 1 {
+                c.push((start + a * 8, prev + WIN - a));
+                a = m;
+            }
+            prev = m;
+        }
+        c.push((start + a * 8, prev + WIN - a));
     }
     c.sort_by_key(|(a, _)| *a);
     c.dedup();
     log::log_tag(
         "meta",
-        &format!("class tables detected: {:?}", c.iter().map(|(a, n)| format!("{a:#x}+{n}")).collect::<Vec<_>>()),
+        &format!(
+            "class tables: {:?}",
+            c.iter()
+                .map(|(a, n)| format!("{a:#x}+{n}w"))
+                .collect::<Vec<_>>()
+        ),
     );
     c.clone()
 }
