@@ -350,6 +350,88 @@ pub fn repair(table: &Table) -> Vec<String> {
     out
 }
 
+/// `GetExitCodeThread` on a running thread answers this.
+const STILL_ACTIVE: u32 = 0x103;
+
+/// Is the thread behind this handle still running? `None` = the query itself
+/// failed (a handle we do not own, or a recycled one).
+fn alive_by_handle(handle: u64) -> Option<bool> {
+    if handle == 0 || handle == u64::MAX {
+        return None;
+    }
+    let mut code: u32 = 0;
+    let ok = unsafe { ffi::GetExitCodeThread(handle as ffi::HANDLE, &mut code) };
+    if ok == 0 {
+        return None;
+    }
+    Some(code == STILL_ACTIVE)
+}
+
+/// Unlink one record, given its bucket and pointer. Returns true on success.
+fn unlink_at(base: usize, bucket: usize, ptr: usize) -> bool {
+    let mut prev = 0usize;
+    let mut cur = safe::read_usize(base + bucket * 8).unwrap_or(0);
+    let mut guard = 0;
+    while cur != 0 && guard < 16 {
+        if cur == ptr {
+            let next = safe::read_usize(cur + OFF_NEXT).unwrap_or(0);
+            return if prev == 0 {
+                safe::write_usize(base + bucket * 8, next)
+            } else {
+                safe::write_usize(prev + OFF_NEXT, next)
+            };
+        }
+        prev = cur;
+        cur = safe::read_usize(cur + OFF_NEXT).unwrap_or(0);
+        guard += 1;
+    }
+    false
+}
+
+/// **The fix that races the collector.** Read the table and unlink any record
+/// whose own handle reports an exited thread (`GetExitCodeThread != 0x103`) —
+/// the game's threads die on a schedule of seconds and `GC_suspend_all` then
+/// spins 1e6 times on the corpse (`SuspendThread loop failed: thread id=…,
+/// errcode= 0x5` = ACCESS_DENIED for a terminated thread) before `int3`.
+///
+/// Uses Boehm's own handle, so no `Toolhelp32` snapshot (which can block for
+/// minutes under wine) and no ambiguity about a dead-but-openable id. Called
+/// from the console loop every ~400 ms; the window between the death and the
+/// collection is ~1–6 s, so this has to be much faster than the 8 s watcher.
+pub fn reap() -> Vec<String> {
+    let mut out = Vec::new();
+    let (base, _rva) = match find_table(&[], None) {
+        Some(v) => v,
+        None => {
+            // `find_table` needs live ids for scoring; fall back to the known rva
+            let ga = match procs::own_module(GAME_ASSEMBLY) {
+                Some((b, _)) => b,
+                None => return out,
+            };
+            (ga.wrapping_add(CANDIDATE_RVAS[0] as usize), CANDIDATE_RVAS[0])
+        }
+    };
+    for bucket in 0..BUCKETS {
+        let mut p = safe::read_usize(base + bucket * 8).unwrap_or(0);
+        let mut depth = 0;
+        while p != 0 && depth < 8 {
+            let next = safe::read_usize(p + OFF_NEXT).unwrap_or(0);
+            let id = safe::read_u32(p + OFF_ID).unwrap_or(0);
+            let handle = safe::read_u64(p + OFF_HANDLE).unwrap_or(0);
+            if id != 0 && alive_by_handle(handle) == Some(false) {
+                let ok = unlink_at(base, bucket, p);
+                out.push(format!(
+                    "reaped dead record id={:#x} handle={:#x} bucket={} -> {ok}",
+                    id, handle, bucket
+                ));
+            }
+            p = next;
+            depth += 1;
+        }
+    }
+    out
+}
+
 /// Should `watch()` auto-repair? On by default: without it the next collection
 /// aborts the process, so the alternative is certain death.
 fn auto_fix() -> bool {
@@ -423,7 +505,7 @@ pub fn watch() -> Vec<String> {
             let n = IDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n % 5 == 0 {
                 out.push(format!(
-                    "no change in thread/record counts for ~{} s — game looks frozen",
+                    "counts idle for ~{} s (quiet menu looks the same as a freeze — cross-check the Unity log mtime)",
                     n * 8
                 ));
             }

@@ -75,6 +75,19 @@ fn console_loop(secs: u32) -> bool {
         // "SuspendThread loop failed", the last line before the end of the log
         // names the record that made the collector spin.
         polls += 1;
+        // Every ~0.8 s: unlink records whose thread already exited. This is the
+        // only thing that runs fast enough — measured: a dead record was reaped
+        // 6 s after the death was noticed, and the collector had already started
+        // its 1e6-iteration loop on it (gc.log: "SuspendThread loop failed:
+        // thread id= 0x37c, errcode= 0x5" = ACCESS_DENIED for a terminated
+        // thread). `reap()` asks Boehm's own handle, so it is 40 cheap syscalls.
+        if polls % 2 == 0 {
+            let reaped = log::guard("gct reap", hromatite_core::gcthreads::reap)
+                .unwrap_or_default();
+            for l in reaped {
+                log::log_tag("gct", &l);
+            }
+        }
         // Every ~8 s: thread births/deaths plus the state of Boehm's own thread
         // table. The line we are hunting is "thread 0xNNN exited" immediately
         // followed by "Boehm STILL holds it" — that record is what makes
