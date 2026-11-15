@@ -1,4 +1,5 @@
 /target
+crates/hromatite-overlay/target/
 .idea/
 *.iml
 __pycache__/

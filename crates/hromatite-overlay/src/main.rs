@@ -107,6 +107,22 @@ unsafe extern "C" {
         attrs: *mut XSetWindowAttributes,
     ) -> Window;
     fn XMapWindow(d: *mut Display, w: Window) -> c_int;
+    fn XDefaultDepth(d: *mut Display, screen: c_int) -> c_int;
+    fn XCreatePixmap(d: *mut Display, drawable: XID, w: c_uint, h: c_uint, depth: c_uint) -> XID;
+    fn XFreePixmap(d: *mut Display, pixmap: XID) -> c_int;
+    fn XCopyArea(
+        d: *mut Display,
+        src: XID,
+        dest: XID,
+        gc: GContext,
+        sx: c_int,
+        sy: c_int,
+        w: c_uint,
+        h: c_uint,
+        dx: c_int,
+        dy: c_int,
+    ) -> c_int;
+    fn XSetGraphicsExposures(d: *mut Display, gc: GContext, onoff: c_int) -> c_int;
     fn XStoreName(d: *mut Display, w: Window, name: *const c_char) -> c_int;
     fn XCreateGC(d: *mut Display, w: Window, mask: c_ulong, values: *mut c_void) -> GContext;
     fn XSetForeground(d: *mut Display, gc: GContext, pixel: c_ulong) -> c_int;
@@ -348,6 +364,10 @@ struct Gfx {
     display: *mut Display,
     win: Window,
     gc: GContext,
+    /// Back buffer: everything is drawn here and blitted in one `XCopyArea`,
+    /// which is what keeps the panel free of flicker at 60 fps.
+    pixmap: XID,
+    pgc: GContext,
     root: Window,
 }
 
@@ -496,10 +516,24 @@ fn main() {
         unsafe { XSetFont(display, gc, fid) };
     }
 
+    // Backing pixmap: draw off-screen, blit once per frame.
+    // SAFETY: default depth/screen of the live display; window id is valid.
+    let depth = unsafe { XDefaultDepth(display, XDefaultScreen(display)) } as c_uint;
+    let pixmap = unsafe { XCreatePixmap(display, win, PANEL_W, PANEL_H, depth) };
+    let pgc = unsafe { XCreateGC(display, pixmap, 0, std::ptr::null_mut()) };
+    if !font_ptr.is_null() {
+        let fid = unsafe { *(font_ptr as *const c_ulong).add(1) };
+        unsafe { XSetFont(display, pgc, fid) };
+    }
+    // SAFETY: no GraphicsExpose storm on every blit.
+    unsafe { XSetGraphicsExposures(display, gc, 0) };
+
     let gfx = Gfx {
         display,
         win,
         gc,
+        pixmap,
+        pgc,
         root,
     };
     let mut ui = Ui {
@@ -521,13 +555,16 @@ fn main() {
     let mut last_pos = Instant::now() - Duration::from_secs(5);
     let mut last_who = Instant::now() - Duration::from_secs(5);
     let mut dirty = true;
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut game_win: Window = 0;
     let started = Instant::now();
 
     loop {
         let now = Instant::now();
         let mut wants = String::new();
-        if ui.cfg.show_cam && now.duration_since(last_pos) >= Duration::from_millis(400) {
+        // The payload polls the command file every ~250 ms; asking a bit more
+        // often keeps the numbers as fresh as the channel allows.
+        if ui.cfg.show_cam && now.duration_since(last_pos) >= Duration::from_millis(200) {
             wants.push_str("pos\n");
             last_pos = now;
         }
@@ -598,7 +635,11 @@ fn main() {
             game_win = 0;
         }
 
-        if dirty {
+        // Redraw when something changed (telemetry, hover, drag) and at ~4 Hz
+        // otherwise, so the `age` counter stays alive without burning CPU on
+        // identical frames — each frame is a full 470x250 blit through kwin.
+        if dirty || now.duration_since(last_draw) >= Duration::from_millis(250) {
+            last_draw = now;
             dirty = false;
             draw(&gfx, &ui, &tel, glyph_w, glyph_h, started);
         }
@@ -688,7 +729,7 @@ fn main() {
             }
         }
 
-        sleep(Duration::from_millis(120));
+        sleep(Duration::from_millis(33));
     }
 }
 
@@ -850,8 +891,8 @@ fn draw(g: &Gfx, ui: &Ui, tel: &Telemetry, gh: i32, _gw: i32, started: Instant) 
     // SAFETY: all handles live; drawing only.
     unsafe {
         let d = g.display;
-        let w = g.win;
-        let gc = g.gc;
+        let w = g.pixmap;
+        let gc = g.pgc;
         XSetForeground(d, gc, 0x0010_1014);
         XFillRectangle(d, w, gc, 0, 0, PANEL_W, PANEL_H);
 
@@ -949,6 +990,9 @@ fn draw(g: &Gfx, ui: &Ui, tel: &Telemetry, gh: i32, _gw: i32, started: Instant) 
                 tel.players.len()
             ),
         );
+
+        // One blit: the window never shows a half-drawn frame.
+        XCopyArea(d, g.pixmap, g.win, g.gc, 0, 0, PANEL_W, PANEL_H, 0, 0);
     }
 }
 
@@ -957,8 +1001,8 @@ fn text(g: &Gfx, x: i32, y: i32, s: &str) {
     unsafe {
         XDrawString(
             g.display,
-            g.win,
-            g.gc,
+            g.pixmap,
+            g.pgc,
             x,
             y,
             s.as_ptr() as *const c_char,
