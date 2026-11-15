@@ -790,6 +790,13 @@ pub fn class_by_name_string(ns: &str, name: &str) -> Option<Class> {
             // `name` lives at class+0x10
             let c = slot.wrapping_sub(CLASS_NAME_OFF);
             if !class_like(c) {
+                log::log_tag(
+                    "meta",
+                    &format!(
+                        "    slot {slot:#x} -> {c:#x}: not class-like (name@+0x10={:?})",
+                        class_name(c)
+                    ),
+                );
                 continue;
             }
             let n = class_name(c)?;
