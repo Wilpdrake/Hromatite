@@ -1582,3 +1582,29 @@ il2cpp одними чтениями памяти (без единого выз�
   доказывающий необходимость `file_offset -> RVA`; `api_map.py --check` — OK.
   `--require-complete` ожидаемо завершается кодом 2 (неполные личности не
   выдумываются). Следующий этап — parser расшифрованной метадаты.
+
+### 2026-11-15 — База IL2CPP, этап 2: checked parser метаданных v29–31 в Rust и Python
+
+- Коммит: этот (`feat(metadata): parse decrypted v29-v31 catalogs on either side`).
+- Новые `crates/hromatite-core/src/metadata.rs`, `tools/meta_parse.py` и тесты.
+  Структуры и версии взяты из Il2CppDumper `MetadataClass.cs` (Min/Max attributes
+  для v29+): header 256 B, type 88 B, method 32/36 B, field 12 B, property 20 B,
+  image 32 B, assembly 80 B. Строки, string literals, типы, методы, поля,
+  properties, images/assemblies, диапазоны методов по образу — всё с проверками
+  границ, отрицательных start/count, whole-record stride и `Result`/исключений,
+  без `unwrap()` на данных.
+- `Meta::from_bytes` получает неизменяемый снапшот. `Meta::locate` ищет
+  `AF 1B B1 FA` только в committed, non-exec регионах крупными первыми; кандидат
+  проходит полную структурную валидацию до выделения 40+ МБ, кэшируется только
+  успех. JIT-ready `Meta` копируется в Vec, поэтому повторные методы не
+  перечитывают живую heap-память и `dump()` точен байт-в-байт. Вживую locate
+  пока НЕ проверен — это следующий этап runtime-bridge.
+- Публичная пара parser'ов одинаково считает `image_method_range` — индекс
+  метода внутри `codegen.methodPointers` для следующего этапа.
+- Проверено: Rust 5/5 (v31, v29, v30, string literals, испорченные таблицы),
+  Python 7/7 плюс integration-test opt-in `HROMATITE_META_DUMP`;
+  `cargo test -p hromatite-core --target x86_64-unknown-linux-gnu metadata::tests`
+  и `cargo check --workspace` — OK. Python test реально отвергает нынешний
+  зашифрованный файл игры (`missing decrypted metadata magic`) и CLI падает
+  кодом 2, а не показывает фальшивую статистику.
+

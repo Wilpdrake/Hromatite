@@ -7,6 +7,7 @@ pub mod api;
 pub mod api_symbols;
 pub mod console;
 pub mod crypto;
+pub mod metadata;
 pub mod ffi;
 pub mod gcthreads;
 pub mod hook;
