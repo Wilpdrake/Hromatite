@@ -2169,3 +2169,33 @@ il2cpp одними чтениями памяти (без единого выз�
   `worker start … body=<fn>` / наличие либо ОТСУТСТВИЕ `unregister tid=…` /
   `reaped dead record … body=<тот же fn>`. Только это отделит доказанный пропуск
   unregister от сбоя внутри самого unregister.
+
+### 2026-11-15 — Подтверждены оба тела: `+0xbd1ca0` и `+0xbe81a0`; trace переведён на очередь
+
+- Коммит: этот (`fix(gc): queue worker trace outside game locks`).
+- **Живое доказательство причины** (режим stub/LIVE, guard и trace включены):
+  поток `0x378` стартовал в `1794769345` с `fn=GameAssembly+0xbd1ca0`, затем без
+  единого `unregister tid=0x378` вышел с `exitcode=0x0`; репер снял запись в
+  `1794769418` (`hromatite.log:43171,43740`). Это непосредственно подтверждает
+  static-кандидата из прошлой записи. Два аналогичных выхода без unregister пойманы
+  и для `+0xbe81a0` (`0x598` в `1794769415`, `0x7b8` в `1794769418`). Значит это
+  общий класс worker-lifetime ошибки, а не частная ветка лишь одного тела.
+- **Триггер совпал с наблюдением пользователя**: переход на карту/профиль/группу
+  сопровождается пачкой `worker start` и быстрыми выходами worker-задач. Сама
+  страница ни при чём: гонка идёт между массовым завершением потоков и следующим
+  stop-the-world GC.
+- Первый trace делал `procs::modules` на worker/unregister-потоках: это
+  `CreateToolhelp32Snapshot`, уже известный многоминутными зависаниями. После его
+  удаления повторный freeze показал, что файловый I/O из detour тоже нельзя считать
+  безопасным. **Финальная граница**: detour только кладёт `(tid,fn,arg)` и факт
+  unregister в ограниченную VecDeque (4096), файл открывает исключительно stub.
+  Reaper добавляет `unregister_called=true/false`, labels больше не вызывают
+  `Toolhelp` даже ради имени модуля.
+- TDD: registry/events/unregister-called test сначала падает `E0432`, теперь
+  GREEN; core **40/40**, DLL **2/2**, release build OK, scoped Clippy OK.
+- Доказано также, что stub-guard установлен живьём: обе строки
+  `inline GetThreadContext guard installed` и `stub-thread GC guard installed=true`.
+  В прогоне репер успел снять записи до фатала (`SuspendThread loop failed` нет,
+  GC дошёл до #65), но прямое событие `inline guard: stale record…` ещё не
+  поймано; долговременная стабильность queue-варианта проверяется следующим
+  запуском, преждевременно «заморожено» не объявлять.

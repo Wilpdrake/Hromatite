@@ -1798,10 +1798,6 @@ pub unsafe extern "system" fn gc_worker_detour(inner: *mut u8) -> usize {
     let tid = crate::gcthreads::own_tid();
     if let Some([entry, arg]) = crate::safe::read_words::<2>((inner as usize).wrapping_add(8)) {
         crate::gcthreads::note_worker_body(tid, entry, arg);
-        log::log_tag(
-            "gct",
-            &format!("worker start tid={tid:#x} body={}", crate::gcthreads::worker_body_label(tid)),
-        );
     }
     let original = GC_DISPATCH_ORIG.load(Ordering::Acquire);
     if original == 0 {
@@ -1822,10 +1818,7 @@ pub unsafe extern "system" fn gc_worker_detour(inner: *mut u8) -> usize {
 /// it has been published by the installer.
 pub unsafe extern "system" fn gc_unregister_detour() -> usize {
     let tid = crate::gcthreads::own_tid();
-    log::log_tag(
-        "gct",
-        &format!("unregister tid={tid:#x} body={}", crate::gcthreads::worker_body_label(tid)),
-    );
+    crate::gcthreads::note_unregister(tid);
     let original = GC_UNREGISTER_ORIG.load(Ordering::Acquire);
     if original == 0 {
         return 0;

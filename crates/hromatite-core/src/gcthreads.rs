@@ -460,7 +460,7 @@ pub fn reap() -> Vec<String> {
                 let detail = if body.is_empty() {
                     start
                 } else {
-                    format!("{start} body={body}")
+                    format!("{start} body={body} unregister_called={}", worker_unregister_called(id))
                 };
                 let ok = unlink_at(base, bucket, p);
                 out.push(format!(
@@ -501,6 +501,33 @@ static WORKER_BODIES: std::sync::Mutex<
     Option<std::collections::HashMap<u32, (usize, usize)>>,
 > = std::sync::Mutex::new(None);
 
+static WORKER_UNREGISTERED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+    std::sync::Mutex::new(None);
+static WORKER_EVENTS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Queue only. File I/O and module enumeration in a worker detour can block
+/// against Wine/GC locks; the stub thread drains and prints these strings.
+fn push_worker_event(event: String) {
+    let mut events = match WORKER_EVENTS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    const CAP: usize = 4096;
+    if events.len() >= CAP {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+pub fn drain_worker_events() -> Vec<String> {
+    let mut events = match WORKER_EVENTS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    events.drain(..).collect()
+}
+
 pub fn note_worker_body(tid: u32, entry: usize, arg: usize) {
     let mut g = match WORKER_BODIES.lock() {
         Ok(g) => g,
@@ -508,6 +535,34 @@ pub fn note_worker_body(tid: u32, entry: usize, arg: usize) {
     };
     g.get_or_insert_with(std::collections::HashMap::new)
         .insert(tid, (entry, arg));
+    drop(g);
+    push_worker_event(format!(
+        "worker start tid={tid:#x} body=fn={entry:#x} arg={arg:#x}"
+    ));
+}
+
+pub fn note_unregister(tid: u32) {
+    let body = worker_body_label(tid);
+    let mut unregistered = match WORKER_UNREGISTERED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unregistered
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(tid);
+    drop(unregistered);
+    push_worker_event(format!("unregister tid={tid:#x} body={body}"));
+}
+
+pub fn worker_unregister_called(tid: u32) -> bool {
+    let unregistered = match WORKER_UNREGISTERED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    unregistered
+        .as_ref()
+        .map(|set| set.contains(&tid))
+        .unwrap_or(false)
 }
 
 pub fn worker_body(tid: u32) -> Option<(usize, usize)> {
@@ -520,7 +575,7 @@ pub fn worker_body(tid: u32) -> Option<(usize, usize)> {
 
 pub fn worker_body_label(tid: u32) -> String {
     worker_body(tid)
-        .map(|(entry, arg)| format!("{entry:#x} {} arg={arg:#x}", module_of(entry)))
+        .map(|(entry, arg)| format!("fn={entry:#x} arg={arg:#x}"))
         .unwrap_or_default()
 }
 
@@ -533,6 +588,14 @@ pub fn prune_worker_bodies(live_tids: &[u32], gc_registered: &[u32]) {
     };
     if let Some(bodies) = g.as_mut() {
         bodies.retain(|tid, _| live_tids.contains(tid) || gc_registered.contains(tid));
+    }
+    drop(g);
+    let mut unregistered = match WORKER_UNREGISTERED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(set) = unregistered.as_mut() {
+        set.retain(|tid| live_tids.contains(tid) || gc_registered.contains(tid));
     }
 }
 
@@ -730,16 +793,28 @@ pub fn probe(forced_rva: Option<u32>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{note_worker_body, prune_worker_bodies, worker_body};
+    use super::{
+        drain_worker_events, note_unregister, note_worker_body, prune_worker_bodies,
+        worker_body, worker_unregister_called,
+    };
 
     #[test]
     fn worker_registry_resolves_a_reaped_tid_to_its_real_body() {
         let tid = 0xf00d_0042;
         note_worker_body(tid, 0xbd1ca0, 0x1234);
         assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
+        assert!(!worker_unregister_called(tid));
+        note_unregister(tid);
+        assert!(worker_unregister_called(tid));
+        let events = drain_worker_events();
+        assert!(events.iter().any(|e| e.contains("worker start") && e.contains("fn=0xbd1ca0")));
+        assert!(events.iter().any(|e| e.contains("unregister") && e.contains("fn=0xbd1ca0")));
+        assert!(drain_worker_events().is_empty());
         prune_worker_bodies(&[], &[tid]);
         assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
+        assert!(worker_unregister_called(tid));
         prune_worker_bodies(&[], &[]);
         assert_eq!(worker_body(tid), None);
+        assert!(!worker_unregister_called(tid));
     }
 }

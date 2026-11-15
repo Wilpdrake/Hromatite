@@ -101,6 +101,12 @@ fn console_loop(secs: u32) -> bool {
                 log::log_tag("gct", &l);
             }
         }
+        // Worker/unregister detours never open the log themselves: they only
+        // queue compact events. This stub owns every file open/close, so worker
+        // threads cannot block inside our logger while holding runtime locks.
+        for line in hromatite_core::gcthreads::drain_worker_events() {
+            log::log_tag("gct", &line);
+        }
         // `poll()` is the one call in this loop that is not a `dispatch`: an AV
         // there used to kill the payload thread silently (the log simply stops
         // right after "console ready" and every command goes unanswered).
