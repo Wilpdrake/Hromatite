@@ -1,5 +1,10 @@
-//! Just enough PE parsing to map an image by hand: headers, sections,
-//! relocations, import descriptors. No sec-adjacent cleverness.
+//! Checked PE input parsing. Every offset originates in the input file, so all
+//! reads are bounds-checked and malformed data returns an error, never a panic.
+
+#![forbid(unsafe_code)]
+
+const MAX_SECTIONS: usize = 96;
+const MAX_IMAGE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Section {
@@ -29,53 +34,95 @@ pub struct PeImage {
     pub is_64: bool,
 }
 
-fn u16_at(d: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([d[o], d[o + 1]])
+fn take(data: &[u8], offset: usize, len: usize) -> Result<&[u8], String> {
+    let end = offset.checked_add(len).ok_or("PE offset overflow")?;
+    data.get(offset..end).ok_or_else(|| {
+        format!("PE range {offset:#x}..{end:#x} is truncated (file is {:#x} bytes)", data.len())
+    })
 }
 
-fn u32_at(d: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+fn u16_at(data: &[u8], offset: usize) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(take(data, offset, 2)?.try_into().map_err(|_| "PE u16 conversion")?))
 }
 
-fn u64_at(d: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+fn u32_at(data: &[u8], offset: usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(take(data, offset, 4)?.try_into().map_err(|_| "PE u32 conversion")?))
+}
+
+fn u64_at(data: &[u8], offset: usize) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(take(data, offset, 8)?.try_into().map_err(|_| "PE u64 conversion")?))
 }
 
 impl PeImage {
     pub fn from_file(path: &str) -> Result<Self, String> {
         let data = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        if data.len() < 0x200 || &data[0..2] != b"MZ" {
+        Self::from_bytes(data)
+    }
+
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
+        if data.len() < 0x200 || take(&data, 0, 2)? != b"MZ" {
             return Err("not a PE (no MZ)".into());
         }
-        let e_lfanew = u32_at(&data, 0x3C) as usize;
-        if &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+        let pe_offset = u32_at(&data, 0x3C)? as usize;
+        if take(&data, pe_offset, 4)? != b"PE\0\0" {
             return Err("not a PE (no PE sig)".into());
         }
-        let nsec = u16_at(&data, e_lfanew + 6) as usize;
-        let opt_size = u16_at(&data, e_lfanew + 20) as usize;
-        let opt = e_lfanew + 24;
-        let magic = u16_at(&data, opt);
-        let is_64 = magic == 0x20B;
-        let image_base = if is_64 { u64_at(&data, opt + 24) } else { u32_at(&data, opt + 28) as u64 };
-        let entry = u32_at(&data, opt + 16);
-        let size_of_image = u32_at(&data, opt + 56);
-        let size_of_headers = u32_at(&data, opt + 60);
-        let dd = if is_64 { opt + 112 } else { opt + 96 };
-        let reloc = (u32_at(&data, dd + 5 * 8), u32_at(&data, dd + 5 * 8 + 4));
-        let imports = (u32_at(&data, dd + 8), u32_at(&data, dd + 12));
-        let tls = (u32_at(&data, dd + 9 * 8), u32_at(&data, dd + 9 * 8 + 4));
-        let mut sections = Vec::new();
-        let st = opt + opt_size;
-        for i in 0..nsec {
-            let b = st + i * 40;
-            sections.push(Section {
-                vsize: u32_at(&data, b + 8),
-                va: u32_at(&data, b + 12),
-                rsize: u32_at(&data, b + 16),
-                raw: u32_at(&data, b + 20),
-                characteristics: u32_at(&data, b + 36),
-            });
+        let nsec = u16_at(&data, pe_offset.checked_add(6).ok_or("PE header overflow")?)? as usize;
+        if nsec > MAX_SECTIONS {
+            return Err(format!("too many PE sections: {nsec}"));
         }
+        let opt_size = u16_at(&data, pe_offset.checked_add(20).ok_or("PE header overflow")?)? as usize;
+        let opt = pe_offset.checked_add(24).ok_or("PE header overflow")?;
+        let magic = u16_at(&data, opt)?;
+        let is_64 = match magic {
+            0x20B => true,
+            0x10B => false,
+            other => return Err(format!("unsupported PE optional-header magic {other:#x}")),
+        };
+        let dir = opt.checked_add(if is_64 { 112 } else { 96 }).ok_or("PE directory overflow")?;
+        let dir_end = dir.checked_add(10 * 8).ok_or("PE directory overflow")?;
+        let opt_end = opt.checked_add(opt_size).ok_or("PE optional header overflow")?;
+        if opt_end < dir_end {
+            return Err("PE optional header is shorter than its data directories".into());
+        }
+        take(&data, opt, opt_size)?;
+
+        let image_base = if is_64 {
+            u64_at(&data, opt + 24)?
+        } else {
+            u32_at(&data, opt + 28)? as u64
+        };
+        let entry = u32_at(&data, opt + 16)?;
+        let size_of_image = u32_at(&data, opt + 56)?;
+        let size_of_headers = u32_at(&data, opt + 60)?;
+        if size_of_image == 0 || size_of_image as usize > MAX_IMAGE_SIZE {
+            return Err(format!("invalid SizeOfImage {size_of_image:#x}"));
+        }
+        if size_of_headers > size_of_image {
+            return Err("SizeOfHeaders exceeds SizeOfImage".into());
+        }
+        let reloc = (u32_at(&data, dir + 5 * 8)?, u32_at(&data, dir + 5 * 8 + 4)?);
+        let imports = (u32_at(&data, dir + 8)?, u32_at(&data, dir + 12)?);
+        let tls = (u32_at(&data, dir + 9 * 8)?, u32_at(&data, dir + 9 * 8 + 4)?);
+
+        let section_table = opt_end;
+        take(&data, section_table, nsec.checked_mul(40).ok_or("PE section-table overflow")?)?;
+        let mut sections = Vec::with_capacity(nsec);
+        for i in 0..nsec {
+            let at = section_table + i * 40;
+            let vsize = u32_at(&data, at + 8)?;
+            let va = u32_at(&data, at + 12)?;
+            let rsize = u32_at(&data, at + 16)?;
+            let raw = u32_at(&data, at + 20)?;
+            let characteristics = u32_at(&data, at + 36)?;
+            let raw_end = (raw as usize).checked_add(rsize as usize).ok_or("section raw range overflow")?;
+            let va_end = (va as usize).checked_add(vsize as usize).ok_or("section VA range overflow")?;
+            if raw_end > data.len() || va_end > size_of_image as usize {
+                return Err(format!("section {i} lies outside its file/image bounds"));
+            }
+            sections.push(Section { va, vsize, raw, rsize, characteristics });
+        }
+
         Ok(Self {
             data,
             image_base,
@@ -88,5 +135,55 @@ impl PeImage {
             tls,
             is_64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Vec<u8> {
+        let mut data = vec![0u8; 0x400];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        data[0x80..0x84].copy_from_slice(b"PE\0\0");
+        data[0x86..0x88].copy_from_slice(&0u16.to_le_bytes());
+        data[0x94..0x96].copy_from_slice(&0xF0u16.to_le_bytes());
+        data[0x98..0x9A].copy_from_slice(&0x20Bu16.to_le_bytes());
+        data[0xB0..0xB8].copy_from_slice(&0x400000u64.to_le_bytes());
+        data[0xA8..0xAC].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[0xD0..0xD4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[0xD4..0xD8].copy_from_slice(&0x200u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn parses_a_well_formed_header() {
+        let image = PeImage::from_bytes(fixture()).unwrap();
+        assert!(image.is_64);
+        assert_eq!(image.image_base, 0x400000);
+        assert_eq!(image.entry, 0x1000);
+        assert_eq!(image.sections.len(), 0);
+    }
+
+    #[test]
+    fn every_truncation_is_an_error_not_a_panic() {
+        let data = fixture();
+        for len in 0..0x200 {
+            let result = PeImage::from_bytes(data[..len].to_vec());
+            assert!(result.is_err(), "prefix {len:#x} unexpectedly parsed");
+        }
+        assert!(PeImage::from_bytes(data[..0x200].to_vec()).is_ok());
+        assert!(PeImage::from_bytes(data).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_optional_magic_and_section_counts() {
+        let mut data = fixture();
+        data[0x98..0x9A].copy_from_slice(&0x999u16.to_le_bytes());
+        assert!(PeImage::from_bytes(data).is_err());
+        let mut data = fixture();
+        data[0x86..0x88].copy_from_slice(&97u16.to_le_bytes());
+        assert!(PeImage::from_bytes(data).is_err());
     }
 }

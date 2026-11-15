@@ -9,6 +9,8 @@
 //! `b`, `s`, `find`, `asm` let the host walk the il2cpp structures live, which
 //! turns a 2-minute rebuild+restart cycle into a single command.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use crate::il2cpp;
 use crate::procs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -211,19 +213,22 @@ fn find_string(text: &str, max: usize) -> Vec<usize> {
             continue;
         }
         crate::safe::scan_yield(); // let Unity's GC suspend us
-        let mut a = r.base;
-        // last start such that a+pat.len() (the NUL) is still inside the region
-        let last = r.base + r.size - need;
-        while a <= last && out.len() < max {
-            if unsafe { *(a as *const u8) } == pat[0]
-                && unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
-                && unsafe { *((a + pat.len()) as *const u8) } == 0
-            {
-                out.push(a);
-                a += pat.len();
-                continue;
+        let mut chunks = crate::safe::ScanChunks::new(r.base, r.size, r.protect, 64 * 1024, need);
+        while chunks.next_chunk() {
+            let span = chunks.span();
+            // last start such that a+pat.len() (the NUL) is still inside this chunk
+            let last = chunks.candidate_end().saturating_sub(need);
+            let mut a = span.base();
+            while a <= last && out.len() < max {
+                if crate::safe::matches_in_span(span, a, pat)
+                    && crate::safe::read_u8_in_span(span, a + pat.len()) == Some(0)
+                {
+                    out.push(a);
+                    a += pat.len();
+                    continue;
+                }
+                a += 1;
             }
-            a += 1;
         }
     }
     out
@@ -246,8 +251,10 @@ fn find_qword_slots(value: usize, max: usize) -> Vec<usize> {
         crate::safe::scan_yield();
         // регион уже проверен как committed+readable → прямой обход внутри
         // его границ (per-word VirtualQuery здесь стоил бы минуты)
-        let span = crate::safe::Span { base: r.base, size: r.size, protect: r.protect };
-        crate::safe::find_qword_in_span(&span, want, max, &mut out);
+        let mut chunks = crate::safe::ScanChunks::new(r.base, r.size, r.protect, 64 * 1024, 0);
+        while chunks.next_chunk() {
+            crate::safe::find_qword_in_span(chunks.span(), want, max, &mut out);
+        }
     }
     out
 }
@@ -381,7 +388,8 @@ fn pos_probe() -> Vec<String> {
             out
         },
     };
-    let cam_inst = match crate::veh::call0(main) {
+    // SAFETY: main is Camera.get_main's decoded MethodInfo entry with no args.
+    let cam_inst = match unsafe { crate::veh::call0(main) } {
         Ok(v) => v,
         Err(e) => {
             out.push(format!("pos: Camera.main faulted: {e}"));
@@ -413,7 +421,8 @@ fn pos_probe() -> Vec<String> {
             return out;
         }
     };
-    let tr = match crate::veh::call1(get_transform, cam_inst) {
+    // SAFETY: decoded Component.get_transform entry, exactly one `this` pointer.
+    let tr = match unsafe { crate::veh::call1(get_transform, cam_inst) } {
         Ok(v) => v,
         Err(e) => {
             out.push(format!("pos: get_transform faulted: {e}"));
@@ -446,7 +455,9 @@ fn pos_probe() -> Vec<String> {
         }
     };
     let mut buf = [0u64; 2];
-    match crate::veh::call2(get_pos, buf.as_mut_ptr() as usize, tr) {
+    // SAFETY: get_position expects its hidden Vector3 output pointer first and
+    // `this` second; buf is a live two-qword writable output buffer.
+    match unsafe { crate::veh::call2(get_pos, buf.as_mut_ptr() as usize, tr) } {
         Ok(_) => {
             let (x, y, z) = vec3(buf);
             out.push(format!(
@@ -562,23 +573,23 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     break;
                 }
                 crate::safe::scan_yield();
-                let mut a = r.base;
-                let end = r.base + r.size;
                 let n = pat.len();
-                // регион уже проверен как committed+readable, поэтому читаем
-                // напрямую: VirtualQuery на каждый байт — это минуты
-                while a + n <= end && total < 64 {
-                    let b0 = unsafe { *(a as *const u8) };
-                    if b0 == pat[0] {
-                        let window = unsafe { core::slice::from_raw_parts(a as *const u8, n) };
-                        if window == &pat[..] {
+                let mut chunks = crate::safe::ScanChunks::new(r.base, r.size, r.protect, 64 * 1024, n);
+                while chunks.next_chunk() {
+                    let span = chunks.span();
+                    let mut a = span.base();
+                    let end = chunks.candidate_end();
+                    // регион уже проверен как committed+readable, поэтому читаем
+                    // через snapshot-границу safe: VirtualQuery на каждый байт — минуты
+                    while a + n <= end && total < 64 {
+                        if crate::safe::matches_in_span(span, a, &pat) {
                             total += 1;
                             hits.push(format!("  {a:#x}"));
                             a += n;
                             continue;
                         }
+                        a += 1;
                     }
-                    a += 1;
                 }
             }
             hits.insert(
@@ -656,9 +667,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 if r.size < 16 {
                     continue;
                 }
-                let span = crate::safe::Span { base: r.base, size: r.size, protect: r.protect };
                 let mut slots = Vec::new();
-                crate::safe::find_qword_in_span(&span, want, 24 - hits.len(), &mut slots);
+                let mut chunks = crate::safe::ScanChunks::new(r.base, r.size, r.protect, 64 * 1024, 0);
+                while chunks.next_chunk() {
+                    crate::safe::find_qword_in_span(chunks.span(), want, 24 - hits.len(), &mut slots);
+                }
                 for a in slots {
                     hits.push(format!("  {a:#x}"));
                 }
@@ -772,7 +785,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 g(1),
                 g(2)
             )];
-            match crate::veh::call3(f, g(0), g(1), g(2)) {
+            // SAFETY: this is the explicit low-level `call` command: the user
+            // supplied the Win64 address and all opaque pointer arguments knowingly.
+            match unsafe { crate::veh::call3(f, g(0), g(1), g(2)) } {
                 Ok(v) => out.push(format!("  -> {v:#x}")),
                 Err(e) => out.push(format!("  fault: {e}")),
             }
@@ -814,7 +829,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         "guard" => match parse_addr(a1) {
             Some(addr) => {
                 crate::log::log_tag("con", &format!("guard {addr:#x}: calling under VEH"));
-                match crate::veh::call0(addr) {
+                // SAFETY: the explicit guard command is a delegated raw Win64
+                // probe; VEH captures the calling thread before dereferencing code.
+                match unsafe { crate::veh::call0(addr) } {
                     Ok(v) => (vec![format!("guard {addr:#x}: returned {v:#x}")], Action::None),
                     Err(f) => (vec![format!("guard {addr:#x}: {f}")], Action::None),
                 }
@@ -889,7 +906,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "ustub {off:#x} -> {target:#x} ({:#x}, {:#x}, {:#x})",
                 get(0), get(1), get(2)
             )];
-            match crate::veh::call3(target, get(0), get(1), get(2)) {
+            // SAFETY: target is computed from UnityPlayer base + the user supplied
+            // lazy stub offset; arguments are forwarded opaque integers/pointers.
+            match unsafe { crate::veh::call3(target, get(0), get(1), get(2)) } {
                 Ok(r) => {
                     out.push(format!("  -> {r:#x}"));
                     if r >= 0x10000 && crate::safe::readable_at(r) {
@@ -924,7 +943,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let ns_c = crate::ffi::cstr(ns);
             let nm_c = crate::ffi::cstr(name);
             let mut out = vec![format!("c3 {f:#x}({image:#x}, '{ns}', '{name}')")];
-            match crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize) {
+            // SAFETY: explicit c3 probe with live image and NUL-terminated names.
+            match unsafe { crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize) } {
                 Ok(r) => {
                     out.push(format!("  -> {r:#x}"));
                     if r >= 0x10000 && crate::safe::readable_at(r) {
@@ -962,7 +982,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let mut out = vec![format!(
                 "cls3: {f:#x}(image {image:#x}, '{ns}', '{name}')"
             )];
-            let called = crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize);
+            // SAFETY: explicit cls3 candidate with a live image and valid C strings.
+            let called = unsafe {
+                crate::veh::call3(f, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize)
+            };
             match called {
                 Ok(r) => {
                     out.push(format!("  -> {r:#x}"));
@@ -996,7 +1019,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 None => return (vec!["no image".into()], Action::None),
             };
             let mut out = vec![format!("imgc: {f:#x}(image {image:#x}, {idx:#x})")];
-            match crate::veh::call2(f, image, idx) {
+            // SAFETY: imgc probes image_get_class(image,index) with a live image.
+            match unsafe { crate::veh::call2(f, image, idx) } {
                 Ok(r) => {
                     out.push(format!("  -> {r:#x}"));
                     if r >= 0x10000 && crate::safe::readable_at(r) {
@@ -1028,7 +1052,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let mut hits = 0usize;
             let mut faults = 0usize;
             for i in 0..max {
-                match crate::veh::call2(f, image, i) {
+                // SAFETY: imgfind repeats the same image/index ABI and never
+                // transcends an index derived from the user's bounded max.
+                match unsafe { crate::veh::call2(f, image, i) } {
                     Ok(r) if r >= 0x10000 && crate::safe::readable_at(r) => {
                         for d in (0..0x60).step_by(8) {
                             if let Some(p) = crate::safe::read_u64(r + d)
@@ -1213,7 +1239,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let a: Vec<usize> = rest.split_whitespace().filter_map(parse_addr).collect();
             let g = |i: usize| a.get(i).copied().unwrap_or(0);
             let mut out = vec![format!("mcall {mname} @ {entry:#x}({:#x}, {:#x}, {:#x})", g(0), g(1), g(2))];
-            match crate::veh::call3(entry, g(0), g(1), g(2)) {
+            // SAFETY: entry comes from MethodInfo and its three opaque arguments
+            // are supplied explicitly by the user of the low-level mcall command.
+            match unsafe { crate::veh::call3(entry, g(0), g(1), g(2)) } {
                 Ok(r) => {
                     out.push(format!("  -> {r:#x}"));
                     if r >= 0x10000 && crate::safe::readable_at(r) {
@@ -1457,14 +1485,13 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             // log before the raw deref: if the process dies here, this line is
             // the only witness we get.
             crate::log::log_tag("con", &head);
-            let raw = unsafe { *(addr as *const u64) };
-            (
-                vec![
-                    head,
-                    format!("raw deref @{addr:#x} = {raw:#016x} (VEH did not run / addr was mapped)"),
-                ],
-                Action::None,
-            )
+            // SAFETY: this command deliberately performs an unaligned probe of
+            // an arbitrary address under VEH, as documented by diagnostic_raw_read.
+            let raw = match unsafe { crate::safe::diagnostic_raw_read(addr) } {
+                Ok(v) => format!("raw deref @{addr:#x} = {v:#016x} (address was mapped)"),
+                Err(e) => format!("raw deref @{addr:#x}: {e} (VEH caught it)"),
+            };
+            (vec![head, raw], Action::None)
         }
         "seal" => (vec!["seal requested, returning from DllMain".into()], Action::Seal),
         "quit" | "exit" => (vec!["bye".into()], Action::Quit),

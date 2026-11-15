@@ -1707,3 +1707,33 @@ il2cpp одними чтениями памяти (без единого выз�
   безопасные facade-функции; включить `unsafe_op_in_unsafe_fn` и
   `undocumented_unsafe_blocks`; отдельно проверить TOCTOU чтения и запись.
 
+### 2026-11-15 — Изоляция raw/, защита unsafe и полный code review
+
+- Коммит: этот (`refactor(rust): isolate unsafe code and harden boundaries`).
+- Приватный `raw/` содержит Win32/FFI, память, RAII Remote, VEH, hooks и
+  probes чужих функций. Публичные имена модулей сохранены реэкспортами;
+  высокоуровневые модули `forbid(unsafe_code)`, исключение только export
+  `#[unsafe(no_mangle)]` у `DllMain`. Workspace включает
+  `unsafe_op_in_unsafe_fn`, `undocumented_unsafe_blocks` и
+  `missing_safety_doc` на `deny`; 86 блоков получили SAFETY-инварианты.
+- Память через `ReadProcessMemory` или owned snapshots. `ScanChunks` и `Ranges`
+  переиспользуют 64 КиБ, `UnityPlayer` — 1 МиБ, вместо VQ/RPM на слово и
+  многогигабайтных аллокаций. Записи проверяют write-protection; числовой
+  `Span` сам по себе больше не разрешает dereference. Generic function calls и
+  AV-probe явно `unsafe` и только внутри `raw`.
+- Native review исправил: VEH return 0, nested panic-state restore, mutex
+  вне longjmp, GC publication до patch, rel8/rel32/RIP `-delta`, отказ внутренних
+  targets и неатомарных patches, полный набор imm16/0x66/REX.W и проверку
+  порядка prefixes. Full-seal больше не допускает in-image GC/hookat.
+  Chunk duplicates и двойной up_base устранены, ошибка чтения разрывает run.
+  PE parser возвращает `Err` на усечениях без прямых срезов/unwrap.
+- Проверка: host tests 35/35; workspace Clippy `-D warnings` — OK;
+  release build Windows — OK; `git diff --check` — OK. Финальный независимый
+  reviewer подтвердил последние две находки: **PASS**.
+- Ограничения: live VRChat/Wine/VEH/full-seal не запускались, PEB unlink и
+  long A/B не проверялись. Нет полного дифференциального декодера всех x86-64.
+  OS-read возвращает ошибку при гонках; VEH не доказывает корректность
+  неправильной функции, если та вернулась без исключения.
+- Осталось: стендовый runtime mapper/VEH/hook, затем длительное live A/B —
+  отдельным этапом, не выдавая этот статический refactor за live-доказательство.
+

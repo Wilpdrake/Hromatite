@@ -98,6 +98,8 @@ fn modrm_len(b: &[u8], at: usize) -> Option<ModRm> {
 pub fn decode_one(b: &[u8]) -> Option<Insn> {
     let mut i = 0usize;
     let mut rex_w = false;
+    let mut saw_rex = false;
+    let mut opsize_66 = false;
     // legacy prefixes, then at most one REX (which must come last)
     let mut guard = 0;
     loop {
@@ -107,15 +109,31 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
         }
         let c = *b.get(i)?;
         match c {
-            0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => i += 1,
+            0x66 => {
+                if saw_rex {
+                    return None;
+                }
+                opsize_66 = true;
+                i += 1;
+            }
+            0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {
+                // Reject legacy prefixes only when they follow REX. All other
+                // bytes continue into instruction decoding, including opcodes.
+                if saw_rex {
+                    return None;
+                }
+                i += 1;
+            }
             0x40..=0x4F => {
                 rex_w = (c & 0x08) != 0;
+                saw_rex = true;
                 i += 1;
             }
             _ => break,
         }
     }
     let op = *b.get(i)?;
+    let imm16 = opsize_66 && !rex_w;
     let mut rel = None;
     let mut rip = None;
     let total;
@@ -148,7 +166,6 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
                 | 0x7E | 0x7F // movd / movdqa store
                 | 0x90..=0x9F // setcc
                 | 0xB6 | 0xB7 | 0xBE | 0xBF // movzx / movsx
-                | 0xC6 // shuffle
                 | 0xD6 // movq
                 | 0xEF // pxor
                 | 0x1F => { // multi-byte nop
@@ -158,6 +175,13 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
                     }
                     total = i + 2 + m.bytes;
                 }
+                0xC6 => { // shuffle, with an immediate byte after ModRM
+                    let m = modrm_len(b, i + 2)?;
+                    if let Some(o) = m.rip {
+                        rip = Some(i + 2 + o);
+                    }
+                    total = i + 2 + m.bytes + 1;
+                }
                 _ => return None,
             }
         }
@@ -166,11 +190,13 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
         0x90 | 0x98 | 0x99 | 0x9C | 0x9D | 0xC3 | 0xC9 | 0xCC | 0xF4 => total = i + 1,
         0xC2 => total = i + 3, // ret imm16
         0x6A => total = i + 2, // push imm8
-        0x68 => total = i + 5, // push imm32
+        0x68 => total = i + if imm16 { 3 } else { 5 }, // push imm16/imm32
         0xA8 => total = i + 2,
-        0xA9 => total = i + 5,
+        0xA9 => total = i + if imm16 { 3 } else { 5 },
         0xB0..=0xB7 => total = i + 2, // mov r8, imm8
-        0xB8..=0xBF => total = i + if rex_w { 9 } else { 5 }, // mov r64, imm64 (opcode + 8)
+        0xB8..=0xBF => {
+            total = i + if rex_w { 9 } else if opsize_66 { 3 } else { 5 };
+        } // REX.W: imm64; 0x66: imm16 (unless REX.W wins); default: imm32
         0xE8 | 0xE9 => {
             rel = Some((i + 1, 32));
             total = i + 5;
@@ -186,33 +212,58 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
         // group 1 / moves with immediate
         0x80 => {
             let m = modrm_len(b, i + 1)?;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
             total = i + 1 + m.bytes + 1;
         }
         0x81 => {
             let m = modrm_len(b, i + 1)?;
-            total = i + 1 + m.bytes + 4;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
+            total = i + 1 + m.bytes + if imm16 { 2 } else { 4 };
         }
         0x83 => {
             let m = modrm_len(b, i + 1)?;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
             total = i + 1 + m.bytes + 1;
         }
         0xC0 | 0xC1 => {
             let m = modrm_len(b, i + 1)?;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
             total = i + 1 + m.bytes + 1;
         }
         0xC6 => {
             let m = modrm_len(b, i + 1)?;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
             total = i + 1 + m.bytes + 1;
         }
         0xC7 => {
             let m = modrm_len(b, i + 1)?;
-            total = i + 1 + m.bytes + 4;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
+            total = i + 1 + m.bytes + if imm16 { 2 } else { 4 };
         }
         // group 3: only `test` carries an immediate
         0xF6 | 0xF7 => {
             let m = modrm_len(b, i + 1)?;
+            if let Some(o) = m.rip {
+                rip = Some(i + 1 + o);
+            }
             let reg = (b[i + 1] >> 3) & 7;
-            let imm = if reg <= 1 { if op == 0xF6 { 1 } else { 4 } } else { 0 };
+            let imm = if reg <= 1 {
+                if op == 0xF6 { 1 } else if imm16 { 2 } else { 4 }
+            } else {
+                0
+            };
             total = i + 1 + m.bytes + imm;
         }
         // plain modrm forms: alu/mov/lea/test/xchg/shift/inc-dec
@@ -278,6 +329,25 @@ fn rel32_ok(from: usize, to: usize) -> bool {
     d >= i32::MIN as i64 && d <= i32::MAX as i64
 }
 
+fn adjusted_disp32(original: i32, delta: i64) -> Option<i32> {
+    // delta = trampoline - old_address. The relocated instruction's next RIP
+    // moved by +delta, so its displacement must move by -delta, not +delta.
+    (original as i64 - delta).try_into().ok()
+}
+
+fn write_mode(offset_in_16: usize) -> Option<u8> {
+    match offset_in_16 {
+        0..=3 => Some(8),
+        4..=11 => Some(16),
+        _ => None, // the two-byte non-atomic fallback is forbidden
+    }
+}
+
+fn branch_into_prologue(target: usize, prologue: usize, off: usize, len: usize, disp: i64) -> bool {
+    let absolute = target as i64 + (off + len) as i64 + disp;
+    absolute >= target as i64 && absolute < target as i64 + prologue as i64
+}
+
 /// Nearest `MEM_FREE` region within rel32 reach, via `VirtualQuery` (cheap: one
 /// call per region, not per page).
 fn nearest_free_near(target: usize, size: usize) -> Option<usize> {
@@ -289,6 +359,8 @@ fn nearest_free_near(target: usize, size: usize) -> Option<usize> {
     while addr < hi && hops < 100_000 {
         hops += 1;
         let mut mbi = ffi::MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: mbi is a correctly sized live output buffer; `addr` is an
+        // opaque address for the synchronous query and is not dereferenced.
         let n = unsafe {
             ffi::VirtualQuery(
                 addr as *const core::ffi::c_void,
@@ -337,6 +409,8 @@ fn enum_near(target: usize, size: usize) -> Option<usize> {
                 continue;
             }
             tries += 1;
+            // SAFETY: requested address/size/protection are valid for allocation;
+            // no pointers to Rust data cross the FFI boundary.
             let p = unsafe {
                 ffi::VirtualAlloc(
                     cand,
@@ -362,6 +436,7 @@ fn enum_near(target: usize, size: usize) -> Option<usize> {
 pub fn alloc_near(target: usize, size: usize) -> Option<usize> {
     let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     if let Some(c) = nearest_free_near(target, size) {
+        // SAFETY: `c` was computed from a free region large enough for `size`.
         let p = unsafe {
             ffi::VirtualAlloc(
                 c,
@@ -432,10 +507,14 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
             let off = o16 - (base - base16);
             let mut w = [0u8; 8];
             w.copy_from_slice(&new32[off..off + 8]);
+            // SAFETY: base16 is readable target code and wmode 8 proves the full
+            // aligned qword is inside the original 32-byte snapshot window.
             unsafe { core::ptr::write_volatile(base as *mut u64, u64::from_le_bytes(w)) };
             true
         }
         16 => {
+            // SAFETY: base16 is 16-byte aligned and the complete 16-byte block
+            // lies within the validated target-code snapshot.
             let old = unsafe { core::ptr::read_volatile(base16 as *const [u8; 16]) };
             let mut oldv = [0u64; 2];
             for i in 0..2 {
@@ -455,6 +534,8 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
                 let ok: u8;
                 // rbx is reserved by LLVM, so it is borrowed inside the asm
                 // (cmpxchg16b insists on rbx:rcx as the new value).
+                // SAFETY: base16 points to a 16-byte writable aligned block;
+                // expected and desired register pairs match cmpxchg16b and rbx is preserved.
                 unsafe {
                     core::arch::asm!(
                         "push rbx",
@@ -474,6 +555,8 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
                     return true;
                 }
                 // window changed under us: re-read and use the fresh compare value
+                // SAFETY: unchanged from the initial read: base16 is a complete,
+                // aligned, readable 16-byte target-code block.
                 let fresh = unsafe { core::ptr::read_volatile(base16 as *const [u8; 16]) };
                 for i in 0..2 {
                     let mut w = [0u8; 8];
@@ -483,15 +566,9 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
             }
             false
         }
-        _ => {
-            // narrow: rel32 part first, opcode last
-            let tail = [new32[o16 + 1], new32[o16 + 2], new32[o16 + 3], new32[o16 + 4]];
-            unsafe {
-                core::ptr::write_volatile((target + 1) as *mut [u8; 4], tail);
-                core::ptr::write_volatile(target as *mut u8, new32[o16]);
-            }
-            true
-        }
+        // wmode 0 was the old non-atomic, two-block fallback. It is never
+        // selected any more: write_mode refuses those alignments up front.
+        _ => false,
     }
 }
 
@@ -499,11 +576,15 @@ fn set_range_protect(addr: usize, len: usize, prot: u32) -> Option<u32> {
     let page = addr & !(PAGE_SIZE - 1);
     let end = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut old = 0u32;
+    // SAFETY: `old` is a valid output pointer and page..end is computed within
+    // the caller's already allocated target range.
     let ok = unsafe { ffi::VirtualProtect(page as *mut u8, end - page, prot, &mut old) };
     (ok != 0).then_some(old)
 }
 
 fn flush(addr: usize, len: usize) {
+    // SAFETY: the pseudo-process handle is always valid; addr/len describe the
+    // generated code range supplied by the caller.
     unsafe {
         ffi::FlushInstructionCache(ffi::GetCurrentProcess(), addr as *const u8, len);
     }
@@ -572,15 +653,29 @@ fn prepare(target: usize) -> Option<Prep> {
     for ins in &insns {
         let mut chunk = head[off..off + ins.len].to_vec();
         if let Some((ro, bits)) = ins.rel {
+            let displacement = if bits == 32 {
+                i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?) as i64
+            } else {
+                chunk[ro] as i8 as i64
+            };
+            if branch_into_prologue(target, prologue, off, ins.len, displacement) {
+                log::log_tag(
+                    "hook",
+                    &format!("prepare: relative branch at {target:#x}+{off} targets the overwritten prologue, refusing"),
+                );
+                return None;
+            }
             if bits == 32 {
-                let v = i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?) as i64 + delta;
-                if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                let Some(v) = adjusted_disp32(
+                    i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?),
+                    delta,
+                ) else {
                     log::log_tag("hook", &format!("prepare: rel32 at {target:#x}+{off} out of range"));
                     return None;
-                }
-                chunk[ro..ro + 4].copy_from_slice(&(v as i32).to_le_bytes());
+                };
+                chunk[ro..ro + 4].copy_from_slice(&v.to_le_bytes());
             } else {
-                let v = chunk[ro] as i8 as i64 + delta;
+                let v = chunk[ro] as i8 as i64 - delta;
                 if v < i8::MIN as i64 || v > i8::MAX as i64 {
                     log::log_tag(
                         "hook",
@@ -592,12 +687,14 @@ fn prepare(target: usize) -> Option<Prep> {
             }
         }
         if let Some(ro) = ins.rip {
-            let v = i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?) as i64 + delta;
-            if v < i32::MIN as i64 || v > i32::MAX as i64 {
+            let Some(v) = adjusted_disp32(
+                i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?),
+                delta,
+            ) else {
                 log::log_tag("hook", &format!("prepare: rip disp at {target:#x}+{off} out of range"));
                 return None;
-            }
-            chunk[ro..ro + 4].copy_from_slice(&(v as i32).to_le_bytes());
+            };
+            chunk[ro..ro + 4].copy_from_slice(&v.to_le_bytes());
         }
         code.extend_from_slice(&chunk);
         off += ins.len;
@@ -616,6 +713,8 @@ fn prepare(target: usize) -> Option<Prep> {
     relay_bytes[0] = 0xFF;
     relay_bytes[1] = 0x25;
 
+    // SAFETY: tramp is a newly allocated full page owned by us. Length checks
+    // above keep code before RELAY_OFF and the 14-byte relay inside that page.
     unsafe {
         core::ptr::copy_nonoverlapping(code.as_ptr(), tramp as *mut u8, code.len());
         core::ptr::copy_nonoverlapping(relay_bytes.as_ptr(), (tramp + RELAY_OFF) as *mut u8, 14);
@@ -646,6 +745,8 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
         return None;
     }
     // publish the detour in the relay *before* the target can jump to it
+    // SAFETY: relay points into our allocated page at RELAY_OFF; relay+6..+14
+    // is the qword slot reserved by the 14-byte relay encoding.
     unsafe {
         core::ptr::write_volatile((p.relay + 6) as *mut u64, detour as u64);
     }
@@ -656,7 +757,14 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
     flush(p.trampoline, PAGE_SIZE);
     let base16 = p.target & !15usize;
     let o16 = p.target - base16;
-    let wmode: u8 = if o16 <= 3 { 8 } else if o16 <= 11 { 16 } else { 0 };
+    if o16 > 11 {
+        log::log_tag(
+            "hook",
+            &format!("patch: {:#x} straddles a 16-byte boundary; non-atomic fallback refused", p.target),
+        );
+        return None;
+    }
+    let wmode = write_mode(o16)?;
     // 32 bytes: a 5-byte patch can start at offset 13 of a 16-byte block
     let mut orig32 = [0u8; 32];
     let got = crate::safe::read_upto(base16, 32);
@@ -674,6 +782,8 @@ fn patch(p: &Prep, detour: usize) -> Option<Hook> {
     let mut new32 = orig32;
     new32[o16] = 0xE9;
     new32[o16 + 1..o16 + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+    // SAFETY: new32 contains the full original target window plus the decoded
+    // five-byte jump; target was made writable and wmode was derived from its alignment.
     let ok = unsafe { write_window(base16, p.target, &new32, wmode) };
 
     // restore: the old protection when it was executable, RX otherwise
@@ -729,11 +839,17 @@ impl Hook {
         if self.detached {
             return true;
         }
+        if self.wmode == 0 {
+            log::log_tag("hook", "unhook: refusing a non-atomic 16-byte-straddling restore");
+            return false;
+        }
         // the whole 16-byte window is rewritten, so the original snapshot is
         // the payload — no read-back needed
         let cur = self.orig32;
         let old = set_range_protect(self.target, self.prologue + 8, ffi::PAGE_EXECUTE_READWRITE);
         let ok = if old.is_some() {
+            // SAFETY: cur is the original 32-byte snapshot for this exact
+            // target; protection was restored to writable and wmode is unchanged.
             unsafe { write_window(self.base16, self.target, &cur, self.wmode) }
         } else {
             false
@@ -904,6 +1020,8 @@ fn own_image_range() -> Option<(usize, usize)> {
         log::log_tag("hook", &format!("l2b: HROMATITE_IMAGE={v:?} unparsable, falling back to VirtualQuery"));
     }
     let mut mbi = ffi::MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: mbi is a valid output buffer and SEAL_PROBE has static lifetime;
+    // its address only identifies our own allocation for VirtualQuery.
     let n = unsafe {
         ffi::VirtualQuery(
             &SEAL_PROBE as *const _ as *const core::ffi::c_void,
@@ -1172,6 +1290,8 @@ static mut NOTE_SEEN: [bool; 16] = [false; 16];
 /// decrypted. The logger and its runtime state must be readable and executable.
 pub unsafe extern "system" fn l2b_note(stage: u64) {
     let i = (stage as usize) & 0xF;
+    // SAFETY: i is masked to 0..15 and this callback is entered serially by the
+    // shim while holding the L2b window, so adjacent bools cannot race.
     unsafe {
         if NOTE_SEEN[i] {
             return;
@@ -1356,7 +1476,9 @@ fn build_veh(p: &ShimParams) -> Vec<u8> {
     a.mov_mem_rdi_imm8_0(0); // release
     a.bind(done);
     epilogue(&mut a);
-    a.bs(&[0xB8, 0xFF, 0xFF, 0xFF, 0xFF]); // mov eax, EXCEPTION_CONTINUE_SEARCH
+    // Continue the VEH chain: this shim only repairs readability, it does not
+    // prove that the faulting instruction itself is safe to retry.
+    a.bs(&[0xB8, 0, 0, 0, 0]); // mov eax, EXCEPTION_CONTINUE_SEARCH (0)
     a.b(0xC3); // ret
     a.finish()
 }
@@ -1371,6 +1493,8 @@ const VEH_OFF: usize = 0x800;
 fn install_shims(mut p: ShimParams) -> Option<(usize, usize)> {
     // The data page is an operand of the shim itself (`&old_prot`), so it has to
     // exist before the code is generated.
+    // SAFETY: no input buffers are shared with FFI; two full pages are allocated
+    // and owned by this installation, with code and data kept at distinct offsets.
     let mem = unsafe { ffi::VirtualAlloc(0, 2 * PAGE_SIZE, ffi::MEM_COMMIT | ffi::MEM_RESERVE, ffi::PAGE_READWRITE) };
     if mem.is_null() {
         log::log_tag("hook", "l2b: VirtualAlloc(2 pages) failed");
@@ -1389,11 +1513,14 @@ fn install_shims(mut p: ShimParams) -> Option<(usize, usize)> {
         log::log_tag("hook", &format!("l2b: exception shim {} bytes overflows the page", veh.len()));
         return None;
     }
+    // SAFETY: code points to two writable pages; the size checks above prove
+    // tick and VEH payloads fit their non-overlapping code-page slots.
     unsafe {
         core::ptr::copy_nonoverlapping(tick.as_ptr(), code as *mut u8, tick.len());
         core::ptr::copy_nonoverlapping(veh.as_ptr(), (code + VEH_OFF) as *mut u8, veh.len());
     }
     let mut old = 0u32;
+    // SAFETY: old is a valid output pointer and code names our allocated page.
     if unsafe { ffi::VirtualProtect(code as *mut u8, PAGE_SIZE, ffi::PAGE_EXECUTE_READ, &mut old) } == 0 {
         log::log_tag("hook", "l2b: VirtualProtect(RX) on the shim page failed");
         return None;
@@ -1426,8 +1553,13 @@ pub unsafe extern "system" fn seal_detour(data: *mut SealData) {
     let iv = INTERVAL_MS.load(Ordering::Relaxed).max(1);
     // The shim asks again in `iv` ms; the deadline lives outside the image so
     // that the sealed fast path can read it without decrypting anything.
+    // SAFETY: data was checked non-null and points to the dedicated writable
+    // SealData page provided by install_shims; due is within that page.
     unsafe { core::ptr::write_volatile(&mut (*data).due, now + iv) };
+    // SAFETY: data is the validated writable SealData page; reads/writes below
+    // stay within that page and are ordered against the shim by volatile stores.
     let wins = unsafe { (*data).windows.wrapping_add(1) };
+    // SAFETY: as above, windows belongs to the validated writable SealData page.
     unsafe { core::ptr::write_volatile(&mut (*data).windows, wins) };
     if wins == 1 {
         // Proof that the shim reached Rust: if this line never appears, the
@@ -1436,7 +1568,9 @@ pub unsafe extern "system" fn seal_detour(data: *mut SealData) {
             "l2b",
             &format!(
                 "first window: now {now}, iv {iv}, hits {}, leaked {}",
+                // SAFETY: data points to the same validated SealData page.
                 unsafe { (*data).hits },
+                // SAFETY: as above, leaked is inside the dedicated SealData page.
                 unsafe { (*data).leaked }
             ),
         );
@@ -1472,6 +1606,7 @@ static LIVE_MODE: AtomicU64 = AtomicU64::new(0);
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
 fn now_ms() -> u64 {
+    // SAFETY: parameterless Win32 query with no pointer preconditions.
     unsafe { ffi::GetTickCount64() }
 }
 
@@ -1535,19 +1670,23 @@ fn work(n: u64, now: u64, dt: u64) {
         log::log_tag("gct", &line);
     }
     let _ = log::guard("hook::work", || {
-        let cmds = {
+        let mut reader = {
             let mut g = match READER.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            if g.is_none() {
-                *g = Some(console::Reader::new());
-            }
-            match g.as_mut() {
-                Some(r) => r.poll(),
-                None => Vec::new(),
-            }
+            g.take().unwrap_or_default()
         };
+        // Never hold READER's mutex across a longjmp boundary: a failed poll
+        // simply leaves `None`, and the next poll constructs a fresh reader.
+        let cmds = log::guard("reader.poll", || reader.poll()).unwrap_or_default();
+        {
+            let mut g = match READER.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            *g = Some(reader);
+        }
         // At most once per 5 s: what the reader actually sees. In frame-hook mode
         // this is the only way to tell "nothing was appended" from "file IO fails
         // inside a QPC detour".
@@ -1607,26 +1746,33 @@ pub unsafe extern "system" fn gc_context_detour(thread: *mut u8, context: *mut u
     if original == 0 {
         return 0;
     }
+    // SAFETY: original stores the GetThreadContext trampoline installed by
+    // hook_inline, whose ABI exactly matches the declared two pointer arguments.
     let f: unsafe extern "system" fn(*mut u8, *mut u8) -> i32 = unsafe { core::mem::transmute(original) };
+    // SAFETY: both pointers are forwarded unchanged from the OS caller.
     unsafe { f(thread, context) }
 }
 
 pub fn install_gc_context_guard() -> bool {
-    let target = match try_resolve("kernel32.dll", "GetThreadContext") {
-        Some(addr) => addr,
-        None => {
-            log::log_tag("gct", "GetThreadContext was not resolved; inline guard disabled");
-            return false;
-        }
+    let Some(target) = try_resolve("kernel32.dll", "GetThreadContext") else {
+        log::log_tag("gct", "GetThreadContext was not resolved; inline guard disabled");
+        return false;
     };
-    match hook_inline(target, gc_context_detour as *const () as usize) {
+    let Some(prep) = prepare(target) else {
+        log::log_tag("gct", "GetThreadContext prologue rejected; inline guard disabled");
+        return false;
+    };
+    // Publish before patching, exactly like QPC: a collector that enters during
+    // the patch window must always have a valid original trampoline to call.
+    GC_CONTEXT_ORIG.store(prep.trampoline, Ordering::Release);
+    match patch(&prep, gc_context_detour as *const () as usize) {
         Some(h) => {
-            GC_CONTEXT_ORIG.store(h.trampoline, Ordering::Release);
             register(h);
             log::log_tag("gct", "inline GetThreadContext guard installed");
             true
         }
         None => {
+            GC_CONTEXT_ORIG.store(0, Ordering::Release);
             log::log_tag("gct", "inline GetThreadContext guard installation failed");
             false
         }
@@ -1649,11 +1795,15 @@ pub unsafe extern "system" fn qpc_detour(counter: *mut i64) -> i32 {
         // (a few instructions wide). Keep the counter monotonic instead of
         // handing the game a zero.
         if !counter.is_null() {
+            // SAFETY: counter was just checked non-null and is forwarded from
+            // QueryPerformanceCounter, which requires a writable LARGE_INTEGER.
             unsafe { *counter = (now_ms() as i64) * 10_000 };
         }
         return 1;
     }
+    // SAFETY: orig is the QPC trampoline generated for this exact signature.
     let f: unsafe extern "system" fn(*mut i64) -> i32 = unsafe { core::mem::transmute(orig) };
+    // SAFETY: counter is the original QPC argument forwarded unchanged.
     let ret = unsafe { f(counter) };
     tick();
     ret
@@ -1681,7 +1831,9 @@ pub unsafe extern "system" fn d3d_detour(
     let orig = ORIG.load(Ordering::Acquire);
     let ret = if orig != 0 {
         let f: unsafe extern "system" fn(usize, u32, usize, u32, usize, u32, u32, usize, usize, usize) -> i32 =
+            // SAFETY: orig is the D3D11CreateDevice trampoline with this exact ABI.
             unsafe { core::mem::transmute(orig) };
+        // SAFETY: all ten arguments are forwarded unchanged from the game.
         unsafe { f(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) }
     } else {
         -1
@@ -1703,7 +1855,9 @@ unsafe extern "system" fn count_detour(a: u64, b: u64, c: u64, d: u64) -> u64 {
     let orig = HOOKAT_ORIG.load(Ordering::Acquire);
     let ret = if orig != 0 {
         let f: unsafe extern "system" fn(u64, u64, u64, u64) -> u64 =
+            // SAFETY: orig is the four-integer trampoline generated by install_at.
             unsafe { core::mem::transmute(orig) };
+        // SAFETY: all four integer arguments are forwarded unchanged.
         unsafe { f(a, b, c, d) }
     } else {
         0
@@ -1720,20 +1874,7 @@ unsafe extern "system" fn count_detour(a: u64, b: u64, c: u64, d: u64) -> u64 {
 
 fn try_resolve(module: &str, func: &str) -> Option<usize> {
     let (_, _) = crate::procs::own_module(module)?;
-    let name = ffi::cstr(func);
-    let m = unsafe {
-        let w = ffi::wide(module);
-        ffi::GetModuleHandleW(w.as_ptr())
-    };
-    if m.is_null() {
-        return None;
-    }
-    let p = unsafe { ffi::GetProcAddress(m, name.as_ptr()) };
-    if p.is_null() {
-        None
-    } else {
-        Some(p as usize)
-    }
+    crate::raw::sys::export_address(module, func)
 }
 
 fn register(h: Hook) {
@@ -1826,6 +1967,9 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
     // The probe must *read back as the magic* while the image is plaintext: the
     // headers are erased to zero, so stamp the magic into page 0 (it is dead
     // space either way) and let the seal turn it into ciphertext.
+    // SAFETY: base is page-aligned and belongs to our own mapping; old is a live
+    // out pointer and the qword store stays inside that RW page. Result ignored
+    // deliberately: payload headers are already free/dead space.
     unsafe {
         let mut old = 0u32;
         ffi::VirtualProtect(base as *mut u8, PAGE_SIZE, ffi::PAGE_READWRITE, &mut old);
@@ -1860,6 +2004,8 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
     SEAL_TRAMP.store(p.trampoline, Ordering::Release);
     // First tick no earlier than `SEAL_START_DELAY_MS`: the injector seals only
     // after `DllMain` returns, and a half-sealed image must not be decrypted.
+    // SAFETY: data is the dedicated second page returned by install_shims and
+    // is writable/aligned for SealData; only fields within that page are used.
     unsafe {
         let d = data as *mut SealData;
         core::ptr::write_volatile(&mut (*d).due, now_ms() + SEAL_START_DELAY_MS);
@@ -1868,6 +2014,8 @@ fn arm_l2b(p: &Prep) -> Option<usize> {
         (*d).hits = 0;
         (*d).windows = 0;
     }
+    // SAFETY: vein points to the fully emitted, RX exception-shim code which
+    // remains allocated for the process lifetime and follows the VEH ABI.
     let h = unsafe {
         ffi::AddVectoredExceptionHandler(1, vein as *const core::ffi::c_void)
     };
@@ -1992,7 +2140,15 @@ pub fn install_tick() -> bool {
                 {
                     log::log_tag("hook", &format!("HROMATITE_HOOK_AT: counting hook at {o:#x}"));
                 }
-                let gc_guard = install_gc_context_guard();
+                // The GC detour is still in-image code. Full L2b cannot keep
+                // every callback in that code inside the external shim's window,
+                // so keep only the tick-side reaper in this mode, not this hook.
+                let gc_guard = if l2b {
+                    log::log_tag("gct", "inline GetThreadContext guard disabled under full L2b sealing");
+                    false
+                } else {
+                    install_gc_context_guard()
+                };
                 log::log_tag("hook", &format!("inline GC guard installed={gc_guard}; waiting for the game to call us (no thread of our own)"));
                 return true;
             }
@@ -2008,6 +2164,10 @@ pub fn install_tick() -> bool {
 
 /// Install a counting hook at an arbitrary address (`hookat`).
 fn install_at(addr: usize, log_first: u64) -> Option<usize> {
+    if seal_active() {
+        log::log_tag("hook", "hookat: in-image diagnostic hooks are disabled under full sealing");
+        return None;
+    }
     if HOOKAT_ORIG.load(Ordering::Acquire) != 0 {
         return None;
     }
@@ -2159,6 +2319,8 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             let l2b = if d.is_null() {
                 "l2b=off".to_string()
             } else {
+                // SAFETY: d is the dedicated SealData page returned by
+                // install_shims and remains allocated for the process lifetime.
                 let s = unsafe { &*d };
                 format!(
                     "l2b=on shim_hits={} windows={} leaked={} due_in={}ms",
@@ -2313,8 +2475,12 @@ mod tests {
         crypt(&mut a, buf.as_ptr() as u64, size as u64);
         a.bs(&[0x5F, 0x5E, 0x5B, 0xC3]); // pop rdi, rsi, rbx, ret
         let code = a.finish();
+        // SAFETY: test-only anonymous 4096-byte mapping; arguments are valid and
+        // the resulting pointer is checked for NULL/MAP_FAILED before use.
         let mem = unsafe { mmap(core::ptr::null_mut(), 4096, 7, 0x22, -1, 0) }; // RWX, MAP_ANON|PRIVATE
         assert!(!mem.is_null() && mem as isize != -1, "mmap failed");
+        // SAFETY: mem is a checked 4096-byte executable mapping and code fits;
+        // it contains the expected prologue/crypt/epilogue/ret instruction stream.
         unsafe {
             core::ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len());
             let f: extern "C" fn() = core::mem::transmute(mem);
@@ -2346,5 +2512,77 @@ mod tests {
         // rip-relative first instruction: rip field must be recorded
         let ins = decode_one(&[0x48, 0x8B, 0x05, 1, 0, 0, 0]).unwrap();
         assert_eq!(ins.rip, Some(3));
+    }
+
+    #[test]
+    fn relocation_preserves_the_absolute_target() {
+        // old next RIP=0x2005, original target=0x200a. Moving the instruction
+        // to 0x3000 changes its next RIP to 0x3005, so disp=-0xffb (-4091).
+        assert_eq!(adjusted_disp32(5, 0x1000), Some(-4091));
+        assert_eq!(adjusted_disp32(i32::MIN, 0x1000), None);
+        assert_eq!(adjusted_disp32(i32::MAX, -0x1000), None);
+    }
+
+    #[test]
+    fn immediate_modrm_forms_have_exact_lengths_and_rip_offsets() {
+        let shuffle = [0x0F, 0xC6, 0x05, 4, 0, 0, 0, 0x7f];
+        let shuffle_ins = decode_one(&shuffle).unwrap();
+        assert_eq!(shuffle_ins.len, shuffle.len());
+        assert_eq!(shuffle_ins.rip, Some(3));
+
+        let store = [0xC7, 0x05, 4, 0, 0, 0, 0x78, 0x56, 0x34, 0x12];
+        let store_ins = decode_one(&store).unwrap();
+        assert_eq!(store_ins.len, store.len());
+        assert_eq!(store_ins.rip, Some(2));
+    }
+
+    #[test]
+    fn non_atomic_patch_alignment_is_refused() {
+        assert_eq!(write_mode(3), Some(8));
+        assert_eq!(write_mode(11), Some(16));
+        for offset in 12..16 {
+            assert_eq!(write_mode(offset), None);
+        }
+    }
+
+    #[test]
+    fn operand_size_prefix_selects_imm16() {
+        let mov_ax = [0x66, 0xB8, 0x34, 0x12];
+        assert_eq!(decode_one(&mov_ax).unwrap().len, mov_ax.len());
+        assert!(decode_one(&[0x48, 0x66, 0xB8, 0x34, 0x12]).is_none());
+        let push_rex = [0x66, 0x48, 0x68, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(decode_one(&push_rex).unwrap().len, push_rex.len());
+        let test_rex = [0x66, 0x48, 0xA9, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(decode_one(&test_rex).unwrap().len, test_rex.len());
+
+        let push = [0x66, 0x68, 0x34, 0x12];
+        assert_eq!(decode_one(&push).unwrap().len, push.len());
+
+        let sub = [0x66, 0x81, 0xEC, 0x34, 0x12];
+        assert_eq!(decode_one(&sub).unwrap().len, sub.len());
+
+        let store = [0x66, 0xC7, 0x05, 4, 0, 0, 0, 0x78, 0x56];
+        let ins = decode_one(&store).unwrap();
+        assert_eq!(ins.len, store.len());
+        assert_eq!(ins.rip, Some(3));
+    }
+
+    #[test]
+    fn relative_branches_into_the_overwrite_window_are_rejected() {
+        assert!(branch_into_prologue(0x2000, 5, 0, 2, 1)); // 0x2000 -> 0x2003
+        assert!(branch_into_prologue(0x2000, 5, 0, 2, -1)); // backward to 0x2001
+        assert!(!branch_into_prologue(0x2000, 5, 0, 2, 0x100)); // external target
+        assert!(!branch_into_prologue(0x2000, 5, 0, 2, 3)); // original continuation
+    }
+
+    #[test]
+    fn exception_shim_continues_the_veh_chain() {
+        let code = build_veh(&shim_params());
+        let marker = [0xB8, 0, 0, 0, 0, 0xC3];
+        assert!(
+            code.windows(marker.len()).any(|window| window == marker),
+            "exception shim must end with EXCEPTION_CONTINUE_SEARCH (0), not -1"
+        );
+        assert!(!code.windows(6).any(|w| w == [0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3]));
     }
 }

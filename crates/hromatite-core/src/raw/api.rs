@@ -18,6 +18,8 @@
 //! shape) costs an `Err(Fault)`, not the game. A candidate that faulted is
 //! never called again in the same phase.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::sync::Mutex;
 
 use crate::ffi;
@@ -49,18 +51,7 @@ const RSS_BUDGET_MB: usize = 96;
 
 /// Current working set of this process (watched around calls into unknown code).
 fn rss_mb() -> usize {
-    unsafe {
-        let mut c = ffi::PROCESS_MEMORY_COUNTERS {
-            cb: core::mem::size_of::<ffi::PROCESS_MEMORY_COUNTERS>() as u32,
-            ..Default::default()
-        };
-        let ok = ffi::K32GetProcessMemoryInfo(
-            ffi::GetCurrentProcess(),
-            &mut c,
-            c.cb,
-        );
-        if ok == 0 { 0 } else { c.WorkingSetSize / (1024 * 1024) }
-    }
+    crate::raw::sys::working_set_mb()
 }
 
 /// Release a value that looks like an allocation of a function we called by
@@ -82,7 +73,9 @@ fn try_free(rep: &mut Report, ptr: usize) {
         .find(|(n, _)| *n == "il2cpp_free")
         .and_then(|(_, rva)| ga_addr(*rva));
     if let Some(f) = free_fn {
-        let _ = veh::call1(f, ptr);
+        // SAFETY: f is the surviving il2cpp_free export, called with the
+        // allocation address returned by the mistaken candidate call.
+        let _ = unsafe { veh::call1(f, ptr) };
         rep.note(format!("freed {ptr:#x} with il2cpp_free after memory watchdog"));
     }
 }
@@ -129,14 +122,19 @@ static REPORT: Mutex<Option<Report>> = Mutex::new(None);
 /// Identify the API once and cache it. A cached report missing either function
 /// is retried (the previous attempt may have run before the game was ready).
 pub fn identify() -> Report {
-    let mut slot = REPORT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(r) = slot.as_ref()
-        && r.assemblies_fn.is_some()
-        && r.class_fn.is_some()
     {
-        return r.clone();
+        let slot = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = slot.as_ref()
+            && r.assemblies_fn.is_some()
+            && r.class_fn.is_some()
+        {
+            return r.clone();
+        }
     }
+    // Do not hold the cache mutex while probing arbitrary exports: a longjmp
+    // would abandon its guard and deadlock every later identification attempt.
     let r = run_identify(0);
+    let mut slot = REPORT.lock().unwrap_or_else(|e| e.into_inner());
     *slot = Some(r.clone());
     r
 }
@@ -322,7 +320,9 @@ fn run_identify(phase: u8) -> Report {
 
             let mut count = SENTINEL;
             let rss_before = rss_mb();
-            let p1 = veh::call2(addr, domain, &mut count as *mut usize as usize);
+            // SAFETY: addr is deliberately probed as domain_get_assemblies with
+            // the live domain and a valid out pointer; VEH contains rejection.
+            let p1 = unsafe { veh::call2(addr, domain, &mut count as *mut usize as usize) };
             let grew = rss_mb().saturating_sub(rss_before);
             if grew > RSS_BUDGET_MB {
                 rep.note(format!(
@@ -342,7 +342,9 @@ fn run_identify(phase: u8) -> Report {
                     // Same function, same answer twice: a count match is already
                     // strong, a repeat guards against a stale stack slot.
                     let mut count2 = SENTINEL;
-                    match veh::call2(addr, domain, &mut count2 as *mut usize as usize) {
+                    // SAFETY: same candidate and valid output pointer as p1;
+                    // the second call verifies the result is repeatable.
+                    match unsafe { veh::call2(addr, domain, &mut count2 as *mut usize as usize) } {
                         Ok(ptr2) if count2 == want => {
                             rep.assemblies_fn = Some(Func { name, rva, addr });
                             rep.note(format!(
@@ -432,12 +434,11 @@ fn run_identify(phase: u8) -> Report {
             tried += 1;
 
             let rss_before = rss_mb();
-            let called = veh::call3(
-                addr,
-                rep.image,
-                ns.as_ptr() as usize,
-                nm.as_ptr() as usize,
-            );
+            // SAFETY: addr is deliberately probed as class_from_name with an
+            // image pointer and two live NUL-terminated names.
+            let called = unsafe {
+                veh::call3(addr, rep.image, ns.as_ptr() as usize, nm.as_ptr() as usize)
+            };
             let grew = rss_mb().saturating_sub(rss_before);
             if grew > RSS_BUDGET_MB {
                 rep.note(format!(
@@ -467,12 +468,11 @@ fn run_identify(phase: u8) -> Report {
                 None => continue,
             };
             // Same answer twice, or it is not a lookup function.
-            let r2 = match veh::call3(
-                addr,
-                rep.image,
-                ns.as_ptr() as usize,
-                nm.as_ptr() as usize,
-            ) {
+            // SAFETY: same three valid arguments as above; the repeat call
+            // checks that the result is deterministic.
+            let r2 = match unsafe {
+                veh::call3(addr, rep.image, ns.as_ptr() as usize, nm.as_ptr() as usize)
+            } {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -576,7 +576,11 @@ pub fn class_from_name(image: usize, ns: &str, name: &str) -> Option<usize> {
     let f = rep.class_fn?;
     let ns_c = ffi::cstr(ns);
     let nm_c = ffi::cstr(name);
-    let r = veh::call3(f.addr, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize).ok()?;
+    // SAFETY: f is the previously identified class_from_name export; image is
+    // live and both names remain valid NUL-terminated strings through the call.
+    let r = unsafe {
+        veh::call3(f.addr, image, ns_c.as_ptr() as usize, nm_c.as_ptr() as usize).ok()?
+    };
     if r < 0x10000 || !safe::readable_at(r) {
         return None;
     }

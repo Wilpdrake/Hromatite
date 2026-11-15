@@ -10,6 +10,8 @@
 //! through `log::guard`, and the whole body again at the entry point.
 //! (Access violations are *not* caught here: that is the VEH, plan 2.)
 
+#![deny(unsafe_code)]
+
 use hromatite_core::{console, hook, il2cpp, log, procs, GAME_ASSEMBLY, UNITY_PLAYER};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
@@ -134,24 +136,17 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
     // The injector's stub passes `r8 = &{base, size}`: the payload cannot read its
     // own PE header (erased) and `VirtualQuery` reports the section split, so L2b
     // needs the exact range the injector is going to seal.
-    if !reserved.is_null() {
-        unsafe {
-            let p = reserved as *const usize;
-            let base = *p;
-            let size = *p.add(1);
-            let text_lo = *p.add(2);
-            let text_hi = *p.add(3);
-            if base > 0x10000 && size > 0 {
-                hook::set_image_range(base, size);
-            }
-            if text_lo > base && text_hi > text_lo {
-                hook::set_keep_range(text_lo, text_hi);
-            }
-            let code_lo = *p.add(4);
-            let code_hi = *p.add(5);
-            if code_lo > base && code_hi > code_lo {
-                hook::set_code_range(code_lo, code_hi);
-            }
+    if let Some([base, size, text_lo, text_hi, code_lo, code_hi]) =
+        hromatite_core::safe::read_words::<6>(reserved as usize)
+    {
+        if base > 0x10000 && size > 0 {
+            hook::set_image_range(base, size);
+        }
+        if text_lo > base && text_hi > text_lo {
+            hook::set_keep_range(text_lo, text_hi);
+        }
+        if code_lo > base && code_hi > code_lo {
+            hook::set_code_range(code_lo, code_hi);
         }
     }
     // Boot marker: proves execution even if the logger itself is at fault.
@@ -214,6 +209,7 @@ fn attach(hinst: *mut core::ffi::c_void, reserved: *mut core::ffi::c_void) {
     log::log_tag("dll", "recon done, returning from DllMain");
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
     hinst: *mut core::ffi::c_void,

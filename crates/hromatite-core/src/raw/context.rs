@@ -131,6 +131,8 @@ pub fn install() -> bool {
     if INSTALLED.load(Ordering::Acquire) {
         return true;
     }
+    // SAFETY: `handler` has the system ABI and static code lifetime; the OS
+    // invokes it with its documented EXCEPTION_POINTERS argument.
     let h = unsafe {
         ffi::AddVectoredExceptionHandler(1, handler as *const () as *const core::ffi::c_void)
     };
@@ -149,6 +151,41 @@ pub fn install() -> bool {
 
 pub fn installed() -> bool {
     INSTALLED.load(Ordering::Acquire)
+}
+
+/// Extract the two scalar fields shared by logging and recovery. The OS owns
+/// `info` only for the duration of the vectored callback.
+fn exception_parts(info: *mut ffi::EXCEPTION_POINTERS) -> (u32, usize) {
+    if info.is_null() {
+        return (0, 0);
+    }
+    // SAFETY: `info` is supplied by the OS exception dispatcher and remains live
+    // for this callback; ExceptionRecord is either null or a live C record.
+    let rec = unsafe { (*info).ExceptionRecord };
+    if rec.is_null() {
+        return (0, 0);
+    }
+    // SAFETY: `rec` is the OS-owned record checked non-null immediately above;
+    // both fields are plain integers valid for every bit pattern.
+    (unsafe { (*rec).ExceptionCode }, unsafe { (*rec).ExceptionAddress })
+}
+
+fn exception_info0(info: *mut ffi::EXCEPTION_POINTERS) -> Option<usize> {
+    if info.is_null() {
+        return None;
+    }
+    // SAFETY: info/rec are OS-owned callback records, valid for this callback.
+    let rec = unsafe { (*info).ExceptionRecord };
+    if rec.is_null() {
+        return None;
+    }
+    // SAFETY: `rec` is the non-null OS record from above; its parameter count is
+    // validated before indexing into the fixed inline array.
+    let n = unsafe { (*rec).NumberParameters } as usize;
+    (n > 0).then(|| {
+        // SAFETY: NumberParameters > 0 proves element zero is present.
+        unsafe { (*rec).ExceptionInformation[0] }
+    })
 }
 
 /// `HROMATITE_LOG_AV=1`: report every exception that passes through while no
@@ -182,29 +219,13 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
     if !ON.load(Ordering::Relaxed) || SEEN.load(Ordering::Relaxed) >= cap {
         return;
     }
-    let (mut code, mut addr) = (0u32, 0usize);
-    if !info.is_null() {
-        let rec = unsafe { (*info).ExceptionRecord };
-        if !rec.is_null() {
-            code = unsafe { (*rec).ExceptionCode };
-            addr = unsafe { (*rec).ExceptionAddress };
-        }
-    }
+    let (code, addr) = exception_parts(info);
     // The thread id is the whole point: a thread that dies without unregistering
     // from Boehm shows up here first if its exit was an uncaught exception.
     if SEEN.fetch_add(1, Ordering::Relaxed) < cap {
-        let tid = unsafe { ffi::GetCurrentThreadId() };
-        let mut extra = String::new();
-        if !info.is_null() {
-            let rec = unsafe { (*info).ExceptionRecord };
-            if !rec.is_null() {
-                let n = unsafe { (*rec).NumberParameters } as usize;
-                if n > 0 {
-                    let a = unsafe { (*rec).ExceptionInformation[0] };
-                    extra = format!(" info0={a:#x}");
-                }
-            }
-        }
+        let tid = crate::raw::sys::current_thread_id();
+        let extra = exception_info0(info)
+            .map_or_else(String::new, |a| format!(" info0={a:#x}"));
         log::log_tag(
             "veh",
             &format!("passing exception {code:#010x} at {addr:#x} tid={tid:#x}{extra} (unguarded)"),
@@ -219,19 +240,11 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
         log_passing(info);
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
-    if GUARD_TID.load(Ordering::Relaxed) != unsafe { ffi::GetCurrentThreadId() } {
+    if GUARD_TID.load(Ordering::Relaxed) != crate::raw::sys::current_thread_id() {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
 
-    let mut code = 0u32;
-    let mut addr = 0usize;
-    if !info.is_null() {
-        let rec = unsafe { (*info).ExceptionRecord };
-        if !rec.is_null() {
-            code = unsafe { (*rec).ExceptionCode };
-            addr = unsafe { (*rec).ExceptionAddress };
-        }
-    }
+    let (code, addr) = exception_parts(info);
     // A Rust panic only counts as "ours" when a guard asked for it; otherwise it
     // must reach whatever `catch_unwind` the caller set up.
     if code == RUST_PANIC_CODE && !CATCH_PANIC.load(Ordering::Relaxed) {
@@ -250,10 +263,14 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
         // No context to go back to (should not happen): let the game see it.
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
+    // SAFETY: depth is the active 1..=MAX_DEPTH value published by call_with,
+    // so depth-1 indexes an initialized slot owned by the current thread.
     unsafe {
         SLOTS[depth - 1].resumed = true;
     }
     // Does not return when the restored context differs from the current one.
+    // SAFETY: saved points to the 16-byte-aligned, fully sized CONTEXT captured
+    // by this same thread. The handler never publishes a null/non-context pointer.
     unsafe { ffi::RtlRestoreContext(saved as *const u64, core::ptr::null()) };
     // Only reachable if the "restore" was a no-op.
     ffi::EXCEPTION_CONTINUE_SEARCH
@@ -261,6 +278,8 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
 
 /// Undo one nesting level: pop the slot and re-arm the parent (if any).
 fn pop(depth: usize) {
+    // SAFETY: callers pass the active depth in 1..=MAX_DEPTH and hold LOCK_TID,
+    // so no other thread can mutate this slot or its previous-link fields.
     unsafe {
         let slot = &mut SLOTS[depth - 1];
         let prev_saved = slot.prev_saved;
@@ -278,10 +297,10 @@ fn pop(depth: usize) {
 
 /// Run `f` under the vectored handler; a hardware exception inside it becomes
 /// `Err(Fault)` in this frame instead of a dead process.
-pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
+fn call_with_mode<R>(f: impl FnOnce() -> R, catch_panic: bool) -> Result<R, Fault> {
     install();
 
-    let tid = unsafe { ffi::GetCurrentThreadId() };
+    let tid = crate::raw::sys::current_thread_id();
     // Re-entrant per thread: the slots are global, so another *thread* has to
     // run unguarded rather than clobber the owner's context.
     let mut acquired = false;
@@ -307,22 +326,35 @@ pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
         return Ok(f());
     }
 
+    let previous_catch = if catch_panic {
+        CATCH_PANIC.swap(true, Ordering::AcqRel)
+    } else {
+        CATCH_PANIC.load(Ordering::Relaxed)
+    };
+
+    // SAFETY: depth < MAX_DEPTH and LOCK_TID is held; the context storage is
+    // statically allocated, aligned and large enough for RtlCaptureContext.
     let ctx_ptr = unsafe { CTX[depth].0.as_mut_ptr() as usize };
+    // SAFETY: depth < MAX_DEPTH and this thread owns the global guard stack, so
+    // the mutable slot cannot alias another active access.
     unsafe {
         let slot = &mut SLOTS[depth];
         slot.saved = ctx_ptr;
         slot.resumed = false;
         slot.prev_saved = SAVED.load(Ordering::Relaxed);
         slot.prev_tid = GUARD_TID.load(Ordering::Relaxed);
-        slot.prev_catch = CATCH_PANIC.load(Ordering::Relaxed);
+        slot.prev_catch = previous_catch;
     }
     SAVED.store(ctx_ptr, Ordering::Relaxed);
     GUARD_TID.store(tid, Ordering::Relaxed);
     DEPTH.store(depth + 1, Ordering::Release);
 
+    // SAFETY: ctx_ptr targets CTX[depth], an aligned CONTEXT_QWORDS buffer.
     unsafe { ffi::RtlCaptureContext(ctx_ptr as *mut u64) };
 
     // Second return: the handler longjmp'ed here.
+    // SAFETY: depth is still the active slot; only the current thread and its
+    // vectored handler access `resumed` at this point.
     if unsafe { SLOTS[depth].resumed } {
         pop(depth + 1);
         if acquired {
@@ -342,6 +374,11 @@ pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
     Ok(value)
 }
 
+/// Run `f` under the vectored handler without changing panic-catching state.
+pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
+    call_with_mode(f, false)
+}
+
 /// Like [`call_with`], but a Rust **panic** raised inside `f` is caught by the
 /// same handler and turned into `Err` (code `0x20474343`).
 ///
@@ -352,54 +389,76 @@ pub fn call_with<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
 /// The panic hook still logs file/line/message before the raise, so nothing is
 /// lost but memory.
 pub fn call_guarded<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
-    CATCH_PANIC.store(true, Ordering::Relaxed);
-    let r = call_with(f);
-    // `pop` already restored the parent's value; if this was the outermost call
-    // make sure the flag does not stay set.
-    CATCH_PANIC.store(false, Ordering::Relaxed);
-    r
+    // `call_with_mode` snapshots and restores the parent's flag in its slot.
+    // A normally returning nested guard therefore cannot disarm its parent;
+    // a contended thread never mutates the owning thread's flag at all.
+    call_with_mode(f, true)
 }
 
 /// Call a raw function pointer with 0..3 integer/pointer arguments.
 /// The signatures are `extern "system"` because that is how Win32/x64 code is
 /// called; on x64 the calling convention is the same for `"C"`, but being
 /// explicit keeps the intent clear.
-pub fn call0(f: usize) -> Result<usize, Fault> {
+/// # Safety
+/// `f` must be an executable Win64 address with exactly this signature. All
+/// pointer arguments and callee side effects must be valid; a mismatched callee
+/// can corrupt memory even when it returns without raising an exception.
+pub unsafe fn call0(f: usize) -> Result<usize, Fault> {
     if f == 0 {
         return Ok(0);
     }
-    call_with(|| unsafe {
-        let fp: extern "system" fn() -> usize = core::mem::transmute(f);
+    call_with(|| {
+        // SAFETY: the caller deliberately supplies an executable Win64 address;
+        // VEH converts a bad address/signature into Err instead of escaping.
+        let fp: extern "system" fn() -> usize = unsafe { core::mem::transmute(f) };
         fp()
     })
 }
 
-pub fn call1(f: usize, a: usize) -> Result<usize, Fault> {
+/// # Safety
+/// `f` must be an executable Win64 address with exactly this signature. All
+/// pointer arguments and callee side effects must be valid; a mismatched callee
+/// can corrupt memory even when it returns without raising an exception.
+pub unsafe fn call1(f: usize, a: usize) -> Result<usize, Fault> {
     if f == 0 {
         return Ok(0);
     }
-    call_with(|| unsafe {
-        let fp: extern "system" fn(usize) -> usize = core::mem::transmute(f);
+    call_with(|| {
+        // SAFETY: f is supplied for this exact Win64 signature; VEH captures
+        // this thread before the raw call and handles invalid addresses.
+        let fp: extern "system" fn(usize) -> usize = unsafe { core::mem::transmute(f) };
         fp(a)
     })
 }
 
-pub fn call2(f: usize, a: usize, b: usize) -> Result<usize, Fault> {
+/// # Safety
+/// `f` must be an executable Win64 address with exactly this signature. All
+/// pointer arguments and callee side effects must be valid; a mismatched callee
+/// can corrupt memory even when it returns without raising an exception.
+pub unsafe fn call2(f: usize, a: usize, b: usize) -> Result<usize, Fault> {
     if f == 0 {
         return Ok(0);
     }
-    call_with(|| unsafe {
-        let fp: extern "system" fn(usize, usize) -> usize = core::mem::transmute(f);
+    call_with(|| {
+        // SAFETY: f is supplied for this exact Win64 signature; VEH captures
+        // this thread before the raw call and handles invalid addresses.
+        let fp: extern "system" fn(usize, usize) -> usize = unsafe { core::mem::transmute(f) };
         fp(a, b)
     })
 }
 
-pub fn call3(f: usize, a: usize, b: usize, c: usize) -> Result<usize, Fault> {
+/// # Safety
+/// `f` must be an executable Win64 address with exactly this signature. All
+/// pointer arguments and callee side effects must be valid; a mismatched callee
+/// can corrupt memory even when it returns without raising an exception.
+pub unsafe fn call3(f: usize, a: usize, b: usize, c: usize) -> Result<usize, Fault> {
     if f == 0 {
         return Ok(0);
     }
-    call_with(|| unsafe {
-        let fp: extern "system" fn(usize, usize, usize) -> usize = core::mem::transmute(f);
+    call_with(|| {
+        // SAFETY: f is supplied for this exact Win64 signature; VEH captures
+        // this thread before the raw call and handles invalid addresses.
+        let fp: extern "system" fn(usize, usize, usize) -> usize = unsafe { core::mem::transmute(f) };
         fp(a, b, c)
     })
 }

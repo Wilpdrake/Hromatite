@@ -23,14 +23,12 @@
 //!      which is what a `void* api[]` table looks like; if such a run exists,
 //!      its index order should follow the .rdata pool order.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use crate::log;
 use crate::procs;
 use crate::symbols;
 use std::collections::HashMap;
-
-fn slice(base: usize, size: usize) -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts(base as *const u8, size) }
-}
 
 pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
@@ -54,12 +52,14 @@ pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Single pass over an image collecting every occurrence of every known export
 /// name (capped per name: the pool has duplicates and the first copy is not
 /// necessarily the interesting one).
-fn locate_names(mem: &[u8], cap: usize) -> Vec<(&'static str, usize)> {
-    let wanted: HashMap<&'static str, usize> =
-        symbols::EXPORTS.iter().map(|(n, _)| (*n, 0usize)).collect();
-    let mut out: Vec<(&'static str, usize)> = Vec::new();
-    let mut count: HashMap<&'static str, usize> = HashMap::with_capacity(wanted.len());
-
+fn locate_names_chunk(
+    mem: &[u8],
+    base_off: usize,
+    cap: usize,
+    wanted: &HashMap<&'static str, usize>,
+    count: &mut HashMap<&'static str, usize>,
+    out: &mut Vec<(&'static str, usize)>,
+) {
     let is_name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0usize;
     while i < mem.len() {
@@ -77,13 +77,80 @@ fn locate_names(mem: &[u8], cap: usize) -> Vec<(&'static str, usize)> {
             && let Some((k, _)) = wanted.get_key_value(s)
         {
             let c = count.entry(k).or_insert(0);
-            if *c < cap {
-                out.push((k, start));
+            let absolute = base_off + start;
+            if *c < cap && !out.iter().any(|(_, at)| *at == absolute) {
+                out.push((k, absolute));
                 *c += 1;
             }
         }
     }
+}
+
+fn locate_names(base: usize, size: usize, cap: usize) -> Vec<(&'static str, usize)> {
+    let wanted: HashMap<&'static str, usize> =
+        symbols::EXPORTS.iter().map(|(n, _)| (*n, 0usize)).collect();
+    let mut out = Vec::new();
+    let mut count = HashMap::with_capacity(wanted.len());
+    let mut chunk = crate::safe::Span::from_parts(base, 0, crate::ffi::PAGE_READONLY);
+    let mut carry = Vec::new();
+    let mut off = 0usize;
+    // One reused allocation; 31 trailing bytes are enough to join any accepted
+    // name across a chunk boundary (the maximum name length is 32).
+    const WINDOW: usize = 1024 * 1024;
+    const CARRY: usize = 31;
+    while off < size {
+        let read_now = WINDOW.min(size - off);
+        let carried = carry.len();
+        let snapshot_base = base + off - carried;
+        if !chunk.refresh(snapshot_base, carried + read_now, crate::ffi::PAGE_READONLY) {
+            break;
+        }
+        let bytes = chunk.bytes();
+        // Locate relative to the image, not the absolute VA: `resolve` adds
+        // up_base exactly once when it builds the pointer lookup targets.
+        locate_names_chunk(bytes, snapshot_base - base, cap, &wanted, &mut count, &mut out);
+        let mut run_start = bytes.len();
+        while run_start > 0
+            && (bytes[run_start - 1].is_ascii_alphanumeric() || bytes[run_start - 1] == b'_')
+        {
+            run_start -= 1;
+        }
+        carry.clear();
+        carry.extend_from_slice(&bytes[run_start.max(bytes.len().saturating_sub(CARRY))..]);
+        off += read_now;
+    }
     out
+}
+
+#[cfg(test)]
+mod name_scan_tests {
+    use super::*;
+
+    #[test]
+    fn middle_gap_cannot_join_two_runs() {
+        let mut run_len = 7;
+        break_run_on_error(&mut run_len, false); // successful chunk
+        assert_eq!(run_len, 7);
+        break_run_on_error(&mut run_len, true); // failed middle chunk
+        assert_eq!(run_len, 0);
+        run_len = 40;
+        break_run_on_error(&mut run_len, false); // later success starts fresh only
+        assert_eq!(run_len, 40);
+    }
+
+    #[test]
+    fn chunk_hits_are_image_relative_and_deduplicated() {
+        let (name, _) = symbols::EXPORTS[0];
+        let wanted: HashMap<&'static str, usize> = [(name, 0)].into_iter().collect();
+        let data = format!("x {name} yy");
+        let mut out = Vec::new();
+        let mut count = HashMap::new();
+        locate_names_chunk(data.as_bytes(), 0, 4, &wanted, &mut count, &mut out);
+        assert_eq!(out, vec![(name, 2)]);
+        // Replaying an overlapped chunk reports the same offset only once.
+        locate_names_chunk(data.as_bytes(), 0, 4, &wanted, &mut count, &mut out);
+        assert_eq!(out.len(), 1);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +210,12 @@ fn is_readable(r: &procs::Region) -> bool {
     r.readable() && !r.executable()
 }
 
+fn break_run_on_error(run_len: &mut usize, failed: bool) {
+    if failed {
+        *run_len = 0;
+    }
+}
+
 /// One pass over the whole readable address space: collect name-pointer slots
 /// and contiguous GameAssembly pointer runs at the same time.
 fn scan_process(
@@ -184,17 +257,30 @@ fn scan_process(
         // directly — but *nothing* outside it is (the DELTAS probe below used
         // to read across the region edge, which is an AV, not a panic).
         let rbase = reg.base;
-        let rend = rbase + size;
-
-        // align to 8 bytes, walk words
-        let mut addr = (rbase + 7) & !7usize;
-        let end = rend - 8;
+        let mut chunks = crate::safe::ScanChunks::new(rbase, size, reg.protect, 64 * 1024, 0);
         let mut run_start = 0usize;
         let mut run_len = 0usize;
         let mut run_first = 0usize;
 
+        loop {
+            let ok = chunks.next_chunk();
+            break_run_on_error(&mut run_len, chunks.failed());
+            if !ok {
+                break;
+            }
+            let span = chunks.span();
+            // align to 8 bytes, walk words through the checked snapshot boundary
+            let mut addr = (span.base() + 7) & !7usize;
+            let end = span.end().saturating_sub(8);
+
         while addr <= end {
-            let w = unsafe { core::ptr::read_unaligned(addr as *const u64) } as usize;
+            let w = match crate::safe::read_usize_in_span(span, addr) {
+                Some(w) => w,
+                None => {
+                    addr += 8;
+                    continue;
+                }
+            };
             let in_ga = w >= ga_lo && w < ga_hi;
 
             if in_ga {
@@ -238,6 +324,7 @@ fn scan_process(
             }
             addr += 8;
         }
+        }
         if run_len >= 32 {
             runs.push((run_start, run_len, run_first));
         }
@@ -274,9 +361,7 @@ pub fn resolve(budget_mb: usize) -> Option<Resolved> {
     let t0 = std::time::Instant::now();
     let (up_base, up_size) = procs::own_module("UnityPlayer.dll")?;
     let (ga_base, ga_size) = procs::own_module("GameAssembly.dll")?;
-    let mem = slice(up_base, up_size);
-
-    let found = locate_names(mem, 4);
+    let found = locate_names(up_base, up_size, 4);
     let mut stats = Stats {
         names: {
             let mut u: Vec<&str> = found.iter().map(|(n, _)| *n).collect();
@@ -489,8 +574,12 @@ pub fn find_domain() -> Option<usize> {
         if !is_getter {
             continue;
         }
-        let f: extern "system" fn() -> usize = unsafe { core::mem::transmute(addr) };
-        let v = f();
+        // SAFETY: addr is an export whose bytes passed the no-argument getter
+        // signature check above; call0 still relies on VEH to reject bad targets.
+        let v = match unsafe { crate::veh::call0(addr) } {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if readable_at(v) && v > 0x10000 && !walk_assembly_array(v).1.is_empty() {
             log::log(&format!(
                 "console: domain getter {name} (rva {rva:#x}) -> {v:#x}"
@@ -535,9 +624,15 @@ pub fn probe_getters(ga_base: usize, ga_size: usize) -> String {
             continue;
         }
         n += 1;
-        let f: extern "system" fn() -> usize = unsafe { core::mem::transmute(addr) };
-        let v = f();
-        let v2 = f();
+        // SAFETY: same getter-shaped export validated above, invoked twice only
+        // to check whether its no-argument singleton result is stable.
+        let (v, v2) = match (
+            unsafe { crate::veh::call0(addr) },
+            unsafe { crate::veh::call0(addr) },
+        ) {
+            (Ok(v), Ok(v2)) => (v, v2),
+            _ => continue,
+        };
         out.push_str(&format!(
             "getter {name} rva {rva:#x} -> {v:#x} (stable {}, {})\n",
             v == v2,

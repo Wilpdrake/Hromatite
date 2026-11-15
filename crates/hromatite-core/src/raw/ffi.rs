@@ -160,6 +160,8 @@ pub struct MODULEENTRY32W {
 
 impl Default for MODULEENTRY32W {
     fn default() -> Self {
+        // SAFETY: MODULEENTRY32W is a C POD record; all-zero bytes are a valid
+        // initial state and every field has no invalid bit pattern.
         unsafe { core::mem::zeroed() }
     }
 }
@@ -179,6 +181,8 @@ pub struct THREADENTRY32 {
 
 impl Default for THREADENTRY32 {
     fn default() -> Self {
+        // SAFETY: THREADENTRY32 is a C POD record; all-zero bytes are a valid
+        // initial state and every field has no invalid bit pattern.
         unsafe { core::mem::zeroed() }
     }
 }

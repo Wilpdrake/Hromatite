@@ -5,6 +5,8 @@
 //! operations never race the game heap and `dump()` is byte-for-byte identical
 //! to what was parsed. Offsets are comments in each definition below.
 
+#![forbid(unsafe_code)]
+
 use crate::procs;
 use std::sync::{Arc, Mutex};
 
@@ -546,12 +548,16 @@ fn locate_process() -> Result<Meta, String> {
             if spent > budget { break; }
             crate::safe::scan_yield();
             const CHUNK: usize = 64 * 1024;
+            let mut chunk = crate::safe::Span::from_parts(0, 0, r.protect);
             let mut off = 0usize;
             while off < r.size {
                 let n = CHUNK.min(r.size - off);
                 let base = r.base + off;
                 let hits = crate::veh::call_with(|| {
-                    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, n) };
+                    if !chunk.refresh(base, n, r.protect) {
+                        return Vec::new();
+                    }
+                    let bytes = chunk.bytes();
                     let mut hits = Vec::new();
                     for i in (0..bytes.len().saturating_sub(HEADER_SIZE)).step_by(4) {
                         let valid = if structural {

@@ -6,7 +6,9 @@ use crate::ffi::*;
 
 pub struct Remote {
     pub pid: u32,
-    pub h: HANDLE,
+    /// Owned process handle: construction and destruction stay inside this
+    /// module so callers cannot accidentally close or reuse it.
+    h: HANDLE,
 }
 
 impl Remote {
@@ -16,15 +18,22 @@ impl Remote {
             | PROCESS_VM_READ
             | PROCESS_VM_WRITE
             | PROCESS_QUERY_INFORMATION;
+        // SAFETY: pid/access are plain scalars and OpenProcess returns an owned
+        // handle which is stored in Remote and closed by Drop exactly once.
         let h = unsafe { OpenProcess(access, 0, pid) };
         if h.is_null() {
-            Err(format!("OpenProcess(pid={pid}) failed, GetLastError={}", unsafe { GetLastError() }))
+            // SAFETY: GetLastError has no pointer preconditions and reads the
+            // calling thread's error slot immediately after the failed call.
+            let error = unsafe { GetLastError() };
+            Err(format!("OpenProcess(pid={pid}) failed, GetLastError={error}"))
         } else {
             Ok(Self { pid, h })
         }
     }
 
     pub fn read(&self, addr: usize, buf: &mut [u8]) -> bool {
+        // SAFETY: self.h was opened with PROCESS_VM_READ and remains valid;
+        // buf supplies a valid writable region of buf.len() bytes.
         unsafe {
             ReadProcessMemory(self.h, addr as *const u8, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut()) != 0
         }
@@ -60,6 +69,8 @@ impl Remote {
     }
 
     pub fn write(&self, addr: usize, buf: &[u8]) -> bool {
+        // SAFETY: self.h was opened with PROCESS_VM_WRITE|OPERATION and buf is
+        // a valid immutable region of buf.len() bytes for the synchronous call.
         unsafe {
             WriteProcessMemory(self.h, addr as *mut u8, buf.as_ptr(), buf.len(), core::ptr::null_mut()) != 0
         }
@@ -72,6 +83,8 @@ impl Remote {
     /// Allocate at a requested address (0 = anywhere). Used for module stomping,
     /// where the region must land inside an already-mapped image.
     pub fn alloc_at(&self, addr: usize, size: usize, protect: u32) -> Option<usize> {
+        // SAFETY: self.h is live and has allocation rights. No buffer pointer
+        // is passed; the returned address belongs to the target process.
         let p = unsafe {
             VirtualAllocEx(self.h, addr, size, MEM_COMMIT | MEM_RESERVE, protect)
         };
@@ -80,6 +93,7 @@ impl Remote {
 
     pub fn protect(&self, addr: usize, size: usize, prot: u32) -> bool {
         let mut old = 0u32;
+        // SAFETY: old is a valid output pointer and self.h has VM_OPERATION.
         unsafe { VirtualProtectEx(self.h, addr as *mut u8, size, prot, &mut old) != 0 }
     }
 
@@ -87,14 +101,19 @@ impl Remote {
     /// Any filter struct we hand over is dropped immediately: a remote thread
     /// that outlives it is a crash waiting to happen.
     pub fn call(&self, start: usize, param: usize, wait_ms: u32) -> Option<u32> {
+        // SAFETY: start/param are opaque target addresses from the mapper; the
+        // process handle has CREATE_THREAD. The returned handle is closed below.
         let h = unsafe { CreateRemoteThread(self.h, 0, 0, start, param, 0, core::ptr::null_mut()) };
         if h.is_null() {
             crate::log::log(&format!(
                 "call: CreateRemoteThread(start {start:#x}) failed, GetLastError={}",
+                // SAFETY: no pointer preconditions; read the current thread error.
                 unsafe { GetLastError() }
             ));
             return None;
         }
+        // SAFETY: h is a live thread handle; code is a valid out pointer and h
+        // is closed regardless of whether the wait timed out or completed.
         unsafe {
             WaitForSingleObject(h, wait_ms);
             let mut code = 0u32;
@@ -178,6 +197,8 @@ impl Remote {
 
 impl Drop for Remote {
     fn drop(&mut self) {
+        // SAFETY: self.h was returned by OpenProcess and is owned exclusively
+        // by this Remote instance, so Drop closes it exactly once.
         unsafe {
             CloseHandle(self.h);
         }

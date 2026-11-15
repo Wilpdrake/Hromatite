@@ -1,6 +1,8 @@
 //! Read-only bridge: immutable IL2CPP metadata ↔ live codegen/class objects.
 //! No `il2cpp_*` calls (safe from the QPC detour), no new threads.
 
+#![forbid(unsafe_code)]
+
 use crate::metadata::{FieldDef, ImageDef, Meta, MethodDef, TypeDef};
 use crate::{meta, procs, safe};
 use std::sync::Arc;

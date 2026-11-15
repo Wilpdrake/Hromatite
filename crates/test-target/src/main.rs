@@ -1,6 +1,8 @@
 //! Stand-in for VRChat.exe: a long-lived wine process that the manual mapper
 //! can be tested against without launching the game or touching EAC.
 
+#![forbid(unsafe_code)]
+
 fn main() {
     println!("test-target pid {}", std::process::id());
     let mut n: u64 = 0;

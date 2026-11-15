@@ -4,6 +4,8 @@
 use crate::ffi::*;
 
 pub fn find_pid(name: &str) -> Option<u32> {
+    // SAFETY: Toolhelp owns the entry buffer only during each call; the snapshot
+    // is closed on every path and no pointer escapes this function.
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
@@ -28,6 +30,8 @@ pub fn find_pid(name: &str) -> Option<u32> {
 }
 
 pub fn all_pids() -> Vec<(u32, String)> {
+    // SAFETY: each entry is initialised to the required size and the snapshot is
+    // closed before returning; output strings own their UTF-16 contents.
     unsafe {
         let mut out = Vec::new();
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -49,6 +53,8 @@ pub fn all_pids() -> Vec<(u32, String)> {
 }
 
 pub fn modules(pid: u32) -> Vec<(String, usize, usize)> {
+    // SAFETY: see find_pid: entries remain alive during enumeration and the
+    // Toolhelp snapshot handle is closed on all paths.
     unsafe {
         let mut out = Vec::new();
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
@@ -100,6 +106,8 @@ fn read_ptr(addr: usize) -> Option<usize> {
 pub fn unlink_from_peb(module_base: usize) -> bool {
     use crate::safe;
     let peb: usize;
+    // SAFETY: Win64 guarantees GS:[0x60] is the current thread's PEB. The asm
+    // changes no flags, stack or other registers and does not dereference Rust data.
     unsafe {
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, nomem, preserves_flags));
     }
@@ -189,6 +197,8 @@ impl Region {
 /// scan has to reach the heap as well.
 pub fn regions(max_regions: usize) -> Vec<Region> {
     let mut out = Vec::new();
+    // SAFETY: every iteration provides a correctly sized MBI output buffer;
+    // address progression is bounded by `top` and stops on a failed/empty query.
     unsafe {
         let mut addr = 0x10000usize;
         let top = 0x0000_7FFF_FFFF_0000usize;
@@ -219,6 +229,7 @@ pub fn regions(max_regions: usize) -> Vec<Region> {
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
     let w = wide(name);
+    // SAFETY: `w` is NUL-terminated UTF-16 and remains alive throughout the call.
     let h = unsafe { GetModuleHandleW(w.as_ptr()) };
     if h.is_null() {
         return None;

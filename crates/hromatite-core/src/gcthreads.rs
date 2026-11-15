@@ -27,7 +27,8 @@
 //! a wrong base is silent, and detection is cheap: a real table's entries point
 //! at structs whose id matches a live thread id.
 
-use crate::ffi::{self, CloseHandle, TH32CS_SNAPTHREAD, THREADENTRY32};
+#![forbid(unsafe_code)]
+
 use crate::safe;
 use crate::{procs, GAME_ASSEMBLY};
 
@@ -110,36 +111,12 @@ impl Table {
 }
 
 pub fn own_tid() -> u32 {
-    unsafe { ffi::GetCurrentThreadId() }
+    crate::raw::sys::current_thread_id()
 }
 
 /// Every thread id that currently belongs to this process.
 pub fn live_tids() -> Vec<u32> {
-    let mut out = Vec::new();
-    unsafe {
-        let snap = ffi::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snap.is_null() || snap == ffi::INVALID_HANDLE_VALUE {
-            return out;
-        }
-        let me = ffi::GetCurrentProcessId();
-        let mut e = THREADENTRY32 {
-            dwSize: core::mem::size_of::<THREADENTRY32>() as u32,
-            ..Default::default()
-        };
-        if ffi::Thread32First(snap, &mut e) != 0 {
-            loop {
-                if e.th32OwnerProcessID == me && e.th32ThreadID != 0 {
-                    out.push(e.th32ThreadID);
-                }
-                e.dwSize = core::mem::size_of::<THREADENTRY32>() as u32;
-                if ffi::Thread32Next(snap, &mut e) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-    }
-    out
+    crate::raw::sys::live_thread_ids()
 }
 
 fn read_record(ptr: usize) -> Option<(u32, u64, u64)> {
@@ -241,33 +218,11 @@ pub fn snapshot(forced_rva: Option<u32>) -> Option<Table> {
 /// Start address of a thread (`ThreadQuerySetWin32StartAddress`), i.e. the
 /// function it was created with — that is what names an engine thread.
 pub fn thread_start_address(tid: u32) -> Option<usize> {
-    unsafe {
-        let h = ffi::OpenThread(ffi::THREAD_QUERY_INFORMATION, 0, tid);
-        if h.is_null() || h == ffi::INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut start: usize = 0;
-        let mut ret: u32 = 0;
-        let st = ffi::NtQueryInformationThread(
-            h,
-            THREAD_QUERY_START_ADDRESS,
-            &mut start as *mut usize as *mut core::ffi::c_void,
-            core::mem::size_of::<usize>() as u32,
-            &mut ret,
-        );
-        ffi::CloseHandle(h);
-        if st == 0 && start != 0 {
-            Some(start)
-        } else {
-            None
-        }
-    }
+    crate::raw::sys::thread_start_address(tid)
 }
 
-const THREAD_QUERY_START_ADDRESS: u32 = 9;
-
 fn module_of(addr: usize) -> String {
-    let pid = unsafe { ffi::GetCurrentProcessId() };
+    let pid = crate::raw::sys::current_process_id();
     for (name, base, size) in procs::modules(pid) {
         if addr >= base && addr < base + size {
             return format!("{}+{:#x}", name, addr - base);
@@ -384,7 +339,7 @@ fn alive_by_handle(handle: u64) -> Option<bool> {
         // 0 = none, -1 = pseudo "current thread" sentinels
         return None;
     }
-    let rc = unsafe { ffi::WaitForSingleObject(handle as ffi::HANDLE, 0) };
+    let rc = crate::raw::sys::wait_handle(handle, 0)?;
     match rc {
         WAIT_OBJECT_0 => Some(false), // signalled: the thread has fully exited
         WAIT_TIMEOUT => Some(true),   // still running (even if merely suspended)
@@ -490,8 +445,7 @@ pub fn reap() -> Vec<String> {
                 // exception usually leaves the OS code. This is the only way to
                 // tell "exited normally but skipped GC_unregister_my_thread"
                 // from "was killed".
-                let mut code: u32 = 0xDEAD_BEEF;
-                let have_code = unsafe { ffi::GetExitCodeThread(handle as ffi::HANDLE, &mut code) } != 0;
+                let exit_code = crate::raw::sys::thread_exit_code(handle);
                 let start = {
                     let mut g = match STARTS.lock() {
                         Ok(g) => g,
@@ -505,7 +459,7 @@ pub fn reap() -> Vec<String> {
                     id,
                     handle,
                     bucket,
-                    if have_code { format!("{code:#x}") } else { "?".into() },
+                    exit_code.map_or_else(|| "?".into(), |code| format!("{code:#x}")),
                     start.map(|a| format!("{a:#x} {}", module_of(a))).unwrap_or_default(),
                 ));
             }
@@ -679,26 +633,13 @@ pub fn watch() -> Vec<String> {
 /// whether that is what happened.
 pub fn resume_all(table: &Table) -> Vec<String> {
     let mut out = Vec::new();
-    let addr = unsafe {
-        let k = ffi::GetModuleHandleW(ffi::wide("kernel32.dll").as_ptr());
-        if k.is_null() {
-            out.push("resume: kernel32 not found".to_string());
-            return out;
-        }
-        ffi::GetProcAddress(k, ffi::cstr("ResumeThread").as_ptr())
-    };
-    if addr.is_null() {
-        out.push("resume: ResumeThread not resolved".to_string());
-        return out;
-    }
-    let f = addr as usize;
     for e in &table.entries {
         if e.handle == 0 {
             continue;
         }
-        match crate::veh::call1(f, e.handle as usize) {
-            Ok(v) => out.push(format!("ResumeThread(id {:#x}, h {:#x}) -> {v:#x}", e.id, e.handle)),
-            Err(fault) => out.push(format!("ResumeThread(id {:#x}) faulted: {fault}", e.id)),
+        match crate::raw::sys::resume_thread(e.handle) {
+            Some(v) => out.push(format!("ResumeThread(id {:#x}, h {:#x}) -> {v:#x}", e.id, e.handle)),
+            None => out.push(format!("ResumeThread(id {:#x}) could not be resolved/called", e.id)),
         }
     }
     out

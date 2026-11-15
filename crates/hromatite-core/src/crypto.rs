@@ -25,6 +25,8 @@
 //! `xor_page` is an involution (XOR), so decrypt == encrypt: no separate code
 //! path, no state to keep, and `apply twice` is the unit test.
 
+#![forbid(unsafe_code)]
+
 /// Fixed ASCII key, expanded per page so neighbouring pages do not repeat.
 pub const SEAL_KEY: u64 = 0x4852_4F4D_4154_4954; // "HROMATIT"
 

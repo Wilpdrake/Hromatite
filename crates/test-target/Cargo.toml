@@ -8,3 +8,6 @@ name = "test-target"
 path = "src/main.rs"
 
 [dependencies]
+
+[lints]
+workspace = true

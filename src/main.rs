@@ -6,6 +6,8 @@
 //! `bridge` proves cross-process access works at all (M0b); `inject` is the
 //! manual mapper (M1).
 
+#![forbid(unsafe_code)]
+
 use hromatite_core::{log, manualmap, procs, remote::Remote, GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER};
 
 fn usage() {

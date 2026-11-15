@@ -19,6 +19,8 @@
 //! between Unity versions — and why it needs no guarded calls at all: it only
 //! reads memory that a previous validation already proved readable.
 
+#![forbid(unsafe_code)]
+
 use crate::log;
 use crate::procs;
 use crate::safe;
@@ -452,32 +454,58 @@ fn readable_protect(p: u32) -> bool {
 
 /// Cheap readable-range index: the scan touches millions of words, and a
 /// `VirtualQuery` per word would take minutes. Regions come from one snapshot.
-struct Ranges(Vec<(usize, usize)>);
+struct Ranges {
+    regions: Vec<safe::Span>,
+    scratch: std::cell::RefCell<safe::Span>,
+}
 
 impl Ranges {
     fn new() -> Self {
-        let mut v: Vec<(usize, usize)> = procs::regions(1 << 20)
+        let mut v: Vec<safe::Span> = procs::regions(1 << 20)
             .into_iter()
             // PAGE_GUARD pages raise 0xC00000FD when touched — the scan runs on
             // the game thread, so a "readable" stack guard page must be skipped.
             .filter(|r| readable_protect(r.protect) && r.protect & 0x100 == 0)
-            .map(|r| (r.base, r.base + r.size))
+            .map(|r| safe::Span::from_parts(r.base, r.size, r.protect))
             .collect();
-        v.sort_unstable();
-        Self(v)
+        v.sort_unstable_by_key(|s| s.base());
+        Self {
+            regions: v,
+            scratch: std::cell::RefCell::new(safe::Span::from_parts(0, 0, 0)),
+        }
+    }
+
+    fn containing(&self, a: usize, len: usize) -> Option<&safe::Span> {
+        let i = match self.regions.binary_search_by_key(&a, |s| s.base()) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let span = self.regions.get(i)?;
+        span.contains(a, len).then_some(span)
     }
 
     fn readable(&self, a: usize, len: usize) -> bool {
-        let i = match self.0.binary_search_by(|(base, _)| base.cmp(&a)) {
-            Ok(i) => i,
-            Err(0) => return false,
-            Err(i) => i - 1,
-        };
-        a.saturating_add(len) <= self.0[i].1
+        self.containing(a, len).is_some()
+    }
+
+    fn chunk_for(&self, a: usize, len: usize) -> Option<std::cell::RefMut<'_, safe::Span>> {
+        const WINDOW: usize = 64 * 1024;
+        let region = self.containing(a, len)?;
+        let base = (a / WINDOW * WINDOW).max(region.base());
+        let size = (region.end() - base).min(WINDOW);
+        let mut scratch = self.scratch.borrow_mut();
+        if (scratch.base() != base || scratch.bytes().is_empty())
+            && !scratch.refresh(base, size, region.protect())
+        {
+            return None;
+        }
+        Some(scratch)
     }
 
     fn u64(&self, a: usize) -> Option<u64> {
-        self.readable(a, 8).then(|| unsafe { *(a as *const u64) })
+        let chunk = self.chunk_for(a, 8)?;
+        safe::read_u64_in_span(&chunk, a)
     }
 
     fn cstr(&self, a: usize, max: usize) -> Option<String> {
@@ -486,10 +514,10 @@ impl Ranges {
         }
         let mut s = String::with_capacity(32);
         for i in 0..max {
-            if !self.readable(a + i, 1) {
-                return None;
-            }
-            let b = unsafe { *((a + i) as *const u8) };
+            let b = {
+                let span = self.chunk_for(a + i, 1)?;
+                safe::read_u8_in_span(&span, a + i)?
+            };
             if b == 0 {
                 return (!s.is_empty()).then_some(s);
             }
@@ -740,18 +768,20 @@ pub fn find_string(pat: &[u8], max: usize) -> Vec<usize> {
         if size < pat.len() + 1 {
             continue;
         }
-        let last = base + size - pat.len();
-        let mut a = base;
-        while a <= last && out.len() < max {
-            // substring match: metadata strings are NUL-terminated, but a method
-            // name may also appear inside a longer run, and requiring the NUL
-            // here made `mfind get_main` find nothing while `findb` found 4.
-            if unsafe { *(a as *const u8) } == pat[0]
-                && unsafe { core::slice::from_raw_parts(a as *const u8, pat.len()) } == pat
-            {
-                out.push(a);
+        let mut chunks = safe::ScanChunks::new(base, size, crate::ffi::PAGE_READWRITE, 64 * 1024, pat.len());
+        while chunks.next_chunk() {
+            let span = chunks.span();
+            let last = chunks.candidate_end().saturating_sub(pat.len());
+            let mut a = span.base();
+            while a <= last && out.len() < max {
+                // substring match: metadata strings are NUL-terminated, but a method
+                // name may also appear inside a longer run, and requiring the NUL
+                // here made `mfind get_main` find nothing while `findb` found 4.
+                if safe::matches_in_span(span, a, pat) {
+                    out.push(a);
+                }
+                a += 1;
             }
-            a += 1;
         }
     }
     out
@@ -770,13 +800,9 @@ pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
         if size < 16 {
             continue;
         }
-        let mut a = (base + 7) & !7usize;
-        let end = base + size - 8;
-        while a <= end && out.len() < max {
-            if unsafe { *(a as *const u64) } == want {
-                out.push(a);
-            }
-            a += 8;
+        let mut chunks = safe::ScanChunks::new(base, size, crate::ffi::PAGE_READWRITE, 64 * 1024, 0);
+        while chunks.next_chunk() {
+            safe::find_qword_in_span(chunks.span(), want, max, &mut out);
         }
     }
     out

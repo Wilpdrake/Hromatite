@@ -9,3 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hromatite-core = { path = "../hromatite-core" }
+
+[lints]
+workspace = true

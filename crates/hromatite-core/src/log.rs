@@ -1,6 +1,8 @@
 //! File logging. The game process has no console under Proton, so every stage
 //! of the pipeline writes to one predictable file inside the wine prefix.
 
+#![forbid(unsafe_code)]
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};

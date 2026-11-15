@@ -8,6 +8,8 @@
 //!     game already mapped (its `/proc/<pid>/maps` entry then belongs to that
 //!     module, not to an anonymous region).
 
+#![forbid(unsafe_code)]
+
 use crate::log;
 use crate::pe::PeImage;
 use crate::procs;
@@ -154,10 +156,9 @@ fn remote_load(r: &Remote, dll: &str) -> Option<usize> {
             return None;
         }
     };
-    let w = crate::ffi::wide(dll);
-    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2) };
+    let bytes = crate::raw::sys::wide_bytes(dll);
     let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE)?;
-    if !r.write(arg, bytes) {
+    if !r.write(arg, &bytes) {
         log::log("remote_load: cannot write dll path into target");
         return None;
     }
@@ -359,10 +360,9 @@ pub fn inject_loadlib(pid: u32, dll_win_path: &str) -> Result<usize, String> {
         .ok_or("kernel32.dll not found in target")?;
     let llw = r.export(k32, "LoadLibraryW").ok_or("kernel32!LoadLibraryW unresolved")?;
 
-    let w = crate::ffi::wide(dll_win_path);
-    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 2) };
+    let bytes = crate::raw::sys::wide_bytes(dll_win_path);
     let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE).ok_or("alloc path failed")?;
-    if !r.write(arg, bytes) {
+    if !r.write(arg, &bytes) {
         return Err("write path failed".into());
     }
     let code = r
