@@ -6,12 +6,14 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const REPLAY_BYTES: u64 = 128 * 1024;
+const OVERLAP_BYTES: u64 = 256;
 const MAX_CARRY: usize = 1024 * 1024;
 
 pub struct LogTail {
     path: PathBuf,
     position: u64,
     identity: Option<(u64, u64)>,
+    overlap: Vec<u8>,
     carry: Vec<u8>,
 }
 
@@ -49,10 +51,16 @@ impl LogTail {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let overlap = if identity.is_some() {
+            read_overlap(&mut File::open(path)?, position)?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             path: path.to_path_buf(),
             position,
             identity,
+            overlap,
             carry: Vec::new(),
         })
     }
@@ -65,8 +73,14 @@ impl LogTail {
         };
         let metadata = file.metadata()?;
         let identity = (metadata.dev(), metadata.ino());
-        if self.identity.is_some_and(|old| old != identity) || metadata.len() < self.position {
+        let mut replaced =
+            self.identity.is_some_and(|old| old != identity) || metadata.len() < self.position;
+        if !replaced && read_overlap(&mut file, self.position)? != self.overlap {
+            replaced = true;
+        }
+        if replaced {
             self.position = 0;
+            self.overlap.clear();
             self.carry.clear();
         }
         self.identity = Some(identity);
@@ -77,6 +91,9 @@ impl LogTail {
         let mut fresh = Vec::new();
         file.read_to_end(&mut fresh)?;
         self.position = self.position.saturating_add(fresh.len() as u64);
+        self.overlap.extend_from_slice(&fresh);
+        let excess = self.overlap.len().saturating_sub(OVERLAP_BYTES as usize);
+        self.overlap.drain(..excess);
         self.carry.extend_from_slice(&fresh);
         let mut lines = Vec::new();
         while let Some(end) = self.carry.iter().position(|byte| *byte == b'\n') {
@@ -94,6 +111,16 @@ impl LogTail {
         }
         Ok(lines)
     }
+}
+
+/// Read the bytes immediately before `position`; this identifies replacement
+/// even when truncation and regrowth both happen between two polls.
+fn read_overlap(file: &mut File, position: u64) -> io::Result<Vec<u8>> {
+    let len = position.min(OVERLAP_BYTES);
+    file.seek(SeekFrom::Start(position - len))?;
+    let mut overlap = vec![0; len as usize];
+    file.read_exact(&mut overlap)?;
+    Ok(overlap)
 }
 
 pub struct CommandWriter {
@@ -181,6 +208,36 @@ mod tests {
         assert_eq!(tail.poll().unwrap(), vec!["[2] [gct] partial"]);
         fs::write(&path, "[3] [dll] after truncate\n").unwrap();
         assert_eq!(tail.poll().unwrap(), vec!["[3] [dll] after truncate"]);
+    }
+
+    #[test]
+    fn tail_detects_truncate_and_regrow_beyond_previous_length() {
+        let dir = TestDir::new();
+        let path = dir.0.join("game.log");
+        fs::write(&path, "old generation\n").unwrap();
+        let old_len = fs::metadata(&path).unwrap().len();
+        let mut tail = LogTail::open(&path, true).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec!["old generation"]);
+
+        let replacement = "new generation that is longer\n";
+        assert!(replacement.len() as u64 > old_len);
+        fs::write(&path, replacement).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec!["new generation that is longer"]);
+    }
+
+    #[test]
+    fn tail_detects_truncate_and_regrow_to_equal_length() {
+        let dir = TestDir::new();
+        let path = dir.0.join("game.log");
+        fs::write(&path, "generation one\n").unwrap();
+        let old_len = fs::metadata(&path).unwrap().len();
+        let mut tail = LogTail::open(&path, true).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec!["generation one"]);
+
+        let replacement = "generation two\n";
+        assert_eq!(replacement.len() as u64, old_len);
+        fs::write(&path, replacement).unwrap();
+        assert_eq!(tail.poll().unwrap(), vec!["generation two"]);
     }
 
     #[test]

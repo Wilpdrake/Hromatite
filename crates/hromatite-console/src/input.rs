@@ -11,13 +11,6 @@ pub const COMMANDS: &[&str] = &[
     "bytes",
     "s",
     "ws",
-    "find",
-    "findb",
-    "findw",
-    "asm",
-    "entry",
-    "domain",
-    "diag",
     "gct",
     "threads",
     "gctfix",
@@ -26,35 +19,17 @@ pub const COMMANDS: &[&str] = &[
     "wq",
     "wb",
     "guard",
-    "api",
-    "cls",
-    "cls2",
-    "cam",
-    "types",
-    "tfind",
-    "fields",
-    "methods",
-    "mcall",
-    "pos",
-    "who",
-    "esp",
-    "cam2",
-    "meta",
-    "typelist",
-    "typedump",
-    "meths",
-    "fields2",
     "m3f",
     "m3c",
     "m3l",
     "m3s",
+    "m3i",
     "latec",
     "latehook",
     "late",
-    "imgset",
-    "imgc",
-    "imgfind",
-    "dumpmeta",
+    "pos",
+    "who",
+    "esp",
     "panic",
     "av",
     "seal",
@@ -80,6 +55,7 @@ pub enum Key {
     CtrlR,
     CtrlC,
     Esc,
+    Ignore,
 }
 
 #[derive(Default)]
@@ -129,12 +105,23 @@ impl KeyDecoder {
         self.pending.drain(..at);
         keys
     }
+
+    /// Resolve a lone Escape after the terminal read timeout. Longer split
+    /// sequences stay pending so a slow read cannot turn an arrow into Exit.
+    pub fn timeout(&mut self) -> Vec<Key> {
+        if self.pending.as_slice() == b"\x1b" {
+            self.pending.clear();
+            vec![Key::Esc]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
-/// Return `None` only while a CSI/SS3 sequence is demonstrably incomplete.
+/// Return `None` while an Escape, CSI or SS3 sequence may be incomplete.
 fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
     if bytes.len() == 1 {
-        return Some((Key::Esc, 1));
+        return None;
     }
     if bytes[1] == b'O' {
         if bytes.len() < 3 {
@@ -151,7 +138,7 @@ fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
             b'Q' => Key::F(2),
             b'R' => Key::F(3),
             b'S' => Key::F(4),
-            _ => Key::Esc,
+            _ => Key::Ignore,
         };
         return Some((key, 3));
     }
@@ -182,7 +169,7 @@ fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
         ("17", b'~') => Key::F(6),
         ("18", b'~') => Key::F(7),
         ("19", b'~') => Key::F(8),
-        _ => return Some((Key::Esc, end + 1)),
+        _ => Key::Ignore,
     };
     Some((key, end + 1))
 }
@@ -292,7 +279,7 @@ pub fn complete(input: &str) -> Completion {
 
 #[cfg(test)]
 mod tests {
-    use super::{Completion, History, Key, KeyDecoder, complete};
+    use super::{COMMANDS, Completion, History, Key, KeyDecoder, complete};
 
     #[test]
     fn history_preserves_draft_and_deduplicates_commands() {
@@ -322,6 +309,48 @@ mod tests {
     }
 
     #[test]
+    fn completion_matches_current_raw_console_help() {
+        assert_eq!(
+            COMMANDS,
+            &[
+                "help",
+                "?",
+                "q",
+                "qword",
+                "b",
+                "bytes",
+                "s",
+                "ws",
+                "gct",
+                "threads",
+                "gctfix",
+                "gctresume",
+                "call",
+                "wq",
+                "wb",
+                "guard",
+                "m3f",
+                "m3c",
+                "m3l",
+                "m3s",
+                "m3i",
+                "latec",
+                "latehook",
+                "late",
+                "pos",
+                "who",
+                "esp",
+                "panic",
+                "av",
+                "seal",
+                "quit",
+            ]
+        );
+        assert_eq!(complete("m3i").text, "m3i ");
+        assert!(complete("find").matches.is_empty());
+    }
+
+    #[test]
     fn decoder_handles_csi_function_keys_utf8_and_controls() {
         let mut decoder = KeyDecoder::default();
         assert_eq!(
@@ -330,7 +359,27 @@ mod tests {
         );
         assert_eq!(decoder.feed(&[18, 3]), vec![Key::CtrlR, Key::CtrlC]);
         assert_eq!(decoder.feed("й".as_bytes()), vec![Key::Char('й')]);
-        assert_eq!(decoder.feed(b"\x1b"), vec![Key::Esc]);
+        assert!(decoder.feed(b"\x1b").is_empty());
+    }
+
+    #[test]
+    fn decoder_distinguishes_split_arrows_from_single_escape() {
+        let mut decoder = KeyDecoder::default();
+        assert!(decoder.feed(b"\x1b").is_empty());
+        assert_eq!(decoder.feed(b"[A"), vec![Key::Up]);
+        assert!(decoder.feed(b"\x1b").is_empty());
+        assert_eq!(decoder.timeout(), vec![Key::Esc]);
+        assert!(decoder.timeout().is_empty());
+    }
+
+    #[test]
+    fn decoder_ignores_unknown_csi_and_ss3_sequences() {
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(
+            decoder.feed(b"\x1b[99~\x1bOZ"),
+            vec![Key::Ignore, Key::Ignore]
+        );
+        assert_eq!(decoder.feed(b"x"), vec![Key::Char('x')]);
     }
 
     #[test]
