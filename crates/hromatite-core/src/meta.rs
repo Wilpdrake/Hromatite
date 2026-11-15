@@ -567,10 +567,13 @@ fn scan_region(start: usize, words: usize, ranges: &Ranges) -> (Vec<(usize, usiz
 
 #[inline]
 fn v_break(out: &mut Vec<(usize, usize)>, start: usize, len: usize, hits: usize, best: &mut usize) {
-    if len >= 1024 && hits >= 64 {
-        if hits > *best {
-            *best = hits;
-        }
+    // `best` records the strongest run even when it is below the acceptance
+    // threshold — without that, "no tables" cannot be told apart from "the
+    // detector never fired".
+    if len >= 256 && hits > *best {
+        *best = hits;
+    }
+    if len >= 256 && hits >= 16 {
         out.push((start, len));
     }
 }
@@ -609,7 +612,7 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         }
         match crate::veh::call_with(|| scan_region(start, words, &ranges)) {
             Ok((found, best)) => {
-                if best >= 4 {
+                if best >= 1 {
                     log::log_tag(
                         "meta",
                         &format!(
