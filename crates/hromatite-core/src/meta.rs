@@ -514,70 +514,65 @@ fn class_like_in(r: &Ranges, p: usize) -> bool {
         Some(s) if ident_like(&s) => {}
         _ => return false,
     }
-    match r.u64(p + CLASS_NS_OFF).unwrap_or(0) as usize {
-        0 => true,
-        ns => matches!(r.cstr(ns, 96), Some(s) if ident_like(&s)),
-    }
+    // `namespaze` may legitimately be NULL (global namespace) — and, in this
+    // build, sometimes points at a metadata handle rather than a C string, so a
+    // readable pointer is accepted here; callers filter by exact name anyway.
+    let ns = r.u64(p + CLASS_NS_OFF).unwrap_or(0) as usize;
+    ns == 0 || r.readable(ns, 1)
 }
 
-/// Density scan of one region, in chunks: returns the merged stretches where at
-/// least 75% of a 128-word window looks like class pointers, plus the best
-/// density seen (useful when nothing crosses the threshold).
-fn scan_region(start: usize, words: usize, ranges: &Ranges) -> (Vec<(usize, usize)>, f32) {
-    const WIN: usize = 128;
-    const CH: usize = 1 << 16;
+/// Sparse-table scan: `s_TypeInfoTable` is `IL2CPP_CALLOC(typesCount * 8)`, so
+/// it is a long stretch of **zeros** with class pointers scattered where types
+/// were lazily initialized. A density window misses it; "zero or class-like" run
+/// detection is what matches (`GlobalMetadata.cpp:341`).
+fn scan_region(start: usize, words: usize, ranges: &Ranges) -> (Vec<(usize, usize)>, usize) {
     let mut out: Vec<(usize, usize)> = Vec::new();
-    let mut best = 0f32;
-    let mut i = 0usize;
-    while i < words {
-        let n = CH.min(words - i);
-        // read one window past the chunk so windows are never truncated
-        let extra = WIN - 1;
-        let cnt = n + extra;
-        let mut flags = vec![0u8; cnt];
-        for k in 0..cnt {
-            let idx = i + k;
-            if idx >= words {
-                break;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    let mut run_hits = 0usize;
+    let mut best_hits = 0usize;
+    for i in 0..words {
+        let a = start + i * 8;
+        let v = match ranges.u64(a) {
+            Some(v) => v as usize,
+            None => {
+                v_break(&mut out, run_start, run_len, run_hits, &mut best_hits);
+                run_len = 0;
+                run_hits = 0;
+                continue;
             }
-            let v = match ranges.u64(start + idx * 8) {
-                Some(v) => v as usize,
-                None => continue,
-            };
-            if v >= 0x10000 && class_like_in(ranges, v) {
-                flags[k] = 1;
+        };
+        if v == 0 {
+            if run_len == 0 {
+                run_start = a;
             }
+            run_len += 1;
+            continue;
         }
-        let mut prefix = vec![0u32; cnt + 1];
-        for k in 0..cnt {
-            prefix[k + 1] = prefix[k] + flags[k] as u32;
+        if v >= 0x10000 && class_like_in(ranges, v) {
+            if run_len == 0 {
+                run_start = a;
+            }
+            run_len += 1;
+            run_hits += 1;
+            continue;
         }
-        let mut marked: Vec<usize> = Vec::new();
-        for w in 0..n {
-            if w + WIN > cnt {
-                break;
-            }
-            let d = prefix[w + WIN] - prefix[w];
-            let dens = d as f32 / WIN as f32;
-            if dens > best {
-                best = dens;
-            }
-            if d as usize * 4 >= WIN * 3 {
-                marked.push(i + w);
-            }
-        }
-        for m in marked {
-            if let Some(last) = out.last_mut() {
-                if m <= last.0 + last.1 {
-                    last.1 = m + WIN - last.0;
-                    continue;
-                }
-            }
-            out.push((m, WIN));
-        }
-        i += n;
+        v_break(&mut out, run_start, run_len, run_hits, &mut best_hits);
+        run_len = 0;
+        run_hits = 0;
     }
-    (out, best)
+    v_break(&mut out, run_start, run_len, run_hits, &mut best_hits);
+    (out, best_hits)
+}
+
+#[inline]
+fn v_break(out: &mut Vec<(usize, usize)>, start: usize, len: usize, hits: usize, best: &mut usize) {
+    if len >= 1024 && hits >= 64 {
+        if hits > *best {
+            *best = hits;
+        }
+        out.push((start, len));
+    }
 }
 
 pub fn class_tables() -> Vec<(usize, usize)> {
@@ -593,8 +588,8 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     let ranges = Ranges::new();
     let mut scanned_words = 0usize;
     let mut scanned_regions = 0usize;
-    // Unity 6 allocates the class table with `IL2CPP_MALLOC`, so it lives on the
-    // **heap**, not in GameAssembly's `.data`. Hence: every writable region.
+    // Unity 6 allocates the class table with `IL2CPP_CALLOC`, so it lives on the
+    // **heap**, not in GameAssembly's `.data` (`GlobalMetadata.cpp: s_TypeInfoTable`).
     for r in procs::regions(65536) {
         // PAGE_GUARD (0x100) has to be excluded: touching such a page raises
         // 0xC00000FD on the game thread, which our VEH reports as a fault.
@@ -602,35 +597,30 @@ pub fn class_tables() -> Vec<(usize, usize)> {
         if !writable || r.size < 0x10000 {
             continue;
         }
-        // skip the classic module image ranges: `.text`/`.rdata` are read-only
         let start = (r.base + 7) & !7usize;
         let words = (r.base + r.size).saturating_sub(start) / 8;
-        if words < 256 {
+        if words < 1024 {
             continue;
         }
         scanned_words += words;
         scanned_regions += 1;
-        if scanned_words > 60_000_000 {
+        if scanned_words > 80_000_000 {
             break;
         }
-        // A stale page snapshot can still fault; the scan runs on the game's own
-        // thread, so one guarded call per region keeps a bad page from costing
-        // the whole command (and the game).
         match crate::veh::call_with(|| scan_region(start, words, &ranges)) {
             Ok((found, best)) => {
-                if best >= 0.5 {
+                if best >= 64 {
                     log::log_tag(
                         "meta",
                         &format!(
-                            "  region {start:#x}+{words}w best {:.2} windows {}",
-                            best,
+                            "  {start:#x}+{words}w: best {best} class words, {} run(s)",
                             found.len()
                         ),
                     );
                 }
                 c.extend(found);
             }
-            Err(_) => log::log_tag("meta", &format!("  region {start:#x}: fault")),
+            Err(_) => log::log_tag("meta", &format!("  {start:#x}: fault")),
         }
     }
     c.sort_by_key(|(a, _)| *a);
@@ -642,6 +632,7 @@ pub fn class_tables() -> Vec<(usize, usize)> {
             scanned_regions,
             scanned_words,
             c.iter()
+                .take(24)
                 .map(|(a, n)| format!("{a:#x}+{n}w"))
                 .collect::<Vec<_>>()
         ),
