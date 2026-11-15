@@ -1309,6 +1309,40 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             }
             (out, Action::None)
         }
+        // `mfind <method-name>` — locate a MethodInfo through its name string and
+        // walk to the declaring class (layout-free route to `Il2CppClass`).
+        "mfind" => {
+            if a1.is_empty() {
+                return (vec!["usage: mfind <method-name>".into()], Action::None);
+            }
+            let hits = crate::meta::find_method_by_name(a1);
+            let mut out = vec![format!("mfind '{a1}': {} hit(s)", hits.len())];
+            let mut seen: Vec<usize> = Vec::new();
+            for (mi, fp, klass) in hits.iter() {
+                out.push(format!(
+                    "  MethodInfo {mi:#x} fn {fp:#x} klass {klass:#x} ({})",
+                    crate::meta::class_name(*klass).unwrap_or_else(|| "?".into())
+                ));
+                if seen.contains(klass) {
+                    continue;
+                }
+                seen.push(*klass);
+                let f = crate::meta::fields_of(*klass);
+                let m = crate::meta::methods_of(*klass);
+                out.push(format!(
+                    "    class {klass:#x}: {} field(s), {} method(s)",
+                    f.len(),
+                    m.len()
+                ));
+                for (n, off) in f.iter().take(10) {
+                    out.push(format!("      field {n} @ +{off:#x}"));
+                }
+                for (n, e, _) in m.iter().take(10) {
+                    out.push(format!("      method {n} @ {e:#x}"));
+                }
+            }
+            (out, Action::None)
+        }
         // `ctab` — find the runtime's global class arrays (Unity 6 keeps them
         // outside the codegen module) and report what was found.
         "ctab" => {

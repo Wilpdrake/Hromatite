@@ -781,6 +781,64 @@ pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
     out
 }
 
+/// Find a **method** by its name string and walk to its class.
+///
+/// This avoids the `Il2CppClass` layout problem entirely: whatever the offsets
+/// are, a `MethodInfo` holds `methodPointer` (inside GameAssembly) and a pointer
+/// to its declaring class, and the class in turn names itself. The name offset
+/// inside `MethodInfo` is tried at 0x18 (Unity 6), 0x10 (older) and 0x20, and a
+/// candidate is accepted only when the first word points into GameAssembly.
+pub fn find_method_by_name(mname: &str) -> Vec<(usize, usize, usize)> {
+    let mut out: Vec<(usize, usize, usize)> = Vec::new(); // (methodinfo, fnptr, klass)
+    let ranges = Ranges::new();
+    let ga = procs::own_module(crate::GAME_ASSEMBLY);
+    let ptrs = find_string(mname.as_bytes(), 8);
+    log::log_tag(
+        "meta",
+        &format!("method '{mname}': {} string(s)", ptrs.len()),
+    );
+    for sp in ptrs {
+        for slot in find_qword(sp as u64, 64) {
+            for name_off in [0x18usize, 0x10, 0x20] {
+                let mi = slot.wrapping_sub(name_off);
+                if mi < 0x10000 || !ranges.readable(mi, 0x40) {
+                    continue;
+                }
+                let fp = match ranges.u64(mi) {
+                    Some(v) => v as usize,
+                    None => continue,
+                };
+                let in_ga = ga.map(|(b, sz)| fp >= b && fp < b + sz).unwrap_or(false);
+                if !in_ga {
+                    continue;
+                }
+                // Unity 6: klass@+0x20; older: +0x18. Accept whichever reads as
+                // a class-shaped record.
+                let mut klass = 0usize;
+                for koff in [0x20usize, 0x18] {
+                    if let Some(k) = ranges.u64(mi + koff) {
+                        if class_like_in(&ranges, k as usize) {
+                            klass = k as usize;
+                            break;
+                        }
+                    }
+                }
+                if klass != 0 {
+                    log::log_tag(
+                        "meta",
+                        &format!(
+                            "  name '{mname}' @ {sp:#x} -> MethodInfo {mi:#x} (name@{name_off:#x}), fn {fp:#x}, klass {klass:#x}"
+                        ),
+                    );
+                    out.push((mi, fp, klass));
+                }
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
 /// Directory scan for a class record: `+0x10` must be the exact name string.
 ///
 /// Measured on this build: a full heap pass performs ~19 M `class_like_in` tests
