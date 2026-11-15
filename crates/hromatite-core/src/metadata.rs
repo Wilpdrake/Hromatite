@@ -144,7 +144,11 @@ pub struct Meta {
 
 impl Meta {
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
-        let header = parse_header(&data)?;
+        Self::from_bytes_impl(data, true)
+    }
+
+    fn from_bytes_impl(data: Vec<u8>, require_magic: bool) -> Result<Self, String> {
+        let header = parse_header(&data, require_magic)?;
         if data.len() < header.block_size {
             return Err(format!(
                 "short metadata: {} bytes, sections need {}",
@@ -444,9 +448,11 @@ fn pair(data: &[u8], index: usize) -> Result<(u32, i32), String> {
     Ok((i32(data, index * 4)? as u32, i32(data, (index + 1) * 4)?))
 }
 
-fn parse_header(data: &[u8]) -> Result<Header, String> {
+fn parse_header(data: &[u8], require_magic: bool) -> Result<Header, String> {
     if data.len() < HEADER_SIZE { return Err("metadata header is shorter than 256 bytes".into()); }
-    if i32(data, 0)? as u32 != MAGIC { return Err("metadata magic AF 1B B1 FA not found".into()); }
+    if require_magic && i32(data, 0)? as u32 != MAGIC {
+        return Err("metadata magic AF 1B B1 FA not found".into());
+    }
     let version = i32(data, 4)?;
     if !(29..=31).contains(&version) { return Err(format!("unsupported metadata version {version} (need 29–31)")); }
     let indices = [
@@ -493,54 +499,85 @@ fn parse_header(data: &[u8]) -> Result<Header, String> {
     Ok(h)
 }
 
-fn candidate(at: usize) -> Result<Meta, String> {
+fn candidate(at: usize, structural: bool) -> Result<Meta, String> {
     let prefix = crate::safe::read_bytes(at, HEADER_SIZE).ok_or_else(|| "unreadable header".to_string())?;
-    let h = parse_header(&prefix)?;
+    let h = parse_header(&prefix, !structural)?;
     let data = crate::safe::read_bytes(at, h.block_size)
         .ok_or_else(|| format!("cannot snapshot {:#x} bytes of metadata", h.block_size))?;
-    Meta::from_bytes(data)
+    let m = Meta::from_bytes_impl(data, !structural)?;
+    if structural {
+        // A header without the magic is accepted only with an independent
+        // catalog oracle: plausible counts plus valid UTF-8 image/type names.
+        // Live measurement showed magic bytes in code, never in a valid header.
+        let counts = m.counts()?;
+        if counts.types < 1000 || counts.methods < 100 || counts.images == 0 {
+            return Err("weak structural metadata candidate".into());
+        }
+        let images = m.images()?;
+        let image_name = m.image_name(&images[0])?;
+        if !image_name.ends_with(".dll") {
+            return Err(format!("structural candidate has invalid image name {image_name:?}"));
+        }
+        for ty in m.types()?.iter().take(64) {
+            m.type_name(ty)?;
+        }
+        if m.r#type("UnityEngine", "Camera")?.is_none() {
+            return Err("structural candidate has no UnityEngine.Camera".into());
+        }
+    }
+    Ok(m)
 }
 
-/// Regions are probed largest-first: the real blob is tens of megabytes and this
-/// avoids spending a tick reviewing thousands of tiny heap regions first.
+/// Regions are probed largest-first. First try the normal magic, then the
+/// structural fallback: this VRChat build has no valid magic in live memory
+/// (verified independently over `/proc/<pid>/mem`).
 fn locate_process() -> Result<Meta, String> {
     let budget = std::env::var("HROMATITE_SCAN_MB").ok().and_then(|v| v.parse().ok())
         .unwrap_or(512usize) * 1024 * 1024;
-    let mut regions: Vec<_> = procs::regions(200_000).into_iter()
-        .filter(|r| r.readable() && !r.executable() && r.size >= 0x1000).collect();
-    regions.sort_by_key(|r| std::cmp::Reverse(r.size));
-    let mut spent = 0usize;
     let mut rejected = 0usize;
-    for r in regions {
-        spent = spent.saturating_add(r.size);
-        if spent > budget { break; }
-        crate::safe::scan_yield();
-        const CHUNK: usize = 64 * 1024;
-        let mut off = 0usize;
-        while off < r.size {
-            let n = CHUNK.min(r.size - off);
-            let base = r.base + off;
-            let hits = crate::veh::call_with(|| {
-                let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, n) };
-                let mut hits = Vec::new();
-                for i in (0..bytes.len().saturating_sub(3)).step_by(4) {
-                    if bytes[i..i + 4] == MAGIC.to_le_bytes() { hits.push(base + i); }
-                }
-                hits
-            }).map_err(|e| format!("metadata scan fault at {base:#x}: {e}"))?;
-            for at in hits {
-                match candidate(at) {
-                    Ok(m) => {
-                        crate::log::log_tag("meta", &format!(
-                            "decrypted metadata @ {at:#x}: v{}, {} bytes",
-                            m.header.version, m.header.block_size
-                        ));
-                        return Ok(m);
+    for structural in [false, true] {
+        let mut regions: Vec<_> = procs::regions(200_000).into_iter()
+            .filter(|r| r.readable() && !r.executable() && r.size >= 0x1000).collect();
+        regions.sort_by_key(|r| std::cmp::Reverse(r.size));
+        let mut spent = 0usize;
+        for r in regions {
+            spent = spent.saturating_add(r.size);
+            if spent > budget { break; }
+            crate::safe::scan_yield();
+            const CHUNK: usize = 64 * 1024;
+            let mut off = 0usize;
+            while off < r.size {
+                let n = CHUNK.min(r.size - off);
+                let base = r.base + off;
+                let hits = crate::veh::call_with(|| {
+                    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, n) };
+                    let mut hits = Vec::new();
+                    for i in (0..bytes.len().saturating_sub(HEADER_SIZE)).step_by(4) {
+                        let valid = if structural {
+                            bytes[i + 4..i + 8] == 31u32.to_le_bytes() ||
+                                bytes[i + 4..i + 8] == 30u32.to_le_bytes() ||
+                                bytes[i + 4..i + 8] == 29u32.to_le_bytes()
+                        } else {
+                            bytes[i..i + 4] == MAGIC.to_le_bytes()
+                        };
+                        if valid { hits.push(base + i); }
                     }
-                    Err(_) => rejected += 1,
+                    hits
+                }).map_err(|e| format!("metadata scan fault at {base:#x}: {e}"))?;
+                for at in hits {
+                    match candidate(at, structural) {
+                        Ok(m) => {
+                            crate::log::log_tag("meta", &format!(
+                                "decrypted metadata @ {at:#x}: v{}, {} bytes (structural={structural})",
+                                m.header.version, m.header.block_size
+                            ));
+                            return Ok(m);
+                        }
+                        Err(_) => rejected += 1,
+                    }
                 }
+                off += n;
             }
-            off += n;
         }
     }
     Err(format!("decrypted global-metadata.dat not found ({} rejected candidate(s))", rejected))
@@ -674,6 +711,14 @@ mod tests {
         let mut d = fixture(31);
         section(&mut d, 6, usize::MAX - 8, 100);
         assert!(Meta::from_bytes(d).is_err());
+    }
+
+    #[test]
+    fn structural_header_can_ignore_rewritten_magic_but_strict_cannot() {
+        let mut d = fixture(31);
+        put_i32(&mut d, 0, 0x3a08_77f3);
+        assert!(Meta::from_bytes(d.clone()).is_err());
+        assert_eq!(Meta::from_bytes_impl(d, false).unwrap().types().unwrap()[0].name_index, 12);
     }
 
     #[test]
