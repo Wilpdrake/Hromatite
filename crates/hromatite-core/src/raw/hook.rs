@@ -485,7 +485,9 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
     match wmode {
         8 => {
             let base = if o16 >= 8 { base16 + 8 } else { base16 };
-            let off = o16 - (base - base16);
+            // Source qword must have the same alignment as the destination:
+            // o16 is the target offset, not the start of the patch window.
+            let off = base - base16;
             let mut w = [0u8; 8];
             w.copy_from_slice(&new32[off..off + 8]);
             // SAFETY: base16 is readable target code and wmode 8 proves the full
@@ -2110,6 +2112,35 @@ mod tests {
         assert_eq!(write_mode(11), Some(16));
         for offset in 12..16 {
             assert_eq!(write_mode(offset), None);
+        }
+    }
+
+    #[test]
+    fn aligned_patch_window_does_not_move_target_bytes_left() {
+        #[repr(align(16))]
+        struct Window([u8; 32]);
+
+        let mut window = Window([0x90; 32]);
+        let original_prefix = [
+            0x10, 0x00, 0xff, 0x15, 0x60, 0x78, 0xac, 0x0a, 0x85, 0xc0, 0x0f, 0x85,
+        ];
+        window.0[..original_prefix.len()].copy_from_slice(&original_prefix);
+        let base = window.0.as_mut_ptr() as usize;
+        let original = window.0;
+
+        for o16 in 0..=11 {
+            let mut expected = original;
+            expected[o16] = 0xe9;
+            expected[o16 + 1..o16 + 5].copy_from_slice(&[0x29, 0xe6, 0x3a, 0xff]);
+            let wmode = write_mode(o16).expect("aligned target's patch mode");
+            // SAFETY: target lies in window; write_mode chooses a complete
+            // aligned word/quadword within this live 16-byte-aligned buffer.
+            assert!(unsafe { write_window(base, base + o16, &expected, wmode) });
+            assert_eq!(window.0, expected, "target alignment {o16:#x}");
+            // SAFETY: same live buffer, target and per-alignment write mode:
+            // restore the original 32-byte snapshot into its owned window.
+            assert!(unsafe { write_window(base, base + o16, &original, wmode) });
+            assert_eq!(window.0, original, "restore alignment {o16:#x}");
         }
     }
 

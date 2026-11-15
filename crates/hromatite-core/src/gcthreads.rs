@@ -831,8 +831,13 @@ mod tests {
         prune_worker_bodies, worker_body, worker_exit_via, worker_unregister_called,
     };
 
+    // Both registry tests own the same global queue and must not drain one
+    // another's events when the host test runner executes them concurrently.
+    static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn worker_registry_resolves_a_reaped_tid_to_its_real_body() {
+        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let tid = 0xf00d_0042;
         note_worker_body(tid, 0xbd1ca0, 0x1234);
         assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
@@ -853,6 +858,7 @@ mod tests {
 
     #[test]
     fn removal_and_exit_hooks_name_the_leaking_path() {
+        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let tid = 0xf00d_0043;
         note_worker_body(tid, 0xbe81a0, 0x55);
         assert_eq!(worker_exit_via(tid), None);
