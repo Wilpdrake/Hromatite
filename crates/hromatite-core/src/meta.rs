@@ -502,16 +502,22 @@ impl Ranges {
     }
 }
 
+static STAT_RD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn class_like_in(r: &Ranges, p: usize) -> bool {
     if p < 0x10000 || !r.readable(p, 0x20) {
         return false;
     }
+    STAT_RD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name_ptr = match r.u64(p + CLASS_NAME_OFF) {
         Some(v) => v as usize,
         None => return false,
     };
     match r.cstr(name_ptr, 96) {
-        Some(s) if ident_like(&s) => {}
+        Some(s) if ident_like(&s) => {
+            STAT_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         _ => return false,
     }
     // `namespaze` may legitimately be NULL (global namespace) — and, in this
@@ -628,6 +634,14 @@ pub fn class_tables() -> Vec<(usize, usize)> {
     }
     c.sort_by_key(|(a, _)| *a);
     c.dedup();
+    log::log_tag(
+        "meta",
+        &format!(
+            "class_like_in: {} readable-class-pointer test(s), {} printable name(s)",
+            STAT_RD.load(std::sync::atomic::Ordering::Relaxed),
+            STAT_NAME.load(std::sync::atomic::Ordering::Relaxed)
+        ),
+    );
     log::log_tag(
         "meta",
         &format!(
