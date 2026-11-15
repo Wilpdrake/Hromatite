@@ -782,6 +782,98 @@ pub fn find_qword(want: u64, max: usize) -> Vec<usize> {
     out
 }
 
+/// The `Il2CppClass.image` test, which does **not** depend on `name` being
+/// materialized: `class+0x00` → an `Il2CppImage` whose own `+0x00` is a C string
+/// ending in `.dll`. On this build class names look lazily filled (a heap sweep
+/// found ~300 k printable "name at +0x10" words but no dense class array), so the
+/// image back-pointer is the reliable signature.
+fn image_backref(r: &Ranges, p: usize) -> Option<String> {
+    if p < 0x10000 || !r.readable(p, 0x20) {
+        return None;
+    }
+    let img = r.u64(p)? as usize;
+    if img < 0x10000 || !r.readable(img, 0x10) {
+        return None;
+    }
+    let name_ptr = r.u64(img)? as usize;
+    let s = r.cstr(name_ptr, 96)?;
+    if s.len() > 4 && s.ends_with(".dll") {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Sweep writable memory for class records by the image back-pointer. Returns
+/// `(class, image_name, name_or_empty)`.
+pub fn scan_classes_by_image(max: usize) -> Vec<(usize, String, String)> {
+    let ranges = Ranges::new();
+    let mut out: Vec<(usize, String, String)> = Vec::new();
+    let mut words_total = 0usize;
+    for reg in procs::regions(65536) {
+        let writable =
+            matches!(reg.protect & 0xff, 4 | 8 | 0x40 | 0x80) && reg.protect & 0x100 == 0;
+        if !writable || reg.size < 0x1000 {
+            continue;
+        }
+        let start = (reg.base + 7) & !7usize;
+        let words = (reg.base + reg.size).saturating_sub(start) / 8;
+        if words < 16 {
+            continue;
+        }
+        words_total += words;
+        if words_total > 120_000_000 {
+            break;
+        }
+        const CHUNK: usize = 8192;
+        let mut ci = 0usize;
+        while ci < words {
+            let n = CHUNK.min(words - ci);
+            let found = crate::veh::call_with(|| {
+                let mut hit: Vec<(usize, String, String)> = Vec::new();
+                for i in ci..ci + n {
+                    let v = match ranges.u64(start + i * 8) {
+                        Some(v) => v as usize,
+                        None => continue,
+                    };
+                    if v < 0x10000 {
+                        continue;
+                    }
+                    if let Some(img) = image_backref(&ranges, v) {
+                        let nm = ranges
+                            .u64(v + CLASS_NAME_OFF)
+                            .map(|q| ranges.cstr(q as usize, 96))
+                            .flatten()
+                            .unwrap_or_default();
+                        hit.push((v, img, nm));
+                    }
+                }
+                hit
+            });
+            if let Ok(mut h) = found {
+                out.append(&mut h);
+            }
+            ci += n;
+            if out.len() >= max {
+                break;
+            }
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out.dedup_by_key(|(a, _, _)| *a);
+    log::log_tag(
+        "meta",
+        &format!(
+            "image-shaped classes: {} found ({} named)",
+            out.len(),
+            out.iter().filter(|(_, _, n)| !n.is_empty()).count()
+        ),
+    );
+    out
+}
+
 /// Layout probe: given a candidate class record, try every qword slot in its
 /// body as a pointer to an array of records, and report the shapes that fit —
 /// `(slot, stride, name_off, parent_off)` for fields, `(slot, fp_off, name_off)`

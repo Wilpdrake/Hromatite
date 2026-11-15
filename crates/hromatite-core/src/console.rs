@@ -1372,6 +1372,34 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             out.extend(hits);
             (out, Action::None)
         }
+        // `iscan` — class records recognised by their image back-pointer
+        // (`class+0x00` → Il2CppImage whose name ends in ".dll"), which works even
+        // when `Il2CppClass.name` is not materialized.
+        "iscan" => {
+            let max = parse_addr(a2).unwrap_or(64).min(2000);
+            let hits = crate::meta::scan_classes_by_image(max);
+            let mut out = vec![format!("iscan: {} record(s)", hits.len())];
+            let mut by_img: Vec<(String, usize)> = Vec::new();
+            for (_, img, _) in hits.iter() {
+                match by_img.iter_mut().find(|(n, _)| n == img) {
+                    Some(e) => e.1 += 1,
+                    None => by_img.push((img.clone(), 1)),
+                }
+            }
+            for (n, c) in by_img.iter().take(12) {
+                out.push(format!("  image {n}: {c} class record(s)"));
+            }
+            let want = if a1.is_empty() { "" } else { a1 };
+            for (addr, img, nm) in hits.iter().filter(|(_, _, nm)| {
+                want.is_empty() || nm.eq_ignore_ascii_case(want)
+            }) {
+                out.push(format!("  {addr:#x} image {img} name '{nm}'"));
+                if out.len() > 40 {
+                    break;
+                }
+            }
+            (out, Action::None)
+        }
         // `ctab` — find the runtime's global class arrays (Unity 6 keeps them
         // outside the codegen module) and report what was found.
         "ctab" => {
