@@ -202,6 +202,18 @@ pub fn write_usize(addr: usize, v: usize) -> bool {
     true
 }
 
+/// Write a byte slice (console `wb`). One readability check per page is not worth
+/// it here: these writes are single, deliberate pokes.
+pub fn write_bytes(addr: usize, data: &[u8]) -> bool {
+    if data.is_empty() || !readable_range(addr, data.len()) {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+    }
+    true
+}
+
 fn span_of(cur: &mut Option<Span>, p: usize) -> Option<Span> {
     if let Some(s) = *cur {
         if s.contains(p, 1) {

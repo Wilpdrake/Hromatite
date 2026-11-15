@@ -328,6 +328,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "diag                      — полный recon заново".into(),
                 "gct [rva]                 — таблица потоков Boehm (живые/мёртвые записи)".into(),
                 "threads                   — все потоки процесса: старт-адрес и есть ли запись в GC".into(),
+                "gctfix                    — вычеркнуть мёртвые записи из таблицы Boehm".into(),
+                "wq <addr> <hex>           — записать qword".into(),
+                "wb <addr> <hexbytes>      — записать байты".into(),
                 "guard <addr>              — вызов функции под VEH (fault -> Err, не смерть)".into(),
                 "api [1|2|reset]           — идентифицировать il2cpp API (1=assemblies, 2=class)".into(),
                 "cls2 <ns> <name> [asm]    — класс через il2cpp_class_from_name".into(),
@@ -539,6 +542,59 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             match crate::gcthreads::snapshot(forced) {
                 Some(t) => out.extend(t.lines()),
                 None => out.push("gct: table not found (see candidate scores above)".into()),
+            }
+            (out, Action::None)
+        }
+        // Writes. Deliberate, single pokes — the payload has no other way to
+        // change game state, and a dead Boehm record has to be unlinked by hand
+        // when the automatic repair is off.
+        "wq" => match (parse_addr(a1), parse_addr(a2)) {
+            (Some(addr), Some(v)) => {
+                let ok = crate::safe::write_usize(addr, v);
+                (
+                    vec![format!("wq {addr:#x} <- {v:#x}: {ok} (now {:#x})", crate::safe::read_usize(addr).unwrap_or(0))],
+                    Action::None,
+                )
+            }
+            _ => (vec!["usage: wq <addr> <hex value>".into()], Action::None),
+        },
+        "wb" => match (parse_addr(a1), rest.trim()) {
+            (Some(addr), hex) if !hex.is_empty() => {
+                let cleaned: String = hex.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
+                let bytes: Option<Vec<u8>> = (cleaned.len() % 2 == 0)
+                    .then(|| {
+                        (0..cleaned.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
+                            .collect::<Option<Vec<u8>>>()
+                    })
+                    .flatten();
+                match bytes {
+                    Some(b) => {
+                        let ok = crate::safe::write_bytes(addr, &b);
+                        (vec![format!("wb {addr:#x} <- {} byte(s): {ok}", b.len())], Action::None)
+                    }
+                    None => (vec!["usage: wb <addr> <hex bytes, e.g. 0100ff>".into()], Action::None),
+                }
+            }
+            _ => (vec!["usage: wb <addr> <hex bytes>".into()], Action::None),
+        },
+        // Unlink every dead record from Boehm's table right now.
+        "gctfix" => {
+            let mut out = Vec::new();
+            match crate::gcthreads::snapshot(None) {
+                Some(t) => {
+                    out.push(t.summary());
+                    if t.dead == 0 {
+                        out.push("nothing to repair".into());
+                    } else {
+                        out.extend(crate::gcthreads::repair(&t));
+                        if let Some(t2) = crate::gcthreads::snapshot(None) {
+                            out.push(format!("after repair: {}", t2.summary()));
+                        }
+                    }
+                }
+                None => out.push("gctfix: table not found".into()),
             }
             (out, Action::None)
         }

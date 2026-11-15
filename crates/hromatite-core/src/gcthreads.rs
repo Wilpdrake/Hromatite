@@ -305,7 +305,64 @@ pub fn thread_rows(table: Option<&Table>) -> Vec<String> {
     out
 }
 
+/// `suspended` lives in the last byte of `finalizer_skipped/nested/suspended`
+/// (u16, u8, u8) — measured on this build, where the record ends with
+/// `context_sp` at +0x40 (RETRY_GET_THREAD_CONTEXT is compiled in).
+pub const OFF_SUSPENDED: usize = 0x3b;
+
+/// Remove records whose thread is gone from `GC_threads[bucket]`.
+///
+/// This is the only repair that helps: `GC_suspend_all` walks the table and
+/// calls `GC_suspend` on every record with `suspended == 0`, and for a dead
+/// thread that loop can never succeed — 1 000 000 retries and then an `int3`.
+/// Merely setting `suspended = 1` is worse: `GC_resume_all` then aborts with
+/// "ResumeThread failed". Unlinking makes the collector forget the thread
+/// entirely, which is what `GC_unregister_my_thread` should have done.
+pub fn repair(table: &Table) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in table.entries.iter().filter(|e| !e.live) {
+        // find the predecessor in this bucket (the chain is short: 1-2 nodes)
+        let mut prev = 0usize;
+        let mut cur = safe::read_usize(table.base + e.bucket as usize * 8).unwrap_or(0);
+        let mut guard = 0;
+        while cur != 0 && guard < 16 {
+            if cur == e.ptr {
+                let next = safe::read_usize(cur + OFF_NEXT).unwrap_or(0);
+                let ok = if prev == 0 {
+                    safe::write_usize(table.base + e.bucket as usize * 8, next)
+                } else {
+                    safe::write_usize(prev + OFF_NEXT, next)
+                };
+                out.push(format!(
+                    "unlinked dead record id={:#x} from bucket {} (next {:#x}) -> {}",
+                    e.id, e.bucket, next, ok
+                ));
+                break;
+            }
+            prev = cur;
+            cur = safe::read_usize(cur + OFF_NEXT).unwrap_or(0);
+            guard += 1;
+        }
+        if guard >= 16 {
+            out.push(format!("record id={:#x}: chain too long, not unlinked", e.id));
+        }
+    }
+    out
+}
+
+/// Should `watch()` auto-repair? On by default: without it the next collection
+/// aborts the process, so the alternative is certain death.
+fn auto_fix() -> bool {
+    !matches!(
+        std::env::var("HROMATITE_GCT_FIX").as_deref(),
+        Ok("0") | Ok("no") | Ok("off")
+    )
+}
+
 static LAST_TIDS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LAST_SIG: std::sync::Mutex<(usize, usize, usize)> = std::sync::Mutex::new((0, 0, 0));
 
 /// Periodic watcher: logs thread births/deaths and, the moment a thread dies
 /// while Boehm still holds its record, the full record (this is the thread that
@@ -320,11 +377,60 @@ pub fn watch() -> Vec<String> {
         };
         g.replace(tids.clone())
     };
-    let table = snapshot(None);
+    let mut table = snapshot(None);
+    // First scan: name every thread that already exists. A thread we never saw
+    // start is otherwise anonymous when it dies thirty seconds later.
+    if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        out.push("first scan — naming every thread".to_string());
+        out.extend(thread_rows(table.as_ref()));
+    }
     if let Some(t) = table.as_ref() {
         out.push(t.summary());
+        // Heal: a dead record makes the next collection spin 1e6 times and then
+        // `int3` the process. Unlinking it is the only repair that helps.
+        if t.dead > 0 {
+            if auto_fix() {
+                let fixes = repair(t);
+                let fixed = !fixes.is_empty();
+                out.extend(fixes);
+                if fixed {
+                    table = snapshot(None);
+                    if let Some(t2) = table.as_ref() {
+                        out.push(format!("after repair: {}", t2.summary()));
+                    }
+                }
+            } else {
+                out.push("HROMATITE_GCT_FIX=0: dead record left in place".to_string());
+            }
+        }
     } else {
         out.push("table not found".to_string());
+    }
+    // Freeze detector: the game spawning/reaping no threads and the GC table not
+    // moving means the process is wedged (a dead worker holding a lock), not
+    // busy. This is the line that separates "hung" from "slow".
+    let sig = (
+        tids.len(),
+        table.as_ref().map(|t| t.entries.len()).unwrap_or(0),
+        table.as_ref().map(|t| t.dead).unwrap_or(0),
+    );
+    {
+        let mut last = match LAST_SIG.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if *last == sig {
+            let n = IDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % 5 == 0 {
+                out.push(format!(
+                    "no change in thread/record counts for ~{} s — game looks frozen",
+                    n * 8
+                ));
+            }
+        } else {
+            *last = sig;
+            IDLE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(prev) = prev {
         let now: std::collections::HashSet<u32> = tids.iter().copied().collect();
