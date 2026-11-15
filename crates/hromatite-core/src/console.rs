@@ -1275,12 +1275,37 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 return (vec!["usage: cscan <ns> <name>".into()], Action::None);
             }
             let hits = crate::meta::find_class_by_scan(a1, a2);
+            let mut seen: Vec<usize> = Vec::new();
             let mut out = vec![format!("cscan {}.{}: {} hit(s)", a1, a2, hits.len())];
-            for (addr, cns) in hits.iter().take(8) {
+            let mut best: Option<usize> = None;
+            for (addr, cns) in hits.iter() {
+                if seen.contains(addr) {
+                    continue;
+                }
+                seen.push(*addr);
+                let nf = crate::meta::fields_of(*addr).len();
+                let nm = crate::meta::methods_of(*addr).len();
                 out.push(format!(
-                    "  {addr:#x}  ns='{cns}'  {}",
-                    crate::meta::layout_of(*addr)
+                    "  {addr:#x} ns='{cns}' fields={nf} methods={nm}  {}",
+                    crate::meta::field_offset(*addr, "m_LocalPosition")
+                        .map(|o| format!("m_LocalPosition@+{o:#x}"))
+                        .unwrap_or_default()
                 ));
+                if nm > 0 && best.is_none() {
+                    best = Some(*addr);
+                }
+                if out.len() > 20 {
+                    break;
+                }
+            }
+            if let Some(b) = best {
+                out.push(format!("cscan: class with a method table = {b:#x}"));
+                for (m, fp, _) in crate::meta::methods_of(b).iter().take(12) {
+                    out.push(format!("   method {m} @ {fp:#x}"));
+                }
+                for (f, o) in crate::meta::fields_of(b).iter().take(12) {
+                    out.push(format!("   field {f} @ +{o:#x}"));
+                }
             }
             (out, Action::None)
         }
