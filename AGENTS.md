@@ -2241,3 +2241,57 @@ il2cpp одними чтениями памяти (без единого выз�
   `late` (нужны `hits>0` и стабильный tid) → `esp`. Если hits снова 0 — следующий
   кандидат `#26877`. Только после живого доказательства включать автозапуск,
   пересобрать release, сделать ревью и закоммитить код. `HROMATITE_SEAL=0` обязателен.
+
+### 2026-11-15 — LateUpdate код закоммичен после ревью; живая точка всё ещё не выбрана
+
+- Коммит кода: **`c42fe28`** (`[verified] feat(tick): drive payload from a
+  validated LateUpdate`). Все ранее остававшиеся изменения LateUpdate вошли в него.
+- После независимого ревью добавлена проверка ABI: кандидат обязан быть
+  **instance `void LateUpdate()` без managed-параметров**. `m3::Method` теперь
+  читает `MethodInfo.flags`, `parameters_count` и `Il2CppType` return kind; static,
+  параметризованные и non-void методы не патчатся.
+- Автозапуск `HROMATITE_LATE_UPDATE` теперь материализует выбранный класс точечно
+  через `il2cpp_image_get_class(Assembly-CSharp, index)` и ждёт bounded retry:
+  250 мс на попытку, 30 с по умолчанию, `HROMATITE_LATE_UPDATE_WAIT_MS` ограничен
+  120 с. QPC остаётся default, silent fallback на него не добавлен.
+- Lifecycle detach/reinstall исправлен: `LATE_ATTACHED` отдельно от сохранённого
+  trampoline; generic `unhook` пересчитывает его по **актуальным не-detached
+  hooks**, поэтому старая запись не маскирует переустановленный hook и повторный
+  `latehook` не возвращает ложный success. Есть regression-тест.
+- **Опасный эксперимент с прямым hook `GC_SUSPEND_RVA=0xc41a20` не вошёл в код.**
+  Дизассемблер подтвердил: это walker по всем `GC_threads[]`, не ABI одного record.
+  Восстановлен прежний `kernel32!GetThreadContext` guard. Копии эксперимента —
+  `~/.hermes/cache/scratch/gc-direct-guard-{gcthreads,hook}.unverified.rs`.
+- **Проверка итогового коммита**: core host tests **49/49**, DLL **3/3**,
+  Windows workspace `--release` OK, `git diff --check` OK. Независимый финальный
+  reviewer: `passed=true`, ошибок логики/security нет. Полный Clippy по-прежнему
+  останавливается на пяти pre-existing ошибках в `raw/console.rs`, новых в этом
+  списке нет. Live-проверки после этих правок ещё не было.
+- **Не сделано**: `#31241` и автозапуск вживую не проверены; `LateUpdate → esp`
+  не подтверждён; `#34553` по-прежнему имеет лишь отрицательное доказательство
+  `hits=0`. Мелочь следующего шага: при rearm сбрасывать `LATE_TID`, чтобы статус
+  без hits не показывал tid предыдущего подключения.
+
+### 2026-11-15 — REA + Ghidra на NixOS: окружение исправлено, полный PE-анализ проверен
+
+- Коммит: этот (`docs(agents): verify REA Ghidra analysis on NixOS`).
+- Вне репозитория исправлен `mcp_servers.rea.env` в `~/.hermes/config.yaml`
+  через `hermes config set`: сохранён исходный PATH MCP-процесса (включая
+  поддерживаемый bundled Node 26.12.1), добавлены `/run/current-system/sw/bin`
+  и `~/.nix-profile/bin`; задан `JAVA_HOME` на полный OpenJDK 21.0.13.0.2.
+  Резервная копия конфигурации: `~/.hermes/cache/scratch/config.before-rea-fix-1794772174.yaml`.
+  Это устраняет исходный `spawn ps ENOENT` и конфликт Ghidra с системной Java 17.
+- Проверено новым отдельным MCP-сервером с resolved registration env:
+  `binary_session` проходит, Ghidra 12.1.2 доступна; `hermes mcp test rea`
+  находит 229 инструментов. Полный runtime-тест: `open_binary` для release
+  `test-target.exe` с `provider_id=ghidra`, затем `list_procedures(summary)` —
+  **2638 процедур**, `coverage complete-within-view`, Ghidra analysis 239.4 с;
+  `close_binary` успешен. Evidence `ev_a9b6455e…`, view
+  `ev_74032a1b…`; ответ сохранён в
+  `~/.hermes/cache/scratch/rea-list_procedures-verification.json`.
+- Инструкция по восстановлению добавлена в skill
+  `reverse-engineer-anything/references/connection-and-recovery.md`.
+- Осталось: перезапустить Hermes Desktop/gateway — MCP-конфигурация не
+  hot-reload'ится, поэтому уже запущенный REA-процесс продолжает использовать
+  старое окружение. Сам GameAssembly через Ghidra ещё не открывался; тест
+  выполнен на маленьком `test-target.exe`.
