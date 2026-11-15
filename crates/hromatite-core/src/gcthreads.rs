@@ -468,6 +468,40 @@ pub fn watch() -> Vec<String> {
     out
 }
 
+/// Undo a leaked suspension.
+///
+/// A collection suspends every thread, then resumes it. If the pass dies half-way
+/// (abort, a fault in a resume, our own longjmp), the world stays suspended and
+/// the game looks frozen while our own thread keeps running. Boehm's records
+/// carry the handle, so `ResumeThread` on each of them is a cheap way to find out
+/// whether that is what happened.
+pub fn resume_all(table: &Table) -> Vec<String> {
+    let mut out = Vec::new();
+    let addr = unsafe {
+        let k = ffi::GetModuleHandleW(ffi::wide("kernel32.dll").as_ptr());
+        if k.is_null() {
+            out.push("resume: kernel32 not found".to_string());
+            return out;
+        }
+        ffi::GetProcAddress(k, ffi::cstr("ResumeThread").as_ptr() as *const u8)
+    };
+    if addr.is_null() {
+        out.push("resume: ResumeThread not resolved".to_string());
+        return out;
+    }
+    let f = addr as usize;
+    for e in &table.entries {
+        if e.handle == 0 {
+            continue;
+        }
+        match crate::veh::call1(f, e.handle as usize) {
+            Ok(v) => out.push(format!("ResumeThread(id {:#x}, h {:#x}) -> {v:#x}", e.id, e.handle)),
+            Err(fault) => out.push(format!("ResumeThread(id {:#x}) faulted: {fault}", e.id)),
+        }
+    }
+    out
+}
+
 /// Diagnostic for the log/console: how each candidate scored, even when none
 /// qualifies (so a failed detection is not silent).
 pub fn probe(forced_rva: Option<u32>) -> Vec<String> {

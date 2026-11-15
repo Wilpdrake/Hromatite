@@ -329,6 +329,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "gct [rva]                 — таблица потоков Boehm (живые/мёртвые записи)".into(),
                 "threads                   — все потоки процесса: старт-адрес и есть ли запись в GC".into(),
                 "gctfix                    — вычеркнуть мёртвые записи из таблицы Boehm".into(),
+                "gctresume                 — ResumeThread по всем записям (снять утёкший suspend)".into(),
+                "call <addr> [a1..a3]      — вызов функции под VEH".into(),
                 "wq <addr> <hex>           — записать qword".into(),
                 "wb <addr> <hexbytes>      — записать байты".into(),
                 "guard <addr>              — вызов функции под VEH (fault -> Err, не смерть)".into(),
@@ -579,6 +581,38 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             }
             _ => (vec!["usage: wb <addr> <hex bytes>".into()], Action::None),
         },
+        // Resume every thread Boehm knows about: if a collection died half-way,
+        // the world is left suspended and the game looks frozen while we still
+        // run. Harmless when nothing is suspended (a resume of a running thread
+        // only decrements a count that is already 0... and returns 0/-1).
+        "gctresume" => match crate::gcthreads::snapshot(None) {
+            Some(t) => (crate::gcthreads::resume_all(&t), Action::None),
+            None => (vec!["gctresume: table not found".into()], Action::None),
+        },
+        // Raw guarded call: `call <addr> [a1] [a2] [a3]`.
+        "call" => {
+            let args: Vec<usize> = line
+                .split_whitespace()
+                .skip(1)
+                .map(|s| parse_addr(s).unwrap_or(0))
+                .collect();
+            let f = args.first().copied().unwrap_or(0);
+            if f == 0 {
+                return (vec!["usage: call <addr> [a1] [a2] [a3]".into()], Action::None);
+            }
+            let g = |i: usize| args.get(i + 1).copied().unwrap_or(0);
+            let mut out = vec![format!(
+                "call {f:#x}({:#x}, {:#x}, {:#x})",
+                g(0),
+                g(1),
+                g(2)
+            )];
+            match crate::veh::call3(f, g(0), g(1), g(2)) {
+                Ok(v) => out.push(format!("  -> {v:#x}")),
+                Err(e) => out.push(format!("  fault: {e}")),
+            }
+            (out, Action::None)
+        }
         // Unlink every dead record from Boehm's table right now.
         "gctfix" => {
             let mut out = Vec::new();
