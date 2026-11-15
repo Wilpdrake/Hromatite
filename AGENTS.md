@@ -1893,3 +1893,29 @@ il2cpp одними чтениями памяти (без единого выз�
   известных функций (`call`, `imgc`, `imgfind`) и чтения.
 - Осталось: `Camera.main → transform → position` (инстанс-методы `this` в rcx,
   `Vector3` возвращается через скрытый указатель/по `rax`), затем M4.
+
+### 2026-11-15 — M3 до конца: живая позиция камеры через `get_main → transform → position`
+
+- Коммит: `feat(m3): read the live camera transform position`.
+- `pos` переписан на измеренную раскладку (`m3`), старый путь через `meta`
+  (`name@+0x10`) больше не участвует. Добавлено в `m3.rs`: `parent` (`+0x10`),
+  `chain`, `method_in_chain` (поиск метода по иерархии классов).
+- **Раскладка, без которой это не работало**: родитель класса — `+0x10`
+  (проверено цепочкой `Camera → Behaviour → Component → Object → System.Object`);
+  `Component.get_transform` есть только у `Component`, в методах `Camera` его нет;
+  `Transform.get_position` и `get_localPosition` возвращают `Vector3` через
+  **скрытый указатель в rcx**, `this` идёт в `rdx` (`veh::call2(buf, this)`).
+- **Подтверждено в живой игре** (pid 686542):
+  ```
+  pos: Camera class 0x30344d10 (UnityEngine.Camera), #21033
+  pos: Camera.main = 0x78834480
+  pos: get_transform from UnityEngine.Component
+  pos: transform = 0x787a47a0 (UnityEngine.Transform)
+  pos: get_position = (-1.102, 1.301, -3.726)      [raw 0x3fa67a08bf8d0eb4 0xc06e75bd]
+  pos: get_localPosition = (0.003, 0.116, 0.137)   [raw 0x3dec9e203b24a355 0x3e0c9e50]
+  ```
+  Числа — валидные float (не мусор): мировая позиция камеры и локальная.
+- Сборка release OK, единственный warning — неиспользуемый `lookup_class`
+  (старый путь `meta`, оставлен для сравнений).
+- Следующее: статические поля (`PlayerManager`/`VRCPlayerApi`) → список игроков;
+  затем M4 (визуализация) — только чтение.

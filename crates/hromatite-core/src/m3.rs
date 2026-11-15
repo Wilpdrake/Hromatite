@@ -96,6 +96,43 @@ pub fn class_at(index: usize) -> Option<usize> {
     (p >= 0x10000 && safe::readable_at(p)).then_some(p)
 }
 
+/// Parent class (`Il2CppClass.parent`, measured at `+0x10` on this build:
+/// Camera → Behaviour → Component → Object → System.Object).
+pub const CLASS_PARENT_OFF: usize = 0x10;
+
+pub fn parent(class: usize) -> Option<usize> {
+    let p = safe::read_usize(class + CLASS_PARENT_OFF)?;
+    (p >= 0x10000 && safe::readable_at(p)).then_some(p)
+}
+
+/// Walk the inheritance chain, starting with `class` itself.
+pub fn chain(class: usize) -> Vec<usize> {
+    let mut out = vec![class];
+    let mut cur = class;
+    for _ in 0..32 {
+        match parent(cur) {
+            Some(p) => {
+                out.push(p);
+                cur = p;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// First method with this name anywhere in the class hierarchy.
+pub fn method_in_chain(class: usize, name: &str) -> Option<(usize, usize)> {
+    for c in chain(class) {
+        for m in methods(c) {
+            if m.name == name {
+                return Some((c, m.entry));
+            }
+        }
+    }
+    None
+}
+
 /// Class name/namespace (this build: name at +0x98, namespace at +0x18).
 pub fn class_name(class: usize) -> Option<String> {
     name_at(safe::read_usize(class + CLASS_NAME_OFF)?)

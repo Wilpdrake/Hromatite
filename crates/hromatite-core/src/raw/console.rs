@@ -380,30 +380,29 @@ fn vec3(bits: [u64; 2]) -> (f32, f32, f32) {
 /// `rdx` = this).
 fn pos_probe() -> Vec<String> {
     let mut out = Vec::new();
-    let image = match core_image() {
-        Some(i) => i,
-        None => return vec!["pos: no UnityEngine.CoreModule image".into()],
+    // Everything below uses the measured Unity 6 layout (crate::m3), not the
+    // older `meta` guesses: name@+0x98, methods@+0x50, parent@+0x10.
+    let cam = match crate::m3::find("UnityEngine", "Camera", 120_000).first() {
+        Some((i, c)) => {
+            out.push(format!(
+                "pos: Camera class {c:#x} ({}), #{i}",
+                crate::m3::class_full_name(*c)
+            ));
+            *c
+        }
+        None => return vec!["pos: Camera class not found (class table)".into()],
     };
-    let cam = match lookup_class("UnityEngine", "Camera") {
-        Some(c) => c,
-        None => return vec![format!("pos: Camera not found in image {image:#x}")],
-    };
-    out.push(format!(
-        "pos: Camera class {:#x} ({}), {} field(s)",
-        cam.addr,
-        crate::meta::layout_of(cam.addr),
-        crate::meta::fields_of(cam.addr).len()
-    ));
 
     // 1. static Camera.main
-    let main = match crate::meta::method_entry(cam.addr, "get_main") {
-        Some(f) => f,
-        None => return {
+    let main = match crate::m3::methods(cam).into_iter().find(|m| m.name == "get_main") {
+        Some(m) => m.entry,
+        None => {
             out.push("pos: no Camera.get_main".into());
-            out
-        },
+            return out;
+        }
     };
-    // SAFETY: main is Camera.get_main's decoded MethodInfo entry with no args.
+    // SAFETY: get_main is Camera's static accessor (no arguments) taken from
+    // the live MethodInfo table; VEH contains a bad target.
     let cam_inst = match unsafe { crate::veh::call0(main) } {
         Ok(v) => v,
         Err(e) => {
@@ -417,26 +416,20 @@ fn pos_probe() -> Vec<String> {
         return out;
     }
 
-    // 2. instance transform — Camera overrides it, Component declares it
-    let mut get_transform = crate::meta::method_entry(cam.addr, "get_transform");
-    if get_transform.is_none() {
-        for (ns, name) in [("UnityEngine", "Component"), ("UnityEngine", "Transform")] {
-            if let Some(c) = lookup_class(ns, name) {
-                get_transform = crate::meta::method_entry(c.addr, "get_transform");
-                if get_transform.is_some() {
-                    break;
-                }
-            }
-        }
-    }
-    let get_transform = match get_transform {
-        Some(f) => f,
+    // 2. `Component.transform` — found through the parent chain
+    //    (Camera → Behaviour → Component), never in Camera's own method list.
+    let (owner, get_transform) = match crate::m3::method_in_chain(cam, "get_transform") {
+        Some(v) => v,
         None => {
-            out.push("pos: no get_transform anywhere".into());
+            out.push("pos: no get_transform in the class chain".into());
             return out;
         }
     };
-    // SAFETY: decoded Component.get_transform entry, exactly one `this` pointer.
+    out.push(format!(
+        "pos: get_transform from {}",
+        crate::m3::class_full_name(owner)
+    ));
+    // SAFETY: instance getter, exactly one `this` pointer, from a live MethodInfo.
     let tr = match unsafe { crate::veh::call1(get_transform, cam_inst) } {
         Ok(v) => v,
         Err(e) => {
@@ -444,43 +437,45 @@ fn pos_probe() -> Vec<String> {
             return out;
         }
     };
-    out.push(format!("pos: transform = {tr:#x}"));
+    out.push(format!(
+        "pos: transform = {tr:#x} ({})",
+        crate::m3::class_full_name(crate::safe::read_usize(tr).unwrap_or(0))
+    ));
     if tr < 0x10000 {
         return out;
     }
 
-    // 3. `Transform.position` (struct return: hidden buffer in rcx)
-    let trc = match lookup_class("UnityEngine", "Transform") {
-        Some(c) => c,
+    // 3. `Transform.position` and `localPosition` (struct return: hidden buffer
+    //    in rcx, `this` in rdx — measured, not assumed).
+    let trc = match crate::m3::find("UnityEngine", "Transform", 120_000).first() {
+        Some((_, c)) => *c,
         None => {
             out.push("pos: Transform class not found".into());
             return out;
         }
     };
-    out.push(format!(
-        "pos: Transform class {:#x}, {} method(s)",
-        trc.addr,
-        crate::meta::methods_of(trc.addr).len()
-    ));
-    let get_pos = match crate::meta::method_entry(trc.addr, "get_position") {
-        Some(f) => f,
-        None => {
-            out.push("pos: no Transform.get_position".into());
-            return out;
+    for name in ["get_position", "get_localPosition"] {
+        let f = match crate::m3::methods(trc).into_iter().find(|m| m.name == name) {
+            Some(m) => m.entry,
+            None => {
+                out.push(format!("pos: no Transform.{name}"));
+                continue;
+            }
+        };
+        let mut buf = [0u64; 2];
+        // SAFETY: get_*Position returns a 12-byte Vector3 through a hidden
+        // output pointer (first argument) and takes `this` second; `buf` is a
+        // live two-qword writable buffer on our own stack.
+        match unsafe { crate::veh::call2(f, buf.as_mut_ptr() as usize, tr) } {
+            Ok(_) => {
+                let (x, y, z) = vec3(buf);
+                out.push(format!(
+                    "pos: {name} = ({x:.3}, {y:.3}, {z:.3})  [raw {:#x} {:#x}]",
+                    buf[0], buf[1]
+                ));
+            }
+            Err(e) => out.push(format!("pos: {name} faulted: {e}")),
         }
-    };
-    let mut buf = [0u64; 2];
-    // SAFETY: get_position expects its hidden Vector3 output pointer first and
-    // `this` second; buf is a live two-qword writable output buffer.
-    match unsafe { crate::veh::call2(get_pos, buf.as_mut_ptr() as usize, tr) } {
-        Ok(_) => {
-            let (x, y, z) = vec3(buf);
-            out.push(format!(
-                "pos: world position = ({x:.3}, {y:.3}, {z:.3})  [raw {:#x} {:#x}]",
-                buf[0], buf[1]
-            ));
-        }
-        Err(e) => out.push(format!("pos: get_position faulted: {e}")),
     }
     out
 }
