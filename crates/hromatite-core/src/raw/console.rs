@@ -14,6 +14,21 @@
 use crate::il2cpp;
 use crate::procs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// `imgset` override: the assembly record's `+0x28` is an Il2CppCodeGenModule
+/// on this build, so image-taking API calls need an explicitly chosen image.
+static IMAGE_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Image argument for `imgc`/`imgfind`: explicit override wins, otherwise the
+/// assembly-record default (CoreModule, then mscorlib).
+fn image_arg() -> Option<usize> {
+    let over = IMAGE_OVERRIDE.load(Ordering::Relaxed);
+    if over != 0 {
+        return Some(over);
+    }
+    crate::api::image_of("UnityEngine.CoreModule").or_else(|| crate::api::image_of("mscorlib"))
+}
 
 pub const CMD_FILE: &str = "hromatite-cmd.txt";
 
@@ -514,6 +529,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 "typelist <filter> [max]    — каталог типов из metadata".into(),
                 "typedump <ns.name>        — поля (тип+offset) и методы (RVA)".into(),
                 "meths / fields2 <ns.name> — только методы / только поля".into(),
+                "imgset <image|reset>      — какой Il2CppImage* отдавать imgc/imgfind".into(),
                 "dumpmeta <Z:\\path>        — сохранить расшифрованный metadata blob".into(),
                 "panic [msg]               — намеренная паника (проверка catch_unwind)".into(),
                 "av [addr]                 — safe-чтение + сырое разыменование (проверка VEH)".into(),
@@ -1004,6 +1020,29 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             }
             (out, Action::None)
         }
+        // `imgset [addr|reset]` — choose the `Il2CppImage*` handed to `imgc` and
+        // `imgfind`. Needed on this build: the assembly record's `+0x28` is an
+        // `Il2CppCodeGenModule`, and calling `image_get_class` with it returns
+        // structures that carry no name. `q <assembly-record>` lists the
+        // candidate pointers; try them one by one.
+        "imgset" => {
+            if a1.is_empty() || a1 == "reset" || a1 == "0" {
+                IMAGE_OVERRIDE.store(0, Ordering::Relaxed);
+                (vec![format!("imgset: reset (assembly record default)")], Action::None)
+            } else {
+                match parse_addr(a1) {
+                    Some(v) if v >= 0x10000 => {
+                        IMAGE_OVERRIDE.store(v, Ordering::Relaxed);
+                        let head = crate::safe::read_u64(v)
+                            .and_then(|p| crate::safe::ascii_at(p as usize, 48))
+                            .unwrap_or_else(|| "?"
+                                .to_string());
+                        (vec![format!("imgset: image {v:#x} (name ptr -> '{head}')")], Action::None)
+                    }
+                    _ => (vec!["usage: imgset <imageaddr>|reset".into()], Action::None),
+                }
+            }
+        }
         // `imgc <fnaddr> <index>` — call a 1/2-arg image function under VEH and
         // dump what it returns. 0x4cbd70 is `mov rax,[rcx+8]; ret`, i.e. the
         // image's typeCount (0x1dc5); the same shape with an index argument is
@@ -1014,7 +1053,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 (Some(f), Some(i)) => (f, i),
                 _ => return (vec!["usage: imgc <fnaddr> <index>".into()], Action::None),
             };
-            let image = match crate::api::image_of("UnityEngine.CoreModule") {
+            let image = match image_arg() {
                 Some(i) => i,
                 None => return (vec!["no image".into()], Action::None),
             };
@@ -1044,7 +1083,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             if want.is_empty() {
                 return (vec!["usage: imgfind <fnaddr> <max> <name>".into()], Action::None);
             }
-            let image = match crate::api::image_of("UnityEngine.CoreModule") {
+            let image = match image_arg() {
                 Some(i) => i,
                 None => return (vec!["no image".into()], Action::None),
             };
@@ -1056,7 +1095,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 // transcends an index derived from the user's bounded max.
                 match unsafe { crate::veh::call2(f, image, i) } {
                     Ok(r) if r >= 0x10000 && crate::safe::readable_at(r) => {
-                        for d in (0..0x60).step_by(8) {
+                        for d in (0..0x100).step_by(8) {
                             if let Some(p) = crate::safe::read_u64(r + d)
                                 && let Some(s) = crate::safe::ascii_at(p as usize, 64)
                                 && s == want
