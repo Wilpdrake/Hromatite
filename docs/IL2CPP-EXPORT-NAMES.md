@@ -72,7 +72,7 @@ Il2CppClass  +0x00 image   +0x10 parent   +0x18 namespaze   +0x20 byval_arg (Il2
              +0x135 биты: 1 initialized, 2 enumtype, 4 is_generic, 5 has_references
              +0x136 биты: 0 initialized_and_no_error, 3 import/windows-runtime, size_inited
 MethodInfo   +0x00 methodPointer +0x08 virtualMethodPointer +0x10 invoker +0x18 name
-             +0x20 klass +0x28 return_type +0x30 parameters +0x38 metadataHandle
+             +0x20 return_type +0x28 klass +0x30 parameters +0x38 metadataHandle
              +0x48 token +0x4c flags(u16) +0x4e iflags +0x50 slot +0x52 param_count(u8)
 FieldInfo    stride 0x28: +0x00 type, +0x08 offset(int32), +0x10 name, +0x18 token, +0x20 parent
 Il2CppType   +0x00 data, +0x08 attrs(u16), +0x0a type(int8, IL2CPP_TYPE_*)
@@ -107,9 +107,12 @@ Ghidra считалось гипотезой, доказательство ис�
 
 ### Что проверка уточнила в раскладках
 
-- `MethodInfo`: `klass@0x20`, `return_type@0x28`, `parameters@0x30` — подтверждено телом
-  `il2cpp_method_get_param` (`mov 0x30(%rcx)`); версия «klass@0x28, return_type@0x20» из
-  промежуточного отчёта **опровергнута**.
+- `MethodInfo`: **`return_type@0x20`, `klass@0x28`, `parameters@0x30`**. Прежняя запись
+  с переставленными `klass`/`return_type` опровергнута чтением живых структур 2026-11-16:
+  у `VRCTweenPostLateUpdater.LateUpdate` и `AsyncLateUpdateTrigger.LateUpdate` `+0x20`
+  ведёт к Il2CppType `void` (`type=1`), а у `Camera.get_main` — к class-типу (`type=0x12`);
+  `+0x28` в обоих случаях равен указателю на собственный `Il2CppClass`. Тело
+  `il2cpp_method_get_param` подтверждает только `parameters@0x30`, но не различает +0x20/+0x28.
 - `Il2CppImage+0x14` — это **не** `typeStart`, а счётчик диапазонов custom-атрибутов
   (`typeStart` лежит в `imageDef+0x00`, куда ведёт `+0x20`).
 - `Il2CppClass+0x136`: `bit3` = `is_blittable`, `bit4` = `import/windows-runtime` (в прежней
@@ -143,7 +146,8 @@ bsearch `0xc53f7c` с токенами `+0x11c` / `+0x48` / `+0x18`.
 | `0x3540` (`mov (%rcx)`) | `object_get_class`, `class_get_image`, `image_get_assembly`, `assembly_get_image`, `property_get_parent` |
 | `0x191870` (`mov $0x10`) | `object_header_size`, `allocation_granularity`, `offset_of_array_bounds_in_array_object_header` |
 | `0x29200` (`mov 0x18`) | `class_get_namespace`, `method_get_name` |
-| `0x29240` (`mov 0x20`) | `field_get_parent`, `method_get_class` |
+| `0x291f0` (`mov 0x28`) | `method_get_class` |
+| `0x29240` (`mov 0x20`) | `field_get_parent` + `method_get_return_type` |
 | `0x8acd0` (`mov 0x10`) | `class_get_parent`, `field_get_name` |
 | `0xc47b0` (`mov 0x40`) | `image_get_filename`, `class_get_element_class` |
 | `0xc28040` (`mov $1,%dl; jmp 0xc15a20`) | `class_from_il2cpp_type`, `class_from_type` |

@@ -142,29 +142,36 @@ pub fn candidates(max: usize) -> Vec<Candidate> {
     candidates_from(m3::classes(max), m3::methods)
 }
 
-/// Call `attempt` at least once and at most `attempts` times. The caller decides
-/// how to report errors; `None` means that the bounded wait expired.
-pub fn retry_bounded<T, F>(attempts: u32, delay: std::time::Duration, mut attempt: F) -> Option<T>
+/// Retry until `wait` has actually elapsed, including time spent in `attempt`.
+/// The attempt is always made once, even for a zero-duration budget.
+pub fn retry_for<T, F>(
+    wait: std::time::Duration,
+    delay: std::time::Duration,
+    mut attempt: F,
+) -> Option<T>
 where
     F: FnMut(usize) -> Option<T>,
 {
-    let attempts = attempts.max(1) as usize;
-    for index in 0..attempts {
-        if let Some(value) = attempt(index) {
+    let started = std::time::Instant::now();
+    let mut attempt_index = 0usize;
+    loop {
+        if let Some(value) = attempt(attempt_index) {
             return Some(value);
         }
-        if index + 1 < attempts {
-            std::thread::sleep(delay);
+        let elapsed = started.elapsed();
+        if elapsed >= wait {
+            return None;
         }
+        std::thread::sleep(delay.min(wait.saturating_sub(elapsed)));
+        attempt_index += 1;
     }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AUTO_CLASS, Selector, auto_candidate_from, candidate_from_methods, candidates_from,
-        parse_selector, resolve_with, retry_bounded,
+        parse_selector, resolve_with, retry_for,
     };
     use crate::m3::Method;
 
@@ -285,14 +292,45 @@ mod tests {
     }
 
     #[test]
-    fn bounded_retry_retries_until_ready_and_honours_the_limit() {
+    fn wall_clock_deadline_includes_time_spent_inside_an_attempt() {
         let mut calls = 0;
-        let ready = retry_bounded(4, std::time::Duration::ZERO, |attempt| {
-            calls += 1;
-            (attempt == 2).then_some("ready")
-        });
+        let result = retry_for(
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+            |_| {
+                calls += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None::<()>
+            },
+        );
+        assert_eq!(result, None);
+        assert_eq!(calls, 1, "a slow scan must not reset the retry budget");
+    }
+
+    #[test]
+    fn retry_for_retries_until_ready_and_zero_budget_attempts_once() {
+        let mut calls = 0;
+        let ready = retry_for(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::ZERO,
+            |attempt| {
+                calls += 1;
+                (attempt == 2).then_some("ready")
+            },
+        );
         assert_eq!(ready, Some("ready"));
         assert_eq!(calls, 3);
-        assert_eq!(retry_bounded(2, std::time::Duration::ZERO, |_| None::<()>), None);
+
+        let mut failed_calls = 0;
+        let expired = retry_for(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            |_| {
+                failed_calls += 1;
+                None::<()>
+            },
+        );
+        assert_eq!(expired, None);
+        assert_eq!(failed_calls, 1);
     }
 }

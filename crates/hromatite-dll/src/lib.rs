@@ -77,16 +77,20 @@ fn install_late_update_with_retry(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30_000)
         .min(120_000);
-    let attempts = (wait_ms / 250).max(1) as u32;
-    hromatite_core::lateupdate::retry_bounded(
-        attempts,
+    let wait = std::time::Duration::from_millis(wait_ms);
+    let started = std::time::Instant::now();
+    hromatite_core::lateupdate::retry_for(
+        wait,
         std::time::Duration::from_millis(250),
         |attempt| {
             if !hook::materialise_late_class(selector) {
                 if attempt % 20 == 0 {
                     log::log_tag(
                         "late",
-                        &format!("waiting for class: attempt {attempt}/{attempts}"),
+                        &format!(
+                            "waiting for class: attempt {attempt}, elapsed {}ms/{wait_ms}ms",
+                            started.elapsed().as_millis()
+                        ),
                     );
                 }
                 return None;

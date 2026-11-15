@@ -18,6 +18,9 @@
 //!            +0x20              → Il2CppClass* parent        (stride 0x28)
 //! MethodInfo +0x00              → methodPointer
 //!            +0x18              → const char* name
+//!            +0x20              → const Il2CppType* return_type
+//!            +0x28              → Il2CppClass* klass
+//!            +0x30              → parameters
 //! ```
 //!
 //! The image array is not the "domain": `il2cpp_get_corlib` (obfuscated
@@ -62,6 +65,18 @@ const FIELD_OFFSET_OFF: usize = 0x08;
 const FIELD_PARENT_OFF: usize = 0x20;
 
 const METHOD_NAME_OFF: usize = 0x18;
+const METHOD_RETURN_TYPE_OFF: usize = 0x20;
+
+fn method_return_kind_with<R, U>(mi: usize, read_usize: R, read_u32: U) -> u32
+where
+    R: FnOnce(usize) -> Option<usize>,
+    U: FnOnce(usize) -> Option<u32>,
+{
+    read_usize(mi + METHOD_RETURN_TYPE_OFF)
+        .and_then(|ty| read_u32(ty + 0x08))
+        .map(|bits| (bits >> 16) & 0xff)
+        .unwrap_or(u32::MAX)
+}
 
 /// Resolved class table (cached: the pointer is stable for the run).
 pub fn class_table() -> Option<usize> {
@@ -279,10 +294,7 @@ pub fn methods(class: usize) -> Vec<Method> {
             break;
         }
         let entry = safe::read_usize(mi).unwrap_or(0);
-        let return_kind = safe::read_usize(mi + 0x28)
-            .and_then(|ty| safe::read_u32(ty + 0x08))
-            .map(|bits| (bits >> 16) & 0xff)
-            .unwrap_or(u32::MAX);
+        let return_kind = method_return_kind_with(mi, safe::read_usize, safe::read_u32);
         let parameters_count = safe::read_u8(mi + 0x52).unwrap_or(u8::MAX);
         let flags = safe::read_u16(mi + 0x4c).unwrap_or(u16::MAX);
         out.push(Method {
@@ -332,7 +344,24 @@ pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIELD_STRIDE, field_offset};
+    use super::{FIELD_STRIDE, field_offset, method_return_kind_with};
+
+    #[test]
+    fn return_type_uses_slot_0x20_not_class_slot_0x28() {
+        const METHOD_INFO: usize = 0x1000;
+        const RETURN_TYPE: usize = 0x6fff_f8c6_2f60;
+        const CLASS: usize = 0x3034_4d10;
+        let kind = method_return_kind_with(
+            METHOD_INFO,
+            |address| match address {
+                x if x == METHOD_INFO + 0x20 => Some(RETURN_TYPE),
+                x if x == METHOD_INFO + 0x28 => Some(CLASS),
+                _ => None,
+            },
+            |address| (address == RETURN_TYPE + 0x08).then_some(0x8001_0000),
+        );
+        assert_eq!(kind, 1, "LateUpdate must be accepted as void");
+    }
 
     #[test]
     fn field_offset_comes_before_name_and_token_comes_after_it() {

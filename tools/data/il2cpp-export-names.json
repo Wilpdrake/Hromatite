@@ -109,10 +109,10 @@
     "AssufKjqFwY",
     "mGLGidnWnAd"
    ],
-   "real_name": "il2cpp_method_get_return_type",
-   "confidence": "strong",
-   "evidence": "mov 0x28(%rcx),%rax; ret = MethodInfo.return_type (+0x28 по снятому лейауту). 2-й алиас не расшифрован.",
-   "renamed_in_ghidra": true
+   "real_name": "il2cpp_method_get_class",
+   "confidence": "proven",
+   "evidence": "mov 0x28(%rcx),%rax; ret = MethodInfo.klass. Живые MethodInfo 2026-11-16: +0x28 = собственный Il2CppClass; +0x20 = Il2CppType возвращаемого значения. В Ghidra ещё осталось старое имя method_get_return_type.",
+   "renamed_in_ghidra": false
   },
   {
    "addr": "0x180029200",
@@ -141,11 +141,11 @@
    ],
    "real_name": "il2cpp_field_get_parent",
    "confidence": "shape/alias-group",
-   "evidence": "mov 0x20(%rcx),%rax; ret — 2 алиаса: FieldInfo.parent (+0x20) и MethodInfo.klass (+0x20).",
+   "evidence": "mov 0x20(%rcx),%rax; ret — 2 алиаса: FieldInfo.parent (+0x20) и MethodInfo.return_type (+0x20, подтверждено живыми void/class Il2CppType).",
    "renamed_in_ghidra": true,
    "icf_aliases": [
     "il2cpp_field_get_parent",
-    "il2cpp_method_get_class"
+    "il2cpp_method_get_return_type"
    ]
   },
   {
@@ -207,7 +207,7 @@
    ],
    "real_name": "il2cpp_method_get_token",
    "confidence": "strong",
-   "evidence": "mov 0x48(%rcx),%eax; ret — 32-битное чтение по +0x48 у MethodInfo. Лейаут MethodInfo сходится: name=+0x18 и param_count=+0x52 видны в il2cpp_class_get_method_from_name (0xc28360), return_type=+0x28 в 0x1800291f0. +0x48 = token; единственная альтернатива (flags) лежит в +0x4c (u16), и il2cpp_method_get_flags уже назван. ПЕРЕИМЕНОВАТЬ НЕ УДАЛОСЬ: у Ghidra по этому адресу нет ни функции, ни символа (get_function_info → 'Function not found', rename data → 'Could not resolve data/global symbol'), т.е. 8-байтовый стаб не распознан и лежит в undefined-байтах; нужен create_function/label тем, кому это разрешено. ОТДЕЛЬНО: при первой попытке я по опечатке отправил адрес '0x180bf620' (на разряд короче) — Ghidra создала там мусорную метку il2cpp_method_get_token; её надо снести (адрес вне образа).",
+   "evidence": "mov 0x48(%rcx),%eax; ret — 32-битное чтение по +0x48 у MethodInfo. Лейаут MethodInfo сходится: name=+0x18 и param_count=+0x52 видны в il2cpp_class_get_method_from_name (0xc28360), klass=+0x28 в 0x1800291f0, return_type=+0x20 в 0x180029240. +0x48 = token; единственная альтернатива (flags) лежит в +0x4c (u16), и il2cpp_method_get_flags уже назван. ПЕРЕИМЕНОВАТЬ НЕ УДАЛОСЬ: у Ghidra по этому адресу нет ни функции, ни символа (get_function_info → 'Function not found', rename data → 'Could not resolve data/global symbol'), т.е. 8-байтовый стаб не распознан и лежит в undefined-байтах; нужен create_function/label тем, кому это разрешено. ОТДЕЛЬНО: при первой попытке я по опечатке отправил адрес '0x180bf620' (на разряд короче) — Ghidra создала там мусорную метку il2cpp_method_get_token; её надо снести (адрес вне образа).",
    "renamed_in_ghidra": false
   },
   {
@@ -2579,7 +2579,7 @@
   }
  ],
  "layout_notes": {
-  "MethodInfo": "methodPointer@0x00, virtualMethodPointer@0x08, invoker@0x10, name@0x18, klass@0x20, return_type@0x28, parameters@0x30 (proven: il2cpp_method_get_param reads [rcx+0x30]), metadataHandle/token@0x38/0x48, flags@0x4c, iflags@0x4e, slot@0x50, parameters_count@0x52",
+  "MethodInfo": "methodPointer@0x00, virtualMethodPointer@0x08, invoker@0x10, name@0x18, return_type@0x20, klass@0x28, parameters@0x30 (live-proven 2026-11-16), metadataHandle/token@0x38/0x48, flags@0x4c, iflags@0x4e, slot@0x50, parameters_count@0x52",
   "Il2CppImage": "assembly@0x00, short name@0x08, custom-attribute range count@0x14 (NOT typeStart), metadata handle@0x20 (typeStart at imageDef+0x00), codegenModule@0x30, filename@0x40",
   "Il2CppClass": "+0x136 bit3 = is_blittable, bit4 = import/windows-runtime (bit order from Il2CppTypeDefinition.flags unpacking); +0x135 bit1 = initialized, bit2 = enumtype, bit4 = is_generic, bit5 = has_references",
   "canonical_list_gaps": "tools/data/il2cpp-api-names.txt lacks il2cpp_field_get_object, il2cpp_field_get_from_reflection and the seven il2cpp_profiler_* entries present in this build"
