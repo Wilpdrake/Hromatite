@@ -3,19 +3,6 @@
 
 use crate::raw::ffi;
 
-/// Current process working set in MiB; zero when the OS query fails.
-pub fn working_set_mb() -> usize {
-    // SAFETY: `c` is a live, correctly sized output buffer for the duration of
-    // the synchronous call; the current-process pseudo-handle needs no close.
-    unsafe {
-        let mut c = ffi::PROCESS_MEMORY_COUNTERS {
-            cb: core::mem::size_of::<ffi::PROCESS_MEMORY_COUNTERS>() as u32,
-            ..Default::default()
-        };
-        let ok = ffi::K32GetProcessMemoryInfo(ffi::GetCurrentProcess(), &mut c, c.cb);
-        if ok == 0 { 0 } else { c.WorkingSetSize / (1024 * 1024) }
-    }
-}
 
 pub fn current_process_id() -> u32 {
     // SAFETY: parameterless Win32 query with no pointer preconditions.
