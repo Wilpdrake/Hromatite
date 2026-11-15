@@ -419,6 +419,16 @@ pub fn reap() -> Vec<String> {
             let id = safe::read_u32(p + OFF_ID).unwrap_or(0);
             let handle = safe::read_u64(p + OFF_HANDLE).unwrap_or(0);
             if id != 0 && alive_by_handle(handle) == Some(false) {
+                // Second opinion before touching the table: unlinking a thread
+                // that is merely suspended (or whose handle got recycled) would
+                // drop its stack from the mark phase and free live objects.
+                if live_tids().contains(&id) {
+                    out.push(format!(
+                        "record id={:#x} looks dead to its handle but the thread is alive — kept",
+                        id
+                    ));
+                    continue;
+                }
                 let ok = unlink_at(base, bucket, p);
                 out.push(format!(
                     "reaped dead record id={:#x} handle={:#x} bucket={} -> {ok}",
