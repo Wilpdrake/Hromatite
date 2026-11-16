@@ -5,7 +5,7 @@
 > «проверено» — подтверждено реальным запуском на этой машине, а не выведено
 > логически. Всё, что не проверено, помечено явно.
 
-Дата последнего обновления: 2026-11-16 (MSK), runtime коммит `eed71fb`.
+Дата последнего обновления: 2026-11-16 (MSK), runtime коммит `21d6f0e`.
 Хост: NixOS 26.11, kernel 6.18.x, Intel i5-11300H, 15 GB RAM.
 Пользователь пишет по-русски; предпочитает: сначала план → согласование → код.
 Коммитить **каждое** изменение (просьба пользователя).
@@ -27,16 +27,17 @@
 | Steam launch-options wrapper | ✅ проверено (инжект в подставной и в живой VRChat) |
 | Attach-режим (env игры вместо `proton run`) | ✅ внутри контейнера игры работает (лог 07:14); ❌ вне контейнера (`/lib/ld-linux.so.2` отсутствует) |
 | L1 скрытность: `RW→RX`, стёртые заголовки, один стаб-поток | ✅ в коде, подтверждено логом живой игры |
-| L3: без своих потоков (inline `DllMain`) | ✅ в коде; ✅ `--frame-hook`: тик в потоке игры, консоль отвечает при `HROMATITE_LIVE=0` |
+| L3: без своих потоков (inline `DllMain`) | ✅ тик — managed `LateUpdate` (`HROMATITE_LATE_UPDATE=auto`) или native PlayerLoop (`HROMATITE_PLAYER_LOOP=1`); QPC/`LIVE`-консоль/`seal`/`L2B` удалены и отклоняются на старте |
+| Hot-reload фич без перезапуска игры | ✅ код + host-тесты + 4 реальных поколения под Proton (smoke); ⏳ live-приёмка в VRChat не проводилась |
 | Паника/AV в payload не убивают игру | ✅ VEH-longjmp (проверено в живой игре: `panic`, `guard 0x1`) |
 | L1.5a: `--mode loadlib` (file-backed, не анонимная память) | ✅ реализовано, `DllMain` исполняется |
 | L1.5b: PEB unlink (вычерк из Ldr-списка) | ✅ подтверждено на подставном exe 2026-11-16: `peb unlink: true` |
 | Module stomp | ⚠️ реализован через slack; slack у всех модулей 2–4 КБ → нужен release+strip или перезапись мёртвой секции |
 | Резолв таблицы экспортов il2cpp в рантайме | ⚠️ скан теперь по всем регионам процесса (235/251 имён, 236 указателей на имена найдены в куче), но поле с адресом рядом не лежит → layout неизвестен |
 | L2 «шифр в покое» (`--seal`) | ✅ проверено в живой игре: регион `rw-p`, ни одной exec-страницы, содержимое — шифр |
-| `il2cpp_domain_get` | ✅ найден эмпирически: `wYRnnMQuvvH` @ RVA `0xc27f00`; домен `0x3027c1c0`, массив **216** сборок по `+0x8` (stride 0x48) |
-| Выход на классы/методы (`Il2CppImage`, `Il2CppClass`) | ⚠️ `entry+0x28` = `Il2CppCodeGenModule` (в Unity 6 **без** `typeInfoTable`); `meta.rs` ищет классы структурно (`cscan` нашёл 77 записей со строкой `Camera`, но раскладка `Il2CppClass` этого билда ещё не снята) |
-| Чтение игроков/позиций (M3) | ⚠️ углублённо: чтения без API (`types/tfind/fields/methods/mcall/pos/cscan`), классы локализуются по имени; вызов `Camera.main` ещё не подтверждён |
+| Геттер «домена» | ✅ `wYRnnMQuvvH` @ RVA `0xc27f00` — это **`il2cpp_get_corlib`**, а не `domain_get`: возвращает corlib `Il2CppImage` `0x3027c1c0`; образы сборок лежат подряд с шагом **0x48** (216 записей) |
+| Выход на классы/методы (`Il2CppImage`, `Il2CppClass`) | ✅ закрыто (2026-11-15): таблица классов `s_TypeInfoDefinitionTable` RVA `0xe66c870`; `il2cpp_image_get_class` = `GEsTfKaEfsh` @ `0xc2a330`; раскладки `Il2CppClass`/`FieldInfo`/`MethodInfo` сняты живьём (см. §17) |
+| Чтение игроков/позиций (M3) | ✅ `pos` (Camera.main → transform → position) и `who` (VRCPlayerApi: id + позиции) подтверждены в живой игре |
 | Запись в игру (M5) | ❌ |
 | L2 «двойная память» | ❌ спроектировано (§7.4), не написано |
 | Инцидент: EAC выкинул с «failed to verify installation integrity» (error 16) | ⚠️ причина не изолирована (см. §8.4) |
@@ -620,7 +621,47 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 
 ## 16. Состояние и план следующей сессии
 
-Сделано (проверено в живой игре, не переоткрывать):
+> **Актуально на 2026-11-16 (`21d6f0e`). Всё, что ниже до «Сделано…» — история;
+> QPC-режим, stub-консоль `LIVE>0`, `--seal` и L2b удалены из runtime.**
+
+**Текущий runtime (проверено в живой игре):**
+- доставка — launch-wrapper + manual map, `peb unlink: true` (подставной exe,
+  2026-11-16);
+- тик — только managed LateUpdate (`HROMATITE_LATE_UPDATE=auto` →
+  `VRC.Udon.UdonManager`, ~47 hits/s) либо native PlayerLoop
+  (`HROMATITE_PLAYER_LOOP=1`, `Update/ScriptRunBehaviourUpdate`, ~90 hits/s).
+  Любой старт с `FRAME_HOOK!=1`, `LIVE!=0`, `SEAL!=0`, `L2B!=0` отклоняется;
+- обязательный inline GC guard: точный call-site `GameAssembly+0xc41ad2`
+  (`call GetThreadContext` + `test/jne`) и `GC_remove_thread`; без него старт
+  отклоняется;
+- команды — через `%USERPROFILE%\hromatite-cmd.txt`, ответы в `[con]` лога;
+  резидентные (`gct/threads/gctfix/gctresume/loopc/loop/latec/latehook/late/
+  panic/av/seal/quit`) фиче не отдаются;
+- hot-reload фич: резидент постоянный, команды фич — в `hromatite-features`
+  поколениями (детали и цифры — §17, 2026-11-16).
+
+**Единственный ближайший шаг — живая приёмка hot-reload (нужен один обычный
+рестарт игры, его делает пользователь):**
+1. запуск как обычно; wrapper сам экспортирует `HROMATITE_FEATURE_DLL`;
+2. ждём в логе `[hot] generation 0 canary OK` и `[hot] state=active generation=0`;
+3. `tools/hromatite-reload.sh` — публикует `features-1-<sha12>.dll`, меняет
+   `current.manifest`, пишет `reload 1`; ждём `generation 1 canary OK`,
+   `state=active generation=1 previous=0`;
+4. без рестарта: `reload status`, `feature`, `pos`, `who`, затем `rollback`
+   (назад на gen 0) и `config set TICK_MS 100`;
+5. ≥15 мин по меню/мирам: `VRChat.gc.log` без `SuspendThread loop failed`,
+   нового `crash.dmp` нет, `reload status` с `flight=0`.
+
+**После приёмки:** починить найденное; опционально — file-backed образы фич
+через `NtCreateSection`/`SEC_IMAGE` вместо приватного RW→RX (единственный
+заметный след схемы для EAC); M5 (запись в игру) — только с явного согласия.
+
+**Правила:** игру запускает пользователь (агент не делает kill/start); каждая
+правка `raw/hot.rs` требует `cargo build --workspace --release` (host-тесты
+windows-only модуль не компилируют); не запускать второй `proton run` на живом
+префиксе; каждый шаг — коммит и запись в §17.
+
+Сделано (история; проверено в живой игре, не переоткрывать):
 - **План 5 (гигиена)** — паника/AV в payload не убивают игру. `catch_unwind` НЕ
   работает (у manual-map стёрты заголовки → унвиндер не находит `.pdata`);
   всё ловится VEH-longjmp'ом (`veh::call_guarded`, код паники `0x20474343`).
@@ -2788,3 +2829,84 @@ il2cpp одними чтениями памяти (без единого выз�
   drain/atomic switch/rollback/retirement, host watcher/TUI, hot-config и live
   acceptance. Rust String/Vec/static runtime не должны пересекать границу DLL;
   GC guard и существующий tick остаются исключительно в resident runtime.
+
+### 2026-11-16 — Hot-reload M1–M5: фичи меняются без перезапуска игры (live ещё нет)
+
+- Коммиты: `a072979`, `af7f96b`, `4a6baa3`, `97a5669`, `61fd2d7`, `46cfad2`,
+  `3613b03`, `119af25`, `d16aa5e`, `777de62`, `adaa0fb`, `23ed5a1`, `43386f5`,
+  `e089ac3`, `76e0d04`, `4068a83`, `8d209cf`, `60fa869`, `270c48b`, `3a4a172`.
+- **Что теперь есть.** Резидент (`hromatite.dll`) не меняется; команды фич
+  (`pos/who/esp/m3f/m3s/m3l/m3c/m3i/q/b/s/ws/wq/wb/guard/call`, `feature`,
+  `help`) живут в отдельной `hromatite-features.dll` (cdylib, только
+  `hromatite-abi`, без своего VEH/panic-hook/статик-кэшей) и маппятся в процесс
+  локальным PE-маппером (`raw/localmap.rs`: relocs, импорты с forwarder'ами и
+  apiset, TLS, RW→RX, заголовки остаются читаемыми `RW`, SHA-256 сверяется по
+  тому же снапшоту, который маппится).
+- **Поколения** (`crates/hromatite-core/src/hot.rs`, чистая модель + юнит-тесты):
+  active + previous + pending + failed, фазы Idle/Stable/Requested/Draining/
+  Loading/Canary/ActiveGrace/RollingBack/Failed, in-flight счётчики на каждое
+  поколение, дедлайн на timed-фазы, `retire_previous`/`retire_failed` только при
+  `in_flight == 0`. Маршрутизация — `raw/hot.rs` в уже существующем тике
+  (`hook::tick` раз в `TICK_MS`, по умолчанию 250 мс): drain → map → init →
+  configure → canary (`feature`) → публикация → grace → retire. Падение canary
+  или любого вызова откатывает на previous, а если его нет — на встроенную
+  консоль, без нового потока и без перезапуска игры.
+- **Канал команд и конфигурация.** `reload [latest|gen N|N]`, `reload status`,
+  `rollback`, `config show|reload|set KEY VALUE` — резидентные и фиче не
+  отдаются; `TICK_MS/GRACE_MS/TELEMETRY/MEMORY/M3` применяются на лету, уже
+  установленный дедлайн не переписывается. Путь манифеста —
+  `HROMATITE_MODULE_DIR` (по умолчанию `%USERPROFILE%\hromatite-modules`),
+  конфиг — `%USERPROFILE%\hromatite-live.conf`.
+- **Хостовые инструменты.** `tools/hromatite-reload.sh` (сборка фичи, immutable
+  `features-N-SHA12.dll`, atomic `current.manifest`, затем `reload N` в
+  командный файл; сверка sha256 `GameAssembly.dll` до сборки),
+  `tools/hromatite-watch.sh` (наблюдение за `crates/hromatite-features`,
+  `hromatite-abi`, Cargo-манифестами), TUI-команды и статус (`docs/HOT-RELOAD.md`).
+- **Чем подтверждено (хост/стенд).** `cargo test -p hromatite-core` — 119,
+  `hromatite-abi` — 3, `hromatite-features` — 13, TUI-воркспейс — 48; Clippy
+  `--workspace --all-targets --release -- -D warnings` чист; `cargo build
+  --workspace --release` OK; `tools/test-hromatite-hot.sh all` — 10/10;
+  `tools/hromatite-reload.sh --dry-run` на реальном `GameAssembly.dll` даёт
+  `GENERATION=1` и sha256 `54175a3f…`. `tools/test-hot-smoke.sh` в отдельном
+  префиксе (`pmhotsmoke4`) реально смэпил 4 поколения
+  (`0xa40000`/`0xb30000`), прогнал canary `feature: generation=0..3 abi=1`,
+  `shutdown/retire` и отверг битый PE.
+- **Чем НЕ подтверждено.** В живой VRChat hot-reload не запускался ни разу:
+  процесс `1347379` с 06:42 держит старый payload (PlayerLoop, в логе нет ни
+  одной строки `[hot]`). Первый живой прогон требует одного обычного
+  рестарта игры — резидент со старым кодом команду `reload` понять не может.
+  После него смена поколений обязана происходить без рестарта.
+
+### 2026-11-16 — H1/H2: канонические поколения, Windows-сборка ловит `?` на `Option`; ворота перед live
+
+- Коммит **`21d6f0e`** (`[verified] fix(hot): reject non-canonical generations
+  before any side effect`).
+- **Найденный баг (незакоммиченное состояние прошлой сессии).** `apply_config_file`
+  делал `after_config_result(previous, result)?`, где функция возвращала
+  `Option<String>`, а сама `apply_config_file` — `Result<String, String>`. Host-тесты
+  этого не видели: `mod imp` целиком `#[cfg(target_os = "windows")]`, поэтому ошибку
+  ловил только `cargo build --workspace --release` (`E0308`, `E0277`). Теперь
+  конфиг-файл пишется, ошибка `configure` возвращается в консоль и остаётся в
+  `[hot] … error=`, а несвязанная резидентная ошибка переживает успешное
+  обновление. Вывод для дисциплины: **каждая правка в `raw/hot.rs` требует
+  windows-сборки**, host-тесты её не заменяют.
+- **Канонические номера поколений** (консоль, имя `features-N-SHA12.dll`,
+  `current.manifest`, `--generation` публикатора): ведущие нули (`00`, `09`) и
+  пустое значение отвергаются до чтения game-hash, до сборки и до любых staging
+  файлов. `--generation` теперь валидируется прямо в парсере опций, а не позже
+  проверкой `[ -n "$GENERATION_OVERRIDE" ]`.
+- **Тесты.** `tools/test-hromatite-hot.sh` получил кейс `zero-padded`: ни
+  каталога модулей, ни манифеста, ни DLL, ни командного файла после отказа;
+  публикация `--generation 1` тем же фикстурным префиксом проверяется следом.
+  `assert_no_staging_files` больше не падает, если каталога ещё нет.
+- **Ворота перед live (все зелёные).** core 119/119, abi 3/3, features 13/13,
+  TUI 48, Clippy `-D warnings`, `cargo build --workspace --release`,
+  `test-hromatite-hot.sh all` 10/10, `reload.sh --dry-run` на реальном
+  `GameAssembly.dll` (`GENERATION=1`, sha256 `54175a3f…`), `test-hot-smoke.sh`
+  в `pmhotsmoke4` — 4 поколения, `smoke: final shutdown/retire`, без AV.
+- **Осталось (только live).** Пользователь перезапускает игру обычным способом;
+  далее по шагам: `[hot] generation 0 canary OK` → `reload.sh` (публикует gen 1 и
+  пишет `reload 1`) → `[hot] generation 1 canary OK` / `state=active
+  generation=1 previous=0` → `reload status`, `feature`, `pos`, `who` без
+  рестарта → `rollback` → `config set TICK_MS 100` → ≥15 мин наблюдения
+  (`VRChat.gc.log` без `SuspendThread loop failed`, нового `crash.dmp` нет).
