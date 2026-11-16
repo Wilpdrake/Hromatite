@@ -70,10 +70,9 @@ impl Feature {
                         [format!("configure: eac_log={}", path.display())],
                         STATUS_OK,
                     ),
-                    Err(error) => self.respond(
-                        [format!("configure: eac_log: {error}")],
-                        STATUS_NOT_READY,
-                    ),
+                    Err(error) => {
+                        self.respond([format!("configure: eac_log: {error}")], STATUS_NOT_READY)
+                    }
                 };
             }
             "eac_tail" => {
@@ -82,16 +81,17 @@ impl Feature {
                         [format!("configure: eac_tail={}", path.display())],
                         STATUS_OK,
                     ),
-                    Err(error) => self.respond(
-                        [format!("configure: eac_tail: {error}")],
-                        STATUS_NOT_READY,
-                    ),
+                    Err(error) => {
+                        self.respond([format!("configure: eac_tail: {error}")], STATUS_NOT_READY)
+                    }
                 };
             }
             "eac_interval_ms" => {
                 let Ok(requested) = value.trim().parse::<u64>() else {
                     return self.respond(
-                        [format!("configure: eac_interval_ms expects milliseconds, got '{value}'")],
+                        [format!(
+                            "configure: eac_interval_ms expects milliseconds, got '{value}'"
+                        )],
                         STATUS_NOT_READY,
                     );
                 };
@@ -126,6 +126,7 @@ impl Feature {
             "eac" => self.eac.set_enabled(enabled),
             "eac_auto" => self.eac.set_auto(enabled),
             "eac_autosession" => self.eac.set_autosession(enabled),
+            "eac_hooks" => self.eac.set_hooks_enabled(enabled),
             _ => {
                 return self.respond(
                     [format!("configure: unknown key '{key}'")],

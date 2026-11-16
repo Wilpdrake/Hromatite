@@ -2,9 +2,12 @@
 //! JSONL correlation log.
 //!
 //! Everything heavy lives in `hromatite-eac` (pure std, host-testable); this
-//! module only owns payload-side state and the console contract. No game memory
-//! is touched — hooks into EOSSDK exports are phase 2, so epochs are driven by
-//! `eac.begin`/`eac.end` or, when enabled, by `[AntiCheatClient]` log lines.
+//! module only owns payload-side state and the console contract. Phase 2 adds
+//! the inline hooks on the `EOS_AntiCheatClient_*` exports: the managed tick
+//! installs them lazily (only when `EOSSDK-Win64-Shipping.dll` is mapped) and
+//! drains their observations into the epoch model here. The console commands and
+//! the `[AntiCheatClient]` log tailer remain as fallbacks when the hooks are
+//! absent or disabled.
 
 use std::path::PathBuf;
 
@@ -16,6 +19,7 @@ use hromatite_eac::eventlog::{Event, JsonlLog};
 use hromatite_eac::payload::{integrity_digest, module_list_hash};
 use hromatite_eac::session::{EacSession, MAX_INTERVAL_MS, MIN_INTERVAL_MS};
 use hromatite_eac::tailer::{Tailer, announces_begin, announces_end};
+use hromatite_eac::{HookEvent, Hooks};
 
 /// Checksum candidate currently used for the outgoing header. **HYPOTHESIS**;
 /// the real algorithm lives in a bytecode VM.
@@ -34,7 +38,10 @@ fn placeholder_integrity() -> [u8; 32] {
     let files = [
         ("VRChat.exe", sha256(b"VRChat.exe")),
         ("GameAssembly.dll", sha256(b"GameAssembly.dll")),
-        ("EOSSDK-Win64-Shipping.dll", sha256(b"EOSSDK-Win64-Shipping.dll")),
+        (
+            "EOSSDK-Win64-Shipping.dll",
+            sha256(b"EOSSDK-Win64-Shipping.dll"),
+        ),
         ("EasyAntiCheat_EOS.sys", sha256(b"EasyAntiCheat_EOS.sys")),
     ];
     integrity_digest(files)
@@ -64,6 +71,8 @@ pub struct EacFeature {
     modules: [u8; 32],
     last_game_begin_epoch: u64,
     last_error: Option<String>,
+    hooks: Hooks,
+    hooks_enabled: bool,
 }
 
 impl Default for EacFeature {
@@ -88,6 +97,8 @@ impl EacFeature {
             modules: placeholder_modules(),
             last_game_begin_epoch: 0,
             last_error: None,
+            hooks: Hooks::new(),
+            hooks_enabled: true,
         }
     }
 
@@ -110,6 +121,146 @@ impl EacFeature {
     /// and close epochs until the EOSSDK hooks exist.
     pub fn set_autosession(&mut self, autosession: bool) {
         self.autosession = autosession;
+    }
+
+    /// `configure eac_hooks=0|1` — enable/disable lazy EOSSDK hook install.
+    pub fn set_hooks_enabled(&mut self, enabled: bool) {
+        self.hooks_enabled = enabled;
+        self.hooks.set_enabled(enabled);
+    }
+
+    /// Apply hook observations to the epoch model and the JSONL log.
+    ///
+    /// Public so the host-testable feature tests can feed synthetic events
+    /// without a Windows process. Console lines are appended for epoch changes
+    /// only; per-message observations go to the JSONL log.
+    pub fn apply_hook_events(&mut self, events: Vec<HookEvent>, lines: &mut Vec<String>) {
+        for event in events {
+            match event {
+                HookEvent::SessionBegin { mode, ts_ms } => {
+                    if self.session.running()
+                        && let Some(end) = self.session.end(ts_ms)
+                    {
+                        let _ = self.emit(
+                            Event::at(end.timestamp_ms, "session_end")
+                                .num("epoch", end.epoch)
+                                .num("heartbeats", u64::from(end.heartbeats))
+                                .text("reason", "hook reopen"),
+                        );
+                    }
+                    let begin = self.session.begin(ts_ms, None);
+                    lines.push(format!(
+                        "eac: BeginSession epoch={} mode={mode} (hook)",
+                        begin.epoch
+                    ));
+                    let _ = self.emit(
+                        Event::at(begin.timestamp_ms, "session_begin")
+                            .num("epoch", begin.epoch)
+                            .text("sid", format!("0x{:016x}", begin.session_id))
+                            .num("mode", u64::try_from(mode).unwrap_or(0))
+                            .text("source", "hook"),
+                    );
+                }
+                HookEvent::SessionEnd { ts_ms } => {
+                    if let Some(end) = self.session.end(ts_ms) {
+                        lines.push(format!(
+                            "eac: EndSession epoch={} heartbeats={} (hook)",
+                            end.epoch, end.heartbeats
+                        ));
+                        let _ = self.emit(
+                            Event::at(end.timestamp_ms, "session_end")
+                                .num("epoch", end.epoch)
+                                .num("heartbeats", u64::from(end.heartbeats))
+                                .num("total_heartbeats", end.total_heartbeats)
+                                .text("reason", "hook"),
+                        );
+                    }
+                }
+                HookEvent::OutMessage { len, dt_ms, ts_ms } => {
+                    let _ = self.emit(
+                        Event::at(ts_ms, "ac_out")
+                            .num("epoch", self.session.epoch())
+                            .num("len", u64::from(len))
+                            .num("dt_ms", u64::from(dt_ms)),
+                    );
+                }
+                HookEvent::InMessage { len, ts_ms } => {
+                    let _ = self.emit(
+                        Event::at(ts_ms, "ac_in")
+                            .num("epoch", self.session.epoch())
+                            .num("len", u64::from(len)),
+                    );
+                }
+                HookEvent::Protect { in_len, out_len } => {
+                    if in_len != 0 && out_len >= in_len {
+                        let _ = self.emit(
+                            Event::at(now(), "ac_protect")
+                                .num("in_len", u64::from(in_len))
+                                .num("out_len", u64::from(out_len))
+                                .num("overhead", u64::from(out_len - in_len)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn hooks_command(&mut self, arg: &str) -> (Vec<String>, i32) {
+        let mut parts = arg.split_whitespace();
+        match parts.next().unwrap_or("") {
+            "" | "status" => {
+                let mut lines = self.hooks.status_lines();
+                lines.push(format!(
+                    "eac.hooks: enabled={} installs_on_tick={}",
+                    self.hooks_enabled, self.hooks_enabled
+                ));
+                (lines, STATUS_OK)
+            }
+            "install" => {
+                self.hooks_enabled = true;
+                self.hooks.set_enabled(true);
+                let line = self.hooks.install_now();
+                let mut lines = vec![line];
+                lines.extend(self.hooks.status_lines());
+                (lines, STATUS_OK)
+            }
+            "capture" => {
+                let path = parts.collect::<Vec<_>>().join(" ");
+                if path.is_empty() {
+                    return (
+                        vec![format!(
+                            "eac.hooks capture: {}",
+                            self.hooks
+                                .capture_path()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "-".to_string())
+                        )],
+                        STATUS_OK,
+                    );
+                }
+                match self.hooks.set_capture_path(std::path::Path::new(&path)) {
+                    Ok(path) => (
+                        vec![format!("eac.hooks capture: {}", path.display())],
+                        STATUS_OK,
+                    ),
+                    Err(error) => (
+                        vec![format!("eac.hooks capture: {error}")],
+                        STATUS_NOT_READY,
+                    ),
+                }
+            }
+            "on" | "off" => {
+                let enabled = arg.trim() == "on";
+                self.set_hooks_enabled(enabled);
+                (vec![format!("eac.hooks: enabled={enabled}")], STATUS_OK)
+            }
+            other => (
+                vec![format!(
+                    "eac.hooks: unknown argument '{other}' (status|install|capture <path>|on|off)"
+                )],
+                STATUS_BAD_ARGUMENT,
+            ),
+        }
     }
 
     /// `configure eac_interval_ms=<200..60000>`, clamped.
@@ -135,7 +286,11 @@ impl EacFeature {
         Ok(PathBuf::from(path))
     }
 
-    /// One managed tick: mirror new game lines, then heartbeat if due.
+    /// One managed tick: hook housekeeping, then game lines, then heartbeat.
+    ///
+    /// The hooks are installed lazily here (managed tick, no new thread, L3):
+    /// until `EOSSDK-Win64-Shipping.dll` is mapped the probe costs one
+    /// `GetModuleHandleA` every two seconds.
     ///
     /// Returns console lines (only on a state change or a fresh error), so a
     /// 250 ms tick does not flood the log.
@@ -143,6 +298,15 @@ impl EacFeature {
         let mut lines = Vec::new();
         if !self.enabled {
             return lines;
+        }
+        if self.hooks_enabled {
+            if let Some(line) = self.hooks.poll(now()) {
+                lines.push(line);
+            }
+            let events = self.hooks.drain_events();
+            if !events.is_empty() {
+                self.apply_hook_events(events, &mut lines);
+            }
         }
         self.poll_tail(&mut lines);
         if self.auto && self.session.running() && self.session.due(now()) {
@@ -169,9 +333,13 @@ impl EacFeature {
             "eac.begin" => self.begin_command(arg),
             "eac.tick" => self.tick_command(),
             "eac.end" => self.end_command(arg),
+            "eac.hooks" => self.hooks_command(arg),
             "eac.log" => self.log_command(arg),
             "eac.tail" => self.tail_command(arg),
-            other => (vec![format!("unknown eac command: {other} (try eac.help)")], STATUS_BAD_ARGUMENT),
+            other => (
+                vec![format!("unknown eac command: {other} (try eac.help)")],
+                STATUS_BAD_ARGUMENT,
+            ),
         }
     }
 
@@ -181,6 +349,7 @@ impl EacFeature {
             "eac.begin [sid]                — open an anti-cheat epoch (per room)",
             "eac.tick                       — emit one heartbeat now",
             "eac.end [reason]               — close the epoch (session_end record)",
+            "eac.hooks [install|capture <path>|on|off] — EOSSDK hook status",
             "eac.log <path>                 — JSONL event log (32 MiB, 2 files)",
             "eac.tail <path>                — mirror output_log room markers",
         ]
@@ -225,11 +394,18 @@ impl EacFeature {
             self.auto as u8,
             self.autosession as u8,
         ));
+        if let Some(line) = self.hooks.status_lines().into_iter().nth(1) {
+            lines.push(line);
+        }
         lines
     }
 
     fn begin_command(&mut self, arg: &str) -> (Vec<String>, i32) {
-        let sid = if arg.is_empty() { None } else { Some(parse_id(arg)) };
+        let sid = if arg.is_empty() {
+            None
+        } else {
+            Some(parse_id(arg))
+        };
         let begin = self.session.begin(now(), sid);
         let mut lines = vec![format!(
             "eac.begin: epoch={} sid=0x{:016x}",
@@ -296,16 +472,10 @@ impl EacFeature {
 
     fn log_command(&mut self, arg: &str) -> (Vec<String>, i32) {
         if arg.is_empty() {
-            return (
-                vec![format!("eac.log: {}", self.log_path())],
-                STATUS_OK,
-            );
+            return (vec![format!("eac.log: {}", self.log_path())], STATUS_OK);
         }
         match self.set_log(arg) {
-            Ok(path) => (
-                vec![format!("eac.log: {}", path.display())],
-                STATUS_OK,
-            ),
+            Ok(path) => (vec![format!("eac.log: {}", path.display())], STATUS_OK),
             Err(error) => (vec![format!("eac.log: {error}")], STATUS_BAD_ARGUMENT),
         }
     }
@@ -387,7 +557,9 @@ impl EacFeature {
                     .num("epoch", epoch)
                     .text("line", line.clone()),
             );
-            if !self.autosession {
+            // The hooks own the epoch when they are installed; the log lines
+            // are only a fallback for builds without EOSSDK.
+            if !self.autosession || self.hooks.installed() {
                 continue;
             }
             if announces_begin(&line)

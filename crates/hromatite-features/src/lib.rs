@@ -534,4 +534,60 @@ mod tests {
 
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn hook_observations_drive_epochs_and_the_jsonl_log() {
+        let _serial = fake::serial();
+        start(31);
+        let dir = std::env::temp_dir().join(format!(
+            "hromatite-features-hooks-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("hooks.jsonl");
+        assert_eq!(configure("eac_auto", "0"), STATUS_OK);
+        assert_eq!(send(&format!("eac.log {}", path.display())), STATUS_OK);
+
+        // BeginSession(handle, mode=1) observed by the Rust hook handler.
+        hromatite_eac::Hooks::observe(hromatite_eac::HookEvent::SessionBegin {
+            mode: 1,
+            ts_ms: 1_000,
+        });
+        (api().tick)();
+        hromatite_eac::Hooks::observe(hromatite_eac::HookEvent::OutMessage {
+            len: 144,
+            dt_ms: 0,
+            ts_ms: 1_100,
+        });
+        hromatite_eac::Hooks::observe(hromatite_eac::HookEvent::Protect {
+            in_len: 122,
+            out_len: 144,
+        });
+        hromatite_eac::Hooks::observe(hromatite_eac::HookEvent::SessionEnd { ts_ms: 2_000 });
+        (api().tick)();
+        assert_eq!(send("eac.hooks"), STATUS_OK);
+        assert_eq!(send("eac.hooks nope"), STATUS_BAD_ARGUMENT);
+        assert_eq!(configure("eac_hooks", "0"), STATUS_OK);
+        assert_eq!(configure("eac_hooks", "1"), STATUS_OK);
+
+        let text = std::fs::read_to_string(&path).expect("jsonl log");
+        assert!(text.contains("\"ev\":\"session_begin\""));
+        assert!(text.contains("\"source\":\"hook\""));
+        assert!(text.contains("\"ev\":\"ac_out\""));
+        assert!(text.contains("\"ev\":\"ac_protect\""));
+        assert!(text.contains("\"overhead\":22"), "{text}");
+        assert!(text.contains("\"reason\":\"hook\""));
+
+        let console = fake::message_log();
+        assert!(console.contains("BeginSession epoch=1 mode=1"), "{console}");
+        assert!(
+            console.contains("EndSession epoch=1 heartbeats=0"),
+            "{console}"
+        );
+        assert!(console.contains("eac.hooks: installed=false"), "{console}");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
