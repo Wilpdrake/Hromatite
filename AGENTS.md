@@ -2695,3 +2695,34 @@ il2cpp одними чтениями памяти (без единого выз�
   двойные snapshot/getter-вызовы убраны, нечитаемые поля больше не превращаются
   в фальшивые NULL-записи. Статические проверки: **61 core + 5 DLL tests**,
   Clippy `-D warnings`, Windows release.
+
+### 2026-11-16 — Список миров: `0x710` остался в GC_threads при установленном guard
+
+- Коммит: этот — только журнал живой диагностики; код ещё не менялся.
+- Пользователь открыл меню и начал листать миры с карточками/изображениями.
+  Свежий `VRChat.gc.log` при сборке **#58**:
+  `SuspendThread loop failed: thread id= 0x710, handle= 00000000000006F4,
+  errcode= 0x5`, затем `SuspendThread loop failed`. Лог payload заканчивается
+  `0x80000003` по `GameAssembly+0xc41b65` в **04:27:59**. Это тот же Boehm
+  stale-record abort, а не новый `0xc0000096` и не доказанная ошибка PlayerLoop.
+- **Guard присутствовал, но не вылечил событие.**
+  `hromatite.log:50008-50196`: exact call-site guard установлен по
+  `0x6fffeb651ad2`, native Update hook установлен, `hits=3454 (90.5/s)`;
+  `hromatite.log:50223` — финальный int3. Новый `inline guard` repair перед
+  ним не появлялся. Нового crash.dmp для этого прогона нет; процесс Linux
+  `1240779` оставался живым на диалоге/остановленном fatal.
+- **Живая память подтверждает запись и patch.** `/proc/1240779/mem` read-only:
+  `GC_threads[23]` содержит `rec=0x1287334e0`, `tid=0x710`, `handle=0x6f4`,
+  `stack=0x7b910000`, `suspended=0`, `next=0x6679c410`; в target стоит `E9`
+  на relay, relay ведёт на naked detour. Значит detour находился на пути,
+  но `WaitForSingleObject(handle,0) != WAIT_OBJECT_0`, поэтому route снова
+  передал управление падающему `GetThreadContext`.
+- **Гипотеза, ещё не доказанная:** handle уже закрыт, поэтому wait возвращает
+  `WAIT_FAILED` (`GetLastError=ERROR_INVALID_HANDLE=6`) вместо сигнального 0.
+  Следующий небольшой шаг — доказать wait/error изолированным probe либо
+  lock-free диагностикой, затем покрыть ровно этот случай TDD; `WAIT_TIMEOUT`,
+  прочие ошибки и pseudo-handle нельзя превращать в основание для unlink.
+- Живой GC-лог сохранён до следующего перезапуска в
+  `~/.hromatite-logs/gc-20261116-042539-crash-manual.log`
+  (sha256 `25e7edd68dad5972b0fd96ccf5bc1e826411a8a39af17fe2c454de395fdc833e`).
+  Агент не перезапускал и не убивал игру. Репозиторий был чист на `d808cc7`.
