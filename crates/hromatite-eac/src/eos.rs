@@ -177,6 +177,10 @@ impl Sink {
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 
+/// Serializes `reset_state` with the tests that depend on the global counters:
+/// the hook state is process-global and the harness runs tests in parallel.
+static STATE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Bounded observation queue drained by the managed tick.
 static EVENTS: Mutex<VecDeque<HookEvent>> = Mutex::new(VecDeque::new());
 
@@ -740,6 +744,7 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn reset_state() {
+    let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     for tramp in &TRAMPS {
         tramp.store(0, Ordering::Relaxed);
     }
@@ -1688,5 +1693,131 @@ mod tests {
     #[test]
     fn a_sinkless_hook_log_does_not_panic() {
         hook_log("no sink yet");
+    }
+
+    // ------------------------------------------------------------- forge
+    //
+    // These tests touch the forge globals, so they take a lock and reset the
+    // whole hook state instead of relying on ordering.
+
+    static DELIVERED: AtomicU64 = AtomicU64::new(0);
+    static DELIVERED_LEN: AtomicU64 = AtomicU64::new(0);
+
+    /// Reset only the forge state: `reset_state` also clears the event queue and
+    /// the tests run in parallel with the queue test.
+    fn forge_state_reset() {
+        FORGE_AFTER_MS.store(0, Ordering::Relaxed);
+        FORGE_MIN_FRAMES.store(0, Ordering::Relaxed);
+        FORGE_INTERVAL_MS.store(forge::INTERVAL_MS, Ordering::Relaxed);
+        FORGE_BUMP.store(false, Ordering::Relaxed);
+        FORGE_STARTED.store(false, Ordering::Relaxed);
+        FORGE_SEEN.store(0, Ordering::Relaxed);
+        FORGE_EMITTED.store(0, Ordering::Relaxed);
+        FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
+        FORGE_LAST_MS.store(0, Ordering::Relaxed);
+        *FORGE_TEMPLATE.lock().expect("template lock") = None;
+    }
+
+    /// Stand-in for the game's callback: records one delivery.
+    unsafe extern "system" fn recording_callback(info: *const MessageInfo) {
+        if info.is_null() {
+            return;
+        }
+        // SAFETY: the caller builds the struct for the duration of the call.
+        let message = unsafe { &*info };
+        DELIVERED.fetch_add(1, Ordering::Relaxed);
+        DELIVERED_LEN.store(u64::from(message.size), Ordering::Relaxed);
+        assert!(!message.data.is_null());
+    }
+
+    fn forge_frame(tag: u8) -> Vec<u8> {
+        let template = Template {
+            session_id: 0x158b,
+            flags: 0,
+            last_seq: 10,
+            body: vec![tag; forge::BODY_LEN],
+        };
+        forge::build_frame(&template, 11, BodyMode::Stale)
+    }
+
+    #[test]
+    fn the_forge_only_learns_512_byte_frames_and_waits_for_its_deadline() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        forge_state_reset();
+        FORGE_AFTER_MS.store(30_000, Ordering::Relaxed);
+        FORGE_MIN_FRAMES.store(2, Ordering::Relaxed);
+        SESSION_START_MS.store(1_000, Ordering::Relaxed);
+
+        forge_learn(&forge_frame(0xAA)[..24], 24);
+        assert_eq!(FORGE_SEEN.load(Ordering::Relaxed), 0, "a 24-byte ACK");
+        assert!(!forge_due(60_000), "no 512-byte frame learned yet");
+
+        forge_learn(&forge_frame(0xAA), forge::FRAME_LEN);
+        assert_eq!(FORGE_SEEN.load(Ordering::Relaxed), 1);
+        assert!(!forge_due(60_000), "the minimum frame count is not reached");
+
+        forge_learn(&forge_frame(0xBB), forge::FRAME_LEN);
+        assert_eq!(FORGE_SEEN.load(Ordering::Relaxed), 2);
+        assert!(!forge_due(30_999), "the deadline is measured from BeginSession");
+        assert!(forge_due(31_000));
+
+        let template = FORGE_TEMPLATE
+            .lock()
+            .expect("template lock")
+            .clone()
+            .expect("template");
+        assert_eq!(template.session_id, 0x158b);
+        assert_eq!(template.last_seq, 11, "the newest live frame wins");
+        assert_eq!(template.body[0], 0xBB);
+
+        // A new epoch forgets everything learned in the previous room.
+        forge_reset_epoch();
+        assert!(!forge_due(60_000));
+        assert!(FORGE_TEMPLATE.lock().expect("template lock").is_none());
+        forge_state_reset();
+    }
+
+    #[test]
+    fn an_emitted_frame_reaches_the_registered_callback_with_a_valid_crc() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        forge_state_reset();
+        DELIVERED.store(0, Ordering::Relaxed);
+        DELIVERED_LEN.store(0, Ordering::Relaxed);
+        BINDS[0]
+            .client_data
+            .store(0x33, Ordering::Relaxed);
+        BINDS[0]
+            .function
+            .store(recording_callback as *const () as usize, Ordering::Relaxed);
+        BIND_COUNT.store(1, Ordering::Relaxed);
+
+        let template = Template::from_frame(&forge_frame(0xCC)).expect("template");
+        *FORGE_TEMPLATE.lock().expect("template lock") = Some(template);
+        FORGE_NEXT_SEQ.store(42, Ordering::Relaxed);
+        FORGE_BUMP.store(false, Ordering::Relaxed);
+
+        emit_forge_frame(5_000);
+        assert_eq!(DELIVERED.load(Ordering::Relaxed), 1, "callback invoked");
+        assert_eq!(DELIVERED_LEN.load(Ordering::Relaxed), 512);
+        assert_eq!(FORGE_EMITTED.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            FORGE_NEXT_SEQ.load(Ordering::Relaxed),
+            43,
+            "the sequence advances per frame"
+        );
+
+        // Rebuild the same frame and check the CRC field the way the Python
+        // reference does: recompute over the frame with 20..24 zeroed.
+        let frame = {
+            let slot = FORGE_TEMPLATE.lock().expect("template lock");
+            forge::build_frame(slot.as_ref().expect("template"), 42, BodyMode::Stale)
+        };
+        let stored = u32::from_le_bytes(frame[20..24].try_into().expect("4 bytes"));
+        let mut zeroed = frame.clone();
+        zeroed[20..24].copy_from_slice(&[0; 4]);
+        assert_eq!(crate::digest::crc32c_eac(&zeroed), stored);
+        BINDS[0].function.store(0, Ordering::Relaxed);
+        BIND_COUNT.store(0, Ordering::Relaxed);
+        forge_state_reset();
     }
 }
