@@ -213,11 +213,18 @@ pub fn tick_interval_ms() -> u64 {
     value
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn bootstrap_feature_requested(path: Option<std::ffi::OsString>) -> bool {
+    path.as_deref()
+        .and_then(|path| path.to_str())
+        .is_some_and(|path| !path.trim().is_empty())
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use super::{
-        FeatureArtifact, ReloadSelection, config_text, parse_feature_manifest,
-        parse_reload_request, parse_versioned_name, replace_config,
+        FeatureArtifact, ReloadSelection, bootstrap_feature_requested, config_text,
+        parse_feature_manifest, parse_reload_request, parse_versioned_name, replace_config,
     };
     use crate::hot::{Fault, HotConfig, HotReload, Phase, Tick};
     use crate::raw::localmap::FeatureImage;
@@ -1048,8 +1055,10 @@ mod imp {
                             | Phase::Canary
                             | Phase::Failed
                     )
+                    || (!runtime.bootstrap_attempted
+                        && bootstrap_feature_requested(std::env::var_os("HROMATITE_FEATURE_DLL")))
             }
-            _ => false,
+            _ => bootstrap_feature_requested(std::env::var_os("HROMATITE_FEATURE_DLL")),
         }
     }
 
@@ -1243,6 +1252,15 @@ mod tests {
         ] {
             assert!(!super::resident_command(command), "feature loses {command}");
         }
+    }
+
+    #[test]
+    fn first_bootstrap_is_a_pending_reload_not_an_idle_tick() {
+        assert!(!super::bootstrap_feature_requested(None));
+        assert!(!super::bootstrap_feature_requested(Some("   ".into())));
+        assert!(super::bootstrap_feature_requested(Some(
+            "Z:/feature.dll".into()
+        )));
     }
 
     #[test]
