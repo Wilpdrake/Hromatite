@@ -195,6 +195,15 @@ pub unsafe extern "system" fn player_loop_detour() {
     );
 }
 
+fn native_callback_target(
+    update_function: usize,
+    read_slot: impl FnOnce(usize) -> Option<usize>,
+) -> Result<usize, String> {
+    read_slot(update_function)
+        .filter(|target| *target >= 0x10000)
+        .ok_or_else(|| format!("PlayerLoop callback slot {update_function:#x} is unreadable"))
+}
+
 fn target_change_allowed(previous: usize, candidate: usize) -> bool {
     previous == 0 || previous == candidate
 }
@@ -216,7 +225,9 @@ pub fn install(selector: &str) -> Result<Entry, String> {
     if selected.update_function < 0x10000 {
         return Err("selected PlayerLoop updateFunction is NULL".into());
     }
-    let target = selected.update_function;
+    // This build stores a slot with the actual code address as its first qword,
+    // not executable bytes at updateFunction itself. Patch the loaded stub.
+    let target = native_callback_target(selected.update_function, crate::safe::read_usize)?;
     let previous = PLAYER_ENTRY.load(Ordering::Acquire);
     if !target_change_allowed(previous, target) {
         return Err(format!(
@@ -373,8 +384,8 @@ pub fn select_root(entries: &[Entry], selector: &str) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, PLAYER_ATTACHED, PLAYER_INSTALLING, entry_from_words, refreshed_state,
-        run_with_original, select_root, target_change_allowed,
+        Entry, PLAYER_ATTACHED, PLAYER_INSTALLING, entry_from_words, native_callback_target,
+        refreshed_state, run_with_original, select_root, target_change_allowed,
     };
 
     fn entries() -> Vec<Entry> {
@@ -470,6 +481,18 @@ mod tests {
             "UnityEngine.LowLevel.PlayerLoop.Update.ScriptRunBehaviourUpdate"
         );
         assert_eq!(selected.update_function, 0x56780);
+    }
+
+    #[test]
+    fn update_function_slot_is_dereferenced_before_patching() {
+        let field = 0x6ffffc4d8378usize;
+        let code = 0x6ffffaaefb80usize;
+        let target = native_callback_target(field, |slot| {
+            assert_eq!(slot, field);
+            (slot == field).then_some(code)
+        });
+        assert_eq!(target.unwrap(), code);
+        assert!(native_callback_target(field, |_| None).is_err());
     }
 
     #[test]
