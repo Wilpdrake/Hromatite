@@ -130,6 +130,12 @@ fi
 mkdir -p "$MODULE_DIR"
 VERSIONED_FILE=$MODULE_DIR/features-$GENERATION-$SHORT_SHA.dll
 [ ! -e "$VERSIONED_FILE" ] || fail "refusing to overwrite $VERSIONED_FILE"
+for existing in "$MODULE_DIR"/features-"$GENERATION"-*.dll; do
+    [ ! -e "$existing" ] || fail "generation $GENERATION already exists at $existing; select a new generation"
+done
+LOCK_DIR=$MODULE_DIR/.publisher.lock
+LOCK_HELD=0
+VERSIONED_LINKED=0
 STAGE=$MODULE_DIR/.features-$GENERATION-$$.stage
 MANIFEST_TMP=$MODULE_DIR/.current-$$.manifest
 BACKUP=$MODULE_DIR/.previous-$$.manifest
@@ -138,7 +144,7 @@ MANIFEST_SWAPPED=0
 COMMITTED=0
 cleanup() {
     rm -f "$STAGE" "$MANIFEST_TMP"
-    if [ "$COMMITTED" -eq 0 ]; then
+    if [ "$COMMITTED" -eq 0 ] && [ "$VERSIONED_LINKED" -eq 1 ]; then
         rm -f "$VERSIONED_FILE"
         if [ "$MANIFEST_SWAPPED" -eq 1 ]; then
             rm -f "$MANIFEST_FILE"
@@ -148,7 +154,12 @@ cleanup() {
         fi
     fi
     rm -f "$BACKUP"
+    [ "$LOCK_HELD" -eq 0 ] || rmdir "$LOCK_DIR" 2>/dev/null || :
 }
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    fail "another publisher is active (lock $LOCK_DIR)"
+fi
+LOCK_HELD=1
 trap cleanup EXIT HUP INT TERM
 ( set -C; : >"$STAGE" ) 2>/dev/null || fail "temporary artifact exists: $STAGE"
 ( set -C; : >"$MANIFEST_TMP" ) 2>/dev/null || fail "temporary manifest exists: $MANIFEST_TMP"
@@ -158,6 +169,7 @@ if [ -f "$MANIFEST_FILE" ]; then
 fi
 cp "$ARTIFACT" "$STAGE"
 ln "$STAGE" "$VERSIONED_FILE" 2>/dev/null || fail "refusing to overwrite $VERSIONED_FILE"
+VERSIONED_LINKED=1
 rm -f "$STAGE"
 printf 'GENERATION=%s\nSHA256=%s\nFILE=%s\nGAME_SHA256=%s\nABI=1\n' \
     "$GENERATION" "$FEATURE_SHA" "$VERSIONED_FILE" "$ACTUAL_GAME_SHA" >"$MANIFEST_TMP"

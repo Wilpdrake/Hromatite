@@ -104,9 +104,9 @@ fn parse_bounded(value: &str, minimum: u64, maximum: u64, line: usize) -> Result
 }
 
 fn parse_bool(value: &str, line: usize) -> Result<bool, ConfigError> {
-    match value {
-        "0" => Ok(false),
-        "1" => Ok(true),
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" => Ok(false),
+        "1" | "true" | "on" => Ok(true),
         _ => Err(ConfigError::InvalidValue { line }),
     }
 }
@@ -580,7 +580,7 @@ mod tests {
             "GRACE_MS=99",
             "GRACE_MS=60001",
             "TICK_MS=18446744073709551616",
-            "TELEMETRY=true",
+            "TELEMETRY=maybe",
             "MEMORY=",
             "M3=2",
             "TICK_MS",
@@ -674,6 +674,19 @@ mod tests {
         );
         assert_eq!(hot.retire_previous(), Ok(1));
         assert_eq!(hot.previous_version(), None);
+    }
+
+    #[test]
+    fn configuration_accepts_human_boolean_spellings() {
+        assert_eq!(
+            parse_config("TELEMETRY=on\nMEMORY=off\nM3=false"),
+            Ok(HotConfig {
+                telemetry: true,
+                memory: false,
+                m3: false,
+                ..HotConfig::default()
+            })
+        );
     }
 
     #[test]

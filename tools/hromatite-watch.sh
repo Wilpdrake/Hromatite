@@ -83,11 +83,13 @@ while :; do
             fi
             if [ "$status" -eq 0 ]; then
                 printf 'reload publication succeeded\n'
+                # Only a published generation retires the source fingerprint.
+                # Otherwise the same stable change remains eligible for retry.
+                baseline=$pending
             else
                 printf 'hromatite-watch: reload failed (status=%s); current generation preserved\n' \
                     "$status" >&2
             fi
-            baseline=$pending
             pending=
             pending_count=0
             [ "$ONCE" -eq 0 ] || exit "$status"

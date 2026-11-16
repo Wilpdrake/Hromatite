@@ -100,7 +100,78 @@ test_versioned_no_overwrite() {
     assert_eq "$(sha256_file "$before_dll")" "$before_dll_sha"
     assert_eq "$(sha256_file "$manifest")" "$before_manifest"
     assert_eq "$(cat "$COMMANDS")" "reload 1"
+    printf 'different bytes under an already-used generation\n' >"$ARTIFACT"
+    if run_reload --no-build --generation 1 >"$FIXTURE/out-reused" 2>"$FIXTURE/err-reused"; then
+        fail 'reused generation with different bytes succeeded'
+    fi
+    assert_eq "$(sha256_file "$before_dll")" "$before_dll_sha"
     assert_no_staging_files
+}
+
+test_concurrent_publishers_do_not_delete_the_winner() {
+    new_fixture concurrent
+    artifact_sha=$(sha256_file "$ARTIFACT")
+    short=$(printf '%.12s\n' "$artifact_sha")
+    expected_file=$MODULES/features-1-$short.dll
+    mkdir -p "$FIXTURE/bin"
+    real_ln=$(command -v ln)
+    run_marker=$FIXTURE/ln-called
+    printf '#!/bin/sh\nif [ ! -e "%s" ]; then\n  : >"%s"\n  "%s" "$@"\n  sleep 0.1\nelse\n  exit 1\nfi\n' \
+        "$run_marker" "$run_marker" "$real_ln" >"$FIXTURE/bin/ln"
+    # One deterministic ln wins; the other fails. Do not edit the publisher.
+    chmod +x "$FIXTURE/bin/ln"
+    PATH="$FIXTURE/bin:$PATH" run_reload --no-build >"$FIXTURE/p1.out" 2>&1 &
+    first=$!
+    PATH="$FIXTURE/bin:$PATH" run_reload --no-build >"$FIXTURE/p2.out" 2>&1 &
+    second=$!
+    wait "$first" || :
+    wait "$second" || :
+    assert_file "$expected_file"
+    cmp "$ARTIFACT" "$expected_file" >/dev/null || fail 'concurrent winner artifact was replaced or deleted'
+    [ ! -e "$MODULES/.publisher.lock" ] || fail 'publisher lock was not released'
+}
+
+test_watch_retries_after_transient_failure() {
+    new_fixture watch-retry
+    SRC=$FIXTURE/src
+    mkdir -p "$SRC/crates/hromatite-features/src" "$SRC/crates/hromatite-abi/src"
+    printf 'first\n' >"$SRC/crates/hromatite-features/src/lib.rs"
+    printf 'abi\n' >"$SRC/crates/hromatite-abi/src/lib.rs"
+    printf '#!/bin/sh\nactual="%s"\nif [ ! -e "%s" ]; then\n  printf "attempt\\n" >>"%s"\n  exit 7\nfi\nprintf "attempt\\n" >>"%s"\nexec sh "$actual" "$@"\n' \
+        "$RELOAD" "$FIXTURE/failed-once" "$FIXTURE/failed-once" "$FIXTURE/failed-once" "$FIXTURE/failed-once" >"$FIXTURE/retry.sh"
+    chmod +x "$FIXTURE/retry.sh"
+    env -i PATH="$PATH" HOME="$FIXTURE/home" \
+        HROMATITE_PREFIX="$PREFIX_DIR" \
+        HROMATITE_GAME_ASSEMBLY="$GAME" \
+        HROMATITE_GAME_SHA256="$GAME_SHA" \
+        HROMATITE_ARTIFACT="$ARTIFACT" \
+        HROMATITE_WATCH_ROOT="$SRC" \
+        HROMATITE_RELOAD_BIN="$FIXTURE/retry.sh" \
+        sh "$WATCH" --interval 0 --stable-polls 1 --no-build >"$FIXTURE/watch.out" 2>&1 &
+    WATCH_PID=$!
+    tries=0
+    while ! grep 'watching' "$FIXTURE/watch.out" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 100 ] || fail 'retry watcher did not capture a baseline'
+        sleep 0.02
+    done
+    printf 'stable change\n' >>"$SRC/crates/hromatite-features/src/lib.rs"
+    tries=0
+    while [ ! -f "$COMMANDS" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 500 ] || {
+            cat "$FIXTURE/watch.out" >&2
+            fail 'watcher did not retry the same stable fingerprint'
+        }
+        sleep 0.02
+    done
+    kill "$WATCH_PID" 2>/dev/null || :
+    wait "$WATCH_PID" 2>/dev/null || :
+    WATCH_PID=
+    assert_file "$MODULES/current.manifest"
+    assert_eq "$(cat "$COMMANDS")" "reload 1"
+    attempts=$(wc -l <"$FIXTURE/failed-once")
+    assert_eq "$attempts" "2"
 }
 
 test_dry_run_neither_builds_nor_writes() {
@@ -217,17 +288,19 @@ test_watch_publishes_one_stable_change() {
     assert_file "$MODULES/current.manifest"
 }
 
-TESTS='atomic no-overwrite dry-run wrong-hash command-rollback malformed watch'
+TESTS='atomic no-overwrite concurrent dry-run wrong-hash command-rollback malformed watch watch-retry'
 run_test() {
     printf 'TEST %s\n' "$1"
     case $1 in
         atomic) test_atomic_publication ;;
         no-overwrite) test_versioned_no_overwrite ;;
+        concurrent) test_concurrent_publishers_do_not_delete_the_winner ;;
         dry-run) test_dry_run_neither_builds_nor_writes ;;
         wrong-hash) test_wrong_game_hash_is_rejected_before_build ;;
         command-rollback) test_command_failure_restores_previous_manifest ;;
         malformed) test_malformed_manifest_and_path_abort_without_side_effects ;;
         watch) test_watch_publishes_one_stable_change ;;
+        watch-retry) test_watch_retries_after_transient_failure ;;
         *) fail "unknown test $1" ;;
     esac
     printf 'PASS %s\n' "$1"

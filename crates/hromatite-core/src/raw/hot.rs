@@ -111,7 +111,88 @@ fn replace_config(
     crate::hot::parse_config(&lines.join("\n"))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FeatureManifest {
+    artifact: FeatureArtifact,
+    game_sha256: String,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_artifact_path(host_path: &str) -> Result<std::path::PathBuf, String> {
+    if !host_path.starts_with('/')
+        || host_path.contains("\\")
+        || host_path.split('/').any(|component| component == "..")
+        || !host_path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'/' | b'.' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-'
+                )
+        })
+    {
+        return Err("manifest FILE is not a safe absolute Linux path".into());
+    }
+    Ok(std::path::PathBuf::from(format!(
+        "Z:{}",
+        host_path.replace('/', "\\")
+    )))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_feature_manifest(text: &str) -> Result<FeatureManifest, String> {
+    if text.len() > 4096 {
+        return Err("current.manifest exceeds 4096 bytes".into());
+    }
+    const KEYS: [&str; 5] = ["GENERATION", "SHA256", "FILE", "GAME_SHA256", "ABI"];
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() != KEYS.len() {
+        return Err("current.manifest must have five KEY=VALUE lines".into());
+    }
+    let mut values = [""; 5];
+    for ((key, slot), line) in KEYS.into_iter().zip(&mut values).zip(lines) {
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("malformed manifest line: {line:?}"))?;
+        if name != key {
+            return Err(format!("expected {key}, got {name}"));
+        }
+        *slot = value;
+    }
+    let generation = values[0]
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation != 0)
+        .ok_or("manifest GENERATION must be positive")?;
+    for sha in [&values[1], &values[3]] {
+        if sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("manifest hash must contain 64 lowercase hex characters".into());
+        }
+    }
+    if values[4] != "1" {
+        return Err(format!("unsupported manifest ABI {}", values[4]));
+    }
+    let filename = values[2].rsplit('/').next().unwrap_or_default();
+    let parsed = parse_versioned_name(filename)
+        .ok_or("manifest FILE has no valid features-N-SHA12.dll name")?;
+    if parsed.generation != generation || parsed.short_sha != values[1][..12] {
+        return Err("manifest FILE differs from GENERATION/SHA256".into());
+    }
+    Ok(FeatureManifest {
+        artifact: FeatureArtifact {
+            generation,
+            sha256: values[1].to_string(),
+            path: windows_artifact_path(values[2])?,
+        },
+        game_sha256: values[3].to_string(),
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FeatureArtifact {
     generation: u64,
@@ -135,8 +216,8 @@ pub fn tick_interval_ms() -> u64 {
 #[cfg(target_os = "windows")]
 mod imp {
     use super::{
-        FeatureArtifact, ReloadSelection, config_text, parse_reload_request, parse_versioned_name,
-        replace_config,
+        FeatureArtifact, ReloadSelection, config_text, parse_feature_manifest,
+        parse_reload_request, parse_versioned_name, replace_config,
     };
     use crate::hot::{Fault, HotConfig, HotReload, Phase, Tick};
     use crate::raw::localmap::FeatureImage;
@@ -299,7 +380,6 @@ mod imp {
                 artifact: artifact.clone(),
                 image: None,
             });
-            self.last_error = None;
             self.dirty = true;
             Ok(format!(
                 "reload scheduled: generation {generation}, {}",
@@ -459,7 +539,6 @@ mod imp {
                     let generation = self.pending.take().and_then(|pending| pending.image);
                     self.previous = self.active.take();
                     self.active = generation;
-                    self.last_error = None;
                     self.dirty = true;
                     crate::log::log_tag(
                         "hot",
@@ -678,6 +757,29 @@ mod imp {
 
     fn choose_artifact(requested: Option<u64>) -> Result<FeatureArtifact, String> {
         let directory = module_dir();
+        if requested.is_none() {
+            let path = directory.join("current.manifest");
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("manifest {}: {error}", path.display()))?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err("current.manifest must be a regular file".into());
+            }
+            if metadata.len() > 4096 {
+                return Err("current.manifest exceeds 4096 bytes".into());
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|error| format!("read manifest {}: {error}", path.display()))?;
+            let manifest = parse_feature_manifest(&text)?;
+            if manifest.game_sha256 != symbols::GAMEASSEMBLY_SHA256 {
+                return Err(format!(
+                    "manifest GameAssembly {} differs from resident build {}",
+                    manifest.game_sha256,
+                    symbols::GAMEASSEMBLY_SHA256
+                ));
+            }
+            return Ok(manifest.artifact);
+        }
+        let requested = requested.expect("handled latest above");
         let entries = std::fs::read_dir(&directory)
             .map_err(|e| format!("feature directory {}: {e}", directory.display()))?;
         let mut candidates = Vec::new();
@@ -688,7 +790,7 @@ mod imp {
             let Some(parsed) = parse_versioned_name(name) else {
                 continue;
             };
-            if requested.is_some_and(|requested| requested != parsed.generation) {
+            if requested != parsed.generation {
                 continue;
             }
             candidates.push(FeatureArtifact {
@@ -697,25 +799,17 @@ mod imp {
                 path: entry.path(),
             });
         }
-        if requested.is_none() {
-            candidates.sort_by_key(|candidate| candidate.generation);
+        match candidates.as_slice() {
+            [] => Err(format!(
+                "generation {requested} not found in {}",
+                directory.display()
+            )),
+            [artifact] => Ok(artifact.clone()),
+            _ => Err(format!(
+                "generation {requested} is ambiguous: multiple feature artifacts in {}",
+                directory.display()
+            )),
         }
-        candidates.pop().ok_or_else(|| {
-            requested.map_or_else(
-                || {
-                    format!(
-                        "no features-<generation>-<sha12>.dll in {}",
-                        directory.display()
-                    )
-                },
-                |generation| {
-                    format!(
-                        "generation {generation} not found in {}",
-                        directory.display()
-                    )
-                },
-            )
-        })
     }
 
     fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
@@ -786,6 +880,28 @@ mod imp {
         }
     }
 
+    fn write_config_file(config: HotConfig) -> Result<(), String> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("config directory {}: {error}", parent.display()))?;
+        }
+        let temporary = path.with_extension("conf.tmp");
+        std::fs::write(&temporary, config_text(config))
+            .map_err(|error| format!("write config {}: {error}", temporary.display()))?;
+        std::fs::rename(&temporary, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("publish config {}: {error}", path.display())
+        })
+    }
+
+    fn apply_config_file(runtime: &mut Runtime, config: HotConfig) -> Result<String, String> {
+        write_config_file(config)?;
+        runtime.configure(config);
+        runtime.last_error = None;
+        Ok(config_text(config))
+    }
+
     fn shutdown_retire(generation: ImageGeneration) -> Result<(), String> {
         let api = generation.image.api();
         // SAFETY: the model has rejected all new entries and in_flight==0.
@@ -841,7 +957,9 @@ mod imp {
                     Err(error) => return Some(vec![error]),
                 };
                 if selection == ReloadSelection::Status {
-                    return Some(vec![runtime.status()]);
+                    let status = runtime.status();
+                    crate::log::log_tag("hot", &status);
+                    return Some(vec![status]);
                 }
                 let requested = match selection {
                     ReloadSelection::Latest => None,
@@ -882,8 +1000,10 @@ mod imp {
                     "reload" if parts.next().is_none() => match read_config_file() {
                         Ok(text) => match crate::hot::parse_config(&text) {
                             Ok(config) => {
-                                runtime.configure(config);
-                                config_text(config)
+                                apply_config_file(runtime, config).unwrap_or_else(|error| {
+                                    runtime.last_error = Some(error.clone());
+                                    error
+                                })
                             }
                             Err(error) => format!("config rejected without changes: {error:?}"),
                         },
@@ -897,8 +1017,10 @@ mod imp {
                         } else {
                             match replace_config(runtime.config, &key.to_ascii_uppercase(), value) {
                                 Ok(config) => {
-                                    runtime.configure(config);
-                                    config_text(config)
+                                    apply_config_file(runtime, config).unwrap_or_else(|error| {
+                                        runtime.last_error = Some(error.clone());
+                                        error
+                                    })
                                 }
                                 Err(error) => format!("config rejected without changes: {error:?}"),
                             }
@@ -1070,6 +1192,30 @@ pub fn command(line: &str) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_drives_latest_and_preserves_the_artifact_identity() {
+        let expected = crate::symbols::GAMEASSEMBLY_SHA256.to_string();
+        let sha = "a".repeat(64);
+        let valid = format!(
+            "GENERATION=4\nSHA256={sha}\nFILE=/tmp/features-4-aaaaaaaaaaaa.dll\nGAME_SHA256={expected}\nABI=1\n"
+        );
+        let manifest = super::parse_feature_manifest(&valid).unwrap();
+        assert_eq!(manifest.artifact.generation, 4);
+        assert_eq!(manifest.artifact.sha256, sha);
+        assert_eq!(manifest.game_sha256, expected);
+        let windows = super::windows_artifact_path("/tmp/features-4-aaaaaaaaaaaa.dll").unwrap();
+        assert_eq!(manifest.artifact.path, windows);
+        assert!(super::parse_feature_manifest(&valid.replace("ABI=1", "ABI=2")).is_err());
+        assert!(
+            super::parse_feature_manifest(&valid.replace("aaaaaaaaaaaa.dll", "bbbbbbbbbbbb.dll"))
+                .is_err()
+        );
+        assert!(
+            super::parse_feature_manifest(&valid.replace("/tmp/features-4", "/tmp/../features-4"))
+                .is_err()
+        );
+    }
+
     #[test]
     fn resident_commands_never_fallback_to_a_feature_image() {
         for command in [
