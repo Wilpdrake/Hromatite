@@ -46,7 +46,7 @@ pub fn encode_beat(
     kind: ChecksumKind,
 ) -> (Vec<u8>, HeartbeatPayload) {
     let body = HeartbeatPayload {
-        seq: u32::try_from(beat.hb_in_epoch).unwrap_or(u32::MAX),
+        seq: beat.hb_in_epoch,
         timestamp_ms: beat.timestamp_ms,
         nonce: beat.nonce,
         flags: payload::FLAG_INTEGRITY_OK,
