@@ -1646,10 +1646,18 @@ fn late_install_action(
 }
 
 fn tick_then_original<T, E>(
+    original_first: bool,
     tick_fn: impl FnOnce() -> Result<(), E>,
     original: impl FnOnce() -> T,
 ) -> T {
     // Instrumentation is explicitly best-effort; the managed body is mandatory.
+    // Reload transactions run it before mapping/init/shutdown; ordinary tick work
+    // retains the measured pre-original ordering.
+    if original_first {
+        let result = original();
+        let _ = tick_fn();
+        return result;
+    }
     let _ = tick_fn();
     original()
 }
@@ -1676,6 +1684,7 @@ pub unsafe extern "system" fn late_update_detour(
     let f: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) =
         unsafe { core::mem::transmute(original) };
     tick_then_original(
+        crate::raw::hot::original_first_required(),
         || {
             // A payload fault must not skip the game's method. The guard is
             // inside the pre-original half, so the original call remains the
@@ -2255,6 +2264,7 @@ mod tests {
     fn late_update_tick_runs_before_the_original_method() {
         let events = std::cell::RefCell::new(Vec::new());
         let returned = tick_then_original(
+            false,
             || {
                 events.borrow_mut().push("tick");
                 Ok::<_, ()>(())
@@ -2269,9 +2279,28 @@ mod tests {
     }
 
     #[test]
+    fn reload_phase_runs_the_original_before_instrumentation() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let returned = tick_then_original(
+            true,
+            || {
+                events.borrow_mut().push("instrumentation");
+                Err::<(), _>("feature delay")
+            },
+            || {
+                events.borrow_mut().push("original");
+                64usize
+            },
+        );
+        assert_eq!(returned, 64);
+        assert_eq!(events.into_inner(), ["original", "instrumentation"]);
+    }
+
+    #[test]
     fn late_update_original_survives_a_guarded_tick_failure() {
         let events = std::cell::RefCell::new(Vec::new());
         let returned = tick_then_original(
+            false,
             || {
                 events.borrow_mut().push("guard failed");
                 Err::<(), _>("instrumentation fault")

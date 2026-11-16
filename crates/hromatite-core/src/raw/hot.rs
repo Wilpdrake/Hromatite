@@ -147,6 +147,33 @@ mod imp {
 
     const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
     static HOST_POINTER: AtomicUsize = AtomicUsize::new(0);
+    static LIVE_BUILD_VERIFIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn loaded_game_assembly_hash() -> Result<String, String> {
+        let wide_name = crate::ffi::wide(crate::GAME_ASSEMBLY);
+        // SAFETY: `wide_name` is NUL terminated and lives throughout both calls;
+        // GetModuleHandleW is a borrowed process-owned module handle.
+        let module = unsafe { crate::ffi::GetModuleHandleW(wide_name.as_ptr()) };
+        if module.is_null() {
+            return Err("GameAssembly.dll is not loaded".into());
+        }
+        let mut path = [0u16; 4096];
+        // SAFETY: path is a correctly sized writable UTF-16 output buffer;
+        // Wine/Windows reports the exact number of units excluding NUL.
+        let length =
+            unsafe { crate::ffi::GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) }
+                as usize;
+        if length == 0 {
+            return Err("GetModuleFileNameW(GameAssembly) returned an empty path".into());
+        }
+        if length >= path.len() {
+            return Err("GetModuleFileNameW(GameAssembly) path is truncated".into());
+        }
+        let path = crate::ffi::wide_to_string(&path[..length]);
+        crate::sha256::hex_digest_file(&path)
+            .map_err(|error| format!("hash loaded GameAssembly at {path}: {error}"))
+    }
 
     struct ImageGeneration {
         image: FeatureImage,
@@ -311,7 +338,9 @@ mod imp {
                 Ok(()) => {}
                 Err(problem) => return self.fail_pending(format!("begin canary: {problem:?}")),
             }
-            let loaded = crate::log::guard("hot::FeatureImage::load", || FeatureImage::load(&path));
+            let loaded = crate::log::guard("hot::FeatureImage::load", || {
+                FeatureImage::load_verified(&path, &actual_sha)
+            });
             let image = match loaded {
                 Some(Ok(image)) => image,
                 Some(Err(error)) => return self.fail_pending(format!("local map: {error}")),
@@ -705,10 +734,34 @@ mod imp {
     }
 
     fn game_hash_matches() -> bool {
-        crate::procs::own_module(crate::GAME_ASSEMBLY).is_some()
-            && crate::procs::own_module(crate::UNITY_PLAYER).is_some()
-            && symbols::GAMEASSEMBLY_SHA256.len() == 64
-            && symbols::GAMEASSEMBLY_SHA256 == crate::lateupdate::AUTO_BUILD_SHA256
+        if LIVE_BUILD_VERIFIED.load(Ordering::Acquire) {
+            return true;
+        }
+        let actual = loaded_game_assembly_hash();
+        match actual {
+            Ok(actual) if actual == symbols::GAMEASSEMBLY_SHA256 => {
+                LIVE_BUILD_VERIFIED.store(true, Ordering::Release);
+                crate::log::log_tag("hot", "live GameAssembly SHA-256 verified");
+                true
+            }
+            Ok(actual) => {
+                crate::log::log_tag(
+                    "hot",
+                    &format!(
+                        "loaded GameAssembly SHA mismatch: loaded {actual}, resident {}",
+                        symbols::GAMEASSEMBLY_SHA256
+                    ),
+                );
+                false
+            }
+            Err(error) => {
+                crate::log::log_tag(
+                    "hot",
+                    &format!("loaded GameAssembly not validated: {error}"),
+                );
+                false
+            }
+        }
     }
 
     fn config_path() -> PathBuf {
@@ -859,6 +912,25 @@ mod imp {
         }
     }
 
+    pub(super) fn original_first_required_impl() -> bool {
+        // SAFETY: this scalar phase check uses only the established game thread.
+        // It never starts or joins a worker.
+        match unsafe { (&raw const RUNTIME).as_ref() } {
+            Some(Some(runtime)) => {
+                runtime.model.failed_version().is_some()
+                    || matches!(
+                        runtime.model.phase(),
+                        Phase::Requested
+                            | Phase::Draining
+                            | Phase::Loading
+                            | Phase::Canary
+                            | Phase::Failed
+                    )
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn smoke_impl(paths: &[String], rounds: usize) -> Result<Vec<String>, String> {
         if paths.len() < 2 || rounds == 0 || rounds > 64 {
             return Err("hot-smoke requires at least two DLL paths and 1..64 rounds".into());
@@ -922,6 +994,18 @@ mod imp {
 pub fn tick() {
     #[cfg(target_os = "windows")]
     imp::tick_impl();
+}
+
+/// True only for reload transitions, where native work must not hold the game's
+/// next callback behind mapping, init, or retirement. Ordinary telemetry keeps
+/// the measured pre-original instrumentation order.
+pub fn original_first_required() -> bool {
+    #[cfg(target_os = "windows")]
+    return imp::original_first_required_impl();
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 /// Mapper/ABI-only A/B test with no Unity dependencies. The only invoked

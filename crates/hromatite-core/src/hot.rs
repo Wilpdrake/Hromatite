@@ -152,6 +152,7 @@ pub enum HotError {
     CounterOverflow,
     UnknownGeneration,
     DeadlineOverflow,
+    DeadlineExpired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,6 +329,12 @@ impl HotReload {
     pub fn canary_succeeded(&mut self, now_ms: u64) -> Result<(), HotError> {
         if self.phase != Phase::Canary {
             return Err(HotError::InvalidTransition);
+        }
+        if now_ms.checked_add(self.config.grace_ms).is_none() {
+            return Err(HotError::DeadlineOverflow);
+        }
+        if self.deadline_ms.is_some_and(|deadline| now_ms >= deadline) {
+            return Err(HotError::DeadlineExpired);
         }
         if self.previous.is_some() {
             return Err(HotError::PreviousResident);
@@ -868,6 +875,30 @@ mod tests {
         hot.canary_succeeded(502).unwrap();
         assert_eq!(hot.active_version(), Some(3));
         assert_eq!(hot.previous_version(), Some(2));
+    }
+
+    #[test]
+    fn expired_completed_canary_is_never_published() {
+        let mut hot = HotReload::new(HotConfig {
+            grace_ms: 100,
+            ..HotConfig::default()
+        });
+        hot.request(1, 0).unwrap();
+        hot.begin_loading(0).unwrap();
+        hot.begin_canary(0).unwrap();
+        hot.canary_succeeded(0).unwrap();
+        hot.poll(100).unwrap();
+
+        hot.request(2, 101).unwrap();
+        hot.begin_drain(101).unwrap();
+        hot.begin_loading(101).unwrap();
+        hot.begin_canary(195).unwrap();
+        assert_eq!(hot.canary_succeeded(296), Err(HotError::DeadlineExpired));
+        assert_eq!(hot.phase(), Phase::Canary);
+        assert_eq!(hot.active_version(), Some(1));
+        assert_eq!(hot.pending_version(), Some(2));
+        assert_eq!(hot.fail_pending(), Ok(2));
+        assert_eq!(hot.active_version(), Some(1));
     }
 
     #[test]

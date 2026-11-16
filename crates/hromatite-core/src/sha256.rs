@@ -80,11 +80,61 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub fn hex_digest(data: &[u8]) -> String {
-    digest(data)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex(&digest(data))
+}
+
+fn finish(mut state: [u32; 8], remainder: &[u8], bit_len: u64) -> [u8; 32] {
+    let final_len = if remainder.len() < 56 { 64 } else { 128 };
+    let mut final_blocks = [0u8; 128];
+    final_blocks[..remainder.len()].copy_from_slice(remainder);
+    final_blocks[remainder.len()] = 0x80;
+    final_blocks[final_len - 8..final_len].copy_from_slice(&bit_len.to_be_bytes());
+    for block in final_blocks[..final_len].as_chunks::<64>().0 {
+        compress(&mut state, block);
+    }
+    let mut out = [0u8; 32];
+    for (chunk, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        chunk.copy_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+/// Hash a potentially large stream with bounded memory. Only one 64 KiB read
+/// buffer plus at most one partial digest block is ever live at once.
+pub fn digest_reader<R: std::io::Read>(mut reader: R) -> std::io::Result<[u8; 32]> {
+    let mut state = INITIAL;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut trailing = Vec::new();
+    let mut total_len = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total_len = total_len.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "input exceeds SHA-256 length",
+            )
+        })?;
+        trailing.extend_from_slice(&buffer[..read]);
+        let (blocks, remainder) = trailing.as_chunks::<64>();
+        for block in blocks {
+            compress(&mut state, block);
+        }
+        trailing = remainder.to_vec();
+    }
+    Ok(finish(state, &trailing, total_len.wrapping_mul(8)))
+}
+
+pub fn hex_digest_file(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    digest_reader(file).map(|digest| hex(&digest))
 }
 
 #[cfg(test)]
@@ -138,6 +188,23 @@ mod tests {
             let input: Vec<u8> = (0..length).map(|value| (value % 251) as u8).collect();
             assert_eq!(super::hex_digest(&input), expected, "length {length}");
         }
+    }
+
+    #[test]
+    fn streamed_and_file_hashes_match_the_whole_input_digest() {
+        let data: Vec<u8> = (0..=255).cycle().take(64 * 1024 + 37).collect();
+        let expected = super::hex_digest(&data);
+        assert_eq!(
+            super::digest_reader(&data[..])
+                .map(|digest| super::hex(&digest))
+                .unwrap(),
+            expected.clone()
+        );
+
+        let path = std::env::temp_dir().join(format!("hromatite-sha-{}.bin", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(super::hex_digest_file(&path).unwrap(), expected);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

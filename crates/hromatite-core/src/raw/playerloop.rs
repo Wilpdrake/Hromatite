@@ -173,6 +173,12 @@ pub unsafe extern "system" fn player_loop_detour() {
     // SAFETY: original is the trampoline for the same no-argument native
     // PlayerLoop updateFunction that was returned by Unity.
     let f: unsafe extern "system" fn() = unsafe { core::mem::transmute(original) };
+    let original_first = crate::raw::hot::original_first_required();
+    if original_first {
+        // SAFETY: the trampoline for the selected native updateFunction has already
+        // been validated; the reload transition must not delay this real game call.
+        unsafe { f() };
+    }
     run_with_original(
         || {
             log::guard("player_loop_detour::pre", || {
@@ -190,8 +196,15 @@ pub unsafe extern "system" fn player_loop_detour() {
             .map(|_| ())
             .ok_or(())
         },
-        // SAFETY: the no-argument trampoline preserves the original callback.
-        || unsafe { f() },
+        // SAFETY: during reload the original runs first, so loader/init/shutdown
+        // cannot hold the original behind our transaction. Otherwise ordinary
+        // pre-original telemetry is preserved, and the callback runs exactly once.
+        || {
+            if !original_first {
+                // SAFETY: the no-argument trampoline preserves the original callback.
+                unsafe { f() }
+            }
+        },
     );
 }
 

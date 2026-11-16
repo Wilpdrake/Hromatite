@@ -20,6 +20,19 @@
 
 use crate::pe::PeImage;
 
+fn verify_artifact_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("verified feature digest must contain 64 hexadecimal characters".into());
+    }
+    let actual = crate::sha256::hex_digest(bytes);
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "feature bytes SHA-256 mismatch: got {actual}, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
     let end = offset.checked_add(2).ok_or("PE offset overflow")?;
     let value = bytes.get(offset..end).ok_or("truncated PE integer")?;
@@ -532,11 +545,31 @@ impl FeatureImage {
     pub fn load(path: &str) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
-            imp::load(path)
+            let pe = PeImage::from_file(path)?;
+            imp::load_pe(pe)
         }
         #[cfg(not(target_os = "windows"))]
         {
             let _ = path;
+            Err("local feature mapping requires Windows".into())
+        }
+    }
+
+    /// Map exactly the bytes whose digest was checked. Unlike `load`, this
+    /// never reopens the path after validation: the supplied digest authorizes
+    /// one immutable in-memory snapshot of the generation.
+    pub fn load_verified(path: &str, expected_sha256: &str) -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("read feature {path}: {error}"))?;
+            verify_artifact_digest(&bytes, expected_sha256)?;
+            let pe = PeImage::from_bytes(bytes)?;
+            imp::load_pe(pe)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (path, expected_sha256);
             Err("local feature mapping requires Windows".into())
         }
     }
@@ -727,17 +760,11 @@ mod imp {
         ) -> Result<(ffi::HMODULE, Option<LiveModule>), String> {
             let wide = ffi::wide(name);
             // SAFETY: `wide` is NUL terminated and lives through both calls.
-            let mut handle = unsafe { ffi::GetModuleHandleW(wide.as_ptr()) };
+            let handle = unsafe { ffi::GetModuleHandleW(wide.as_ptr()) };
             if handle.is_null() {
-                // SAFETY: same buffer contract; the new loader reference is retained
-                // in `loaded` until feature retirement or failed-load cleanup.
-                handle = unsafe { ffi::LoadLibraryW(wide.as_ptr()) };
-                if handle.is_null() {
-                    // SAFETY: reads this thread's error slot immediately after failure.
-                    let error = unsafe { ffi::GetLastError() };
-                    return Err(format!("LoadLibraryW({name}) failed, GetLastError={error}"));
-                }
-                self.loaded.push(handle as usize);
+                return Err(format!(
+                    "dependency {name} is not present; reload must not wait for a new loader/lock"
+                ));
             }
             let live = LiveModule::from_base(handle as usize);
             Ok((handle, live))
@@ -927,8 +954,7 @@ mod imp {
         })
     }
 
-    pub fn load(path: &str) -> Result<super::FeatureImage, String> {
-        let pe = PeImage::from_file(path)?;
+    pub fn load_pe(pe: PeImage) -> Result<super::FeatureImage, String> {
         if pe.machine != 0x8664 || !pe.is_64 || !pe.is_dll {
             return Err("local feature image must be an AMD64 PE32+ DLL".into());
         }
@@ -1467,6 +1493,14 @@ mod tests {
     }
 
     #[test]
+    fn load_verified_rejects_a_different_generation_before_mapping() {
+        let expected = crate::sha256::hex_digest(b"generation-one");
+        assert!(super::verify_artifact_digest(b"generation-one", &expected).is_ok());
+        assert!(super::verify_artifact_digest(b"generation-two", &expected).is_err());
+        assert!(super::verify_artifact_digest(b"generation-one", "not-a-full-digest").is_err());
+    }
+
+    #[test]
     fn global_export_fallback_is_only_for_api_set_names() {
         let named = super::ImportSymbol::Name("VirtualAlloc".into());
         assert!(!super::api_set_fallback_allowed("KERNEL32.dll", &named));
@@ -1522,6 +1556,19 @@ mod tests {
         assert!(super::feature_api_bytes_valid(&bytes));
         bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
         assert!(!super::feature_api_bytes_valid(&bytes));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tick_mapping_never_acquires_an_os_loader() {
+        let production = include_str!("localmap.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production mapper");
+        assert!(
+            !production.contains("ffi::LoadLibraryW"),
+            "reload must fail a missing dependency, not block the game on an OS loader"
+        );
     }
 
     #[test]
