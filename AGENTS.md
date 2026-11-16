@@ -2654,3 +2654,44 @@ il2cpp одними чтениями памяти (без единого выз�
   `FIELD MANUAL // help / ? / F1; Esc closes`, Esc/Ctrl-C завершили процесс с 0.
 - Уже запущенный TUI продолжает исполнять старый binary; после сборки нужен
   перезапуск только консоли, игру перезапускать не требуется.
+
+### 2026-11-16 — LateUpdate ABI исправлен; native PlayerLoop tick доказан 90.5 вызовами/с
+
+- Коммиты: **`dfd6094`** (Unity 6 `MethodInfo.return_type@+0x20`, retry по
+  фактическому времени), **`61563db`** (рабочий managed auto-anchor Udon),
+  **`5505ece`** (первый native PlayerLoop runtime), **`348243a`** (рекурсивный
+  поиск callbacks), **`2a18a12`** (разыменование callback slot). Этот коммит —
+  журнал.
+- **Managed доказательство до PlayerLoop:** `VRC.Udon.UdonManager` был
+  материализован и затем пойман вживую: `hits=1932 (47.0/s), last tid=0x1c0`.
+  Исходный `VRCTweenPostLateUpdater` устанавливался, но был неактивен (`hits=0`),
+  поэтому `AUTO_CLASS` сейчас `VRC.Udon.UdonManager` / `#34575`.
+- **PlayerLoop ABI, измеренный вживую:** `GetCurrentPlayerLoop` (GameAssembly
+  `0x86cda10`) принимает скрытый out-buffer RCX, 0x28 байт:
+  `type@0, subSystemList@8, delegate@0x10, updateFunction@0x18, condition@0x20`.
+  Root-массив = 8 групп от TimeUpdate до PostLateUpdate; у них есть pointers на
+  children, но `updateFunction=0`. Поэтому обходим дерево с ограничениями
+  (16 уровней/512 узлов), а не принимаем root за рабочий anchor. `loopc` печатает
+  полные пути; `loop` — hits/частота/tid.
+- **Важный второй indirection:** `updateFunction` указывает на слот, а не на код.
+  Например выбранный `PlayerLoop.Update/ScriptRunBehaviourUpdate` имел поле
+  `0x6ffffc4d8378` в RW-области; содержимое слота — реальный executable stub
+  `0x6ffffaaefb80` (`mov rcx → mov rax → jmp [rax+8]`). Патчится именно stub,
+  trampoline публикуется до атомарной записи. `SetPlayerLoop` не вызывается.
+- **Финальный live-acceptance (pid 1240779):**
+  `hooked UnityEngine.PlayerLoop.Update/ScriptRunBehaviourUpdate at 0x6ffffaaefb80`;
+  GC inline guard установлен; первый native hit `tid=0x1c4`; повторный `loop`:
+  **`hits=3454 (90.5/s), last tid=0x1c4`**. `gc_failures=0` на момент проверки.
+  Игра оставлена работать. Это доказывает исполнение, а не долговременную EAC/GC
+  стабильность; длительный A/B и событие stale-record guard не заявляются.
+- Режим — explicit opt-in: `HROMATITE_PLAYER_LOOP=1`,
+  `HROMATITE_PLAYER_LOOP_TARGET=Update`. Текущий `~/.hromatite-mode` уже в этом
+  режиме. Дефолт runtime остаётся managed LateUpdate. QPC и `SetPlayerLoop`
+  не используются, своих polling-потоков нет, оригинальный callback вызывается
+  даже при защищённой ошибке payload.
+- По независимому review исправлены lifecycle: нельзя сменить target после
+  detach (старый in-flight кадр не попадёт в чужой trampoline), CAS публикации
+  закрывает install/unhook race, повторные permanent installation failures и
+  двойные snapshot/getter-вызовы убраны, нечитаемые поля больше не превращаются
+  в фальшивые NULL-записи. Статические проверки: **61 core + 5 DLL tests**,
+  Clippy `-D warnings`, Windows release.
