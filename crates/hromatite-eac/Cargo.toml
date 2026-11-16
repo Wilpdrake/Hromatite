@@ -1,0 +1,12 @@
+[package]
+name = "hromatite-eac"
+version = "0.1.0"
+edition = "2024"
+description = "EAC/EOS anti-cheat session, heartbeat codec and JSONL event log (pure std)"
+
+[lib]
+name = "hromatite_eac"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

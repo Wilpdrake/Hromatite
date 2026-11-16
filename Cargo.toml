@@ -3,6 +3,7 @@ members = [
     "crates/hromatite-abi",
     "crates/hromatite-core",
     "crates/hromatite-dll",
+    "crates/hromatite-eac",
     "crates/hromatite-features",
     "crates/test-target",
 ]
