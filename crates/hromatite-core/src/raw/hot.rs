@@ -7,6 +7,53 @@ const DEFAULT_TICK_MS: u64 = 250;
 static TICK_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReloadSelection {
+    Latest,
+    Generation(u64),
+    Status,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_reload_request(line: &str) -> Result<ReloadSelection, String> {
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("reload") {
+        return Err("usage: reload [gen [generation]] | reload status".into());
+    }
+    let action = parts.next().unwrap_or("latest");
+    match action {
+        "status" if parts.next().is_none() => Ok(ReloadSelection::Status),
+        "latest" if parts.next().is_none() => Ok(ReloadSelection::Latest),
+        "gen" => {
+            let generation = parts
+                .next()
+                .ok_or("reload gen requires a positive decimal id")?;
+            if parts.next().is_some() {
+                return Err("usage: reload gen <positive-id>".into());
+            }
+            let generation = generation
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation != 0)
+                .ok_or("reload gen requires a positive decimal id")?;
+            Ok(ReloadSelection::Generation(generation))
+        }
+        "status" | "latest" => Err("usage: reload status (no generation argument)".into()),
+        generation => {
+            if parts.next().is_some() {
+                return Err("usage: reload [gen [generation]] | reload status".into());
+            }
+            let generation = generation
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation != 0)
+                .ok_or("reload generation must be a positive decimal integer")?;
+            Ok(ReloadSelection::Generation(generation))
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct VersionedName {
     generation: u64,
@@ -87,7 +134,10 @@ pub fn tick_interval_ms() -> u64 {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{FeatureArtifact, config_text, parse_versioned_name, replace_config};
+    use super::{
+        FeatureArtifact, ReloadSelection, config_text, parse_reload_request, parse_versioned_name,
+        replace_config,
+    };
     use crate::hot::{Fault, HotConfig, HotReload, Phase, Tick};
     use crate::raw::localmap::FeatureImage;
     use crate::symbols;
@@ -733,24 +783,17 @@ mod imp {
         let command = parts.next()?.to_ascii_lowercase();
         match command.as_str() {
             "reload" => {
-                let action = parts.next().unwrap_or("latest");
-                if parts.next().is_some() {
-                    return Some(vec!["usage: reload [generation|status]".into()]);
-                }
-                if action == "status" {
+                let selection = match parse_reload_request(line) {
+                    Ok(selection) => selection,
+                    Err(error) => return Some(vec![error]),
+                };
+                if selection == ReloadSelection::Status {
                     return Some(vec![runtime.status()]);
                 }
-                let requested = if action == "latest" {
-                    None
-                } else {
-                    match action.parse::<u64>() {
-                        Ok(value) if value != 0 => Some(value),
-                        _ => {
-                            return Some(vec![
-                                "reload generation must be a positive decimal integer".into(),
-                            ]);
-                        }
-                    }
+                let requested = match selection {
+                    ReloadSelection::Latest => None,
+                    ReloadSelection::Generation(version) => Some(version),
+                    ReloadSelection::Status => unreachable!(),
                 };
                 let result =
                     choose_artifact(requested).and_then(|artifact| runtime.schedule(artifact));
@@ -969,6 +1012,33 @@ mod tests {
             "feature", "pos", "who", "esp", "m3c", "q", "guard", "unknown",
         ] {
             assert!(!super::resident_command(command), "feature loses {command}");
+        }
+    }
+
+    #[test]
+    fn reload_parser_supports_generation_shorthand_and_rejects_bad_arity() {
+        use super::{ReloadSelection, parse_reload_request};
+        assert_eq!(parse_reload_request("reload"), Ok(ReloadSelection::Latest));
+        assert_eq!(
+            parse_reload_request("reload 7"),
+            Ok(ReloadSelection::Generation(7))
+        );
+        assert_eq!(
+            parse_reload_request("reload gen 8"),
+            Ok(ReloadSelection::Generation(8))
+        );
+        assert_eq!(
+            parse_reload_request("reload status"),
+            Ok(ReloadSelection::Status)
+        );
+        for bad in [
+            "reload gen",
+            "reload gen 0",
+            "reload gen 3 extra",
+            "reload latest 3",
+            "reload 0",
+        ] {
+            assert!(parse_reload_request(bad).is_err(), "accepted {bad}");
         }
     }
 
