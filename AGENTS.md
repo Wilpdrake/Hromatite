@@ -2910,3 +2910,62 @@ il2cpp одними чтениями памяти (без единого выз�
   generation=1 previous=0` → `reload status`, `feature`, `pos`, `who` без
   рестарта → `rollback` → `config set TICK_MS 100` → ≥15 мин наблюдения
   (`VRChat.gc.log` без `SuspendThread loop failed`, нового `crash.dmp` нет).
+
+### 2026-11-16 — EAC heartbeat в payload: epoch-модель, кодек 24 Б, JSONL, команды `eac.*` (ветка, master чист)
+
+- **Где.** Ветка **`eac-heartbeat`**, воркtree `~/RustroverProjects/Hromatite-eac`;
+  master остался на `b7a1f22` (не мержили, не пушили). Коммиты: `04cbed0` — план
+  `docs/EAC-HEARTBEAT-PLAN.md`; `f093a4d` — крейт `hromatite-eac`; `1ecc0f7` —
+  маршрутизация `eac.*` + тик; `f06ee95` — clippy-фикс. Всё по правилу «план →
+  согласование → код»: план написан первым и лежит в ветке.
+- **Что сделано.** Новый крейт `crates/hromatite-eac` — только `std`, ноль внешних
+  крейтов (offline registry не нужен), `#![forbid(unsafe_code)]`:
+  * `session` — epoch-модель: один AC-сеанс на комнату (подтверждено логом: 18 входов =
+    18 `BeginSession` / 17 `EndSession`), монотонный `epoch`, счётчики `seq`/`hb_seq`/
+    `hb_in_epoch` **на эпоху**, `last_hb_ms` **между эпохами** → загрузка мира видна как
+    `dt_ms`, `gap` при `dt > 2 × interval_ms`.
+  * `codec` — 24-байтный заголовок `{u16 Version=2, u16 Flags, u64 SessionId,
+    u64 Sequence, u32 Checksum}` (ручная LE-упаковка, без паддинга `repr(C)`), payload
+    120 Б; `ChecksumKind::{Crc32c(default), Crc32, Fnv1a32}` — **HYPOTHESIS** (алгоритм
+    в bytecode VM неизвестен), регион `hdr[0..20] ++ payload` как в
+    `framing.EacMessage.try_parse`.
+  * `payload` — раскладка `heartbeat.py`: `seq u32 | ts u64 | nonce u64 | flags u32 |
+    sha256(integrity) | sha256(modules) | hmac-sha256(88 Б)`. **Побайтово совпадает с
+    вектором Python-референса** (тест `payload_matches_the_python_reference_vector_exactly`).
+  * `digest` — SHA-256 скопирован из `hromatite-core/src/sha256.rs` с attribution (ядро
+    Win32-специфично, линковать его в payload-образ не нужно) + HMAC-SHA256, CRC-32,
+    CRC-32C, FNV-1a; сверено с RFC 4231 / стандартными check-значениями.
+  * `eventlog` — JSONL, одна запись на строку, flush сразу; жёсткая ротация 32 МБ,
+    2 файла (`.jsonl` + `.jsonl.1`). Поля как в `eventlog.py`: `ts_ms`,`ev`,`epoch`,
+    `sid`,`seq`,`hb_in_epoch`,`dt_ms`,`expected_ms`; `None` не пишется (первый heartbeat
+    эпохи без `dt_ms`).
+  * `tailer` — опрос `output_log_*.txt` через `std::fs` (offset, частичные строки,
+    усечение): `Entering Room:`, `Joining wrld_`, `OnLeftRoom`, `OnDisconnected`,
+    `[AntiCheatClient]` → `ev:"game"` + `line`. Опционально (`eac_autosession=1`) по
+    `BeginSession`/`EndSession` в логе открывает/закрывает эпоху — до появления хуков.
+- **Как встроено в фичи.** Команды через `Feature::execute`: `eac.status`, `eac.begin
+  [sid]`, `eac.tick`, `eac.end [reason]`, `eac.log <path>`, `eac.tail <path>`; `help`
+  обновлён. `configure`: `eac`, `eac_auto`, `eac_autosession`, `eac_log`, `eac_tail`,
+  `eac_interval_ms` (200..60000, клампится). `tick()` в `lib.rs` больше не пустой: зовёт
+  `Feature::tick()` → поллинг tailer + heartbeat по расписанию при `eac_auto=1`; только
+  файловый I/O, память игры не трогается, паника по-прежнему ловится резидентом.
+- **Чем подтверждено (реальный вывод, offline).**
+  `cargo test -p hromatite-eac --target x86_64-unknown-linux-gnu --offline` →
+  `18 passed`; `tests/epochs.rs` (2 эпохи, 21 с разрыв мира, чтение JSONL с диска) →
+  `1 passed`. `cargo test -p hromatite-features …` → `14 passed` (новый тест: `eac.log`
+  → `begin` → 2×`tick` → `status` → `end` даёт 4 записи, `frame_len=144`, кадр 144 Б).
+  `cargo test --workspace --target x86_64-unknown-linux-gnu --offline` → core `119`,
+  abi `3`, eac `18`+`1`, features `14`, dll/`test-target` — всё `ok`, 0 failed.
+  `cargo build --workspace --release --target x86_64-pc-windows-gnu --offline` →
+  `Finished release` (hromatite.dll 1 783 374 Б, hromatite_features.dll 1 426 680 Б).
+  `cargo clippy -p hromatite-eac -p hromatite-features -- -D warnings` → чисто.
+  Python-референс: `PASS: 98 checks in 0.38s` — не сломан, векторы совпадают.
+- **Что НЕ подтверждено.** В живой VRChat не запускалось ни разу: хуков в EOSSDK нет
+  (фаза 2 — `EOS_AntiCheatClient_BeginSession/EndSession`, `AddNotifyMessageToServer(25)`,
+  `AddNotifyClientIntegrityViolated(26)`); эпохи пока двигаются командами или строками
+  лога, `sid` — производный, mac-ключ/integrity/modules — плейсхолдеры (помечены
+  HYPOTHESIS в doc-комментариях). Алгоритм checksum по-прежнему неизвестен: кодек
+  параметризован, смена — одна функция.
+- **Осталось.** Фаза 2: установка хуков и сверка эпох с настоящими `[AntiCheatClient]`
+  строками; затем live-приёмка в игре (лог JSONL ↔ `eacshim.log` по полям
+  `epoch`/`seq`/`dt_ms`). Merge в master — только после явного согласования пользователя.
