@@ -20,12 +20,7 @@ impl Host {
     }
 
     pub fn log(&self, message: &str) {
-        (self.api.log)(
-            b"con\0".as_ptr().cast(),
-            3,
-            message.as_ptr().cast(),
-            message.len(),
-        );
+        (self.api.log)(c"con".as_ptr(), 3, message.as_ptr().cast(), message.len());
     }
 
     pub fn read_upto(&self, address: usize, len: usize) -> Vec<u8> {
@@ -66,7 +61,7 @@ impl Host {
     }
 
     pub fn read_usize(&self, address: usize) -> Option<usize> {
-        Some(usize::try_from(self.read_u64(address)?).ok()?)
+        usize::try_from(self.read_u64(address)?).ok()
     }
 
     pub fn write_bytes(&self, address: usize, data: &[u8]) -> bool {

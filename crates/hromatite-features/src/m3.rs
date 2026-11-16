@@ -283,6 +283,34 @@ impl<'a> Metadata<'a> {
         let function = base.checked_add(IMAGE_GET_CLASS_RVA as usize)?;
         (function.checked_add(8)? <= base.checked_add(size)?).then_some(function)
     }
+
+    /// Find an already materialised class, or populate its assembly through the
+    /// measured `il2cpp_image_get_class(image, index)` export.
+    pub fn class_or_materialise(
+        &mut self,
+        namespace: &str,
+        name: &str,
+        assembly: &str,
+    ) -> Option<usize> {
+        if let Some((_, class)) = self.find(namespace, name, CLASS_MAX).first() {
+            return Some(*class);
+        }
+        let function = self.image_get_class()?;
+        let first = self.find_domain()?;
+        let image = self.image_of(first, assembly)?;
+        for index in 0..40_000usize {
+            let class = self.host.call(function, &[image, index]).ok()?;
+            if class < 0x10000 || self.host.read_u8(class).is_none() {
+                continue;
+            }
+            if self.class_name(class).as_deref() == Some(name)
+                && self.class_namespace(class).as_deref() == Some(namespace)
+            {
+                return Some(class);
+            }
+        }
+        None
+    }
 }
 
 pub fn dispatch(

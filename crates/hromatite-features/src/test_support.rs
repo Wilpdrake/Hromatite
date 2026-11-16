@@ -109,6 +109,45 @@ pub fn fault(status: i32) -> Behavior {
     Box::new(move |_| (status, 0))
 }
 
+pub fn vector3(x: f32, y: f32, z: f32) -> Behavior {
+    Box::new(move |args| {
+        let words = [
+            u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32),
+            u64::from(z.to_bits()),
+        ];
+        if let Some(output) = args.first().copied() {
+            // SAFETY: this fake native getter simulates writes into the real
+            // two-qword Vector3 output buffer supplied by the feature.
+            unsafe {
+                let output = output as *mut u64;
+                output.write(words[0]);
+                output.add(1).write(words[1]);
+            }
+        }
+        (0, 0)
+    })
+}
+
+pub fn matrix4(values: [f32; 16]) -> Behavior {
+    Box::new(move |args| {
+        let mut words = [0u64; 8];
+        for (index, value) in values.iter().enumerate() {
+            words[index / 2] |= u64::from(value.to_bits()) << ((index % 2) * 32);
+        }
+        if let Some(output) = args.first().copied() {
+            // SAFETY: this fake native getter simulates writes into the real
+            // eight-qword Matrix4x4 output buffer supplied by the feature.
+            unsafe {
+                let output = output as *mut u64;
+                for (index, word) in words.iter().enumerate() {
+                    output.add(index).write(*word);
+                }
+            }
+        }
+        (0, 0)
+    })
+}
+
 pub fn on_call(address: u64, behavior: Behavior) {
     FAKE.with(|fake| {
         fake.borrow_mut().behaviors.insert(address, behavior);

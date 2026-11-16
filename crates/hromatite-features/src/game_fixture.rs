@@ -162,3 +162,117 @@ pub fn install() {
         }),
     );
 }
+
+pub const CAMERA_INSTANCE: u64 = 0x0000_0007_0001_0000;
+pub const TRANSFORM_INSTANCE: u64 = 0x0000_0007_0002_0000;
+const PLAYER_LIST: u64 = 0x0000_0007_1000_0000;
+const PLAYER_ITEMS: u64 = 0x0000_0007_1000_1000;
+const PLAYER_ONE: u64 = 0x0000_0007_1000_2000;
+const PLAYER_TWO: u64 = 0x0000_0007_1000_3000;
+
+fn player_objects(player: u64) -> u64 {
+    if player == PLAYER_ONE {
+        PLAYER_ONE + 0x4000
+    } else {
+        PLAYER_TWO + 0x4000
+    }
+}
+
+fn il2cpp_string(address: u64, value: &str) {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    fake::put_u32(address + 0x10, units.len() as u32);
+    fake::put_utf16(address + 0x14, value);
+}
+
+pub fn install_telemetry() {
+    fake::map_zeroed(CAMERA_INSTANCE, 8);
+    fake::put_u64(CAMERA_INSTANCE, CAMERA_CLASS);
+    fake::map_zeroed(TRANSFORM_INSTANCE, 8);
+    fake::put_u64(TRANSFORM_INSTANCE, TRANSFORM_CLASS);
+    fake::on_call(GET_MAIN, fake::returning(CAMERA_INSTANCE));
+    fake::on_call(
+        GET_TRANSFORM,
+        Box::new(|args| {
+            (
+                0,
+                if args.first().copied() == Some(CAMERA_INSTANCE) {
+                    TRANSFORM_INSTANCE
+                } else {
+                    0
+                },
+            )
+        }),
+    );
+    fake::on_call(
+        GET_POSITION,
+        Box::new(|args| {
+            if args.get(1).copied() == Some(TRANSFORM_INSTANCE) {
+                fake::vector3(0.0, 0.0, 0.0)(args)
+            } else {
+                (-100, 0)
+            }
+        }),
+    );
+    fake::on_call(GET_LOCAL_POSITION, fake::vector3(1.0, 2.0, 3.0));
+    fake::on_call(GET_FORWARD, fake::vector3(0.0, 0.0, 1.0));
+    fake::on_call(GET_PIXEL_WIDTH, fake::returning(1920));
+    fake::on_call(GET_PIXEL_HEIGHT, fake::returning(1080));
+    let mut projection = [0f32; 16];
+    for index in 0..4 {
+        projection[index * 5] = 1.0;
+    }
+    // Orthographic projection with horizontal half-scale: world x=1 projects
+    // to NDC x=0.5, or 1440 px on the 1920 px fixture viewport.
+    projection[0] = 0.5;
+    let mut identity = [0f32; 16];
+    for index in 0..4 {
+        identity[index * 5] = 1.0;
+    }
+    fake::on_call(GET_PROJECTION, fake::matrix4(projection));
+    fake::on_call(GET_VIEW, fake::matrix4(identity));
+
+    fake::map_zeroed(PLAYER_LIST, 0x20);
+    fake::put_u64(PLAYER_LIST + 0x10, PLAYER_ITEMS);
+    fake::put_u32(PLAYER_LIST + 0x18, 2);
+    fake::map_zeroed(PLAYER_ITEMS, 0x30);
+    fake::put_u64(PLAYER_ITEMS + 0x18, 2);
+    fake::put_u64(PLAYER_ITEMS + 0x20, PLAYER_ONE);
+    fake::put_u64(PLAYER_ITEMS + 0x28, PLAYER_TWO);
+    fake::on_call(GET_ALL_PLAYERS, fake::returning(PLAYER_LIST));
+    fake::on_call(
+        GET_PLAYER_ID,
+        Box::new(|args| {
+            (
+                0,
+                if args.first().copied() == Some(PLAYER_ONE) {
+                    11
+                } else {
+                    12
+                },
+            )
+        }),
+    );
+    fake::on_call(
+        GET_PLAYER_POSITION,
+        Box::new(|args| match args.get(1).copied() {
+            Some(PLAYER_ONE) => fake::vector3(0.0, 0.0, 0.0)(args),
+            Some(PLAYER_TWO) => fake::vector3(1.0, 0.0, 0.0)(args),
+            _ => (-100, 0),
+        }),
+    );
+    fake::on_call(
+        GET_PLAYER_OBJECTS,
+        Box::new(|args| (0, args.first().copied().map_or(0, player_objects))),
+    );
+    for (player, name) in [(PLAYER_ONE, "AvatarOne"), (PLAYER_TWO, "AvatarTwo")] {
+        let array = player_objects(player);
+        fake::map_zeroed(array, 0x28);
+        fake::put_u64(array + 0x18, 1);
+        fake::put_u64(array + 0x20, player + 0x8000);
+        il2cpp_string(player + 0x8000, name);
+    }
+    fake::on_call(
+        GET_OBJECT_NAME,
+        Box::new(|args| (0, args.first().copied().unwrap_or(0))),
+    );
+}

@@ -3,6 +3,7 @@
 use crate::host::Host;
 use crate::m3::{Cache as MetadataCache, Metadata};
 use crate::memory::{bytes, decode_hex, parse_addr, qwords};
+use crate::telemetry::Cache as TelemetryCache;
 use hromatite_abi::{
     ABI_VERSION, HostApiV1, STATUS_BAD_ARGUMENT, STATUS_ERROR, STATUS_NOT_READY, STATUS_OK,
 };
@@ -14,6 +15,7 @@ pub struct Feature {
     memory: bool,
     m3: bool,
     metadata_cache: MetadataCache,
+    telemetry_cache: TelemetryCache,
 }
 
 impl Feature {
@@ -25,6 +27,7 @@ impl Feature {
             memory: true,
             m3: true,
             metadata_cache: MetadataCache::default(),
+            telemetry_cache: TelemetryCache::default(),
         }
     }
 
@@ -96,6 +99,13 @@ impl Feature {
             let (lines, status) = {
                 let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
                 crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+            };
+            return self.respond(lines, status);
+        }
+        if matches!(command.as_str(), "pos" | "who" | "esp") {
+            let (lines, status) = {
+                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
+                crate::telemetry::dispatch(&mut metadata, &mut self.telemetry_cache, &command)
             };
             return self.respond(lines, status);
         }

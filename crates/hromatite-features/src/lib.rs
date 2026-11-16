@@ -8,6 +8,7 @@ mod feature;
 mod host;
 mod m3;
 mod memory;
+mod telemetry;
 
 use feature::Feature;
 use hromatite_abi::{
@@ -381,5 +382,79 @@ mod tests {
         assert!(fake::message_log().contains(&format!("table {replacement:#x}")));
         assert_eq!(send("feature"), STATUS_OK);
         assert!(fake::message_log().contains("feature: generation=12 abi=1"));
+    }
+
+    #[test]
+    fn telemetry_preserves_camera_players_and_overlay_projection_contract() {
+        let _serial = fake::serial();
+        start(20);
+        crate::game_fixture::install();
+        crate::game_fixture::install_telemetry();
+        use crate::game_fixture as fixture;
+
+        assert_eq!(send("pos"), STATUS_OK);
+        assert_eq!(send("who"), STATUS_OK);
+        assert_eq!(send("esp"), STATUS_OK);
+        let log = fake::message_log();
+        assert!(log.contains("pos: Camera.main ="), "{log}");
+        assert!(
+            log.contains("pos: get_position = (0.000, 0.000, 0.000)"),
+            "{log}"
+        );
+        assert!(
+            log.contains("pos: get_localPosition = (1.000, 2.000, 3.000)"),
+            "{log}"
+        );
+        assert!(log.contains("who: 2 player(s)"), "{log}");
+        assert!(
+            log.contains("id=11 pos=(0.00, 0.00, 0.00) go=\"AvatarOne\""),
+            "{log}"
+        );
+        assert!(
+            log.contains("id=12 pos=(1.00, 0.00, 0.00) go=\"AvatarTwo\""),
+            "{log}"
+        );
+        assert!(log.contains("esp: head w=1920 h=1080 err=0.0"), "{log}");
+        assert!(log.contains("esp: id=11 d=0.00 x=960.0 y=540.0"), "{log}");
+        assert!(log.contains("esp: id=12 d=1.00 x=1440.0 y=540.0"), "{log}");
+        assert!(log.contains("w=1.00,0.00,0.00 name=AvatarTwo"), "{log}");
+
+        let vector_calls: Vec<_> = fake::calls()
+            .into_iter()
+            .filter(|(address, _)| *address == fixture::GET_POSITION)
+            .collect();
+        assert!(
+            vector_calls.iter().all(|(_, args)| args.len() == 2),
+            "{vector_calls:?}"
+        );
+        assert!(
+            vector_calls
+                .iter()
+                .any(|(_, args)| args[1] == fixture::TRANSFORM_INSTANCE)
+        );
+        for function in [fixture::GET_PROJECTION, fixture::GET_VIEW] {
+            assert!(fake::calls().iter().any(|(address, args)| {
+                *address == function && args.len() == 2 && args[1] == fixture::CAMERA_INSTANCE
+            }));
+        }
+    }
+
+    #[test]
+    fn telemetry_faults_return_answer_lines_instead_of_direct_native_calls() {
+        let _serial = fake::serial();
+        start(21);
+        crate::game_fixture::install();
+        crate::game_fixture::install_telemetry();
+        fake::on_call(crate::game_fixture::GET_MAIN, fake::fault(0x0000_0005));
+
+        assert_eq!(send("pos"), STATUS_OK);
+        let log = fake::message_log();
+        assert!(
+            log.contains("pos: Camera.main faulted: host status 5"),
+            "{log}"
+        );
+        assert!(fake::calls().iter().any(|(address, args)| {
+            *address == crate::game_fixture::GET_MAIN && args.is_empty()
+        }));
     }
 }
