@@ -115,6 +115,39 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// Install the EOS anti-cheat hooks from the resident startup thread.
+///
+/// `AddNotifyMessageToServer` is registered by VRChat within a few hundred
+/// milliseconds of `EOSSDK-Win64-Shipping.dll` loading — long before the first
+/// managed tick. Waiting for the module here (50 ms poll, bounded) and patching
+/// immediately is what makes the game's callback interception possible; the
+/// feature image's own `Hooks::poll` then sees the entries already patched and
+/// reuses their trampolines through the shared table.
+fn install_ac_hooks() {
+    const EOSSDK: &str = "EOSSDK-Win64-Shipping.dll";
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(20);
+    while started.elapsed() < budget {
+        if procs::own_module(EOSSDK).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if procs::own_module(EOSSDK).is_none() {
+        log::log_tag(
+            "eac",
+            "EOSSDK not loaded yet; hooks stay pending on the tick",
+        );
+        return;
+    }
+    let mut hooks = hromatite_eac::Hooks::new();
+    let line = hooks.install_now();
+    log::log_tag("eac", &line);
+    if let Some(status) = hooks.status_lines().first() {
+        log::log_tag("eac", status);
+    }
+}
+
 fn attach(hinst: *mut core::ffi::c_void) {
     log::log_tag("dll", "DllMain(PROCESS_ATTACH), managed LateUpdate runtime");
 
@@ -130,6 +163,10 @@ fn attach(hinst: *mut core::ffi::c_void) {
         log::log_tag("dll", "startup aborted: Unity modules are unavailable");
         return;
     }
+
+    // Anti-cheat hooks before any managed tick exists: VRChat registers its
+    // message-to-server callback early and only once.
+    log::guard("install_ac_hooks", install_ac_hooks);
 
     if let Err(error) = validate_modes(
         &env_or("HROMATITE_FRAME_HOOK", "1"),

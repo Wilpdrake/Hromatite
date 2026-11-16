@@ -9,6 +9,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hromatite-core = { path = "../hromatite-core" }
+# The anti-cheat hooks must be installed before VRChat registers its
+# message-to-server callback, i.e. from the resident's startup thread, not from
+# the first managed tick. The crate is pure std + local Win32 declarations.
+hromatite-eac = { path = "../hromatite-eac" }
 
 [lints]
 workspace = true
