@@ -7,6 +7,7 @@
 
 pub mod crypto;
 pub mod gcthreads;
+pub mod hot;
 pub mod lateupdate;
 pub mod log;
 pub mod m3;

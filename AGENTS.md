@@ -2773,3 +2773,18 @@ il2cpp одними чтениями памяти (без единого выз�
   без `SuspendThread loop failed` / `ResumeThread failed`. Проверить именно меню →
   прокрутку миров с изображениями. Долговременная стабильность и EAC-наблюдение
   этой реализации ещё НЕ подтверждены.
+
+### 2026-11-16 — Hot-reload M0: зафиксирован C ABI и граница resident/features
+
+- Коммит этого этапа: `feat(hot): freeze the resident/feature ABI`.
+- Пользователь выбрал полный вариант A и разрешил до пяти агентов. Созданы
+  `hromatite-abi` (версия 1, C POD buffers/callbacks, init/dispatch/tick/configure/
+  shutdown, экспорт `hromatite_feature_v1`) и scaffold `hromatite-features`;
+  зарегистрированы места `hot.rs`, `raw/hot.rs`, `raw/localmap.rs` и `VirtualFree`.
+- Базовая проверка до изменений: core **69/69**, DLL **5/5**, release workspace OK.
+  После scaffold: ABI **3/3**, release workspace (включая feature cdylib) OK,
+  `git diff --check` OK. Поведение работающей DLL ещё не менялось, игра не запускалась.
+- Осталось M1–M5: реальные feature-команды, in-process PE mapper, поколения с
+  drain/atomic switch/rollback/retirement, host watcher/TUI, hot-config и live
+  acceptance. Rust String/Vec/static runtime не должны пересекать границу DLL;
+  GC guard и существующий tick остаются исключительно в resident runtime.

@@ -1,0 +1,13 @@
+[package]
+name = "hromatite-abi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "hromatite_abi"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

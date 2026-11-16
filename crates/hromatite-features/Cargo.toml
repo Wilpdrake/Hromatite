@@ -1,0 +1,15 @@
+[package]
+name = "hromatite-features"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "hromatite_features"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+hromatite-abi = { path = "../hromatite-abi" }
+
+[lints]
+workspace = true

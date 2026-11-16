@@ -10,14 +10,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hromatite-abi"
+version = "0.1.0"
+
+[[package]]
 name = "hromatite-core"
 version = "0.1.0"
+dependencies = [
+ "hromatite-abi",
+]
 
 [[package]]
 name = "hromatite-dll"
 version = "0.1.0"
 dependencies = [
  "hromatite-core",
+]
+
+[[package]]
+name = "hromatite-features"
+version = "0.1.0"
+dependencies = [
+ "hromatite-abi",
 ]
 
 [[package]]

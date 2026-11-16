@@ -8,6 +8,7 @@ name = "hromatite_core"
 path = "src/lib.rs"
 
 [dependencies]
+hromatite-abi = { path = "../hromatite-abi" }
 
 [lints]
 workspace = true

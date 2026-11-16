@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/hromatite-core", "crates/hromatite-dll", "crates/test-target"]
+members = [
+    "crates/hromatite-abi",
+    "crates/hromatite-core",
+    "crates/hromatite-dll",
+    "crates/hromatite-features",
+    "crates/test-target",
+]
 resolver = "3"
 
 [workspace.lints.rust]

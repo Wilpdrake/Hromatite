@@ -234,6 +234,10 @@ unsafe extern "system" {
     pub fn RemoveVectoredExceptionHandler(handle: *mut core::ffi::c_void) -> u32;
     pub fn SetUnhandledExceptionFilter(filter: *const core::ffi::c_void) -> *mut core::ffi::c_void;
 
+    /// `VirtualFree` via mingw import libs reaches kernelbase even though the
+    /// historical declaration is commonly shown under kernel32.
+    #[link_name = "VirtualFree"]
+    pub fn VirtualFree(addr: *mut u8, size: usize, free_type: u32) -> BOOL;
     pub fn VirtualProtect(addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
     pub fn FlushInstructionCache(h: HANDLE, base: *const u8, size: usize) -> BOOL;
     pub fn GetCurrentProcess() -> HANDLE;
