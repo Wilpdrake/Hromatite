@@ -2726,3 +2726,50 @@ il2cpp одними чтениями памяти (без единого выз�
   `~/.hromatite-logs/gc-20261116-042539-crash-manual.log`
   (sha256 `25e7edd68dad5972b0fd96ccf5bc1e826411a8a39af17fe2c454de395fdc833e`).
   Агент не перезапускал и не убивал игру. Репозиторий был чист на `d808cc7`.
+
+### 2026-11-16 — GC Guard: CloseHandle после unlink, VEH с saved-next; независимое ревью PASS
+
+- Кодовый коммит **`259902b`** (`[verified] fix(gc): protect Boehm removal and
+  fatal recovery`). Новый `crates/hromatite-core/src/raw/gcguard.rs`, точечные
+  прод-патчи в `raw/hook.rs`, `raw/context.rs`, `ffi/mod.rs`, регрессии в
+  `tools/test_gc_detour_abi.py`. Этот коммит — дописанный журнал и обновлённый
+  `unity-il2cpp-modding/references/gc-thread-table.md` §10.
+- **Что доказано статически.** Ghidra disassembly/pseudocode показал, что
+  `FUN_180c417b0` делает `CloseHandle` до bucket unlink/free. Прежний guard на
+  `GetThreadContext` не мог помочь раннему `SuspendThread`. Теперь исходный close
+  пропускается на `0xc417f0` и выполняется на `0xc41818`, **после unlink, до
+  sentinel/GC_free**. `GC_remove_thread(tid)` сам выполняет cleanup; ручные
+  очереди, `OpenThread` и подмена handle удалены.
+- **Контур защиты.** entry `GC_suspend_all` держит `GC_threads`-list lock на
+  sanitize + оригинальную сборку. VEH работает только при `ENTRY_ACTIVE` и
+  совпадающем `ENTRY_OWNER_TID`; RBX сначала проверяется как linked record.
+  `next` сохраняется до cleanup, поэтому VEH возвращается на `0xc41a90`
+  (либо `0xc41c6a`), а не читает освобождённый record. Общий payload VEH
+  по-прежнему ловит только собственные guarded ошибки, произвольные `int3`/AV
+  не подавляется.
+- **Lifecycle, который стоил нескольких независимых ревью:** решение `Skip`
+  хранится per-record, `Original` stateless. `DETACHING` липкий до полного
+  reinstall; timeout возвращает прежнее значение. `INFLIGHT` + незавершённые
+  решения блокируют detach между двумя call-site. Origins и `Prep` живут весь
+  процесс, attached регистрируется сразу после каждого patch, relay перед
+  повторной записью возвращается в RWX. `after_unhook` вычисляет каждый GC target
+  отдельно, поэтому частичный detach не выдаётся за полную защиту.
+- **Финальная независимая проверка `passed=true`** (`deleg_bdba23ec`, 2026-11-16):
+  security_concerns и logic_errors пусты. Ранние ревью нашли и затем закрыли:
+  rel8 trampoline, ошибки handle incarnation, ordinary return мимо unlink/free,
+  утечки `Prep`, повторный snapshot E9, RX relay, close between activation flips,
+  потерянные решения и частичный reinstall. Эти проблемы нельзя повторять.
+- **Проверено командами:** `cargo test -p hromatite-core --target
+  x86_64-unknown-linux-gnu` — **69/69**; `cargo test -p hromatite-dll --target
+  x86_64-unknown-linux-gnu` — **5/5**; workspace Clippy `-D warnings` — OK;
+  `cargo build --workspace --release` — OK; `python3 tools/test_gc_detour_abi.py -v`
+  — **2/2** (`gc_context_detour`, оба source-close naked continuations,
+  RBX→RCX explicit argument); `git diff --check` — OK. Release DLL sha256
+  **`0599ac9ce764393850af28ca2d523e720a1eb42a358c17dc5a2a94665ab84b95`**.
+- **Осталось строго live acceptance:** пользователь сам закрывает старый crash-dialog
+  и перезапускает игру (агент не делает kill/start). В логе ожидаем `entry GC guard
+  installed`, затем при массовых worker exits `entry guard: ... cleaned by
+  GC_remove_thread` либо `VEH guard: recovered ...`, а после них следующий `GC #N`
+  без `SuspendThread loop failed` / `ResumeThread failed`. Проверить именно меню →
+  прокрутку миров с изображениями. Долговременная стабильность и EAC-наблюдение
+  этой реализации ещё НЕ подтверждены.
