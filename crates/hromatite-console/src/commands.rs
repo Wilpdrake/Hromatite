@@ -58,8 +58,8 @@ commands![
         "process threads and start addresses",
         ReadOnly
     ),
-    ("help", "help", "payload command reference", ReadOnly),
-    ("?", "?", "alias for payload command reference", ReadOnly),
+    ("help", "help", "open the local field manual", ReadOnly),
+    ("?", "?", "alias for the local field manual", ReadOnly),
     (
         "q",
         "q <addr> [count]",

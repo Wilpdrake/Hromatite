@@ -4,8 +4,10 @@ Interactive Linux host TUI for Hromatite's **existing** Proton file channel.
 It tails `hromatite.log` incrementally and opens `hromatite-cmd.txt` only with
 `create + append`; it does not add any thread, socket or pipe to the game.
 The compact green/cyan dashboard shows link freshness, managed-tick rate, GC
-health, player count, camera and the most recent command/answer stream. F1 keeps
-file paths and the complete key reference out of the main view.
+health, player count, camera and the most recent command/answer stream. `help`,
+`?` (both followed by Enter) or **F1** opens a local field manual with file paths
+and the complete key reference; unlike payload commands, it also works while the
+game log is stale or the payload is not answering.
 
 ## Interactive operations
 
@@ -36,12 +38,12 @@ prefix under `~/.local/share/Steam`. The usual paths are:
 
 | Key | Action |
 | --- | --- |
-| Enter | Send a safe command, or confirm a `RISK` command on the second press |
+| Enter | Open the local manual for exact `help` / `?`, send another safe command, or confirm a `RISK` command on the second press |
 | Up / Down | Command history (with draft preservation), or palette selection |
 | Tab | Complete a payload `help` command; show ambiguous matches |
 | Ctrl-R, or `/` on empty input | Incrementally filter the in-memory log; Enter accepts |
 | PgUp / PgDn | Scroll; pausing/resuming follow is explicit in the status row |
-| F1 | Open/close the field manual and file paths |
+| F1, or `help` / `?` + Enter | Open/close the local field manual and file paths |
 | F2 | Pause/resume following new lines |
 | F3 | Toggle errors + GC filter |
 | F4, or `:` on empty input | Search the described command palette |

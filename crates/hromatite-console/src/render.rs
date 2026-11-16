@@ -179,9 +179,10 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
             .map(human_bytes)
             .unwrap_or_else(|| "--".into());
         let help = [
-            " FIELD MANUAL // F1 or Esc closes".to_string(),
+            " FIELD MANUAL // help / ? / F1; Esc closes".to_string(),
+            " local view: works without a live payload answer".into(),
             " enter send | tab complete | up/down command history".into(),
-            " F4 or : command palette | / or Ctrl-R log filter".into(),
+            " F4 or : payload commands | / or Ctrl-R log filter".into(),
             " F2 follow | F3 errors+GC | PgUp/PgDn scrollback".into(),
             " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
             " F8 clear view only | Ctrl-C quit | Esc back".into(),

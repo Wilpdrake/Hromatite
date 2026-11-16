@@ -14,6 +14,7 @@ USAGE:
   --size WxH     Snapshot dimensions, for example 120x32
 
 KEYS:
+  help or ? local field manual (no payload answer required)
   Enter send/confirm    Up/Down history    Tab complete    Ctrl-R or / filter
   F1 field manual       F2 follow          F3 errors+GC    F4 or : palette
   F5 refresh once       F6 auto telemetry  F8 clear view   PgUp/PgDn scroll

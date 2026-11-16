@@ -353,6 +353,16 @@ impl ConsoleModel {
     }
 
     fn prepare_submission(&mut self, submitted: String) -> Action {
+        if matches!(submitted.as_str(), "help" | "?") {
+            self.pending_confirmation = None;
+            self.mode = Mode::Command;
+            self.history.push(&submitted);
+            self.set_active_text("");
+            self.completions.clear();
+            self.notice = "local field manual — Esc closes".into();
+            self.show_help = true;
+            return Action::None;
+        }
         let name = submitted.split_whitespace().next().unwrap_or("");
         let dangerous = command(name).is_some_and(|item| item.risk == Risk::Dangerous);
         if dangerous && self.pending_confirmation.as_deref() != Some(submitted.as_str()) {
@@ -705,6 +715,17 @@ mod tests {
         assert_eq!(m.handle(Key::Esc), Action::None);
         assert!(!m.help_visible());
         assert_eq!(m.handle(Key::Esc), Action::Exit);
+    }
+
+    #[test]
+    fn help_commands_open_the_local_manual_without_a_payload_roundtrip() {
+        for input in ["help", "?"] {
+            let mut m = ConsoleModel::new(false);
+            m.set_active_text(input);
+            assert_eq!(m.handle(Key::Enter), Action::None, "input: {input}");
+            assert!(m.help_visible(), "input: {input}");
+            assert_eq!(m.active_text(), "", "input: {input}");
+        }
     }
 
     #[test]
