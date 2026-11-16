@@ -47,6 +47,16 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use crate::capture::{CaptureFile, Frame, hex_prefix, read_frames};
 use crate::clock::now_ms;
 use crate::forge::{self, BodyMode, Template};
+
+/// Mutable forge state that belongs to one learned frame.
+#[derive(Clone)]
+struct Learned {
+    template: Template,
+    /// `EAC_FORGE_BODY=bump`: rewrite the message counter per frame.
+    bump: bool,
+    /// Next value for the message counter at `msg+0x18`.
+    counter: u32,
+}
 use crate::hook;
 
 /// DLL that owns every AC export we hook.
@@ -143,8 +153,9 @@ static FORGE_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static FORGE_THREAD: AtomicBool = AtomicBool::new(false);
 /// The learned template *and* the body mode it must be emitted with. Both
 /// live under the same lock because they belong together: the image that
-/// learns the frame also decides how its body is refreshed.
-static FORGE_TEMPLATE: Mutex<Option<(Template, BodyMode)>> = Mutex::new(None);
+/// learns the frame also decides how its body is refreshed, and the counter
+/// must advance across emissions, not restart from the learned value.
+static FORGE_TEMPLATE: Mutex<Option<Learned>> = Mutex::new(None);
 static FORGE_CAPTURE: Mutex<Option<CaptureFile>> = Mutex::new(None);
 
 /// One `(ClientData, callback)` pair registered by the game.
@@ -1164,13 +1175,18 @@ fn forge_learn(data: &[u8], length: usize) {
     // `EAC_FORGE_TEMPLATE=start`: a middle fragment has no message header, so
     // only a start frame can be refreshed field by field (see `BodyMode::Bump`).
     let store = !FORGE_PREFER_START.load(Ordering::Relaxed) || template.starts_message();
-    let mode = if FORGE_BUMP.load(Ordering::Relaxed) {
-        BodyMode::Bump
-    } else {
-        BodyMode::Stale
-    };
     if store && let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
-        *slot = Some((template, mode));
+        let counter = template
+            .body
+            .get(forge::MESSAGE_COUNTER_OFFSET..forge::MESSAGE_COUNTER_OFFSET + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+            .unwrap_or(0);
+        *slot = Some(Learned {
+            template,
+            bump: FORGE_BUMP.load(Ordering::Relaxed),
+            counter,
+        });
     }
     if seen <= 3 || seen.is_multiple_of(20) {
         hook_log(format!(
@@ -1208,9 +1224,10 @@ fn forge_begin(now: u64) -> bool {
     let Ok(slot) = FORGE_TEMPLATE.lock() else {
         return false;
     };
-    let Some((template, _)) = slot.as_ref() else {
+    let Some(learned) = slot.as_ref() else {
         return false;
     };
+    let template = &learned.template;
     let seq = template.next_seq();
     FORGE_NEXT_SEQ.store(seq, Ordering::Relaxed);
     FORGE_STARTED.store(true, Ordering::Release);
@@ -1223,7 +1240,7 @@ fn forge_begin(now: u64) -> bool {
         FORGE_AFTER_MS.load(Ordering::Relaxed),
         FORGE_INTERVAL_MS.load(Ordering::Relaxed),
         if FORGE_BUMP.load(Ordering::Relaxed) {
-            BodyMode::Bump
+            BodyMode::Counter(0)
         } else {
             BodyMode::Stale
         },
@@ -1294,17 +1311,24 @@ fn first_client_data() -> *mut c_void {
 
 /// Build one heartbeat and hand it to the game's `MessageToServer` callback.
 fn emit_forge_frame(now: u64) {
-    let Ok(slot) = FORGE_TEMPLATE.lock() else {
+    let Ok(mut slot) = FORGE_TEMPLATE.lock() else {
         return;
     };
-    let Some((template, mode)) = slot.as_ref() else {
+    let Some(learned) = slot.as_mut() else {
         return;
     };
-    let mode = *mode;
+    learned.counter = learned.counter.wrapping_add(1);
+    let mode = if learned.bump {
+        BodyMode::Counter(learned.counter)
+    } else {
+        BodyMode::Stale
+    };
     let seq = FORGE_NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let template = &learned.template;
     let frame = forge::build_frame(template, seq, mode);
     let sid = template.session_id;
     let flags = template.flags;
+    let counter = learned.counter;
     drop(slot);
     debug_assert_eq!(frame.len(), forge::FRAME_LEN);
     let crc = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]);
@@ -1345,7 +1369,7 @@ fn emit_forge_frame(now: u64) {
     let count = FORGE_EMITTED.load(Ordering::Relaxed);
     hook_log(format!(
         "[forge] sid=0x{sid:x} seq={seq} crc=0x{crc:08x} len=512 flags=0x{flags:x} \
-         n={count} dt_ms={dt} delivered={delivered}"
+         n={count} counter={counter} dt_ms={dt} delivered={delivered}"
     ));
 }
 
@@ -1805,7 +1829,7 @@ mod tests {
             .expect("template lock")
             .clone()
             .expect("template")
-            .0;
+            .template;
         assert_eq!(template.session_id, 0x158b);
         assert_eq!(template.last_seq, 11, "the newest live frame wins");
         assert_eq!(template.body[0], 0xBB);
@@ -1825,7 +1849,11 @@ mod tests {
         template.flags = forge::FLAG_START;
         template.body[forge::MESSAGE_COUNTER_OFFSET..forge::MESSAGE_COUNTER_OFFSET + 4]
             .copy_from_slice(&7u32.to_le_bytes());
-        *FORGE_TEMPLATE.lock().expect("template lock") = Some((template, BodyMode::Bump));
+        *FORGE_TEMPLATE.lock().expect("template lock") = Some(Learned {
+            template,
+            bump: true,
+            counter: 7,
+        });
         FORGE_BUMP.store(true, Ordering::Relaxed);
         FORGE_NEXT_SEQ.store(1, Ordering::Relaxed);
         // No callback bound: the function still builds, captures and logs.
@@ -1865,7 +1893,11 @@ mod tests {
         BIND_COUNT.store(1, Ordering::Relaxed);
 
         let template = Template::from_frame(&forge_frame(0xCC)).expect("template");
-        *FORGE_TEMPLATE.lock().expect("template lock") = Some((template, BodyMode::Stale));
+        *FORGE_TEMPLATE.lock().expect("template lock") = Some(Learned {
+            template,
+            bump: false,
+            counter: 0,
+        });
         FORGE_NEXT_SEQ.store(42, Ordering::Relaxed);
         FORGE_BUMP.store(false, Ordering::Relaxed);
 
@@ -1883,8 +1915,8 @@ mod tests {
         // reference does: recompute over the frame with 20..24 zeroed.
         let frame = {
             let slot = FORGE_TEMPLATE.lock().expect("template lock");
-            let (template, mode) = slot.as_ref().expect("template");
-            forge::build_frame(template, 42, *mode)
+            let learned = slot.as_ref().expect("template");
+            forge::build_frame(&learned.template, 42, BodyMode::Stale)
         };
         let stored = u32::from_le_bytes(frame[20..24].try_into().expect("4 bytes"));
         let mut zeroed = frame.clone();

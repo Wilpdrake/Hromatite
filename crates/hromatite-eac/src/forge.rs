@@ -103,18 +103,28 @@ pub enum BodyMode {
     /// Reuse the learned fragment byte for byte.
     #[default]
     Stale,
-    /// Reuse it, but increment the per-message `u32` counter at `msg+0x18`
-    /// when the frame starts a message. A cheap "the data is fresh" variant.
-    Bump,
+    /// Reuse it, but write `n` into the per-message `u32` counter at `msg+0x18`
+    /// when the frame starts a message. The emitter owns `n`, so the counter
+    /// really advances from frame to frame — a cheap "the data is fresh"
+    /// variant that the live run can falsify.
+    Counter(u32),
 }
 
 impl BodyMode {
     /// Parse `EAC_FORGE_BODY` (`stale` default, `bump` opt-in).
+    ///
+    /// The parsed value only carries the *intent*; the counter itself is owned
+    /// by the emitter (see `eos::emit_forge_frame`).
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
-            Some("bump") | Some("fresh") => Self::Bump,
+            Some("bump") | Some("fresh") => Self::Counter(0),
             _ => Self::Stale,
         }
+    }
+
+    /// True when the body's message counter is refreshed per frame.
+    pub fn bumped(self) -> bool {
+        matches!(self, Self::Counter(_))
     }
 }
 
@@ -127,23 +137,24 @@ pub fn build_frame(template: &Template, seq: u64, mode: BodyMode) -> Vec<u8> {
     frame.extend_from_slice(&seq.to_le_bytes());
     frame.extend_from_slice(&[0u8; 4]); // checksum placeholder
     frame.extend_from_slice(&template.body);
-    if mode == BodyMode::Bump && template.starts_message() {
-        bump_message_counter(&mut frame);
+    if let BodyMode::Counter(counter) = mode
+        && template.starts_message()
+    {
+        write_message_counter(&mut frame, counter);
     }
     let crc = crc32c_eac(&frame);
     frame[CHECKSUM_OFFSET..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
     frame
 }
 
-/// Increment the `u32` message counter at `frame[HEADER_LEN + 0x18]`.
+/// Write `counter` into the `u32` at `frame[HEADER_LEN + 0x18]`.
 ///
 /// The body is a message header only when the frame starts one, so the caller
 /// checks [`Template::starts_message`] first; a short body degrades to a no-op.
-fn bump_message_counter(frame: &mut [u8]) {
+fn write_message_counter(frame: &mut [u8], counter: u32) {
     let at = HEADER_LEN + MESSAGE_COUNTER_OFFSET;
     if let Some(slot) = frame.get_mut(at..at + 4) {
-        let value = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]).wrapping_add(1);
-        slot.copy_from_slice(&value.to_le_bytes());
+        slot.copy_from_slice(&counter.to_le_bytes());
     }
 }
 
@@ -308,14 +319,14 @@ mod tests {
     fn the_bump_mode_only_touches_a_message_counter() {
         let middle = sample_template();
         let plain = build_frame(&middle, 5, BodyMode::Stale);
-        let bumped_middle = build_frame(&middle, 5, BodyMode::Bump);
+        let bumped_middle = build_frame(&middle, 5, BodyMode::Counter(23));
         assert_eq!(plain, bumped_middle, "a middle fragment has no header");
 
         let mut start = sample_template();
         start.flags = FLAG_START;
         start.body[MESSAGE_COUNTER_OFFSET..MESSAGE_COUNTER_OFFSET + 4]
             .copy_from_slice(&22u32.to_le_bytes());
-        let fresh = build_frame(&start, 5, BodyMode::Bump);
+        let fresh = build_frame(&start, 5, BodyMode::Counter(23));
         assert_eq!(
             u32::from_le_bytes(
                 fresh[HEADER_LEN + MESSAGE_COUNTER_OFFSET..HEADER_LEN + MESSAGE_COUNTER_OFFSET + 4]
@@ -337,7 +348,7 @@ mod tests {
         let none = Config::parse(false, |_| None);
         assert!(!none.enabled());
         assert_eq!(none.interval_ms, INTERVAL_MS);
-        assert_eq!(none.body, BodyMode::Stale);
+        assert!(!none.body.bumped());
 
         let flag_only = Config::parse(true, |_| None);
         assert!(flag_only.enabled());
@@ -355,7 +366,7 @@ mod tests {
         assert_eq!(explicit.after_ms, 90_000);
         assert_eq!(explicit.min_frames, 20);
         assert_eq!(explicit.interval_ms, MIN_INTERVAL_MS, "clamped up");
-        assert_eq!(explicit.body, BodyMode::Bump);
+        assert!(explicit.body.bumped());
         assert!(explicit.keep_small);
         assert_eq!(explicit.template, TemplateMode::Start);
         assert!(!none.keep_small);
