@@ -19,6 +19,7 @@ pub const PROCESS_VM_READ: u32 = 0x0010;
 pub const PROCESS_VM_WRITE: u32 = 0x0020;
 pub const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 pub const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+pub const SYNCHRONIZE: u32 = 0x0010_0000;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -225,6 +226,8 @@ unsafe extern "system" {
     pub fn LoadLibraryW(path: *const u16) -> HMODULE;
     pub fn GetModuleFileNameW(m: HMODULE, buf: *mut u16, size: u32) -> u32;
     pub fn GetLastError() -> u32;
+    pub fn EnterCriticalSection(cs: *mut core::ffi::c_void);
+    pub fn LeaveCriticalSection(cs: *mut core::ffi::c_void);
 
     // present in ntdll and forwarders both under Windows and wine
     pub fn AddVectoredExceptionHandler(first: u32, handler: *const core::ffi::c_void) -> *mut core::ffi::c_void;

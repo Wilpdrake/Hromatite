@@ -56,5 +56,27 @@ class GcDetourAbiTest(unittest.TestCase):
         self.assertIn("add    $0x30,%rsp", disassembly)
 
 
+    def test_close_callsites_tail_jump_to_their_continuations(self) -> None:
+        nm = run([llvm_tool("nm"), str(DLL)])
+        for symbol in ["defer_close_detour", "close_after_unlink_detour"]:
+            match = re.search(rf"^([0-9a-f]+) [Tt] .*{symbol}$", nm, re.MULTILINE)
+            self.assertIsNotNone(match, f"{symbol} is missing from release DLL")
+            address = int(match.group(1), 16)
+            disassembly = run(
+                [
+                    llvm_tool("objdump"),
+                    "-d",
+                    f"--start-address=0x{address:x}",
+                    f"--stop-address=0x{address + 0x30:x}",
+                    str(DLL),
+                ]
+            )
+            self.assertIn("jmp    *%r11", disassembly)
+            self.assertIn("sub    $0x30,%rsp", disassembly)
+            self.assertIn("add    $0x30,%rsp", disassembly)
+            if symbol == "close_after_unlink_detour":
+                self.assertIn("mov    %rbx,%rcx", disassembly)
+
+
 if __name__ == "__main__":
     unittest.main()

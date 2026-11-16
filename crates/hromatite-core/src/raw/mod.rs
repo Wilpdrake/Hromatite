@@ -12,6 +12,7 @@
 pub mod console;
 pub mod context;
 pub mod ffi;
+pub mod gcguard;
 pub mod hook;
 pub mod il2cpp;
 pub mod memory;

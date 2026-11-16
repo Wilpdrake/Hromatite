@@ -234,6 +234,12 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
 }
 
 unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
+    // Before ordinary payload guards: the GC recovery gate itself remains closed
+    // unless a fully installed entry detour owns Boehm's record-list lock.
+    // SAFETY: info is the OS-owned callback record described by recover_boehm_abort.
+    if unsafe { crate::raw::gcguard::recover_boehm_abort(info) } {
+        return ffi::EXCEPTION_CONTINUE_EXECUTION;
+    }
     // Cheap gates first: on the game's own exceptions this must cost nothing.
     let depth = DEPTH.load(Ordering::Acquire);
     if depth == 0 {

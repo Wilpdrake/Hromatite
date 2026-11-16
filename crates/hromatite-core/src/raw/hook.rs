@@ -581,7 +581,7 @@ const RELAY_OFF: usize = 0x100;
 
 pub(crate) struct Prep {
     target: usize,
-    prologue: usize,
+    pub(crate) prologue: usize,
     pub(crate) trampoline: usize,
     /// `trampoline + RELAY_OFF`; holds `ff 25 00000000 <qword detour>`
     relay: usize,
@@ -765,9 +765,15 @@ pub(crate) fn patch(p: &Prep, detour: usize) -> Option<Hook> {
         );
         return None;
     }
+    // A retained Prep was already published as RX on a previous install. Restore
+    // write access before replacing its relay; then return it to RX below.
+    if set_range_protect(p.trampoline, PAGE_SIZE, ffi::PAGE_EXECUTE_READWRITE).is_none() {
+        log::log_tag("hook", "patch: VirtualProtect(RWX) on relay page failed");
+        return None;
+    }
     // publish the detour in the relay *before* the target can jump to it
-    // SAFETY: relay points into our allocated page at RELAY_OFF; relay+6..+14
-    // is the qword slot reserved by the 14-byte relay encoding.
+    // SAFETY: relay points into our allocated writable page at RELAY_OFF; its
+    // relay+6..+14 range is the qword slot reserved by the 14-byte relay encoding.
     unsafe {
         core::ptr::write_volatile((p.relay + 6) as *mut u64, detour as u64);
     }
@@ -986,6 +992,9 @@ fn work() {
             "gct",
             &format!("inline guard: {count} stale record(s) reaped; last id={last_tid:#x}"),
         );
+    }
+    for line in crate::raw::gcguard::report_lines() {
+        log::log_tag("gct", &line);
     }
     for line in crate::gcthreads::drain_worker_events() {
         log::log_tag("gct", &line);
@@ -1232,7 +1241,8 @@ pub unsafe extern "system" fn gc_context_detour() -> ! {
     );
 }
 
-pub fn install_gc_context_guard() -> bool {
+#[allow(dead_code)]
+fn install_legacy_gc_context_guard() -> bool {
     if crate::symbols::GAMEASSEMBLY_SHA256
         != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
     {
@@ -1303,6 +1313,13 @@ pub fn install_gc_context_guard() -> bool {
             false
         }
     }
+}
+
+/// Install the synchronized entry-Guard used by every active payload mode.
+/// The previous mid-function installer remains above only for its regression
+/// fixtures and disassembly references; it is not used at runtime.
+pub fn install_gc_context_guard() -> bool {
+    crate::raw::gcguard::install()
 }
 
 // ---- worker-body provenance (why did a GC record leak?) -------------------
@@ -1976,6 +1993,9 @@ pub fn command(line: &str) -> Option<Vec<String>> {
         }
         "late" => Some(late_update_status()),
         "unhook" => {
+            if !crate::raw::gcguard::before_unhook() {
+                return Some(vec!["GC guard is busy; unhook refused, retry later".into()]);
+            }
             let mut n = 0;
             let mut g = match HOOKS.lock() {
                 Ok(g) => g,
@@ -1987,6 +2007,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
                 }
             }
             let installed: Vec<(usize, bool)> = g.iter().map(|h| (h.target, h.detached)).collect();
+            crate::raw::gcguard::after_unhook(&installed);
             LATE_ATTACHED.store(
                 late_attachment_present(LATE_ENTRY.load(Ordering::Acquire), &installed),
                 Ordering::Release,
@@ -2054,6 +2075,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw::gcguard::{GcRecordAction, can_recover_boehm_abort, gc_record_action, valid_gc_suspend_entry};
 
     fn len(b: &[u8]) -> Option<usize> {
         decode_one(b).map(|i| i.len)
@@ -2408,5 +2430,29 @@ mod tests {
             0x0010_0003
         );
         assert!(context[0x34..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn gc_record_action_unlinks_only_on_the_original_signalled_handle() {
+        assert_eq!(gc_record_action(0), GcRecordAction::Unlink);
+        assert_eq!(gc_record_action(0x102), GcRecordAction::Keep);
+        assert_eq!(gc_record_action(u32::MAX), GcRecordAction::Keep);
+        assert_eq!(gc_record_action(0x80), GcRecordAction::Keep);
+    }
+
+    #[test]
+    fn entry_signature_matches_the_measured_boehm_prologue() {
+        assert!(valid_gc_suspend_entry(&[
+            0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48,
+            0x89, 0x74, 0x24, 0x18,
+        ]));
+    }
+
+    #[test]
+    fn recovery_access_and_activation_are_explicit() {
+        assert!(!can_recover_boehm_abort(false, 0x123, 0x123));
+        assert!(!can_recover_boehm_abort(true, 0x123, 0x456));
+        assert!(!can_recover_boehm_abort(true, 0, 0x123));
+        assert!(can_recover_boehm_abort(true, 0x123, 0x123));
     }
 }
