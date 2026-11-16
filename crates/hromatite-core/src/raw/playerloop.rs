@@ -8,6 +8,7 @@
 pub struct Entry {
     pub index: usize,
     pub type_name: String,
+    pub path: String,
     pub children: usize,
     pub update_delegate: usize,
     pub update_function: usize,
@@ -78,17 +79,29 @@ pub fn snapshot() -> Result<Vec<Entry>, String> {
         return Err("GetCurrentPlayerLoop returned NULL".into());
     }
     let children = root[1];
-    if children == 0 {
-        return Ok(Vec::new());
+    let mut entries = Vec::new();
+    if children != 0 {
+        read_children(children, "", 0, &mut entries)?;
+    }
+    Ok(entries)
+}
+
+fn read_children(
+    children: usize,
+    prefix: &str,
+    depth: usize,
+    entries: &mut Vec<Entry>,
+) -> Result<(), String> {
+    if depth > 16 {
+        return Err("PlayerLoop nesting exceeds 16 levels".into());
     }
     let count = crate::safe::read_u32(children.wrapping_add(0x18))
         .ok_or("PlayerLoop child array is unreadable")? as usize;
-    if count > 128 {
+    if count > 128 || entries.len().saturating_add(count) > 512 {
         return Err(format!(
             "PlayerLoop child count {count} exceeds the safety bound"
         ));
     }
-    let mut entries = Vec::with_capacity(count);
     for index in 0..count {
         let at = children.wrapping_add(0x20 + index * 0x28);
         let mut words = [0usize; 5];
@@ -97,9 +110,26 @@ pub fn snapshot() -> Result<Vec<Entry>, String> {
                 .ok_or_else(|| format!("PlayerLoop child {index} qword {slot} is unreadable"))?;
         }
         let name = type_name(words[0]);
-        entries.push(entry_from_words(index, name, words).ok_or("invalid PlayerLoop entry")?);
+        let segment = if name.is_empty() {
+            format!("#{index}")
+        } else {
+            name
+        };
+        let path = if prefix.is_empty() {
+            segment
+        } else {
+            format!("{prefix}/{segment}")
+        };
+        let nested = words[1];
+        let mut entry =
+            entry_from_words(index, path.clone(), words).ok_or("invalid PlayerLoop entry")?;
+        entry.path = path.clone();
+        entries.push(entry);
+        if nested != 0 {
+            read_children(nested, &path, depth + 1, entries)?;
+        }
     }
-    Ok(entries)
+    Ok(())
 }
 
 fn describe_entries(entries: &[Entry]) -> Vec<String> {
@@ -108,10 +138,10 @@ fn describe_entries(entries: &[Entry]) -> Vec<String> {
         lines.push(format!(
             "  #{} {} children={:#x} delegate={:#x} update={:#x} condition={:#x}",
             entry.index,
-            if entry.type_name.is_empty() {
+            if entry.path.is_empty() {
                 "<unnamed>"
             } else {
-                &entry.type_name
+                &entry.path
             },
             entry.children,
             entry.update_delegate,
@@ -214,7 +244,7 @@ pub fn install(selector: &str) -> Result<Entry, String> {
     PLAYER_HITS.store(0, Ordering::Relaxed);
     PLAYER_TID.store(0, Ordering::Relaxed);
     PLAYER_START_MS.store(now_ms(), Ordering::Relaxed);
-    let leaked_name = Box::leak(Box::new(selected.type_name.clone())) as *const String as usize;
+    let leaked_name = Box::leak(Box::new(selected.path.clone())) as *const String as usize;
     PLAYER_NAME.store(leaked_name, Ordering::Relaxed);
     PLAYER_ORIG.store(prep.trampoline, Ordering::Release);
     PLAYER_ENTRY.store(target, Ordering::Release);
@@ -240,8 +270,8 @@ pub fn install(selector: &str) -> Result<Entry, String> {
     log::log_tag(
         "playerloop",
         &format!(
-            "hooked {} root #{} at {target:#x}, native void(*)(void) updateFunction",
-            selected.type_name, selected.index
+            "hooked {} at {target:#x}, native void(*)(void) updateFunction",
+            selected.path
         ),
     );
     Ok(selected)
@@ -299,6 +329,7 @@ pub fn status() -> Vec<String> {
 pub fn entry_from_words(index: usize, type_name: String, words: [usize; 5]) -> Option<Entry> {
     Some(Entry {
         index,
+        path: type_name.clone(),
         type_name,
         children: words[1],
         update_delegate: words[2],
@@ -319,14 +350,24 @@ pub fn select_root(entries: &[Entry], selector: &str) -> Option<Entry> {
     let short = selector.rsplit(['+', '.']).next().unwrap_or(selector);
     let mut matches = entries.iter().filter(|entry| {
         entry.update_function >= 0x10000
-            && (entry.type_name == selector
+            && (entry.path == selector
+                || entry.type_name == selector
                 || entry.type_name.rsplit(['+', '.']).next() == Some(short))
     });
-    let entry = matches.next()?;
-    if matches.next().is_some() {
-        return None;
+    if let Some(entry) = matches.next() {
+        if matches.next().is_some() {
+            return None;
+        }
+        return Some(entry.clone());
     }
-    Some(entry.clone())
+    let root = entries.iter().find(|entry| {
+        entry.path == entry.type_name && entry.type_name.rsplit(['+', '.']).next() == Some(short)
+    })?;
+    let prefix = format!("{}/", root.path);
+    entries
+        .iter()
+        .find(|entry| entry.path.starts_with(&prefix) && entry.update_function >= 0x10000)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -412,6 +453,23 @@ mod tests {
             refreshed_state(PLAYER_ATTACHED, Some(true)),
             PLAYER_ATTACHED
         );
+    }
+
+    #[test]
+    fn zero_callback_root_selects_the_first_native_callback_in_its_own_branch() {
+        let mut list = entries();
+        list[1].update_function = 0;
+        let mut child = list[1].clone();
+        child.path = "UnityEngine.LowLevel.PlayerLoop+Update/ScriptRunBehaviourUpdate".into();
+        child.type_name = "UnityEngine.LowLevel.PlayerLoop.Update.ScriptRunBehaviourUpdate".into();
+        child.update_function = 0x56780;
+        list.push(child);
+        let selected = select_root(&list, "Update").expect("native child in Update branch");
+        assert_eq!(
+            selected.type_name,
+            "UnityEngine.LowLevel.PlayerLoop.Update.ScriptRunBehaviourUpdate"
+        );
+        assert_eq!(selected.update_function, 0x56780);
     }
 
     #[test]
