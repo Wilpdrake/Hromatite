@@ -3045,3 +3045,44 @@ il2cpp одними чтениями памяти (без единого выз�
   x86_64-pc-windows-gnu` → Finished.
 - **Отчёт:** `~/EAC-RE/findings/hooks_control.md`; сырые данные
   `~/EAC-RE/evidence/control_0009/`.
+
+### 2026-11-17 — feat(eac): `EAC_FORGE=1`, свои heartbeat-кадры (ветка `eac-forge`)
+
+- **Зачем.** Оффлайн-разбор (`~/EAC-RE/findings/frame_structure.md`, 451/451 кадров)
+  показал: 512-Б heartbeat не зашифрован — 24-Б открытый заголовок
+  (`Version=2, Flags, SessionId, Sequence, CRC-32C init=0/xorout=0`) + фрагмент
+  сообщения. Значит кадр можно не реплеить, а собирать.
+- **Коммиты** (ветка от master `78d8122`, master не тронут): `fd754c6` план,
+  `1377a41` модуль `forge` + `digest::crc32c_eac`, `9c8c422` генератор в `eos`,
+  `d2ffd3e` тесты, `540465a` `EAC_FORGE_KEEP_SMALL`, `5e3360b`
+  `EAC_FORGE_TEMPLATE=start`, `746af38`/след. фиксы счётчика и сборки.
+- **Что сделано.** `crates/hromatite-eac/src/forge.rs` (`Template`, `build_frame`,
+  `Config`, `BodyMode`, `TemplateMode`, юнит-тесты); в `eos.rs` — обучение шаблона
+  в обёртке `message_to_server_wrapper`, дроп живых кадров после старта, поток
+  `eac-forge` с каденцией 2007 мс, доставка в колбэк игры, `forge_frames.bin`
+  (формат capture) для оффлайн-проверки CRC, счётчик `forged` в `Counters`.
+  `EAC_FORGE_AFTER_MS` (от `BeginSession`), `EAC_FORGE_MIN_FRAMES`,
+  `EAC_FORGE_INTERVAL_MS`, `EAC_FORGE_BODY=stale|bump`, `EAC_FORGE_TEMPLATE=last|start`,
+  `EAC_FORGE_KEEP_SMALL`.
+- **Живой результат (7 прогонов, см. `~/EAC-RE/findings/forge_test.md`).**
+  Транспорт работает: свои кадры собираются, CRC сходится оффлайн 129/129,
+  `delivered=true`, каденция 2007–2013 мс, `Sequence` +1. Но сессию **не держат**:
+  дисконнект через **57 с** (замена всего потока) и **75 с** (ACK'и оставлены) с тем
+  же `code 104`/«could not maintain a verified connection», т.е. раньше «тишины»
+  (120.5 с): сервер оценивает тело и отвергает его (16-Б записи-хеши устаревшие).
+  Вариант `start`+`bump` (растущий счётчик `msg+0x18`) тоже не спас (39–77 с).
+- **Грабли, пойманные вживую.** (1) `std::thread::spawn` внутри `DllMain`
+  (`install()` со стартового потока) → 0 исходящих кадров и «Authentication with the
+  VRChat Anti-Cheat system failed»; поток теперь стартует лениво из первого вызова
+  обёртки. (2) `bump` применялся к копии шаблона → все кадры получали один и тот же
+  `+1`; счётчик вынесен в `Learned` рядом с шаблоном. (3) Две AC-сессии из семи
+  вообще не поднялись (0 кадров, чурн `End/Begin`) — не наш флейк, такие прогоны
+  в выводы не идут.
+- **Проверено.** `cargo test -p hromatite-eac --target x86_64-unknown-linux-gnu`
+  → 41 ok; `clippy -p hromatite-eac --all-targets -- -D warnings` (host и
+  windows-gnu) чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` → Finished.
+- **Что осталось.** Отправка из SDK-потока (внутри обёртки) вместо своего потока —
+  в одном прогоне (`forge_0206`) поток кадров и лог оборвались на 77-й секунде при
+  живом процессе (похоже на залипание в колбэке игры). Свежие 16-Б записи в теле
+  (нужен источник хешей) — единственный оставшийся способ «оживить» содержимое.
