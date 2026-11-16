@@ -3024,3 +3024,24 @@ il2cpp одними чтениями памяти (без единого выз�
   `EACSHIM_DROP_IN=1`; общий event-queue между резидентом и feature-образом
   (сейчас счётчики разделены); при выгрузке образа feature без резидента патчи
   остаются — учитывать при hot-reload. Merge в master — после согласования.
+
+### 2026-11-17 — fix(eac): нечисловой `EACSHIM_DROP_AFTER_MS` = выключено
+
+- **Симптом (пойман живым A/B 2026-11-17).** Прошлый прогон дал исходящие
+  `24×14 / 116×4` вместо ожидаемых 512 Б/2 с и churn `BeginSession`/`EndSession`
+  каждые 24–30 с. Причина: в `~/.hromatite-mode` остался ключ C-шима
+  `EACSHIM_DROP_AFTER_MS=cmd`, а парсер в payload'е на непарсящемся значении
+  брал `DEFAULT_DROP_MS = 20_000` → молча включался drop через 20 с после
+  каждого `BeginSession`.
+- **Исправление.** `DEFAULT_DROP_MS = 0` + `and_then(parse::<u64>().ok())`:
+  нечисловое значение теперь означает «не резать». Заодно это делает переменную
+  общей с C-шимом без сюрпризов.
+- **Контрольный прогон после этого (master, EAC ON).** `hooks 8/8`, вход в мир
+  `Furry Apartment`, `BeginSession`=1/`EndSession`=0, 170 исходящих кадров:
+  **512 Б × 121, median dt 2007 мс**, 24 Б × 18 (событийные), 116 Б нет;
+  входящие 24 Б × 154 (ack). Ни кика, ни `code 104`.
+- **Проверено.** `cargo test -p hromatite-eac` → 32 + 1 ok; `clippy -D warnings`
+  (windows-gnu) чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` → Finished.
+- **Отчёт:** `~/EAC-RE/findings/hooks_control.md`; сырые данные
+  `~/EAC-RE/evidence/control_0009/`.
