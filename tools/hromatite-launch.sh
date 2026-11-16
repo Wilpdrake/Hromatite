@@ -40,6 +40,10 @@ EXE="$BIN/Hromatite.exe"
 # The DLL to inject always comes from *this* checkout (so a worktree build can
 # be tested by pointing Steam at that worktree's copy of this script).
 DLL_WIN="${HROMATITE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/release/hromatite.dll" | tr '/' '\\\\')}"
+# Initial generation 0 comes from this checkout. Subsequent generations are
+# immutable published artifacts under the user profile, loaded by the resident.
+FEATURE_DLL_WIN="${HROMATITE_FEATURE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/release/hromatite_features.dll" | tr '/' '\\\\')}"
+export HROMATITE_FEATURE_DLL="$FEATURE_DLL_WIN"
 # The managed LateUpdate or native PlayerLoop detour and GC guard live in the
 # payload image, so every kind of full seal must stay disabled.
 HROMATITE_FRAME_HOOK="${HROMATITE_FRAME_HOOK:-1}"

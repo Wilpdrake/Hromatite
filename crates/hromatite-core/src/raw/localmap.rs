@@ -359,6 +359,13 @@ fn push_cleanup_error(errors: &mut Vec<String>, stage: &str, result: Result<(), 
     }
 }
 
+/// Mingw/Rust DLL startup may read its erased image base during entry/TLS.
+/// Keep zeroed headers accessible as the proven remote mapper does; NOACCESS
+/// here turns an otherwise valid attach into an AV before feature init runs.
+fn erased_headers_protection() -> u32 {
+    crate::ffi::PAGE_READWRITE
+}
+
 fn protection_plan(pe: &PeImage) -> Result<Vec<(u32, u32, u32)>, String> {
     const PAGE: usize = 4096;
     let image_end = (pe.size_of_image as usize)
@@ -1005,7 +1012,12 @@ mod imp {
                 let mut old = 0;
                 // SAFETY: the header range belongs to this allocation and is no longer used.
                 if unsafe {
-                    ffi::VirtualProtect(base as *mut u8, headers, ffi::PAGE_NOACCESS, &mut old)
+                    ffi::VirtualProtect(
+                        base as *mut u8,
+                        headers,
+                        super::erased_headers_protection(),
+                        &mut old,
+                    )
                 } == 0
                 {
                     return Err("VirtualProtect(erased headers) failed".into());
@@ -1024,15 +1036,16 @@ mod imp {
             }
 
             for callback in &callbacks {
-                guarded_tls(base, *callback, ffi::DLL_PROCESS_ATTACH)
-                    .map_err(|fault| format!("TLS attach {callback:#x}: {fault}"))?;
+                guarded_tls(base, *callback, ffi::DLL_PROCESS_ATTACH).map_err(|fault| {
+                    format!("TLS attach {callback:#x} (image base {base:#x}): {fault}")
+                })?;
                 // A fault longjmps past this increment, so cleanup will not send a
                 // second notification to the faulting or any not-yet-called callback.
                 completed_callbacks += 1;
             }
             if pe.entry != 0 {
                 let attached = guarded_dll_main(base, pe.entry, ffi::DLL_PROCESS_ATTACH)
-                    .map_err(|fault| format!("DllMain attach: {fault}"))?;
+                    .map_err(|fault| format!("DllMain attach (image base {base:#x}): {fault}"))?;
                 // FALSE is a completed attach and receives detach, just like the
                 // native loader; an exception skips this assignment and gets none.
                 entry_returned = true;
@@ -1540,6 +1553,13 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("DLL"), "{error}");
+    }
+
+    #[test]
+    fn erased_headers_remain_readable_for_crt_startup() {
+        let protection = super::erased_headers_protection();
+        assert_eq!(protection, crate::ffi::PAGE_READWRITE);
+        assert_ne!(protection & 0xf0, crate::ffi::PAGE_EXECUTE_READWRITE);
     }
 
     #[test]

@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
-use hromatite_core::{log, manualmap, procs, remote::Remote, GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER};
+use hromatite_core::{
+    GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER, hot_runtime, log, manualmap, procs, remote::Remote,
+};
 
 fn usage() {
     println!(
@@ -16,7 +18,9 @@ fn usage() {
          commands:\n\
          \x20 bridge                 find {GAME_EXE} and report module bases (M0b)\n\
          \x20 inject --dll <path>     manual-map a DLL into the game (M1)\n\
-         \x20 procs                  list wine processes"
+         \x20 procs                  list wine processes\n\
+         \x20 hot-smoke <rounds> <dll-a> <dll-b> [...]\n\
+         \x20                        real local-map/canary/retire A/B loop (no Unity)"
     );
 }
 
@@ -49,7 +53,9 @@ fn bridge(target: &str) -> i32 {
     log::log_echo(&format!("modules visible: {}", mods.len()));
     for want in [GAME_ASSEMBLY, UNITY_PLAYER] {
         match mods.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(want)) {
-            Some((n, base, size)) => log::log_echo(&format!("  {n}: base {base:#x} size {size:#x}")),
+            Some((n, base, size)) => {
+                log::log_echo(&format!("  {n}: base {base:#x} size {size:#x}"))
+            }
             None => log::log_echo(&format!("  {want}: MISSING")),
         }
     }
@@ -63,7 +69,10 @@ fn bridge(target: &str) -> i32 {
     };
     log::log_echo("OpenProcess ok");
 
-    let ga_base = match mods.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(GAME_ASSEMBLY)) {
+    let ga_base = match mods
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(GAME_ASSEMBLY))
+    {
         Some((_, base, _)) => *base,
         None => return 4,
     };
@@ -74,7 +83,9 @@ fn bridge(target: &str) -> i32 {
             u32::from_le_bytes([b[0x3C], b[0x3D], b[0x3E], b[0x3F]])
         )),
         None => {
-            log::log_echo("ReadProcessMemory(GameAssembly header) FAILED - injection path is broken");
+            log::log_echo(
+                "ReadProcessMemory(GameAssembly header) FAILED - injection path is broken",
+            );
             return 3;
         }
     }
@@ -180,6 +191,27 @@ fn main() {
             Some(d) => inject(&d, &target, &opts, &mode, forced_pid),
             None => {
                 log::log_echo("inject needs --dll <path>");
+                1
+            }
+        },
+        "hot-smoke" => match args.get(1).and_then(|v| v.parse::<usize>().ok()) {
+            Some(rounds) if args.len() >= 4 => {
+                let paths = args[2..].to_vec();
+                match hot_runtime::smoke(&paths, rounds) {
+                    Ok(lines) => {
+                        for line in lines {
+                            log::log_echo(&line);
+                        }
+                        0
+                    }
+                    Err(error) => {
+                        log::log_echo(&format!("hot-smoke: {error}"));
+                        2
+                    }
+                }
+            }
+            _ => {
+                log::log_echo("usage: hot-smoke <rounds> <dll-a> <dll-b> [...]");
                 1
             }
         },

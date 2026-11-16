@@ -6,12 +6,12 @@
 #![allow(dead_code)]
 
 use core::ffi::c_char;
+#[cfg(target_os = "windows")]
+use hromatite_abi::STATUS_OK;
 use hromatite_abi::{
     GuardedCallFn, HostApiV1, LogFn, MAX_CALL_ARGS, ReadFn, STATUS_BAD_ARGUMENT, STATUS_ERROR,
     WriteFn,
 };
-#[cfg(target_os = "windows")]
-use hromatite_abi::STATUS_OK;
 
 const MAX_IO_BYTES: usize = 1024 * 1024;
 const MAX_TAG_BYTES: usize = 32;
@@ -162,6 +162,25 @@ pub(crate) fn current_host_api() -> Option<HostApiV1> {
         write: host_write as WriteFn,
         guarded_call: host_guarded_call as GuardedCallFn,
     })
+}
+
+/// Explicit `hot-smoke` fixture for mapper-only tests without Unity modules.
+/// Only the canary marker may be invoked with it; il2cpp/M3 is never simulated.
+#[cfg(target_os = "windows")]
+pub(crate) fn smoke_host_api() -> HostApiV1 {
+    HostApiV1 {
+        struct_size: core::mem::size_of::<HostApiV1>() as u32,
+        abi_version: hromatite_abi::ABI_VERSION,
+        game_assembly_base: 0x0001_8000_0000,
+        game_assembly_size: 0x0f44_0000,
+        unity_player_base: 0x0001_4000_0000,
+        unity_player_size: 0x0215_3000,
+        game_assembly_sha256: game_sha_bytes(),
+        log: host_log as LogFn,
+        read: host_read as ReadFn,
+        write: host_write as WriteFn,
+        guarded_call: host_guarded_call as GuardedCallFn,
+    }
 }
 
 #[cfg(test)]

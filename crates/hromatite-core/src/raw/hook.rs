@@ -965,7 +965,7 @@ fn now_ms() -> u64 {
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
-    let iv = INTERVAL_MS.load(Ordering::Relaxed).max(1);
+    let iv = crate::raw::hot::tick_interval_ms().max(1);
     let last = LAST_MS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < iv {
         return;
@@ -1000,6 +1000,10 @@ fn work() {
         log::log_tag("gct", &line);
     }
 
+    // Versioned feature work uses this same already-established game tick. It
+    // never creates a worker and never replaces the resident GC guard.
+    crate::raw::hot::tick();
+
     let _ = log::guard("hook::work", || {
         let mut reader = {
             let mut g = match READER.lock() {
@@ -1019,6 +1023,15 @@ fn work() {
         }
         for line in cmds {
             log::log_tag("con", &format!("> {line}"));
+            if let Some(out) = crate::raw::hot::command(&line) {
+                for line in out {
+                    log::log_tag("con", &line);
+                }
+                continue;
+            }
+            if !crate::raw::hot::resident_command(&line) && crate::raw::hot::dispatch(&line) {
+                continue;
+            }
             let answered = log::guard("console::dispatch", || console::dispatch(&line));
             let (out, action) = match answered {
                 Some(v) => v,
@@ -2075,7 +2088,9 @@ pub fn command(line: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::gcguard::{GcRecordAction, can_recover_boehm_abort, gc_record_action, valid_gc_suspend_entry};
+    use crate::raw::gcguard::{
+        GcRecordAction, can_recover_boehm_abort, gc_record_action, valid_gc_suspend_entry,
+    };
 
     fn len(b: &[u8]) -> Option<usize> {
         decode_one(b).map(|i| i.len)
@@ -2443,8 +2458,8 @@ mod tests {
     #[test]
     fn entry_signature_matches_the_measured_boehm_prologue() {
         assert!(valid_gc_suspend_entry(&[
-            0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48,
-            0x89, 0x74, 0x24, 0x18,
+            0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
+            0x18,
         ]));
     }
 
