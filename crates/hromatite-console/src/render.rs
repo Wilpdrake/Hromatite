@@ -1,6 +1,7 @@
 //! Fixed-size ANSI/plain frame renderer.
 
-use crate::model::{ConsoleModel, Mode, PALETTE};
+use crate::commands::Risk;
+use crate::model::{ConsoleModel, Mode};
 use crate::parser::LineKind;
 use unicode_width::UnicodeWidthStr;
 
@@ -34,71 +35,91 @@ pub struct Frame {
 }
 
 pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height: u16) -> Frame {
-    let width = width.max(24) as usize;
-    let height = height.max(8) as usize;
+    if width < 24 || height < 8 {
+        let w = width as usize;
+        let h = height as usize;
+        let mut lines = vec![" ".repeat(w); h];
+        let styles = vec![Style::Error; h];
+        if h > 0 {
+            put(&mut lines[0], " 24x8 required", w);
+        }
+        if h > 1 {
+            put(&mut lines[1], &format!(" current {width}x{height}"), w);
+        }
+        return Frame {
+            lines,
+            styles,
+            cursor: (0, 0),
+        };
+    }
+    let width = width as usize;
+    let height = height as usize;
     let mut lines = vec![" ".repeat(width); height];
     let mut styles = vec![Style::Normal; height];
 
-    let mode = if model.demo() {
-        "DEMO — SYNTHETIC (no game)"
+    let link = if model.demo() {
+        "DEMO // SYNTHETIC"
     } else {
-        "LIVE"
+        match context.log_age_secs {
+            Some(age) if age <= 10 => "LINKED",
+            Some(_) => "STALE",
+            None => "NO LOG",
+        }
+    };
+    let age = context
+        .log_age_secs
+        .map_or_else(|| "--".into(), |age| format!("{age}s"));
+    let automatic = if !model.auto_refresh() {
+        "OFF"
+    } else if model.auto_suspended() {
+        "HELD"
+    } else {
+        "ON"
     };
     put(
         &mut lines[0],
-        &format!(" HROMATITE CONSOLE  [{mode}]"),
+        &format!(" HROMATITE // OPS  {link}  rx {age}  AUTO {automatic}"),
         width,
     );
     styles[0] = Style::Header;
 
-    let bytes = context
-        .log_bytes
-        .map(human_bytes)
-        .unwrap_or_else(|| "—".into());
-    let age = context
-        .log_age_secs
-        .map_or_else(|| "—".into(), |age| format!("{age}s"));
+    let tick = model.tick_hz().map_or("--".into(), |hz| format!("{hz}Hz"));
+    let gc = match model.gc_healthy() {
+        Some(true) => "GC OK",
+        Some(false) => "GC FAULT",
+        None => "GC --",
+    };
+    let players = model.player_count().map_or("--".into(), |n| n.to_string());
+    let camera = model.camera.as_deref().unwrap_or("--");
     put(
         &mut lines[1],
-        &format!(" log: {} | {} | age {age}", context.log_path, bytes),
+        &format!(" tick {tick} | {gc} | players {players} | cam {camera}"),
         width,
     );
-    styles[1] = Style::Status;
+    styles[1] = if model.gc_healthy() == Some(false) {
+        Style::Error
+    } else {
+        Style::Status
+    };
+    lines[2] = "─".repeat(width);
+    styles[2] = Style::Dim;
 
-    let camera = model.camera.as_deref().map_or("no camera", |v| v);
-    let player = model.player.as_deref().map_or("no player telemetry", |v| v);
-    put(
-        &mut lines[2],
-        &format!(" camera: {camera} | player: {player}"),
-        width,
-    );
-    styles[2] = Style::Status;
-    let late = model.last_late.as_deref().map_or("late: no status", |v| v);
-    let gc = model.last_gc.as_deref().map_or("GC: no status", |v| v);
-    put(&mut lines[3], &format!(" {late} | {gc}"), width);
-    styles[3] = Style::Status;
-    put(
-        &mut lines[4],
-        &format!(" cmd: {}", context.command_path),
-        width,
-    );
-    styles[4] = Style::Status;
-    lines[5] = "─".repeat(width);
-    styles[5] = Style::Dim;
-
-    let body_start = 6;
+    let body_start = 3;
     let body_len = height.saturating_sub(body_start + 3);
     let body = model.window(body_len);
     for (offset, line) in body.iter().enumerate() {
-        put(
-            &mut lines[body_start + offset],
-            &format!(" {}", line.raw),
-            width,
-        );
+        let formatted = if line.tag == "raw" {
+            format!(" raw  | {}", line.message)
+        } else {
+            format!(" {:<4} | {}", line.tag, line.message)
+        };
+        put(&mut lines[body_start + offset], &formatted, width);
         styles[body_start + offset] = match line.kind {
             LineKind::Error => Style::Error,
             LineKind::Gc => Style::Gc,
             LineKind::Late => Style::Late,
+            LineKind::Info if line.tag == "con" => Style::Late,
+            LineKind::Info if line.tag == "tx" => Style::Accent,
             LineKind::Info => Style::Normal,
         };
     }
@@ -113,25 +134,68 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     if model.mode() == Mode::Palette && body_len > 0 {
         put(
             &mut lines[body_start],
-            " QUICK COMMANDS — ↑/↓ choose, Enter sends",
+            " command graph | type to filter | up/down select | enter accept",
             width,
         );
         styles[body_start] = Style::Accent;
-        for (index, command) in PALETTE.iter().enumerate().take(body_len.saturating_sub(1)) {
-            let marker = if index == model.palette_selection() {
-                ">"
-            } else {
-                " "
+        let palette = model.palette_entries();
+        let capacity = body_len.saturating_sub(1);
+        let start = model
+            .palette_selection()
+            .saturating_sub(capacity.saturating_sub(1));
+        for (index, command) in palette.iter().enumerate().skip(start).take(capacity) {
+            let selected = index == model.palette_selection();
+            let marker = if selected { ">" } else { " " };
+            let risk = match command.risk {
+                Risk::ReadOnly => "SAFE",
+                Risk::Advanced => "ADV",
+                Risk::Dangerous => "RISK",
             };
             put(
-                &mut lines[body_start + 1 + index],
-                &format!(" {marker} {command}"),
+                &mut lines[body_start + 1 + index - start],
+                &format!(
+                    " {marker} {risk:<4} {:<24} {}",
+                    command.usage, command.summary
+                ),
                 width,
             );
-            styles[body_start + 1 + index] = if index == model.palette_selection() {
+            styles[body_start + 1 + index - start] = if command.risk == Risk::Dangerous {
+                Style::Error
+            } else if selected {
                 Style::Accent
             } else {
                 Style::Normal
+            };
+        }
+    }
+
+    if model.help_visible() {
+        for row in body_start..body_start + body_len {
+            lines[row] = " ".repeat(width);
+            styles[row] = Style::Normal;
+        }
+        let bytes = context
+            .log_bytes
+            .map(human_bytes)
+            .unwrap_or_else(|| "--".into());
+        let help = [
+            " FIELD MANUAL // F1 or Esc closes".to_string(),
+            " enter send | tab complete | up/down command history".into(),
+            " F4 or : command palette | / or Ctrl-R log filter".into(),
+            " F2 follow | F3 errors+GC | PgUp/PgDn scrollback".into(),
+            " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
+            " F8 clear view only | Ctrl-C quit | Esc back".into(),
+            " RISK commands require a second Enter; edits cancel it".into(),
+            " channel append-only; no new game threads or sockets".into(),
+            format!(" log {} ({bytes})", context.log_path),
+            format!(" cmd {}", context.command_path),
+        ];
+        for (offset, text) in help.iter().enumerate().take(body_len) {
+            put(&mut lines[body_start + offset], text, width);
+            styles[body_start + offset] = if offset == 0 {
+                Style::Accent
+            } else {
+                Style::Status
             };
         }
     }
@@ -157,10 +221,16 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     styles[filter_row] = Style::Dim;
 
     let input_row = height - 2;
-    let prompt = match model.mode() {
-        Mode::Command => " command> ",
-        Mode::Search => " filter> ",
-        Mode::Palette => " palette> ",
+    let prompt = if model.help_visible() {
+        " help> "
+    } else if model.pending_confirmation().is_some() {
+        " danger> "
+    } else {
+        match model.mode() {
+            Mode::Command => " ops> ",
+            Mode::Search => " grep> ",
+            Mode::Palette => " run> ",
+        }
     };
     let prompt_width = UnicodeWidthStr::width(prompt);
     let available = width.saturating_sub(prompt_width + 1);
@@ -169,12 +239,16 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     let visible_input = &model.active_text()[start..];
     let shown = take_columns(visible_input, available);
     put(&mut lines[input_row], &format!("{prompt}{shown}"), width);
-    styles[input_row] = Style::Input;
+    styles[input_row] = if model.pending_confirmation().is_some() {
+        Style::Error
+    } else {
+        Style::Input
+    };
     let cursor_columns = UnicodeWidthStr::width(&before_cursor[start..]).min(available);
     let cursor = (input_row, (prompt_width + cursor_columns).min(width - 1));
 
     let help = if model.notice().is_empty() {
-        "F2 follow  F3 errors/GC  F4 palette  F5 telemetry  F8 clear  ^R search  Esc quit".into()
+        "F1 help  F4 commands  F5 refresh  F6 auto  / search  PgUp scroll  Esc back".into()
     } else {
         model.notice().to_string()
     };
@@ -195,16 +269,21 @@ pub fn ansi_frame(frame: &Frame) -> String {
     for (index, line) in frame.lines.iter().enumerate() {
         let code = match frame.styles[index] {
             Style::Normal => "0;37",
-            Style::Header => "1;36;44",
+            Style::Header => "1;32",
             Style::Status => "0;36",
             Style::Error => "1;31",
             Style::Gc => "0;33",
             Style::Late => "0;32",
-            Style::Accent => "1;35",
+            Style::Accent => "1;36",
             Style::Dim => "0;90",
             Style::Input => "1;37",
         };
-        out.push_str(&format!("\x1b[{code}m{line}\x1b[0m"));
+        let rendered = if matches!(frame.styles[index], Style::Normal | Style::Gc | Style::Late) {
+            accent_values(line, code)
+        } else {
+            line.clone()
+        };
+        out.push_str(&format!("\x1b[{code}m{rendered}\x1b[0m"));
         if index + 1 < frame.lines.len() {
             out.push_str("\r\n");
         }
@@ -215,6 +294,41 @@ pub fn ansi_frame(frame: &Frame) -> String {
         frame.cursor.1 + 1
     ));
     out
+}
+
+fn accent_values(line: &str, base_code: &str) -> String {
+    let mut output = String::with_capacity(line.len() + 32);
+    let mut unstyled = 0;
+    let mut at = 0;
+    while at < line.len() {
+        if let Some(length) = accented_token_len(&line[at..]) {
+            output.push_str(&line[unstyled..at]);
+            output.push_str("\x1b[1;36m");
+            output.push_str(&line[at..at + length]);
+            output.push_str(&format!("\x1b[{base_code}m"));
+            at += length;
+            unstyled = at;
+        } else {
+            at += line[at..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    output.push_str(&line[unstyled..]);
+    output
+}
+
+fn accented_token_len(text: &str) -> Option<usize> {
+    for prefix in ["0x", "id=", "tid=", "hits=", "hz="] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let length = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_hexdigit() || matches!(byte, b'x' | b'X' | b'.'))
+                .count();
+            if length > 0 {
+                return Some(prefix.len() + length);
+            }
+        }
+    }
+    None
 }
 
 fn put(destination: &mut String, text: &str, width: usize) {
@@ -290,39 +404,81 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
-    fn full_frame_has_fixed_geometry_and_status() {
+    fn compact_frame_prioritizes_link_tick_gc_and_targets() {
         let mut model = ConsoleModel::new(true);
-        model.ingest(["[7] [late] hits=42 hz=90 tid=0x7"]);
+        model.ingest([
+            "[7] [late] hits=42 hz=90.0 tid=0x7",
+            "[8] [con] who: list size 1, items 0xaa, cap 4",
+            "[9] [gct] 17 record(s), 17 live, 0 DEAD",
+            "[10] [con] pos: get_position = (1.000, 2.000, 3.000)  [raw 0x1 0x2]",
+        ]);
         let context = RenderContext {
             log_path: "/demo/hromatite.log".into(),
             command_path: "/demo/hromatite-cmd.txt".into(),
             log_bytes: Some(512),
             log_age_secs: Some(2),
         };
-        let frame = render(&model, &context, 80, 18);
+        let frame = render(&model, &context, 100, 18);
         assert_eq!(frame.lines.len(), 18);
         for (index, line) in frame.lines.iter().enumerate() {
             assert_eq!(
                 UnicodeWidthStr::width(line.as_str()),
-                80,
+                100,
                 "row {index}: {line:?}"
             );
         }
+        assert!(frame.lines[0].contains("HROMATITE // OPS"));
+        assert!(frame.lines[0].contains("DEMO // SYNTHETIC"));
+        assert!(frame.lines[0].contains("rx 2s"));
+        assert!(frame.lines[0].contains("AUTO OFF"));
+        assert!(frame.lines[1].contains("tick 90.0Hz"));
+        assert!(frame.lines[1].contains("GC OK"));
+        assert!(frame.lines[1].contains("players 1"));
         let text = frame.lines.join("\n");
-        assert!(text.contains("DEMO — SYNTHETIC"));
+        assert!(text.contains("con"));
+        assert!(text.contains("get_position"));
+        assert!(!text.contains("[10]"));
+        assert!(!text.contains("/demo/hromatite-cmd.txt"));
+    }
+
+    #[test]
+    fn palette_shows_descriptions_and_marks_dangerous_commands() {
+        let mut model = ConsoleModel::new(false);
+        model.handle(crate::input::Key::F(4));
+        model.set_active_text("write");
+        let frame = render(&model, &RenderContext::default(), 100, 20);
+        let text = frame.lines.join("\n");
+        assert!(text.contains("RISK"));
+        assert!(text.contains("wq <addr> <hex64>"));
+        assert!(text.contains("write one qword"));
+        assert!(text.contains("type to filter"));
+    }
+
+    #[test]
+    fn help_keeps_paths_and_protocol_details_available_on_demand() {
+        let mut model = ConsoleModel::new(false);
+        model.handle(crate::input::Key::F(1));
+        let context = RenderContext {
+            log_path: "/pfx/hromatite.log".into(),
+            command_path: "/pfx/hromatite-cmd.txt".into(),
+            log_bytes: Some(512),
+            log_age_secs: Some(0),
+        };
+        let text = render(&model, &context, 100, 20).lines.join("\n");
+        assert!(text.contains("FIELD MANUAL"));
+        assert!(text.contains("F6 auto"));
+        assert!(text.contains("/pfx/hromatite.log"));
         assert!(text.contains("512 B"));
-        assert!(text.contains("age 2s"));
-        assert!(text.contains("FOLLOW"));
-        assert!(text.contains("hits=42"));
-        assert!(text.contains("/demo/hromatite-cmd.txt"));
+        assert!(text.contains("/pfx/hromatite-cmd.txt"));
+        assert!(text.contains("append-only"));
     }
 
     #[test]
     fn wide_player_names_have_exact_terminal_row_geometry() {
         let mut model = ConsoleModel::new(false);
-        model.player = Some("玩家界🙂".into());
+        model.camera = Some("玩家界🙂".into());
         let frame = render(&model, &RenderContext::default(), 60, 12);
-        assert!(frame.lines[2].contains("玩家界🙂"));
+        assert!(frame.lines[1].contains("玩家界🙂"));
         for (row, line) in frame.lines.iter().enumerate() {
             assert_eq!(
                 UnicodeWidthStr::width(line.as_str()),
@@ -333,19 +489,45 @@ mod tests {
     }
 
     #[test]
+    fn undersized_frames_stay_inside_the_real_terminal_and_explain_the_limit() {
+        let model = ConsoleModel::new(false);
+        let frame = render(&model, &RenderContext::default(), 10, 6);
+        assert_eq!(frame.lines.len(), 6);
+        assert!(
+            frame
+                .lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) == 10)
+        );
+        assert!(frame.cursor.0 < 6 && frame.cursor.1 < 10);
+        assert!(frame.lines.join("\n").contains("24x8"));
+    }
+
+    #[test]
     fn wide_input_cursor_and_scrolling_use_terminal_columns() {
         let mut model = ConsoleModel::new(false);
         model.set_active_text("界🙂x");
         let frame = render(&model, &RenderContext::default(), 24, 8);
-        assert_eq!(frame.cursor, (6, 15));
+        assert_eq!(frame.cursor, (6, 11));
 
-        model.set_active_text("1234567890界🙂xy");
+        model.set_active_text("1234567890123界🙂xy");
         let frame = render(&model, &RenderContext::default(), 24, 8);
-        assert_eq!(frame.lines[6].trim_end(), " command> 4567890界🙂xy");
+        assert_eq!(frame.lines[6].trim_end(), " ops> 34567890123界🙂xy");
         assert_eq!(frame.cursor, (6, 23));
         for line in &frame.lines {
             assert_eq!(UnicodeWidthStr::width(line.as_str()), 24);
         }
+    }
+
+    #[test]
+    fn ansi_renderer_accents_addresses_and_ids_but_plain_text_stays_clean() {
+        let mut model = ConsoleModel::new(false);
+        model.ingest(["[1] [con] esp: id=7 target=0x3027c1c0"]);
+        let frame = super::render(&model, &RenderContext::default(), 80, 12);
+        assert!(!frame.lines.join("\n").contains('\u{1b}'));
+        let ansi = super::ansi_frame(&frame);
+        assert!(ansi.contains("\u{1b}[1;36m0x3027c1c0\u{1b}[0;32m"));
+        assert!(ansi.contains("\u{1b}[1;36mid=7\u{1b}[0;32m"));
     }
 
     #[test]

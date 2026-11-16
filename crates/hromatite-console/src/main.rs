@@ -7,10 +7,11 @@ use hromatite_console::fileio::{CommandWriter, LogTail};
 use hromatite_console::input::KeyDecoder;
 use hromatite_console::model::{Action, ConsoleModel};
 use hromatite_console::render::{RenderContext, ansi_frame, render};
+use hromatite_console::telemetry::AutoRefresh;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::raw::{c_int, c_ulong};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 fn main() {
     let config = Config::parse(std::env::args()).unwrap_or_else(|error| {
@@ -66,6 +67,7 @@ fn interactive(
     }
     let _terminal = TerminalGuard::enter()?;
     let writer = CommandWriter::new(config.command_path.clone());
+    let mut auto = AutoRefresh::new(Instant::now());
     let mut decoder = KeyDecoder::default();
     let mut input = [0u8; 256];
     let mut last_size = (0, 0);
@@ -77,12 +79,33 @@ fn interactive(
                 Err(error) => model.set_notice(format!("log read: {error}")),
             }
         }
+        let render_context = context(&config);
+        let was_suspended = auto.suspended();
+        let automatic = auto.poll(Instant::now(), render_context.log_age_secs);
+        model.set_auto_suspended(auto.suspended());
+        if was_suspended != auto.suspended() {
+            model.set_notice(if auto.suspended() {
+                "auto telemetry paused: log is stale"
+            } else {
+                "auto telemetry resumed"
+            });
+        }
+        if !automatic.is_empty() && !config.demo {
+            match writer.send_batch(&automatic) {
+                Ok(()) => {
+                    for command in &automatic {
+                        model.record_sent(command);
+                    }
+                }
+                Err(error) => model.set_notice(format!("auto telemetry failed: {error}")),
+            }
+        }
         let (width, height) = terminal_size();
         if (width, height) != last_size {
             write!(stdout, "\x1b[2J")?;
             last_size = (width, height);
         }
-        let frame = render(&model, &context(&config), width, height);
+        let frame = render(&model, &render_context, width, height);
         write!(stdout, "{}", ansi_frame(&frame))?;
         stdout.flush()?;
 
@@ -99,17 +122,32 @@ fn interactive(
                 Action::Submit(command) => {
                     if config.demo {
                         model.set_notice(format!("DEMO: not sent: {command}"));
-                    } else if let Err(error) = writer.send(&command) {
-                        model.set_notice(format!("send failed: {error}"));
+                    } else {
+                        match writer.send(&command) {
+                            Ok(()) => model.record_sent(&command),
+                            Err(error) => {
+                                model.set_notice(format!("send failed: {command}: {error}"))
+                            }
+                        }
                     }
                 }
                 Action::Refresh => {
                     if config.demo {
                         model.set_notice("DEMO: telemetry is synthetic; nothing requested");
-                    } else if let Err(error) = writer.send_batch(["pos", "who", "late", "gct"]) {
-                        model.set_notice(format!("telemetry request failed: {error}"));
+                    } else {
+                        match writer.send_batch(["pos", "who", "late", "gct"]) {
+                            Ok(()) => {
+                                for command in ["pos", "who", "late", "gct"] {
+                                    model.record_sent(command);
+                                }
+                            }
+                            Err(error) => {
+                                model.set_notice(format!("telemetry request failed: {error}"))
+                            }
+                        }
                     }
                 }
+                Action::ToggleAuto => auto.set_enabled(model.auto_refresh(), Instant::now()),
             }
         }
     }

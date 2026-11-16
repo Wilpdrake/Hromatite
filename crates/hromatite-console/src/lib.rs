@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod commands;
 pub mod config;
 pub mod demo;
 pub mod fileio;
@@ -7,6 +8,7 @@ pub mod input;
 pub mod model;
 pub mod parser;
 pub mod render;
+pub mod telemetry;
 
 #[cfg(test)]
 mod tests {

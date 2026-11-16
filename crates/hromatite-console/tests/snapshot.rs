@@ -15,8 +15,7 @@ fn demo_snapshot_is_plain_headless_and_explicit() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(!text.contains('\u{1b}'));
     assert_eq!(text.lines().count(), 24);
-    assert!(text.contains("DEMO — SYNTHETIC (no game)"));
-    assert!(text.contains("<built-in demo fixture>"));
+    assert!(text.contains("DEMO // SYNTHETIC"));
     assert!(text.contains("legacy unframed compatibility line"));
 }
 
@@ -28,6 +27,8 @@ fn help_is_available_without_a_tty_or_logfile() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("F5 telemetry"));
+    assert!(text.contains("F5 refresh once"));
+    assert!(text.contains("F6 auto telemetry"));
+    assert!(text.contains("F1 field manual"));
     assert!(text.contains("--demo"));
 }

@@ -1,11 +1,11 @@
 //! Testable UI state: filtering, scrolling, telemetry and key handling.
 
+use crate::commands::{CATALOG, CommandSpec, Risk, command};
 use crate::input::{History, Key, complete};
 use crate::parser::{LineKind, LogLine, parse_line};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 const MAX_LINES: usize = 20_000;
-pub const PALETTE: &[&str] = &["pos", "who", "esp", "late", "gct"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -19,6 +19,7 @@ pub enum Action {
     None,
     Submit(String),
     Refresh,
+    ToggleAuto,
     Exit,
 }
 
@@ -35,10 +36,18 @@ pub struct ConsoleModel {
     cursor: usize,
     saved_command: String,
     palette_selection: usize,
+    pending_confirmation: Option<String>,
     history: History,
     completions: Vec<&'static str>,
     notice: String,
     demo: bool,
+    auto_refresh: bool,
+    auto_suspended: bool,
+    show_help: bool,
+    player_ids: BTreeSet<u64>,
+    reported_players: Option<usize>,
+    esp_seen: bool,
+    tick_hz: Option<String>,
     pub camera: Option<String>,
     pub player: Option<String>,
     pub last_late: Option<String>,
@@ -60,10 +69,18 @@ impl ConsoleModel {
             cursor: 0,
             saved_command: String::new(),
             palette_selection: 0,
+            pending_confirmation: None,
             history: History::default(),
             completions: Vec::new(),
             notice: "type help + Enter; Ctrl-R searches logs".into(),
             demo,
+            auto_refresh: false,
+            auto_suspended: false,
+            show_help: false,
+            player_ids: BTreeSet::new(),
+            reported_players: None,
+            esp_seen: false,
+            tick_hz: None,
             camera: None,
             player: None,
             last_late: None,
@@ -95,6 +112,13 @@ impl ConsoleModel {
         while self.lines.len() > MAX_LINES {
             self.lines.pop_front();
             self.clear_before = self.clear_before.saturating_sub(1);
+        }
+    }
+
+    pub fn record_sent(&mut self, command: &str) {
+        self.ingest([format!("> {}", command.trim())]);
+        if let Some(line) = self.lines.back_mut() {
+            line.tag = "tx".into();
         }
     }
 
@@ -131,10 +155,39 @@ impl ConsoleModel {
     }
 
     pub fn handle(&mut self, key: Key) -> Action {
-        if matches!(key, Key::CtrlC | Key::Esc) {
+        if key == Key::CtrlC {
             return Action::Exit;
         }
+        let cancelled_confirmation =
+            key != Key::Enter && self.pending_confirmation.take().is_some();
+        if key == Key::Esc {
+            if cancelled_confirmation {
+                self.notice = "dangerous command cancelled".into();
+                return Action::None;
+            }
+            if self.show_help {
+                self.show_help = false;
+                return Action::None;
+            }
+            return match self.mode {
+                Mode::Command => Action::Exit,
+                Mode::Search | Mode::Palette => {
+                    self.mode = Mode::Command;
+                    let saved = self.saved_command.clone();
+                    self.set_active_text(&saved);
+                    self.completions.clear();
+                    Action::None
+                }
+            };
+        }
+        if cancelled_confirmation {
+            self.notice = "dangerous command cancelled".into();
+        }
+        if self.show_help && key != Key::F(1) {
+            return Action::None;
+        }
         match key {
+            Key::F(1) => self.show_help = !self.show_help,
             Key::F(2) => {
                 self.follow = !self.follow;
                 if self.follow {
@@ -155,14 +208,20 @@ impl ConsoleModel {
                     "filter: all".into()
                 };
             }
-            Key::F(4) => {
-                self.mode = Mode::Palette;
-                self.palette_selection = 0;
-                self.completions.clear();
-            }
+            Key::F(4) => self.begin_palette(),
             Key::F(5) => {
                 self.notice = "telemetry requested: pos, who, late, gct".into();
                 return Action::Refresh;
+            }
+            Key::F(6) => {
+                self.auto_refresh = !self.auto_refresh;
+                self.auto_suspended = false;
+                self.notice = if self.auto_refresh {
+                    "auto telemetry: ON (pos 1s, summary 5s)".into()
+                } else {
+                    "auto telemetry: OFF".into()
+                };
+                return Action::ToggleAuto;
             }
             Key::F(8) => {
                 self.clear_before = self.lines.len();
@@ -173,6 +232,9 @@ impl ConsoleModel {
             Key::CtrlR => self.begin_search(),
             Key::Char('/') if self.mode == Mode::Command && self.active.is_empty() => {
                 self.begin_search()
+            }
+            Key::Char(':') if self.mode == Mode::Command && self.active.is_empty() => {
+                self.begin_palette()
             }
             Key::PgUp => {
                 self.follow = false;
@@ -190,10 +252,13 @@ impl ConsoleModel {
                 self.set_active_text(&completed.text);
             }
             Key::Up | Key::Down if self.mode == Mode::Palette => {
-                if key == Key::Up {
-                    self.palette_selection = self.palette_selection.saturating_sub(1);
-                } else {
-                    self.palette_selection = (self.palette_selection + 1).min(PALETTE.len() - 1);
+                let count = self.palette_entries().len();
+                if count > 0 {
+                    self.palette_selection = if key == Key::Up {
+                        (self.palette_selection + count - 1) % count
+                    } else {
+                        (self.palette_selection + 1) % count
+                    };
                 }
             }
             Key::Up | Key::Down if self.mode == Mode::Command => {
@@ -206,68 +271,102 @@ impl ConsoleModel {
                     self.set_active_text(&value);
                 }
             }
-            Key::Enter => match self.mode {
-                Mode::Command => {
-                    let command = self.active.trim().to_string();
-                    if !command.is_empty() {
-                        self.history.push(&command);
-                        self.set_active_text("");
-                        self.completions.clear();
-                        self.notice = format!("sent: {command}");
-                        return Action::Submit(command);
+            Key::Enter => {
+                return match self.mode {
+                    Mode::Command => {
+                        let command = self.active.trim().to_string();
+                        if command.is_empty() {
+                            Action::None
+                        } else {
+                            self.prepare_submission(command)
+                        }
                     }
-                }
-                Mode::Search => {
-                    self.mode = Mode::Command;
-                    let saved = self.saved_command.clone();
-                    self.set_active_text(&saved);
-                    self.notice = if self.search.is_empty() {
-                        "search cleared".into()
-                    } else {
-                        format!("log filter: {}", self.search)
-                    };
-                }
-                Mode::Palette => {
-                    let command = PALETTE[self.palette_selection].to_string();
-                    self.mode = Mode::Command;
-                    self.history.push(&command);
-                    self.set_active_text("");
-                    self.notice = format!("sent: {command}");
-                    return Action::Submit(command);
-                }
-            },
-            Key::Char(ch) if self.mode != Mode::Palette => {
+                    Mode::Search => {
+                        self.mode = Mode::Command;
+                        let saved = self.saved_command.clone();
+                        self.set_active_text(&saved);
+                        self.notice = if self.search.is_empty() {
+                            "search cleared".into()
+                        } else {
+                            format!("log filter: {}", self.search)
+                        };
+                        Action::None
+                    }
+                    Mode::Palette => {
+                        let Some(selected) = self.selected_palette_command().copied() else {
+                            return Action::None;
+                        };
+                        if selected.takes_arguments() {
+                            self.mode = Mode::Command;
+                            self.set_active_text(&format!("{} ", selected.name));
+                            self.completions.clear();
+                            self.notice = format!("{} — {}", selected.usage, selected.summary);
+                            Action::None
+                        } else {
+                            self.prepare_submission(selected.name.to_string())
+                        }
+                    }
+                };
+            }
+            Key::Char(ch) => {
                 self.active.insert(self.cursor, ch);
                 self.cursor += ch.len_utf8();
                 self.after_edit();
             }
-            Key::Backspace if self.mode != Mode::Palette => {
+            Key::Backspace => {
                 if let Some((start, _)) = previous_char(&self.active, self.cursor) {
                     self.active.drain(start..self.cursor);
                     self.cursor = start;
                     self.after_edit();
                 }
             }
-            Key::Delete if self.mode != Mode::Palette => {
+            Key::Delete => {
                 if self.cursor < self.active.len() {
                     let end = next_char(&self.active, self.cursor);
                     self.active.drain(self.cursor..end);
                     self.after_edit();
                 }
             }
-            Key::Left if self.mode != Mode::Palette => {
+            Key::Left => {
                 if let Some((start, _)) = previous_char(&self.active, self.cursor) {
                     self.cursor = start;
                 }
             }
-            Key::Right if self.mode != Mode::Palette => {
+            Key::Right => {
                 self.cursor = next_char(&self.active, self.cursor);
             }
-            Key::Home if self.mode != Mode::Palette => self.cursor = 0,
-            Key::End if self.mode != Mode::Palette => self.cursor = self.active.len(),
+            Key::Home => self.cursor = 0,
+            Key::End => self.cursor = self.active.len(),
             _ => {}
         }
         Action::None
+    }
+
+    fn begin_palette(&mut self) {
+        if self.mode == Mode::Command {
+            self.saved_command = self.active.clone();
+        }
+        self.mode = Mode::Palette;
+        self.palette_selection = 0;
+        self.set_active_text("");
+        self.completions.clear();
+    }
+
+    fn prepare_submission(&mut self, submitted: String) -> Action {
+        let name = submitted.split_whitespace().next().unwrap_or("");
+        let dangerous = command(name).is_some_and(|item| item.risk == Risk::Dangerous);
+        if dangerous && self.pending_confirmation.as_deref() != Some(submitted.as_str()) {
+            self.pending_confirmation = Some(submitted);
+            self.notice = "DANGER: press Enter again to execute; Esc cancels".into();
+            return Action::None;
+        }
+        self.pending_confirmation = None;
+        self.mode = Mode::Command;
+        self.history.push(&submitted);
+        self.set_active_text("");
+        self.completions.clear();
+        self.notice = format!("sent: {submitted}");
+        Action::Submit(submitted)
     }
 
     fn begin_search(&mut self) {
@@ -287,6 +386,9 @@ impl ConsoleModel {
             self.search = self.active.clone();
             self.scroll_back = 0;
             self.follow = true;
+        }
+        if self.mode == Mode::Palette {
+            self.palette_selection = 0;
         }
         self.completions.clear();
     }
@@ -336,6 +438,30 @@ impl ConsoleModel {
         self.palette_selection
     }
 
+    pub fn palette_entries(&self) -> Vec<&'static CommandSpec> {
+        if self.mode != Mode::Palette {
+            return Vec::new();
+        }
+        let query = self.active.to_lowercase();
+        CATALOG
+            .iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.name.contains(&query)
+                    || item.usage.to_lowercase().contains(&query)
+                    || item.summary.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn selected_palette_command(&self) -> Option<&'static CommandSpec> {
+        self.palette_entries().get(self.palette_selection).copied()
+    }
+
+    pub fn pending_confirmation(&self) -> Option<&str> {
+        self.pending_confirmation.as_deref()
+    }
+
     pub fn completions(&self) -> &[&'static str] {
         &self.completions
     }
@@ -346,6 +472,40 @@ impl ConsoleModel {
 
     pub fn demo(&self) -> bool {
         self.demo
+    }
+
+    pub fn auto_refresh(&self) -> bool {
+        self.auto_refresh
+    }
+
+    pub fn help_visible(&self) -> bool {
+        self.show_help
+    }
+
+    pub fn auto_suspended(&self) -> bool {
+        self.auto_suspended
+    }
+
+    pub fn player_count(&self) -> Option<usize> {
+        self.reported_players
+            .or((self.esp_seen || !self.player_ids.is_empty()).then_some(self.player_ids.len()))
+    }
+
+    pub fn tick_hz(&self) -> Option<&str> {
+        self.tick_hz.as_deref()
+    }
+
+    pub fn gc_healthy(&self) -> Option<bool> {
+        self.last_gc.as_ref().map(|message| {
+            let lower = message.to_lowercase();
+            !["fatal", "failed", "error"]
+                .iter()
+                .any(|word| lower.contains(word))
+        })
+    }
+
+    pub fn set_auto_suspended(&mut self, suspended: bool) {
+        self.auto_suspended = suspended;
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -365,6 +525,32 @@ fn next_char(text: &str, cursor: usize) -> usize {
 }
 
 fn update_telemetry(model: &mut ConsoleModel, line: &LogLine) {
+    if line.tag == "late"
+        && let Some(hz) = keyed_value(&line.message, "hz=")
+    {
+        model.tick_hz = Some(hz.to_string());
+    }
+    if let Some(rest) = line.message.strip_prefix("who: list ") {
+        let size = rest
+            .strip_prefix("size ")
+            .or_else(|| rest.split_once(", size ").map(|(_, tail)| tail));
+        if let Some(count) = size
+            .and_then(|tail| tail.split([',', ' ']).next())
+            .and_then(|value| value.parse().ok())
+        {
+            model.reported_players = Some(count);
+        }
+    }
+    if line.message.starts_with("esp: head") {
+        model.player_ids.clear();
+        model.reported_players = None;
+        model.esp_seen = true;
+    }
+    if line.message.starts_with("esp: id=")
+        && let Some(id) = keyed_value(&line.message, "id=").and_then(|v| v.parse().ok())
+    {
+        model.player_ids.insert(id);
+    }
     if let Some(rest) = line.message.split("pos: get_position = ").nth(1) {
         let vector = rest.split("  [raw").next().unwrap_or(rest).trim();
         if vector.starts_with('(') && vector.ends_with(')') {
@@ -382,6 +568,11 @@ fn update_telemetry(model: &mut ConsoleModel, line: &LogLine) {
     if line.message.contains("player #") {
         model.player = Some(line.message.trim().to_string());
     }
+}
+
+fn keyed_value<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix))
 }
 
 #[cfg(test)]
@@ -448,6 +639,54 @@ mod tests {
         assert_eq!(m.handle(Key::CtrlC), Action::Exit);
         assert_eq!(m.handle(Key::Esc), Action::Exit);
         assert_eq!(m.handle(Key::F(5)), Action::Refresh);
+        assert_eq!(m.handle(Key::F(6)), Action::ToggleAuto);
+        assert!(m.auto_refresh());
+        assert_eq!(m.handle(Key::F(6)), Action::ToggleAuto);
+        assert!(!m.auto_refresh());
+    }
+
+    #[test]
+    fn successful_transmissions_have_a_distinct_local_echo() {
+        let mut m = ConsoleModel::new(false);
+        m.record_sent("pos");
+        let lines = m.visible_lines();
+        let last = lines.last().unwrap();
+        assert_eq!(last.tag, "tx");
+        assert_eq!(last.message, "> pos");
+        assert!(m.visible_lines().iter().any(|line| line.tag == "tx"));
+    }
+
+    #[test]
+    fn who_reads_the_actual_payload_list_format_and_the_legacy_form() {
+        let mut m = ConsoleModel::new(false);
+        m.ingest(["[1] [con] who: list 0x12db827d0, size 3, items 0xaa, cap 4"]);
+        assert_eq!(m.player_count(), Some(3));
+        m.ingest(["[2] [con] who: list size 2, items 0xbb, cap 2"]);
+        assert_eq!(m.player_count(), Some(2));
+    }
+
+    #[test]
+    fn a_received_esp_snapshot_with_no_targets_is_zero_not_unknown() {
+        let mut m = ConsoleModel::new(false);
+        assert_eq!(m.player_count(), None);
+        m.ingest(["[1] [con] esp: head w=1920 h=1080 err=0 cam=(0, 0, 0)"]);
+        assert_eq!(m.player_count(), Some(0));
+    }
+
+    #[test]
+    fn each_esp_snapshot_replaces_the_previous_target_set() {
+        let mut m = ConsoleModel::new(false);
+        m.ingest([
+            "[1] [con] esp: head w=1920 h=1080 err=0 cam=(0, 0, 0)",
+            "[2] [con] esp: id=1 d=2 target=one",
+            "[3] [con] esp: id=2 d=3 target=two",
+        ]);
+        assert_eq!(m.player_count(), Some(2));
+        m.ingest([
+            "[4] [con] esp: head w=1920 h=1080 err=0 cam=(0, 0, 0)",
+            "[5] [con] esp: id=3 d=4 target=new",
+        ]);
+        assert_eq!(m.player_count(), Some(1));
     }
 
     #[test]
@@ -456,5 +695,50 @@ mod tests {
         m.set_active_text("wh");
         m.handle(Key::Tab);
         assert_eq!(m.active_text(), "who ");
+    }
+
+    #[test]
+    fn help_is_a_dismissible_view_not_an_exit() {
+        let mut m = ConsoleModel::new(false);
+        m.handle(Key::F(1));
+        assert!(m.help_visible());
+        assert_eq!(m.handle(Key::Esc), Action::None);
+        assert!(!m.help_visible());
+        assert_eq!(m.handle(Key::Esc), Action::Exit);
+    }
+
+    #[test]
+    fn palette_searches_descriptions_and_loads_argument_templates() {
+        let mut m = ConsoleModel::new(false);
+        m.handle(Key::F(4));
+        for ch in "players".chars() {
+            m.handle(Key::Char(ch));
+        }
+        assert!(m.palette_entries().iter().any(|item| item.name == "who"));
+        m.set_active_text("q");
+        let selected = m.selected_palette_command().unwrap();
+        assert_eq!(selected.name, "q");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert_eq!(m.mode(), Mode::Command);
+        assert_eq!(m.active_text(), "q ");
+    }
+
+    #[test]
+    fn dangerous_commands_need_a_second_enter() {
+        let mut m = ConsoleModel::new(false);
+        m.set_active_text("wq 0x1000 0x2a");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert_eq!(m.pending_confirmation(), Some("wq 0x1000 0x2a"));
+        assert_eq!(
+            m.handle(Key::Enter),
+            Action::Submit("wq 0x1000 0x2a".into())
+        );
+        assert_eq!(m.pending_confirmation(), None);
+
+        m.set_active_text("quit");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        m.handle(Key::Esc);
+        assert_eq!(m.pending_confirmation(), None);
+        assert_eq!(m.mode(), Mode::Command);
     }
 }
