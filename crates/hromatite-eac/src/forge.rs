@@ -158,6 +158,11 @@ pub struct Config {
     pub interval_ms: u64,
     /// `EAC_FORGE_BODY`.
     pub body: BodyMode,
+    /// `EAC_FORGE_KEEP_SMALL`: let the live 24-byte ACK/handshake frames keep
+    /// flowing while the 512-byte heartbeat is synthesized. Off (replace
+    /// everything) by default, which is the pure "forge carries the session"
+    /// experiment.
+    pub keep_small: bool,
 }
 
 impl Config {
@@ -168,6 +173,7 @@ impl Config {
             min_frames: 0,
             interval_ms: INTERVAL_MS,
             body: BodyMode::Stale,
+            keep_small: false,
         }
     }
 
@@ -205,6 +211,9 @@ impl Config {
                 interval.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
             },
             body: BodyMode::parse(get("EAC_FORGE_BODY").as_deref()),
+            keep_small: get("EAC_FORGE_KEEP_SMALL")
+                .map(|value| !value.trim().is_empty() && value.trim() != "0")
+                .unwrap_or(false),
         }
     }
 }
@@ -313,12 +322,15 @@ mod tests {
             "EAC_FORGE_MIN_FRAMES" => Some("20".to_string()),
             "EAC_FORGE_INTERVAL_MS" => Some("50".to_string()),
             "EAC_FORGE_BODY" => Some("bump".to_string()),
+            "EAC_FORGE_KEEP_SMALL" => Some("1".to_string()),
             _ => None,
         });
         assert_eq!(explicit.after_ms, 90_000);
         assert_eq!(explicit.min_frames, 20);
         assert_eq!(explicit.interval_ms, MIN_INTERVAL_MS, "clamped up");
         assert_eq!(explicit.body, BodyMode::Bump);
+        assert!(explicit.keep_small);
+        assert!(!none.keep_small);
 
         // `EAC_FORGE_AFTER_MS` alone is enough to switch the forge on.
         let after_only = Config::parse(false, |name| {

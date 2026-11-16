@@ -123,6 +123,9 @@ static FORGE_AFTER_MS: AtomicU64 = AtomicU64::new(0);
 static FORGE_MIN_FRAMES: AtomicU64 = AtomicU64::new(0);
 static FORGE_INTERVAL_MS: AtomicU64 = AtomicU64::new(forge::INTERVAL_MS);
 static FORGE_BUMP: AtomicBool = AtomicBool::new(false);
+/// `EAC_FORGE_KEEP_SMALL`: forward live frames that are not the 512-byte
+/// heartbeat (ACKs, handshake fragments) instead of replacing them too.
+static FORGE_KEEP_SMALL: AtomicBool = AtomicBool::new(false);
 /// Set once the forge has replaced the live stream; from then on the wrapper
 /// drops live frames and the generator thread owns the cadence.
 static FORGE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -613,13 +616,13 @@ impl Hooks {
 
         // `EAC_FORGE=1`: parse once, publish into atomics, open the evidence
         // capture for the synthesized frames and start the generator thread.
-        let forge_config = forge::Config::parse(env_flag("EAC_FORGE"), |name| {
-            std::env::var(name).ok()
-        });
+        let forge_config =
+            forge::Config::parse(env_flag("EAC_FORGE"), |name| std::env::var(name).ok());
         FORGE_AFTER_MS.store(forge_config.after_ms, Ordering::Relaxed);
         FORGE_MIN_FRAMES.store(forge_config.min_frames, Ordering::Relaxed);
         FORGE_INTERVAL_MS.store(forge_config.interval_ms, Ordering::Relaxed);
         FORGE_BUMP.store(forge_config.body == BodyMode::Bump, Ordering::Relaxed);
+        FORGE_KEEP_SMALL.store(forge_config.keep_small, Ordering::Relaxed);
         FORGE_STARTED.store(false, Ordering::Relaxed);
         FORGE_SEEN.store(0, Ordering::Relaxed);
         FORGE_EMITTED.store(0, Ordering::Relaxed);
@@ -648,7 +651,10 @@ impl Hooks {
                 forge_config.body,
                 forge_path.display()
             ));
-            spawn_forge_loop();
+            // The generator thread is started from the first wrapper call, not
+            // here: `install` runs inside `DllMain` (resident startup thread) and
+            // creating a thread while the loader lock is held hung the SDK's
+            // message pump in the first live run (`EAC_FORGE=1`, zero frames).
         }
 
         let handlers: [usize; HK_COUNT] = [
@@ -1071,17 +1077,25 @@ unsafe extern "system" fn message_to_server_wrapper(info: *const MessageInfo) {
         // generator has already passed.
         if FORGE_AFTER_MS.load(Ordering::Relaxed) != 0 {
             if FORGE_STARTED.load(Ordering::Relaxed) {
-                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-                if dropped <= 20 || dropped.is_multiple_of(50) {
-                    hook_log(format!(
-                        "[forge] live frame replaced len={length} dropped={dropped} \
+                let heartbeat = length as usize == forge::FRAME_LEN;
+                if !heartbeat && FORGE_KEEP_SMALL.load(Ordering::Relaxed) {
+                    // ACKs and handshake fragments stay live; only the
+                    // heartbeat itself is ours.
+                } else {
+                    let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped <= 20 || dropped.is_multiple_of(50) {
+                        hook_log(format!(
+                            "[forge] live frame replaced len={length} dropped={dropped} \
                          hex={}",
-                        hex_prefix(data, 24)
-                    ));
+                            hex_prefix(data, 24)
+                        ));
+                    }
+                    return;
                 }
-                return;
+            } else {
+                forge_learn(data, length as usize);
+                spawn_forge_loop();
             }
-            forge_learn(data, length as usize);
         }
 
         if drop_active(ts) {
@@ -1221,9 +1235,18 @@ fn spawn_forge_loop() {
         .name("eac-forge".to_string())
         .spawn(|| {
             let mut due = 0u64;
+            let mut announced = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let now = now_ms();
+                if !announced {
+                    announced = true;
+                    hook_log(format!(
+                        "[forge] generator thread alive pid={} after_ms={}",
+                        std::process::id(),
+                        FORGE_AFTER_MS.load(Ordering::Relaxed)
+                    ));
+                }
                 if !FORGE_STARTED.load(Ordering::Relaxed) {
                     if !forge_begin(now) {
                         continue;
@@ -1758,7 +1781,10 @@ mod tests {
 
         forge_learn(&forge_frame(0xBB), forge::FRAME_LEN);
         assert_eq!(FORGE_SEEN.load(Ordering::Relaxed), 2);
-        assert!(!forge_due(30_999), "the deadline is measured from BeginSession");
+        assert!(
+            !forge_due(30_999),
+            "the deadline is measured from BeginSession"
+        );
         assert!(forge_due(31_000));
 
         let template = FORGE_TEMPLATE
@@ -1783,9 +1809,7 @@ mod tests {
         forge_state_reset();
         DELIVERED.store(0, Ordering::Relaxed);
         DELIVERED_LEN.store(0, Ordering::Relaxed);
-        BINDS[0]
-            .client_data
-            .store(0x33, Ordering::Relaxed);
+        BINDS[0].client_data.store(0x33, Ordering::Relaxed);
         BINDS[0]
             .function
             .store(recording_callback as *const () as usize, Ordering::Relaxed);
