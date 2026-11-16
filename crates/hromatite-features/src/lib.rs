@@ -12,18 +12,25 @@ mod telemetry;
 
 use feature::Feature;
 use hromatite_abi::{
-    ABI_VERSION, FeatureApiV1, HostApiV1, STATUS_BAD_ABI, STATUS_BAD_ARGUMENT, STATUS_ERROR,
-    STATUS_NOT_READY, STATUS_OK, host_header_valid,
+    ABI_VERSION, FeatureApiV1, HostApiV1, STATUS_BAD_ABI, STATUS_BAD_ARGUMENT, STATUS_NOT_READY,
+    STATUS_OK, host_header_valid,
 };
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Mutex, MutexGuard};
+use std::cell::UnsafeCell;
 
-static STATE: Mutex<Option<Feature>> = Mutex::new(None);
+/// The resident serializes every lifecycle call on the established game thread;
+/// its hook BUSY admission also prevents host callbacks from re-entering us.
+/// Recovery may abandon feature frames, so this cell deliberately owns no
+/// acquisition state that could survive in an acquired or poisoned condition.
+struct Lifecycle(UnsafeCell<Option<Feature>>);
 
-fn state() -> MutexGuard<'static, Option<Feature>> {
-    STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+// SAFETY: all access is externally serialized by the resident as described
+// above. No reference or pointer escapes a synchronous ABI invocation.
+unsafe impl Sync for Lifecycle {}
+
+static STATE: Lifecycle = Lifecycle(UnsafeCell::new(None));
+
+fn state() -> *mut Option<Feature> {
+    STATE.0.get()
 }
 
 fn init_impl(host: *const HostApiV1, generation: u64) -> i32 {
@@ -50,16 +57,20 @@ fn init_impl(host: *const HostApiV1, generation: u64) -> i32 {
     if !host_header_valid(Some(&host)) {
         return STATUS_BAD_ABI;
     }
-    *state() = Some(Feature::new(host, generation));
+    // SAFETY: the resident exclusively serializes this synchronous lifecycle
+    // access. Validation is complete before replacing the previous generation.
+    unsafe { *state() = Some(Feature::new(host, generation)) };
     STATUS_OK
 }
 
 extern "system" fn init(host: *const HostApiV1, generation: u64) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| init_impl(host, generation))).unwrap_or(STATUS_ERROR)
+    init_impl(host, generation)
 }
 
 fn dispatch_impl(command: *const i8, command_len: usize) -> i32 {
-    let mut state = state();
+    // SAFETY: the resident exclusively serializes this synchronous invocation;
+    // BUSY admission prevents a host callback from creating a second borrow.
+    let state = unsafe { &mut *state() };
     let Some(feature) = state.as_mut() else {
         return STATUS_NOT_READY;
     };
@@ -88,22 +99,13 @@ fn dispatch_impl(command: *const i8, command_len: usize) -> i32 {
 }
 
 extern "system" fn dispatch(command: *const i8, command_len: usize) -> i32 {
-    match catch_unwind(AssertUnwindSafe(|| dispatch_impl(command, command_len))) {
-        Ok(status) => status,
-        Err(_) => {
-            let state = state();
-            if let Some(feature) = state.as_ref() {
-                feature
-                    .host
-                    .log("dispatch: panic contained at feature ABI boundary");
-            }
-            STATUS_ERROR
-        }
-    }
+    dispatch_impl(command, command_len)
 }
 
 fn configure_impl(key: *const i8, key_len: usize, value: *const i8, value_len: usize) -> i32 {
-    let mut state = state();
+    // SAFETY: the resident exclusively serializes this synchronous invocation;
+    // BUSY admission prevents a host callback from creating a second borrow.
+    let state = unsafe { &mut *state() };
     let Some(feature) = state.as_mut() else {
         return STATUS_NOT_READY;
     };
@@ -148,20 +150,7 @@ extern "system" fn configure(
     value: *const i8,
     value_len: usize,
 ) -> i32 {
-    match catch_unwind(AssertUnwindSafe(|| {
-        configure_impl(key, key_len, value, value_len)
-    })) {
-        Ok(status) => status,
-        Err(_) => {
-            let state = state();
-            if let Some(feature) = state.as_ref() {
-                feature
-                    .host
-                    .log("configure: panic contained at feature ABI boundary");
-            }
-            STATUS_ERROR
-        }
-    }
+    configure_impl(key, key_len, value, value_len)
 }
 
 /// Telemetry is request-driven, preserving the existing throttled console.
@@ -170,7 +159,9 @@ extern "system" fn tick() {}
 extern "system" fn shutdown() {
     // Dropping the owned state invalidates our copied service table and every
     // resolved-pointer cache. A fresh generation is built only by `init`.
-    *state() = None;
+    // SAFETY: shutdown is serialized against every other lifecycle entry by
+    // the resident, and no feature reference escapes an earlier invocation.
+    unsafe { *state() = None };
 }
 
 static FEATURE_API: FeatureApiV1 = FeatureApiV1 {
@@ -210,6 +201,31 @@ mod tests {
     use super::*;
     use crate::test_support as fake;
     use hromatite_abi::{STATUS_BAD_ARGUMENT, STATUS_NOT_READY};
+
+    fn production_lifecycle_source() -> &'static str {
+        include_str!("lib.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production lifecycle source")
+    }
+
+    #[test]
+    fn feature_abi_leaves_panic_containment_to_the_resident() {
+        let source = production_lifecycle_source();
+        assert!(
+            !source.contains("catch_unwind") && !source.contains("AssertUnwindSafe"),
+            "manual-mapped feature images cannot unwind through erased PE metadata"
+        );
+    }
+
+    #[test]
+    fn feature_lifecycle_has_no_lock_to_survive_host_recovery() {
+        let source = production_lifecycle_source();
+        assert!(
+            !source.contains("Mutex") && !source.contains(".lock()"),
+            "a host guard recovery must not strand a lifecycle lock in its locked state"
+        );
+    }
 
     fn api() -> &'static FeatureApiV1 {
         // SAFETY: the exported table has static lifetime and a fixed C layout.
