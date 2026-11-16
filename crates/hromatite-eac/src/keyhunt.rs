@@ -203,7 +203,7 @@ fn read_block(addr: usize, dst: &mut [u8]) -> usize {
     let mut read = 0usize;
     // SAFETY: both pointers are valid for the stated length: `dst` is a live
     // slice and the kernel copies out of our own address space.
-    let ok = unsafe {
+    let _ok = unsafe {
         ReadProcessMemory(
             GetCurrentProcess(),
             addr as *const c_void,
@@ -212,7 +212,9 @@ fn read_block(addr: usize, dst: &mut [u8]) -> usize {
             &mut read,
         )
     };
-    if ok == 0 { read.min(dst.len()) } else { 0 }
+    // On a partial copy the API returns 0 *and* still fills `read` with what
+    // landed, which is exactly the case a scan across holes needs.
+    read.min(dst.len())
 }
 
 /// Linux variant of [`read_block`], used on the host target (tests) and by any
@@ -267,6 +269,103 @@ fn read_window(addr: usize, len: usize) -> Vec<u8> {
     }
     out.truncate(done);
     out
+}
+
+
+/// `MEMORY_BASIC_INFORMATION` for x64 (48 bytes, `PartitionId` padded).
+#[cfg(windows)]
+#[repr(C)]
+struct MemoryBasic {
+    base: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    partition_id: u16,
+    _pad0: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+    _pad1: u32,
+}
+
+/// Enumerate committed, readable regions of this process.
+///
+/// `/proc/self/maps` cannot be used for that on Wine: opening `Z:\proc\self`
+/// from a Windows process yields the **wineserver**'s map, not the game's (that
+/// mistake cost one whole run: 110 regions, 51 MiB, no EOSSDK image in it).
+/// `VirtualQuery` walks the NT view of the calling process, which is the one
+/// the payload lives in.
+#[cfg(windows)]
+// `hook::win` declares the same import with its own (layout-identical) struct;
+// both are the same Win32 symbol.
+#[allow(clashing_extern_declarations)]
+fn enumerate_regions() -> Vec<Region> {
+    unsafe extern "system" {
+        fn VirtualQuery(address: *const core::ffi::c_void, out: *mut MemoryBasic, len: usize)
+        -> usize;
+    }
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_IMAGE: u32 = 0x1_0000;
+    const MEM_MAPPED: u32 = 0x4_0000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_GUARD: u32 = 0x100;
+    let mut out = Vec::new();
+    let mut address = 0x1_0000usize;
+    while address < 0x0000_7fff_ffff_0000 {
+        let mut info = MemoryBasic {
+            base: 0,
+            allocation_base: 0,
+            allocation_protect: 0,
+            partition_id: 0,
+            _pad0: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+            _pad1: 0,
+        };
+        // SAFETY: `info` is a live, correctly sized MEMORY_BASIC_INFORMATION and
+        // the probe only inspects the caller's own address space.
+        let written = unsafe {
+            VirtualQuery(
+                address as *const core::ffi::c_void,
+                &mut info,
+                core::mem::size_of::<MemoryBasic>(),
+            )
+        };
+        if written == 0 || info.region_size == 0 {
+            break;
+        }
+        let readable = info.state == MEM_COMMIT
+            && info.protect & PAGE_NOACCESS == 0
+            && info.protect & PAGE_GUARD == 0;
+        let perms = if info.protect & 0xcc != 0 {
+            "rw-p"
+        } else {
+            "r--p"
+        };
+        let path = match info.kind {
+            MEM_IMAGE => "nt:image",
+            MEM_MAPPED => "nt:mapped",
+            _ => "nt:private",
+        };
+        if readable && info.region_size > 0 {
+            out.push(Region {
+                start: info.base,
+                end: info.base + info.region_size,
+                perms: perms.to_string(),
+                path: path.to_string(),
+            });
+        }
+        address = info.base.saturating_add(info.region_size);
+    }
+    out
+}
+
+/// Host variant: the plain `/proc/self/maps` walk (correct off-Wine).
+#[cfg(not(windows))]
+fn enumerate_regions() -> Vec<Region> {
+    parse_maps(&read_maps().unwrap_or_default())
 }
 
 // ------------------------------------------------------------------- matcher
@@ -454,6 +553,37 @@ pub fn probe() -> Option<FrameProbe> {
     PROBE.lock().ok().and_then(|slot| *slot)
 }
 
+/// Fallback: take the first big frame out of the capture file.
+///
+/// The resident image owns `AddNotifyMessageToServer` in the two-image setup,
+/// so its `PROBE` is filled while the feature image's stays empty. The capture
+/// file is the shared state both images already write/read, and its first
+/// 512-byte frame carries the same 12-byte session prefix the scan needs.
+pub fn probe_from_capture() -> Option<FrameProbe> {
+    let path = std::env::var_os("HROMATITE_EAC_CAPTURE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hromatite_eac_capture.bin"));
+    let frames = crate::capture::read_frames(&path).ok()?;
+    // A 512-byte heartbeat is what the hunt is about; any other big frame is a
+    // fallback so a handshake-only session still produces something.
+    let frame = frames
+        .iter()
+        .find(|frame| frame.data.len() == 512)
+        .or_else(|| frames.iter().find(|frame| frame.data.len() >= BIG_FRAME))?;
+    let frame = frame.clone();
+    let mut head = [0u8; 16];
+    let take = frame.data.len().min(16);
+    head[..take].copy_from_slice(&frame.data[..take]);
+    Some(FrameProbe {
+        // The buffer address is only known to the image that ran the callback;
+        // the scan finds the copies itself.
+        ptr: 0,
+        len: frame.data.len(),
+        head,
+        ts_ms: now_ms(),
+    })
+}
+
 // -------------------------------------------------------------------- hunter
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -481,6 +611,7 @@ pub struct Hunter {
     /// Resume point: region index and byte offset inside it.
     cursor: (usize, usize),
     scanned: u64,
+    read_bytes: u64,
     hits: Vec<Hit>,
     /// Key table kept alive for the whole pass — the matcher excludes its bytes.
     keys: Vec<(String, [u8; 32])>,
@@ -521,6 +652,7 @@ impl Hunter {
             matcher: None,
             cursor: (0, 0),
             scanned: 0,
+            read_bytes: 0,
             hits: Vec::new(),
             keys: Vec::new(),
             self_hits: 0,
@@ -568,12 +700,12 @@ impl Hunter {
         let mut lines = Vec::new();
         match self.phase {
             Phase::Wait => {
-                let Some(frame) = probe() else {
+                let Some(frame) = probe().or_else(probe_from_capture) else {
                     return lines;
                 };
                 if self.started_ms == 0 {
                     self.started_ms = now;
-                    self.due_ms = frame.ts_ms + self.first_delay_ms;
+                    self.due_ms = now + self.first_delay_ms;
                     let mut line = format!(
                         "keyhunt: frame ptr={:#x} len={} head={} dir={}",
                         frame.ptr,
@@ -611,13 +743,14 @@ impl Hunter {
         self.phase = Phase::Scan;
         self.cursor = (0, 0);
         self.scanned = 0;
+        self.read_bytes = 0;
         self.hits.clear();
         self.self_hits = 0;
         self.seen.clear();
         self.dropped.clear();
 
         let text = read_maps().unwrap_or_default();
-        self.regions = parse_maps(&text);
+        self.regions = enumerate_regions();
         // One copy of the map per pass: the report needs to show which mapping
         // every hit belongs to.
         if !text.is_empty() && fs::create_dir_all(&self.dir).is_ok() {
@@ -644,7 +777,7 @@ impl Hunter {
             .map(|(name, key)| (name.clone(), key.to_vec()))
             .collect();
         let mut frame_note = "none".to_string();
-        if let Some(frame) = probe() {
+        if let Some(frame) = probe().or_else(probe_from_capture) {
             // 12 bytes: type/flags, SessionId, and the always-zero padding. The
             // per-frame counter at +12 deliberately stays out so older copies of
             // the same session's frames still match.
@@ -687,7 +820,18 @@ impl Hunter {
 
     /// Region info + a 1 KiB window around the buffer the module handed over.
     fn probe_frame_buffer(&self) {
-        let Some(frame) = probe() else { return };
+        let Some(frame) = probe().filter(|frame| frame.ptr != 0).or_else(probe_from_capture)
+        else {
+            return;
+        };
+        if frame.ptr == 0 {
+            self.append(&format!(
+                "keyhunt: frame-buffer unknown (frame taken from capture, len={} head={})",
+                frame.len,
+                hex(&frame.head[..12])
+            ));
+            return;
+        }
         let region = self
             .regions
             .iter()
@@ -781,6 +925,7 @@ impl Hunter {
                 if let Some(matcher) = self.matcher.as_ref() {
                     matcher.find(&buffer[..got], at, &mut hits);
                 }
+                self.read_bytes += got as u64;
                 for hit in hits {
                     self.note_hit(hit, &region);
                 }
@@ -884,9 +1029,10 @@ impl Hunter {
             .map(|(name, count)| format!("{name}+{count}"))
             .collect::<Vec<_>>();
         let line = format!(
-            "keyhunt: pass {} done scanned={} MiB self={} hits: {} droplog: {}",
+            "keyhunt: pass {} done scanned={} MiB read={} MiB self={} hits: {} droplog: {}",
             self.pass,
             self.scanned / (1024 * 1024),
+            self.read_bytes / (1024 * 1024),
             self.self_hits,
             if summary.is_empty() {
                 "none".to_string()

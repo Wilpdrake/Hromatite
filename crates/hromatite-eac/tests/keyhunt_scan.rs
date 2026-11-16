@@ -81,6 +81,7 @@ fn dry_run_finds_the_seed_key_the_frame_prefix_and_dumps_windows() {
 }
 
 #[test]
+#[allow(clippy::useless_vec)] // a heap buffer, so the probe region is writable memory
 fn region_parser_covers_the_live_map_and_the_frame_probe_region_is_readable() {
     let _guard = GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
     let text = std::fs::read_to_string("/proc/self/maps").expect("maps");
@@ -88,7 +89,7 @@ fn region_parser_covers_the_live_map_and_the_frame_probe_region_is_readable() {
     assert!(regions.len() > 8);
     assert!(regions.iter().any(|region| region.readable()));
     // Our own buffer must be inside a readable region.
-    let buffer = [1u8; 64];
+    let buffer = vec![1u8; 64];
     let addr = buffer.as_ptr() as usize;
     let region = regions
         .iter()
