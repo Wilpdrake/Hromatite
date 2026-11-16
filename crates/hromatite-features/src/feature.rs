@@ -1,5 +1,6 @@
 //! Command routing and feature-owned generation state.
 
+use crate::eac::{EacFeature, INTERVAL_RANGE};
 use crate::host::Host;
 use crate::m3::{Cache as MetadataCache, Metadata};
 use crate::memory::{bytes, decode_hex, parse_addr, qwords};
@@ -16,6 +17,7 @@ pub struct Feature {
     m3: bool,
     metadata_cache: MetadataCache,
     telemetry_cache: TelemetryCache,
+    eac: EacFeature,
 }
 
 impl Feature {
@@ -28,6 +30,15 @@ impl Feature {
             m3: true,
             metadata_cache: MetadataCache::default(),
             telemetry_cache: TelemetryCache::default(),
+            eac: EacFeature::new(),
+        }
+    }
+
+    /// Managed tick: anti-cheat housekeeping only (heartbeat cadence, game-log
+    /// mirror). Bounded file I/O, no game-memory access, no native calls.
+    pub fn tick(&mut self) {
+        for line in self.eac.tick() {
+            self.host.log(&line);
         }
     }
 
@@ -50,6 +61,54 @@ impl Feature {
     }
 
     pub fn configure(&mut self, key: &str, value: &str) -> i32 {
+        // Value-carrying anti-cheat keys are handled before the 0/1 switch so a
+        // path or an interval never has to pretend to be a boolean.
+        match key {
+            "eac_log" => {
+                return match self.eac.set_log(value) {
+                    Ok(path) => self.respond(
+                        [format!("configure: eac_log={}", path.display())],
+                        STATUS_OK,
+                    ),
+                    Err(error) => self.respond(
+                        [format!("configure: eac_log: {error}")],
+                        STATUS_NOT_READY,
+                    ),
+                };
+            }
+            "eac_tail" => {
+                return match self.eac.set_tail(value) {
+                    Ok(path) => self.respond(
+                        [format!("configure: eac_tail={}", path.display())],
+                        STATUS_OK,
+                    ),
+                    Err(error) => self.respond(
+                        [format!("configure: eac_tail: {error}")],
+                        STATUS_NOT_READY,
+                    ),
+                };
+            }
+            "eac_interval_ms" => {
+                let Ok(requested) = value.trim().parse::<u64>() else {
+                    return self.respond(
+                        [format!("configure: eac_interval_ms expects milliseconds, got '{value}'")],
+                        STATUS_NOT_READY,
+                    );
+                };
+                let applied = self.eac.set_interval_ms(requested);
+                let note = if applied == requested {
+                    String::new()
+                } else {
+                    format!(" (clamped to {}-{})", INTERVAL_RANGE.0, INTERVAL_RANGE.1)
+                };
+                return self.respond(
+                    [format!("configure: eac_interval_ms={applied}{note}")],
+                    STATUS_OK,
+                );
+            }
+            _ => {}
+        }
+
         let enabled = match value {
             "0" => false,
             "1" => true,
@@ -64,6 +123,9 @@ impl Feature {
             "telemetry" => self.telemetry = enabled,
             "memory" => self.memory = enabled,
             "m3" => self.m3 = enabled,
+            "eac" => self.eac.set_enabled(enabled),
+            "eac_auto" => self.eac.set_auto(enabled),
+            "eac_autosession" => self.eac.set_autosession(enabled),
             _ => {
                 return self.respond(
                     [format!("configure: unknown key '{key}'")],
@@ -81,6 +143,21 @@ impl Feature {
         let a1 = parts.next().unwrap_or("");
         let a2 = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
+
+        // One token (`eac.status`), never a bare prefix match on `eac`.
+        if command == "eac" || command.starts_with("eac.") {
+            if command != "eac" && !self.eac.enabled() {
+                return self.disabled(&command);
+            }
+            let arg = [a1, a2, rest]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (lines, status) = self.eac.dispatch(&command, arg.trim());
+            return self.respond(lines, status);
+        }
 
         const MEMORY_COMMANDS: &[&str] = &[
             "q", "qword", "b", "bytes", "s", "ws", "wq", "wb", "guard", "call",
@@ -256,6 +333,8 @@ fn help_lines() -> Vec<String> {
         "m3l <asm> [substr] [max]       — classes in an IL2CPP image",
         "m3c <class>                    — class fields and methods",
         "m3i <assembly>                 — resolve an IL2CPP image",
+        "eac.status / eac.begin / eac.tick / eac.end — anti-cheat epochs",
+        "eac.log <path> / eac.tail <path> — JSONL log, output_log mirror",
         "call <addr> [a1..a3]           — native call through the host guard",
         "guard <addr>                   — no-argument host-guarded probe",
         "wq <addr> <hex> / wb <addr> <hexbytes> — host-mediated writes",

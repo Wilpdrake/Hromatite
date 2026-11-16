@@ -28,10 +28,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hromatite-eac"
+version = "0.1.0"
+
+[[package]]
 name = "hromatite-features"
 version = "0.1.0"
 dependencies = [
  "hromatite-abi",
+ "hromatite-eac",
 ]
 
 [[package]]

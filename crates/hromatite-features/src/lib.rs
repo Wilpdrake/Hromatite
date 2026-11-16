@@ -4,6 +4,7 @@
 //! No core runtime, VEH handler, panic hook or leaked cache lives in this image.
 #![allow(unsafe_code)]
 
+mod eac;
 mod feature;
 mod host;
 mod m3;
@@ -153,8 +154,18 @@ extern "system" fn configure(
     configure_impl(key, key_len, value, value_len)
 }
 
-/// Telemetry is request-driven, preserving the existing throttled console.
-extern "system" fn tick() {}
+/// Managed tick (LateUpdate / native PlayerLoop). Telemetry stays request-driven;
+/// only anti-cheat housekeeping runs here: heartbeat cadence and the game-log
+/// mirror. Bounded file I/O, no game-memory access, no native calls.
+extern "system" fn tick() {
+    // SAFETY: the resident exclusively serializes this synchronous invocation on
+    // the established game thread; BUSY admission prevents re-entry from a host
+    // callback, and no reference escapes this call.
+    let state = unsafe { &mut *state() };
+    if let Some(feature) = state.as_mut() {
+        feature.tick();
+    }
+}
 
 extern "system" fn shutdown() {
     // Dropping the owned state invalidates our copied service table and every
@@ -472,5 +483,55 @@ mod tests {
         assert!(fake::calls().iter().any(|(address, args)| {
             *address == crate::game_fixture::GET_MAIN && args.is_empty()
         }));
+    }
+
+    #[test]
+    fn eac_commands_write_epochs_heartbeats_and_a_session_end_to_jsonl() {
+        let _serial = fake::serial();
+        start(30);
+        let dir = std::env::temp_dir().join(format!(
+            "hromatite-features-eac-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("eac.jsonl");
+
+        assert_eq!(configure("eac_interval_ms", "5000"), STATUS_OK);
+        assert_eq!(configure("eac_interval_ms", "nope"), STATUS_NOT_READY);
+        assert_eq!(send(&format!("eac.log {}", path.display())), STATUS_OK);
+        assert_eq!(send("eac.begin"), STATUS_OK);
+        assert_eq!(send("eac.tick"), STATUS_OK);
+        assert_eq!(send("eac.tick"), STATUS_OK);
+        assert_eq!(send("eac.status"), STATUS_OK);
+        assert_eq!(send("eac.end OnLeftRoom"), STATUS_OK);
+        assert_eq!(send("eac.tick"), STATUS_NOT_READY, "epoch is closed");
+
+        assert_eq!(configure("eac", "0"), STATUS_OK);
+        assert_eq!(send("eac.status"), STATUS_NOT_READY, "family disabled");
+        assert_eq!(configure("eac", "1"), STATUS_OK);
+
+        let text = std::fs::read_to_string(&path).expect("jsonl log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "records: {text}");
+        assert!(lines[0].contains("\"ev\":\"session_begin\""));
+        assert_eq!(lines[1].matches("\"ev\":\"heartbeat\"").count(), 1);
+        assert!(lines[1].contains("\"frame_len\":144"), "{}", lines[1]);
+        assert!(lines[2].contains("\"ev\":\"heartbeat\""));
+        assert!(lines[3].contains("\"ev\":\"session_end\""));
+        assert!(lines[3].contains("\"heartbeats\":2"), "{}", lines[3]);
+        assert!(lines[3].contains("\"reason\":\"OnLeftRoom\""));
+
+        let console = fake::message_log();
+        assert!(console.contains("eac.tick: epoch=1 seq=1 hb_in_epoch=1"));
+        assert!(console.contains("eac.status: epoch=1"), "{console}");
+        assert!(console.contains("checksum=crc32c"), "{console}");
+        assert!(
+            console.contains("eac.status: disabled by configuration"),
+            "{console}"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }
