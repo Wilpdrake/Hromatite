@@ -15,6 +15,7 @@ pub mod ffi;
 pub mod hook;
 pub mod il2cpp;
 pub mod memory;
+pub mod playerloop;
 pub mod procs;
 pub mod remote;
 pub mod sys;

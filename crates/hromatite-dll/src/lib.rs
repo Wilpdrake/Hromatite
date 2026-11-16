@@ -43,6 +43,12 @@ fn select_late_update(value: Option<&str>) -> Result<hromatite_core::lateupdate:
     })
 }
 
+fn player_loop_requested(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result<(), String> {
     if frame_hook != "1" {
         return Err(
@@ -79,30 +85,30 @@ fn install_late_update_with_retry(
         .min(120_000);
     let wait = std::time::Duration::from_millis(wait_ms);
     let started = std::time::Instant::now();
-    hromatite_core::lateupdate::retry_for(
-        wait,
-        std::time::Duration::from_millis(250),
-        |attempt| {
-            if !hook::materialise_late_class(selector) {
-                if attempt % 20 == 0 {
-                    log::log_tag(
-                        "late",
-                        &format!(
-                            "waiting for class: attempt {attempt}, elapsed {}ms/{wait_ms}ms",
-                            started.elapsed().as_millis()
-                        ),
-                    );
-                }
-                return None;
+    hromatite_core::lateupdate::retry_for(wait, std::time::Duration::from_millis(250), |attempt| {
+        if !hook::materialise_late_class(selector) {
+            if attempt % 20 == 0 {
+                log::log_tag(
+                    "late",
+                    &format!(
+                        "waiting for class: attempt {attempt}, elapsed {}ms/{wait_ms}ms",
+                        started.elapsed().as_millis()
+                    ),
+                );
             }
-            Some(hook::install_late_update(selector))
-        },
-    )
+            return None;
+        }
+        Some(hook::install_late_update(selector))
+    })
     .unwrap_or_else(|| {
         Err(format!(
             "class/method did not become available within {wait_ms}ms"
         ))
     })
+}
+
+fn install_player_loop(selector: &str) -> Result<hromatite_core::playerloop::Entry, String> {
+    hromatite_core::playerloop::install(selector)
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -159,6 +165,28 @@ fn attach(hinst: *mut core::ffi::c_void) {
         log::log_tag("dll", &format!("GC worker trace installed={traced}"));
     }
 
+    if player_loop_requested(std::env::var("HROMATITE_PLAYER_LOOP").ok().as_deref()) {
+        let target = env_or("HROMATITE_PLAYER_LOOP_TARGET", "Update");
+        match log::guard("install_player_loop", || install_player_loop(&target)) {
+            Some(Ok(entry)) => log::log_tag(
+                "playerloop",
+                &format!(
+                    "PlayerLoop runtime ready: hooked entry {:#x}, inline GC guard installed",
+                    entry.update_function
+                ),
+            ),
+            Some(Err(error)) => log::log_tag(
+                "playerloop",
+                &format!("PlayerLoop installation failed: {error}; no late fallback was started"),
+            ),
+            None => log::log_tag(
+                "playerloop",
+                "PlayerLoop installer panicked; no late fallback was started",
+            ),
+        }
+        return;
+    }
+
     match log::guard("install_late_update_with_retry", || {
         install_late_update_with_retry(selector)
     }) {
@@ -208,8 +236,17 @@ pub extern "system" fn DllMain(
 
 #[cfg(test)]
 mod tests {
-    use super::{require_gc_guard, select_late_update, validate_modes};
+    use super::{player_loop_requested, require_gc_guard, select_late_update, validate_modes};
     use hromatite_core::lateupdate::Selector;
+
+    #[test]
+    fn player_loop_is_explicit_opt_in_and_late_update_stays_the_default() {
+        assert!(!player_loop_requested(None));
+        assert!(!player_loop_requested(Some("")));
+        assert!(!player_loop_requested(Some("0")));
+        assert!(player_loop_requested(Some("1")));
+        assert!(player_loop_requested(Some("true")));
+    }
 
     #[test]
     fn late_update_auto_is_the_only_default_tick_source() {

@@ -24,6 +24,7 @@ pub use raw::ffi;
 pub use raw::hook;
 pub use raw::il2cpp;
 pub use raw::memory as safe;
+pub use raw::playerloop;
 pub use raw::procs;
 pub use raw::remote;
 

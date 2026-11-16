@@ -734,6 +734,8 @@ const HELP: &[&str] = &[
     "m3l <asm> [substr] [max]       — классы образа",
     "m3c <class>                    — поля и методы класса",
     "m3i <assembly>                 — Il2CppImage сборки",
+    "loopc                          — native PlayerLoop root callbacks",
+    "loop                           — hits/частота/tid PlayerLoop",
     "latec                          — классы с LateUpdate",
     "latehook #idx|<class>          — hook конкретного LateUpdate",
     "late                           — hits/частота/tid LateUpdate",
@@ -1097,6 +1099,9 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 Action::None,
             ),
         },
+        // Native PlayerLoop discovery/status; still no SetPlayerLoop call.
+        "loopc" => (crate::playerloop::snapshot_lines(), Action::None),
+        "loop" => (crate::playerloop::status(), Action::None),
         // `pos` — the M3 proof: Camera.main -> transform -> position, i.e. a
         // real Vector3 read out of the running game with plain memory reads
         // plus three guarded method calls.
@@ -1217,6 +1222,8 @@ mod command_tests {
                 "m3l",
                 "m3c",
                 "m3i",
+                "loopc",
+                "loop",
                 "latec",
                 "latehook",
                 "late",

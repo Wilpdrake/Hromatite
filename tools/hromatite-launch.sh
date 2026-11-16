@@ -40,22 +40,25 @@ EXE="$BIN/Hromatite.exe"
 # The DLL to inject always comes from *this* checkout (so a worktree build can
 # be tested by pointing Steam at that worktree's copy of this script).
 DLL_WIN="${HROMATITE_DLL:-Z:$(printf '%s' "$ROOT/target/x86_64-pc-windows-gnu/release/hromatite.dll" | tr '/' '\\\\')}"
-# Managed LateUpdate is the only supported runtime. Its detour and the GC guard
-# live in the payload image, so every kind of full seal must stay disabled.
+# The managed LateUpdate or native PlayerLoop detour and GC guard live in the
+# payload image, so every kind of full seal must stay disabled.
 HROMATITE_FRAME_HOOK="${HROMATITE_FRAME_HOOK:-1}"
 HROMATITE_LATE_UPDATE="${HROMATITE_LATE_UPDATE:-auto}"
 HROMATITE_LIVE="${HROMATITE_LIVE:-0}"
 HROMATITE_SEAL="${HROMATITE_SEAL:-0}"
 HROMATITE_L2B="${HROMATITE_L2B:-0}"
-export HROMATITE_FRAME_HOOK HROMATITE_LATE_UPDATE HROMATITE_LIVE HROMATITE_SEAL HROMATITE_L2B
+HROMATITE_PLAYER_LOOP="${HROMATITE_PLAYER_LOOP:-0}"
+HROMATITE_PLAYER_LOOP_TARGET="${HROMATITE_PLAYER_LOOP_TARGET:-Update}"
+export HROMATITE_FRAME_HOOK HROMATITE_LATE_UPDATE HROMATITE_LIVE HROMATITE_SEAL
+export HROMATITE_L2B HROMATITE_PLAYER_LOOP HROMATITE_PLAYER_LOOP_TARGET
 if [ "$HROMATITE_FRAME_HOOK" != "1" ] || [ "$HROMATITE_LIVE" != "0" ] ||
     [ "$HROMATITE_SEAL" != "0" ] || [ "$HROMATITE_L2B" != "0" ]; then
     echo "[hromatite] unsupported legacy runtime mode: require FRAME_HOOK=1 LATE_UPDATE=auto/manual LIVE=0 SEAL=0 L2B=0" >&2
     exit 2
 fi
 INJECT_ARGS="inject --dll $DLL_WIN"
-# Emitted only after both the managed hook and inline GC guard are installed.
-LIVE_PAT='LateUpdate runtime ready: hooked entry .* inline GC guard installed'
+# Emitted only after a managed or native hook plus the inline GC guard.
+LIVE_PAT='(LateUpdate|PlayerLoop) runtime ready: hooked entry .* inline GC guard installed'
 LOG="$HOME/.hromatite-launch.log"
 GAME_LOG="$HOME/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser/hromatite.log"
 

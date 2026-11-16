@@ -579,10 +579,10 @@ fn flush(addr: usize, len: usize) {
 /// on this relay, which does an absolute jump to the real detour.
 const RELAY_OFF: usize = 0x100;
 
-struct Prep {
+pub(crate) struct Prep {
     target: usize,
     prologue: usize,
-    trampoline: usize,
+    pub(crate) trampoline: usize,
     /// `trampoline + RELAY_OFF`; holds `ff 25 00000000 <qword detour>`
     relay: usize,
     alloc_base: usize,
@@ -592,7 +592,7 @@ struct Prep {
 /// Build the trampoline (relocated prologue copy + absolute jump back) and
 /// return it *without* patching the target, so the caller can publish the
 /// trampoline address to its detour before any thread can enter it.
-fn prepare(target: usize) -> Option<Prep> {
+pub(crate) fn prepare(target: usize) -> Option<Prep> {
     prepare_span(target, 5)
 }
 
@@ -751,7 +751,7 @@ fn prepare_span(target: usize, min: usize) -> Option<Prep> {
 }
 
 /// Install the hook for an already prepared trampoline.
-fn patch(p: &Prep, detour: usize) -> Option<Hook> {
+pub(crate) fn patch(p: &Prep, detour: usize) -> Option<Hook> {
     // The patched instruction can only reach the relay (same ±2 GiB); the relay
     // then jumps absolutely to the detour wherever it lives.
     let rel = p.relay as i64 - (p.target as i64 + 5);
@@ -1727,6 +1727,21 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn prepare_tick() {
+    if let Some(interval) = std::env::var("HROMATITE_TICK_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        INTERVAL_MS.store(interval.max(1), Ordering::Relaxed);
+    }
+    let _ = START_MS.compare_exchange(0, now_ms(), Ordering::AcqRel, Ordering::Relaxed);
+    if let Ok(mut g) = READER.lock()
+        && g.is_none()
+    {
+        *g = Some(console::Reader::new());
+    }
+}
+
 /// Resolve and hook one concrete class's own `LateUpdate` method.
 pub fn install_late_update(
     selector: crate::lateupdate::Selector,
@@ -1760,18 +1775,7 @@ pub fn install_late_update(
     }
     let prep = prepare(candidate.entry)
         .ok_or_else(|| format!("cannot prepare a trampoline at {:#x}", candidate.entry))?;
-    if let Some(interval) = std::env::var("HROMATITE_TICK_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        INTERVAL_MS.store(interval.max(1), Ordering::Relaxed);
-    }
-    let _ = START_MS.compare_exchange(0, now_ms(), Ordering::AcqRel, Ordering::Relaxed);
-    if let Ok(mut g) = READER.lock()
-        && g.is_none()
-    {
-        *g = Some(console::Reader::new());
-    }
+    prepare_tick();
     log::log_tag(
         "late",
         &format!("console file {}", console::cmd_path().display()),
@@ -1873,7 +1877,7 @@ fn try_resolve(module: &str, func: &str) -> Option<usize> {
     crate::raw::sys::export_address(module, func)
 }
 
-fn register(h: Hook) {
+pub(crate) fn register(h: Hook) {
     let mut g = match HOOKS.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -1987,6 +1991,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
                 late_attachment_present(LATE_ENTRY.load(Ordering::Acquire), &installed),
                 Ordering::Release,
             );
+            crate::playerloop::refresh_attachment(&installed);
             Some(vec![format!(
                 "{n} hook(s) detached ({} still listed)",
                 g.len()
