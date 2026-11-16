@@ -6,6 +6,7 @@
 
 mod feature;
 mod host;
+mod m3;
 mod memory;
 
 use feature::Feature;
@@ -199,6 +200,8 @@ pub extern "system" fn DllMain(
 }
 
 #[cfg(test)]
+mod game_fixture;
+#[cfg(test)]
 mod test_support;
 
 #[cfg(test)]
@@ -321,5 +324,62 @@ mod tests {
         assert!(log.contains("unknown command: not-a-command (try help)"));
         assert!(log.contains("usage: q <addr> [n]"));
         assert!(log.contains("usage: call <addr> [a1] [a2] [a3]"));
+    }
+
+    #[test]
+    fn m3_commands_use_the_measured_unity6_layout_and_host_guard() {
+        let _serial = fake::serial();
+        start(10);
+        crate::game_fixture::install();
+        use crate::game_fixture as fixture;
+
+        assert_eq!(send("m3f UnityEngine Camera"), STATUS_OK);
+        assert_eq!(send("m3s cam"), STATUS_OK);
+        assert_eq!(send(&format!("m3c {:x}", fixture::CAMERA_CLASS)), STATUS_OK);
+        assert_eq!(send("m3i UnityEngine.CoreModule"), STATUS_OK);
+        assert_eq!(send("m3l Assembly-CSharp cam 2"), STATUS_OK);
+        let log = fake::message_log();
+        assert!(log.contains("#167"), "{log}");
+        assert!(
+            log.contains(&format!("table {:#x}", fixture::CLASS_TABLE)),
+            "{log}"
+        );
+        assert!(log.contains("UnityEngine.Camera"), "{log}");
+        assert!(log.contains("+0x0040 m_FieldOfView"), "{log}");
+        assert!(log.contains("get_main"), "{log}");
+        assert!(log.contains("return_kind=1"), "{log}");
+        assert!(
+            log.contains(&format!("corlib image {:#x}", fixture::CORLIB_IMAGE)),
+            "{log}"
+        );
+        assert!(
+            log.contains("2 class(es) seen, 1 match(es), 0 fault(s)"),
+            "{log}"
+        );
+        let ga = fake::api().game_assembly_base;
+        assert!(fake::calls().iter().any(|(address, args)| {
+            *address == ga + fixture::IMAGE_GET_CLASS_RVA && args.len() == 2
+        }));
+    }
+
+    #[test]
+    fn a_new_generation_does_not_reuse_the_previous_class_table_cache() {
+        let _serial = fake::serial();
+        start(11);
+        crate::game_fixture::install();
+        use crate::game_fixture as fixture;
+        assert_eq!(send("m3f UnityEngine Camera"), STATUS_OK);
+
+        let host = fake::api();
+        assert_eq!((api().init)(&host, 12), STATUS_OK);
+        let replacement = fixture::CLASS_TABLE + 0x1000;
+        fake::put_u64(
+            fake::api().game_assembly_base + fixture::CLASS_TABLE_RVA,
+            replacement,
+        );
+        assert_eq!(send("m3f UnityEngine Camera"), STATUS_OK);
+        assert!(fake::message_log().contains(&format!("table {replacement:#x}")));
+        assert_eq!(send("feature"), STATUS_OK);
+        assert!(fake::message_log().contains("feature: generation=12 abi=1"));
     }
 }

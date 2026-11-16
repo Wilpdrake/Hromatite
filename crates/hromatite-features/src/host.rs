@@ -12,6 +12,13 @@ impl Host {
         Self { api }
     }
 
+    pub fn game_assembly_range(&self) -> (usize, usize) {
+        (
+            self.api.game_assembly_base as usize,
+            self.api.game_assembly_size as usize,
+        )
+    }
+
     pub fn log(&self, message: &str) {
         (self.api.log)(
             b"con\0".as_ptr().cast(),

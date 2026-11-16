@@ -1,6 +1,7 @@
 //! Command routing and feature-owned generation state.
 
 use crate::host::Host;
+use crate::m3::{Cache as MetadataCache, Metadata};
 use crate::memory::{bytes, decode_hex, parse_addr, qwords};
 use hromatite_abi::{
     ABI_VERSION, HostApiV1, STATUS_BAD_ARGUMENT, STATUS_ERROR, STATUS_NOT_READY, STATUS_OK,
@@ -12,6 +13,7 @@ pub struct Feature {
     telemetry: bool,
     memory: bool,
     m3: bool,
+    metadata_cache: MetadataCache,
 }
 
 impl Feature {
@@ -22,6 +24,7 @@ impl Feature {
             telemetry: true,
             memory: true,
             m3: true,
+            metadata_cache: MetadataCache::default(),
         }
     }
 
@@ -88,6 +91,13 @@ impl Feature {
         }
         if matches!(command.as_str(), "pos" | "who" | "esp") && !self.telemetry {
             return self.disabled(&command);
+        }
+        if M3_COMMANDS.contains(&command.as_str()) {
+            let (lines, status) = {
+                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
+                crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+            };
+            return self.respond(lines, status);
         }
 
         match command.as_str() {
