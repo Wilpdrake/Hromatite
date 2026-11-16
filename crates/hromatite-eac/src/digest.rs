@@ -119,6 +119,36 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     sha256(&outer_input)
 }
 
+/// HKDF-SHA256 (RFC 5869): extract then expand to `len` bytes.
+///
+/// Used by the session-key hunt to test plausible derivations of the SDK's
+/// hard-coded seed key. `salt` may be empty (RFC: a string of 32 zero bytes),
+/// `info` is the context label.
+pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let prk = if salt.is_empty() {
+        hmac_sha256(&[0u8; 32], ikm)
+    } else {
+        hmac_sha256(salt, ikm)
+    };
+    let mut out = Vec::with_capacity(len);
+    let mut previous: Vec<u8> = Vec::new();
+    let mut counter = 1u8;
+    while out.len() < len {
+        let mut input = Vec::with_capacity(previous.len() + info.len() + 1);
+        input.extend_from_slice(&previous);
+        input.extend_from_slice(info);
+        input.push(counter);
+        previous = hmac_sha256(&prk, &input).to_vec();
+        out.extend_from_slice(&previous);
+        counter = counter.wrapping_add(1);
+        if counter == 0 {
+            break;
+        }
+    }
+    out.truncate(len);
+    out
+}
+
 /// CRC-32/ISO-HDLC (zlib polynomial), the variant Python's `zlib.crc32` emits.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
@@ -202,6 +232,25 @@ mod tests {
         assert_eq!(
             hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc_5869_case_1() {
+        let ikm = [0x0bu8; 22];
+        let salt: Vec<u8> = (0u8..=0x0c).collect();
+        let info: Vec<u8> = (0xf0u8..=0xf9).collect();
+        assert_eq!(
+            hex(&hkdf_sha256(&salt, &ikm, &info, 42)),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+             34007208d5b887185865"
+        );
+        // Expand-only path, salt omitted, two blocks.
+        let okm = hkdf_sha256(&[], b"seed", b"info", 64);
+        assert_eq!(okm.len(), 64);
+        assert_eq!(
+            &okm[..32],
+            &hkdf_sha256(&[0u8; 32], b"seed", b"info", 32)[..]
         );
     }
 

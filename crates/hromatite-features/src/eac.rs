@@ -16,6 +16,7 @@ use hromatite_eac::codec::{ChecksumKind, FRAME_LEN};
 use hromatite_eac::digest::sha256;
 use hromatite_eac::encode_beat;
 use hromatite_eac::eventlog::{Event, JsonlLog};
+use hromatite_eac::keyhunt::Hunter;
 use hromatite_eac::payload::{integrity_digest, module_list_hash};
 use hromatite_eac::session::{EacSession, MAX_INTERVAL_MS, MIN_INTERVAL_MS};
 use hromatite_eac::tailer::{Tailer, announces_begin, announces_end};
@@ -73,6 +74,7 @@ pub struct EacFeature {
     last_error: Option<String>,
     hooks: Hooks,
     hooks_enabled: bool,
+    hunter: Hunter,
 }
 
 impl Default for EacFeature {
@@ -99,6 +101,7 @@ impl EacFeature {
             last_error: None,
             hooks: Hooks::new(),
             hooks_enabled: true,
+            hunter: Hunter::new(),
         }
     }
 
@@ -308,6 +311,9 @@ impl EacFeature {
                 self.apply_hook_events(events, &mut lines);
             }
         }
+        if self.hunter.enabled() {
+            lines.extend(self.hunter.tick());
+        }
         self.poll_tail(&mut lines);
         if self.auto && self.session.running() && self.session.due(now()) {
             match self.beat(now()) {
@@ -396,6 +402,12 @@ impl EacFeature {
         ));
         if let Some(line) = self.hooks.status_lines().into_iter().nth(1) {
             lines.push(line);
+        }
+        if self.hunter.enabled() {
+            lines.push(format!(
+                "eac.keyhunt: enabled=1 dir={}",
+                self.hunter.dir().display()
+            ));
         }
         lines
     }

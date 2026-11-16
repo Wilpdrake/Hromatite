@@ -19,9 +19,13 @@
 //!   epochs come from `BeginSession`/`EndSession`, every outgoing frame is
 //!   captured, and `ProtectMessage` lengths are counted (the 22-byte proof).
 //! * [`capture`] — the binary capture/replay format (`u32 len, u32 dt_ms, bytes`).
+//! * [`keyhunt`] — `EAC_KEYHUNT=1`: scans the live address space for the SDK's
+//!   seed key and its derivations, probes the 512-byte frame buffer and looks
+//!   for other copies of the frame prefix (observation only).
 //!
-//! Only `hook`/`eos` contain `unsafe`; every block carries a `// SAFETY:`
-//! justification and stays inside the two `#[allow(unsafe_code)]` modules.
+//! Only `hook`/`eos`/`keyhunt` contain `unsafe`; every block carries a
+//! `// SAFETY:` justification and stays inside those `#[allow(unsafe_code)]`
+//! modules.
 
 #![deny(unsafe_code)]
 
@@ -34,6 +38,8 @@ pub mod eos;
 pub mod eventlog;
 #[allow(unsafe_code)]
 pub mod hook;
+#[allow(unsafe_code)]
+pub mod keyhunt;
 pub mod payload;
 pub mod session;
 pub mod tailer;
