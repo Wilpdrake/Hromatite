@@ -637,7 +637,7 @@ impl Hooks {
         FORGE_AFTER_MS.store(forge_config.after_ms, Ordering::Relaxed);
         FORGE_MIN_FRAMES.store(forge_config.min_frames, Ordering::Relaxed);
         FORGE_INTERVAL_MS.store(forge_config.interval_ms, Ordering::Relaxed);
-        FORGE_BUMP.store(forge_config.body == BodyMode::Bump, Ordering::Relaxed);
+        FORGE_BUMP.store(forge_config.body.bumped(), Ordering::Relaxed);
         FORGE_KEEP_SMALL.store(forge_config.keep_small, Ordering::Relaxed);
         FORGE_PREFER_START.store(
             forge_config.template == forge::TemplateMode::Start,
