@@ -10,6 +10,11 @@
 //!   file, then forwarded to the game's callback — unless
 //!   `EACSHIM_DROP_AFTER_MS` cut the heartbeat, or `EAC_REPLAY=1` asks us to
 //!   feed the game the captured frames instead.
+//! * `EAC_FORGE=1` ([`crate::forge`]) goes one step further than replay: the last
+//!   live 512-byte frame of the session is learned as a template and, after
+//!   `EAC_FORGE_AFTER_MS`, every live frame is replaced by a synthesized one
+//!   (same `SessionId`/`Flags`/body, next `Sequence`, fresh CRC-32C) at the
+//!   measured 2007 ms cadence, from a thread of our own.
 //! * `ReceiveMessageFromServer` observes inbound frames and can drop them after
 //!   the same deadline (`EACSHIM_DROP_IN=1`).
 //!
@@ -41,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 
 use crate::capture::{CaptureFile, Frame, hex_prefix, read_frames};
 use crate::clock::now_ms;
+use crate::forge::{self, BodyMode, Template};
 use crate::hook;
 
 /// DLL that owns every AC export we hook.
@@ -106,6 +112,32 @@ static DROP_AFTER_MS: AtomicU64 = AtomicU64::new(0);
 static DROP_IN: AtomicBool = AtomicBool::new(false);
 static REPLAY: AtomicBool = AtomicBool::new(false);
 static LAST_MESSAGE_LOG: AtomicU64 = AtomicU64::new(0);
+
+// ------------------------------------------------------------------- forge
+//
+// `EAC_FORGE=1`: the configuration is copied into atomics at install time (a
+// handler must never read the environment), the template is the last live
+// 512-byte frame and is kept under its own mutex so a forge tick never waits
+// behind the capture sink.
+static FORGE_AFTER_MS: AtomicU64 = AtomicU64::new(0);
+static FORGE_MIN_FRAMES: AtomicU64 = AtomicU64::new(0);
+static FORGE_INTERVAL_MS: AtomicU64 = AtomicU64::new(forge::INTERVAL_MS);
+static FORGE_BUMP: AtomicBool = AtomicBool::new(false);
+/// Set once the forge has replaced the live stream; from then on the wrapper
+/// drops live frames and the generator thread owns the cadence.
+static FORGE_STARTED: AtomicBool = AtomicBool::new(false);
+/// Live 512-byte frames learned in this epoch (the readiness counter).
+static FORGE_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Frames the generator handed to the game callback.
+static FORGE_EMITTED: AtomicU64 = AtomicU64::new(0);
+/// Next `Sequence` the generator will put in a frame.
+static FORGE_NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of the previous emission (for the capture file's `dt_ms`).
+static FORGE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+/// Set once so a double install cannot start two generators.
+static FORGE_THREAD: AtomicBool = AtomicBool::new(false);
+static FORGE_TEMPLATE: Mutex<Option<Template>> = Mutex::new(None);
+static FORGE_CAPTURE: Mutex<Option<CaptureFile>> = Mutex::new(None);
 
 /// One `(ClientData, callback)` pair registered by the game.
 struct Bind {
@@ -270,6 +302,8 @@ pub struct Counters {
     pub dropped: u64,
     /// Frames injected from a capture file during replay.
     pub replayed: u64,
+    /// Synthesized heartbeat frames handed to the game callback (`EAC_FORGE`).
+    pub forged: u64,
     /// `ProtectMessage` calls.
     pub protect: u64,
     /// Sum of `ProtectMessage` input lengths.
@@ -408,6 +442,7 @@ impl Hooks {
             forwarded: FORWARDED.load(Ordering::Relaxed),
             dropped: DROPPED.load(Ordering::Relaxed),
             replayed: REPLAYED.load(Ordering::Relaxed),
+            forged: FORGE_EMITTED.load(Ordering::Relaxed),
             protect: CALLS[HK_PROTECT].load(Ordering::Relaxed),
             protect_in: PROTECT_IN.load(Ordering::Relaxed),
             protect_out: PROTECT_OUT.load(Ordering::Relaxed),
@@ -470,7 +505,9 @@ impl Hooks {
     /// Human-readable install summary for `eac.hooks`.
     pub fn status_lines(&self) -> Vec<String> {
         let counters = self.counters();
-        let mode = if REPLAY.load(Ordering::Relaxed) {
+        let mode = if FORGE_AFTER_MS.load(Ordering::Relaxed) != 0 {
+            "forge"
+        } else if REPLAY.load(Ordering::Relaxed) {
             "replay"
         } else if DROP_AFTER_MS.load(Ordering::Relaxed) != 0 {
             "drop"
@@ -488,13 +525,17 @@ impl Hooks {
                 .unwrap_or_else(|| "-".to_string()),
         )];
         lines.push(format!(
-            "eac.hooks: out={} in={} forwarded={} dropped={} replayed={} begins={} ends={} \
-             addnotify={} protect={} overhead22={}/{} min={} max={}",
+            "eac.hooks: out={} in={} forwarded={} dropped={} replayed={} forged={} \
+             seen512={} forge_seq={} begins={} ends={} addnotify={} protect={} \
+             overhead22={}/{} min={} max={}",
             counters.out_messages,
             counters.in_messages,
             counters.forwarded,
             counters.dropped,
             counters.replayed,
+            counters.forged,
+            FORGE_SEEN.load(Ordering::Relaxed),
+            FORGE_NEXT_SEQ.load(Ordering::Relaxed),
             counters.calls[HK_BEGIN],
             counters.calls[HK_END],
             counters.calls[HK_ADD_NOTIFY],
@@ -564,6 +605,46 @@ impl Hooks {
         };
         if let Ok(mut slot) = SINK.lock() {
             *slot = Some(sink);
+        }
+
+        // `EAC_FORGE=1`: parse once, publish into atomics, open the evidence
+        // capture for the synthesized frames and start the generator thread.
+        let forge_config = forge::Config::parse(env_flag("EAC_FORGE"), |name| {
+            std::env::var(name).ok()
+        });
+        FORGE_AFTER_MS.store(forge_config.after_ms, Ordering::Relaxed);
+        FORGE_MIN_FRAMES.store(forge_config.min_frames, Ordering::Relaxed);
+        FORGE_INTERVAL_MS.store(forge_config.interval_ms, Ordering::Relaxed);
+        FORGE_BUMP.store(forge_config.body == BodyMode::Bump, Ordering::Relaxed);
+        FORGE_STARTED.store(false, Ordering::Relaxed);
+        FORGE_SEEN.store(0, Ordering::Relaxed);
+        FORGE_EMITTED.store(0, Ordering::Relaxed);
+        FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
+        FORGE_LAST_MS.store(0, Ordering::Relaxed);
+        if let Ok(mut slot) = FORGE_TEMPLATE.lock() {
+            *slot = None;
+        }
+        if forge_config.enabled() {
+            let forge_path = std::env::var_os("HROMATITE_EAC_FORGE_CAPTURE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    capture_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join("forge_frames.bin")
+                });
+            if let Ok(mut slot) = FORGE_CAPTURE.lock() {
+                *slot = CaptureFile::open(&forge_path).ok();
+            }
+            hook_log_blocking(&format!(
+                "[forge] armed after_ms={} min_frames={} interval_ms={} body={:?} out={}",
+                forge_config.after_ms,
+                forge_config.min_frames,
+                forge_config.interval_ms,
+                forge_config.body,
+                forge_path.display()
+            ));
+            spawn_forge_loop();
         }
 
         let handlers: [usize; HK_COUNT] = [
@@ -683,6 +764,11 @@ fn reset_state() {
     OVERHEAD_MAX.store(0, Ordering::Relaxed);
     LAST_OUT_MS.store(0, Ordering::Relaxed);
     SESSION_START_MS.store(0, Ordering::Relaxed);
+    FORGE_STARTED.store(false, Ordering::Relaxed);
+    FORGE_SEEN.store(0, Ordering::Relaxed);
+    FORGE_EMITTED.store(0, Ordering::Relaxed);
+    FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
+    FORGE_LAST_MS.store(0, Ordering::Relaxed);
     LAST_MESSAGE_LOG.store(0, Ordering::Relaxed);
     if let Ok(mut events) = EVENTS.lock() {
         events.clear();
@@ -882,6 +968,9 @@ unsafe extern "system" fn hook_begin(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64
         -1
     };
     SESSION_START_MS.store(ts, Ordering::Relaxed);
+    // A new `SessionId` starts a new frame sequence upstream, so the learned
+    // template of the previous room must not be reused.
+    forge_reset_epoch();
     push_event(HookEvent::SessionBegin { mode, ts_ms: ts });
     if verbose(calls) {
         hook_log(format!(
@@ -971,6 +1060,25 @@ unsafe extern "system" fn message_to_server_wrapper(info: *const MessageInfo) {
             }
         }
 
+        // `EAC_FORGE=1`: learn the heartbeat while the live stream is still
+        // real, and from the moment the generator takes over let it own the
+        // channel — a forwarded live frame would carry a `Sequence` the
+        // generator has already passed.
+        if FORGE_AFTER_MS.load(Ordering::Relaxed) != 0 {
+            if FORGE_STARTED.load(Ordering::Relaxed) {
+                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped <= 20 || dropped.is_multiple_of(50) {
+                    hook_log(format!(
+                        "[forge] live frame replaced len={length} dropped={dropped} \
+                         hex={}",
+                        hex_prefix(data, 24)
+                    ));
+                }
+                return;
+            }
+            forge_learn(data, length as usize);
+        }
+
         if drop_active(ts) {
             let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped <= 50 || dropped.is_multiple_of(100) {
@@ -1006,6 +1114,198 @@ fn drop_active(now: u64) -> bool {
     }
     let start = SESSION_START_MS.load(Ordering::Relaxed);
     start != 0 && now.saturating_sub(start) >= deadline
+}
+
+// ------------------------------------------------------------------- forge
+
+/// Remember a live 512-byte frame as the template for the current epoch.
+///
+/// Called from the SDK thread, so it uses `try_lock`: a skipped learning step
+/// only costs one frame, the next one arrives in ~2 s anyway.
+fn forge_learn(data: &[u8], length: usize) {
+    if length != forge::FRAME_LEN {
+        return;
+    }
+    let Some(template) = Template::from_frame(data) else {
+        return;
+    };
+    let seen = FORGE_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let sid = template.session_id;
+    let flags = template.flags;
+    let seq = template.last_seq;
+    if let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
+        *slot = Some(template);
+    }
+    if seen <= 3 || seen.is_multiple_of(20) {
+        hook_log(format!(
+            "[forge] learned #{seen} sid=0x{sid:x} seq={seq} flags=0x{flags:x} len={length}"
+        ));
+    }
+}
+
+/// True when the forge may take over: the deadline elapsed, enough live frames
+/// were learned and a template exists.
+fn forge_due(now: u64) -> bool {
+    let after = FORGE_AFTER_MS.load(Ordering::Relaxed);
+    if after == 0 {
+        return false;
+    }
+    let start = SESSION_START_MS.load(Ordering::Relaxed);
+    if start == 0 || now.saturating_sub(start) < after {
+        return false;
+    }
+    if FORGE_SEEN.load(Ordering::Relaxed) < FORGE_MIN_FRAMES.load(Ordering::Relaxed) {
+        return false;
+    }
+    FORGE_TEMPLATE
+        .try_lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
+
+/// Flip the forge on: seed the sequence from the learned frame and log the
+/// transition. Runs on the generator thread, so a blocking lock is fine.
+fn forge_begin(now: u64) -> bool {
+    if !forge_due(now) {
+        return false;
+    }
+    let Ok(slot) = FORGE_TEMPLATE.lock() else {
+        return false;
+    };
+    let Some(template) = slot.as_ref() else {
+        return false;
+    };
+    let seq = template.next_seq();
+    FORGE_NEXT_SEQ.store(seq, Ordering::Relaxed);
+    FORGE_STARTED.store(true, Ordering::Release);
+    hook_log_blocking(&format!(
+        "[forge] start sid=0x{:x} flags=0x{:x} from_seq={seq} seen={} after_ms={} \
+         interval_ms={} body={:?} uptime_ms={}",
+        template.session_id,
+        template.flags,
+        FORGE_SEEN.load(Ordering::Relaxed),
+        FORGE_AFTER_MS.load(Ordering::Relaxed),
+        FORGE_INTERVAL_MS.load(Ordering::Relaxed),
+        if FORGE_BUMP.load(Ordering::Relaxed) {
+            BodyMode::Bump
+        } else {
+            BodyMode::Stale
+        },
+        now.saturating_sub(SESSION_START_MS.load(Ordering::Relaxed)),
+    ));
+    true
+}
+
+/// Forget the template when a new `BeginSession` opens the next epoch.
+fn forge_reset_epoch() {
+    FORGE_STARTED.store(false, Ordering::Release);
+    FORGE_SEEN.store(0, Ordering::Relaxed);
+    FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
+    if let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
+        *slot = None;
+    }
+}
+
+/// Start the generator thread once. It owns the cadence, so the heartbeat
+/// survives even if the EAC module stops calling the wrapper.
+fn spawn_forge_loop() {
+    if FORGE_THREAD.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("eac-forge".to_string())
+        .spawn(|| {
+            let mut due = 0u64;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let now = now_ms();
+                if !FORGE_STARTED.load(Ordering::Relaxed) {
+                    if !forge_begin(now) {
+                        continue;
+                    }
+                    due = 0;
+                }
+                if due == 0 || now >= due {
+                    emit_forge_frame(now);
+                    due = now.saturating_add(FORGE_INTERVAL_MS.load(Ordering::Relaxed));
+                }
+            }
+        });
+    if spawned.is_err() {
+        FORGE_THREAD.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `ClientData` of the first registered callback, for a synthetic message.
+fn first_client_data() -> *mut c_void {
+    let count = BIND_COUNT.load(Ordering::Acquire).min(MAX_BINDS);
+    BINDS
+        .iter()
+        .take(count)
+        .map(|bind| bind.client_data.load(Ordering::Relaxed) as *mut c_void)
+        .find(|client_data| !client_data.is_null())
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// Build one heartbeat and hand it to the game's `MessageToServer` callback.
+fn emit_forge_frame(now: u64) {
+    let Ok(slot) = FORGE_TEMPLATE.lock() else {
+        return;
+    };
+    let Some(template) = slot.as_ref() else {
+        return;
+    };
+    let seq = FORGE_NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mode = if FORGE_BUMP.load(Ordering::Relaxed) {
+        BodyMode::Bump
+    } else {
+        BodyMode::Stale
+    };
+    let frame = forge::build_frame(template, seq, mode);
+    let sid = template.session_id;
+    let flags = template.flags;
+    drop(slot);
+    debug_assert_eq!(frame.len(), forge::FRAME_LEN);
+    let crc = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]);
+    let previous = FORGE_LAST_MS.swap(now, Ordering::Relaxed);
+    let dt = if previous == 0 {
+        0
+    } else {
+        now.saturating_sub(previous).min(u64::from(u32::MAX)) as u32
+    };
+
+    // Evidence: the exact bytes we hand over, in the capture format, so
+    // `frame_analyze.py checksum` can verify every CRC offline.
+    if let Ok(mut slot) = FORGE_CAPTURE.lock()
+        && let Some(capture) = slot.as_mut()
+    {
+        let _ = capture.append(dt, &frame);
+    }
+
+    let info = MessageInfo {
+        client_data: first_client_data(),
+        data: frame.as_ptr(),
+        size: frame.len() as u32,
+    };
+    let delivered = match bound_callback(info.client_data as usize) {
+        Some(function) => {
+            // SAFETY: `bound_callback` returns a function the game registered
+            // through `AddNotifyMessageToServer`, i.e. the exact
+            // `extern "system" fn(*const MessageInfo)` ABI.
+            let callback: MessageCallback = unsafe { core::mem::transmute(function) };
+            // SAFETY: `info` and the bytes behind `info.data` live on this
+            // stack frame for the whole call, exactly as the SDK's own call.
+            unsafe { callback(&info) };
+            FORGE_EMITTED.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    };
+    let count = FORGE_EMITTED.load(Ordering::Relaxed);
+    hook_log(format!(
+        "[forge] sid=0x{sid:x} seq={seq} crc=0x{crc:08x} len=512 flags=0x{flags:x} \
+         n={count} dt_ms={dt} delivered={delivered}"
+    ));
 }
 
 /// Replay one captured frame into the game callback when it is due.
