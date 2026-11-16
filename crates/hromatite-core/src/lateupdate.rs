@@ -20,8 +20,8 @@ pub enum Selector {
 /// Chosen from the live candidate list for GameAssembly
 /// `648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b`.
 /// Its index is only a materialisation hint; resolution always re-checks the name.
-pub const AUTO_CLASS: &str = "VRC.SDK3.Components.VRCTweenPostLateUpdater";
-pub const AUTO_TYPE_INDEX: usize = 31_241;
+pub const AUTO_CLASS: &str = "VRC.Udon.UdonManager";
+pub const AUTO_TYPE_INDEX: usize = 34_575;
 pub const AUTO_BUILD_SHA256: &str =
     "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b";
 const AUTO_SCAN_LIMIT: usize = 120_000;
