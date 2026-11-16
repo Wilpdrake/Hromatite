@@ -1,6 +1,7 @@
 //! Fixed-size ANSI/plain frame renderer.
 
 use crate::commands::Risk;
+use crate::hot::HotState;
 use crate::model::{ConsoleModel, Mode};
 use crate::parser::LineKind;
 use unicode_width::UnicodeWidthStr;
@@ -101,10 +102,47 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     } else {
         Style::Status
     };
-    lines[2] = "─".repeat(width);
-    styles[2] = Style::Dim;
+    let feature = match (model.feature_generation(), model.feature_abi()) {
+        (Some(generation), Some(abi)) => format!("feature gen={generation} abi={abi}"),
+        _ => "feature --".into(),
+    };
+    let hot_failed = model
+        .hot_status()
+        .is_some_and(|status| status.state == HotState::Error || status.error.is_some());
+    let hot = if let Some(status) = model.hot_status() {
+        let previous = status
+            .previous
+            .map_or("--".into(), |value| value.to_string());
+        let pending = status
+            .pending
+            .map_or("--".into(), |value| value.to_string());
+        let mut text = format!(
+            " hot {} gen={} prev={} pending={} flight={} sha={} | {feature}",
+            status.state_name,
+            status.generation,
+            previous,
+            pending,
+            status.flight,
+            status.sha.as_deref().unwrap_or("--"),
+        );
+        if let Some(error) = &status.error {
+            text.push_str(" | ");
+            text.push_str(error);
+        }
+        text
+    } else {
+        format!(" hot -- | {feature}")
+    };
+    put(&mut lines[2], &hot, width);
+    styles[2] = if hot_failed {
+        Style::Error
+    } else {
+        Style::Status
+    };
+    lines[3] = "─".repeat(width);
+    styles[3] = Style::Dim;
 
-    let body_start = 3;
+    let body_start = 4;
     let body_len = height.saturating_sub(body_start + 3);
     let body = model.window(body_len);
     for (offset, line) in body.iter().enumerate() {
@@ -185,7 +223,8 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
             " F4 or : payload commands | / or Ctrl-R log filter".into(),
             " F2 follow | F3 errors+GC | PgUp/PgDn scrollback".into(),
             " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
-            " F8 clear view only | Ctrl-C quit | Esc back".into(),
+            " F7 reload (second Enter confirms) | F8 clear view only".into(),
+            " Ctrl-C quit | Esc back".into(),
             " RISK commands require a second Enter; edits cancel it".into(),
             " channel append-only; no new game threads or sockets".into(),
             format!(" log {} ({bytes})", context.log_path),

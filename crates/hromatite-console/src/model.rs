@@ -1,6 +1,7 @@
 //! Testable UI state: filtering, scrolling, telemetry and key handling.
 
 use crate::commands::{CATALOG, CommandSpec, Risk, command};
+use crate::hot::{HotStatus, parse_hot_status};
 use crate::input::{History, Key, complete};
 use crate::parser::{LineKind, LogLine, parse_line};
 use std::collections::{BTreeSet, VecDeque};
@@ -48,6 +49,9 @@ pub struct ConsoleModel {
     reported_players: Option<usize>,
     esp_seen: bool,
     tick_hz: Option<String>,
+    hot_status: Option<HotStatus>,
+    feature_generation: Option<u64>,
+    feature_abi: Option<u64>,
     pub camera: Option<String>,
     pub player: Option<String>,
     pub last_late: Option<String>,
@@ -81,6 +85,9 @@ impl ConsoleModel {
             reported_players: None,
             esp_seen: false,
             tick_hz: None,
+            hot_status: None,
+            feature_generation: None,
+            feature_abi: None,
             camera: None,
             player: None,
             last_late: None,
@@ -92,6 +99,15 @@ impl ConsoleModel {
         let mut added_visible = 0;
         for input in inputs {
             let line = parse_line(input.as_ref());
+            if let Some(status) = parse_hot_status(&line.raw) {
+                self.hot_status = Some(status);
+            }
+            if line.tag == "con"
+                && let Some((generation, abi)) = parse_feature_log(&line.message)
+            {
+                self.feature_generation = Some(generation);
+                self.feature_abi = Some(abi);
+            }
             if line.tag == "late" {
                 self.last_late = Some(line.message.clone());
             }
@@ -222,6 +238,13 @@ impl ConsoleModel {
                     "auto telemetry: OFF".into()
                 };
                 return Action::ToggleAuto;
+            }
+            Key::F(7) => {
+                if self.mode != Mode::Command {
+                    self.mode = Mode::Command;
+                }
+                self.set_active_text("reload");
+                return self.prepare_submission("reload".into());
             }
             Key::F(8) => {
                 self.clear_before = self.lines.len();
@@ -364,7 +387,11 @@ impl ConsoleModel {
             return Action::None;
         }
         let name = submitted.split_whitespace().next().unwrap_or("");
-        let dangerous = command(name).is_some_and(|item| item.risk == Risk::Dangerous);
+        let read_only_hot_status =
+            name == "reload" && submitted.split_whitespace().nth(1) == Some("status");
+        let dangerous = !read_only_hot_status
+            && (command(name).is_some_and(|item| item.risk == Risk::Dangerous)
+                || (name == "config" && submitted.split_whitespace().nth(1) == Some("set")));
         if dangerous && self.pending_confirmation.as_deref() != Some(submitted.as_str()) {
             self.pending_confirmation = Some(submitted);
             self.notice = "DANGER: press Enter again to execute; Esc cancels".into();
@@ -505,6 +532,18 @@ impl ConsoleModel {
         self.tick_hz.as_deref()
     }
 
+    pub fn hot_status(&self) -> Option<&HotStatus> {
+        self.hot_status.as_ref()
+    }
+
+    pub fn feature_generation(&self) -> Option<u64> {
+        self.feature_generation
+    }
+
+    pub fn feature_abi(&self) -> Option<u64> {
+        self.feature_abi
+    }
+
     pub fn gc_healthy(&self) -> Option<bool> {
         self.last_gc.as_ref().map(|message| {
             let lower = message.to_lowercase();
@@ -532,6 +571,19 @@ fn next_char(text: &str, cursor: usize) -> usize {
         .chars()
         .next()
         .map_or(cursor, |ch| cursor + ch.len_utf8())
+}
+
+fn parse_feature_log(message: &str) -> Option<(u64, u64)> {
+    let mut fields = message.split_whitespace();
+    if fields.next()? != "feature:" {
+        return None;
+    }
+    let generation = fields.next()?.strip_prefix("generation=")?.parse().ok()?;
+    let abi = fields.next()?.strip_prefix("abi=")?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((generation, abi))
 }
 
 fn update_telemetry(model: &mut ConsoleModel, line: &LogLine) {

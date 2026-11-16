@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod demo;
 pub mod fileio;
+pub mod hot;
 pub mod input;
 pub mod model;
 pub mod parser;
