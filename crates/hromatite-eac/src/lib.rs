@@ -13,23 +13,36 @@
 //!   `dt_ms` measured across epochs so a world load shows up as a `gap`.
 //! * [`eventlog`] — JSONL records with 32 MiB / 2-file rotation.
 //! * [`tailer`] — polling tail over the VRChat `output_log` for room markers.
+//! * [`hook`] — x64 inline-hook engine (trampoline, ±512 MB allocation,
+//!   12-byte `mov rax,imm64; jmp rax` patch), ported from the C shim.
+//! * [`eos`] — the twelve `EOS_AntiCheatClient_*` exports hooked with it:
+//!   epochs come from `BeginSession`/`EndSession`, every outgoing frame is
+//!   captured, and `ProtectMessage` lengths are counted (the 22-byte proof).
+//! * [`capture`] — the binary capture/replay format (`u32 len, u32 dt_ms, bytes`).
 //!
-//! Not implemented here (phase 2): hooking `EOS_AntiCheatClient_BeginSession`
-//! / `EndSession` / `AddNotifyMessageToServer(25)` inside the stripped EOSSDK,
-//! so epochs are currently driven by console commands or log lines.
+//! Only `hook`/`eos` contain `unsafe`; every block carries a `// SAFETY:`
+//! justification and stays inside the two `#[allow(unsafe_code)]` modules.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+pub mod capture;
 pub mod clock;
 pub mod codec;
 pub mod digest;
+#[allow(unsafe_code)]
+pub mod eos;
 pub mod eventlog;
+#[allow(unsafe_code)]
+pub mod hook;
 pub mod payload;
 pub mod session;
 pub mod tailer;
 
+pub use capture::{CaptureFile, Frame as CapturedFrame};
 pub use codec::{ChecksumKind, CodecError, Frame, Header};
+pub use eos::{Counters as HookCounters, HookEvent, Hooks};
 pub use eventlog::{Event, JsonlLog};
+pub use hook::Hook;
 pub use payload::{HeartbeatPayload, PAYLOAD_LEN};
 pub use session::{Beat, EacSession};
 
