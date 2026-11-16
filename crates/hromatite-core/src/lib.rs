@@ -15,6 +15,7 @@ pub mod manualmap;
 pub mod pe;
 #[allow(unsafe_code)]
 mod raw;
+pub mod sha256;
 pub mod symbols;
 
 // Keep the established public API without exposing the raw implementation
