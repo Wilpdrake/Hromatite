@@ -17,7 +17,9 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     pub fn takes_arguments(self) -> bool {
-        self.usage.contains(' ')
+        // Optional arguments do not need a template detour: selecting
+        // `reload [generation]` still follows the normal two-Enter risk flow.
+        self.usage.contains('<')
     }
 }
 
@@ -111,6 +113,24 @@ commands![
         Advanced
     ),
     ("m3i", "m3i <assembly>", "resolve an IL2CPP image", Advanced),
+    (
+        "reload",
+        "reload [generation]",
+        "activate latest or select an immutable feature generation",
+        Dangerous
+    ),
+    (
+        "rollback",
+        "rollback",
+        "return to the previous feature generation",
+        Dangerous
+    ),
+    (
+        "config",
+        "config show|reload|set <key> <value>",
+        "inspect/reload config; config set requires confirmation",
+        Advanced
+    ),
     (
         "latec",
         "latec",

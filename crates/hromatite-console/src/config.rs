@@ -17,7 +17,8 @@ KEYS:
   help or ? local field manual (no payload answer required)
   Enter send/confirm    Up/Down history    Tab complete    Ctrl-R or / filter
   F1 field manual       F2 follow          F3 errors+GC    F4 or : palette
-  F5 refresh once       F6 auto telemetry  F8 clear view   PgUp/PgDn scroll
+  F5 refresh once       F6 auto telemetry  F7 reload       F8 clear view
+  PgUp/PgDn scroll
   Esc back/cancel       Ctrl-C exit
   Palette searches names, syntax and descriptions. RISK commands require a
   second Enter; editing or Esc cancels the pending confirmation.
