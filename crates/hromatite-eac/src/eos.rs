@@ -302,7 +302,6 @@ pub struct Hooks {
     enabled: bool,
     installed: bool,
     reports: Vec<Report>,
-    last_probe_ms: u64,
     absent_logged: bool,
 }
 
@@ -319,7 +318,6 @@ impl Hooks {
             enabled: true,
             installed: false,
             reports: Vec::new(),
-            last_probe_ms: 0,
             absent_logged: false,
         }
     }
@@ -339,19 +337,17 @@ impl Hooks {
         &self.reports
     }
 
-    /// Lazy, idempotent install. Called from the managed tick; probes the module
-    /// at most every two seconds and never panics when EOSSDK is absent.
+    /// Lazy, idempotent install. Called from every managed tick until it lands:
+    /// `GetModuleHandleA` is cheap and `AddNotifyMessageToServer` is registered
+    /// only a few hundred milliseconds after EOSSDK loads, so a coarse probe
+    /// would miss the game's callback. Never panics when EOSSDK is absent.
     ///
     /// Returns a console line the first time state changes (installed, or first
     /// "module absent" observation), `None` otherwise.
-    pub fn poll(&mut self, now: u64) -> Option<String> {
+    pub fn poll(&mut self, _now: u64) -> Option<String> {
         if !self.enabled || self.installed {
             return None;
         }
-        if self.last_probe_ms != 0 && now.saturating_sub(self.last_probe_ms) < 2_000 {
-            return None;
-        }
-        self.last_probe_ms = now;
         match self.install() {
             Ok(reports) => {
                 let ok = reports.iter().filter(|report| report.ok).count();
@@ -546,6 +542,10 @@ impl Hooks {
         DROP_AFTER_MS.store(drop_after, Ordering::Relaxed);
         DROP_IN.store(env_flag("EACSHIM_DROP_IN"), Ordering::Relaxed);
 
+        // The cut deadline is measured from BeginSession; if another image owns
+        // that entry (a mode-3 reuse) no Begin event reaches this copy, so the
+        // install moment is the fallback epoch start.
+        SESSION_START_MS.store(now_ms(), Ordering::Relaxed);
         let sink = Sink {
             capture: CaptureFile::open(&capture_path).ok(),
             log: LogFile::open(log_path),
@@ -714,7 +714,8 @@ mod win {
     pub struct ExportDirectory {
         pub _characteristics: u32,
         pub _timestamp: u32,
-        pub _version: [u32; 2],
+        pub _major_version: u16,
+        pub _minor_version: u16,
         pub name: u32,
         pub base: u32,
         pub number_of_functions: u32,
