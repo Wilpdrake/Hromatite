@@ -152,6 +152,27 @@ pub fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
+/// CRC-32C (Castagnoli) with `init = 0` and `xorout = 0` — the **EAC frame
+/// checksum**, verified offline on 451/451 captured frames
+/// (`findings/frame_structure.md` §3).
+///
+/// Same reflected polynomial as [`crc32c`]; the difference is only the
+/// pre/post inversion, which the standard variant applies and EAC does not.
+pub fn crc32c_eac(data: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
 /// 32-bit FNV-1a, kept only as a third cheap candidate during capture analysis.
 pub fn fnv1a32(data: &[u8]) -> u32 {
     let mut hash = 0x811c_9dc5u32;
@@ -210,5 +231,14 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
         assert_eq!(fnv1a32(b""), 0x811c_9dc5);
+    }
+
+    #[test]
+    fn the_eac_variant_differs_from_the_standard_one_only_in_the_inversions() {
+        // Cross-checked against `tools/frame_analyze.py::eac_crc32c` (init=0,
+        // xorout=0), the reference that reproduces 451/451 captured frames.
+        assert_eq!(crc32c_eac(b"123456789"), 0x58e3_fa20);
+        assert_ne!(crc32c_eac(b"123456789"), crc32c(b"123456789"));
+        assert_eq!(crc32c_eac(b""), 0);
     }
 }
