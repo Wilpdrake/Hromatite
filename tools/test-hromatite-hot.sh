@@ -21,8 +21,15 @@ assert_eq() { [ "$1" = "$2" ] || fail "expected [$2], got [$1]"; }
 assert_file() { [ -f "$1" ] || fail "missing file: $1"; }
 sha256_file() { sha256sum "$1" | { read -r digest _; printf '%s\n' "$digest"; }; }
 assert_no_staging_files() {
+    [ -d "$MODULES" ] || return 0
     leftovers=$(find "$MODULES" -name '.*' -type f -print)
     assert_eq "$leftovers" ""
+}
+
+assert_nothing_published() {
+    assert_no_staging_files
+    [ ! -e "$MODULES" ] || fail "publication directory was created: $MODULES"
+    [ ! -e "$COMMANDS" ] || fail "command channel was created: $COMMANDS"
 }
 
 new_fixture() {
@@ -174,6 +181,21 @@ test_watch_retries_after_transient_failure() {
     assert_eq "$attempts" "2"
 }
 
+test_generation_override_rejects_zero_padded_ids() {
+    new_fixture zero-padded
+    for generation in 00 09 000000001 ''; do
+        if run_reload --no-build --generation "$generation" >"$FIXTURE/out-${generation:-empty}" 2>"$FIXTURE/err-${generation:-empty}"; then
+            fail "generation override '$generation' was accepted"
+        fi
+        grep 'canonical decimal' "$FIXTURE/err-${generation:-empty}" >/dev/null ||
+            fail "generation override '$generation' failed for an unrelated reason"
+    done
+    assert_nothing_published
+    run_reload --no-build --generation 1 >/dev/null
+    assert_file "$MODULES/current.manifest"
+    assert_eq "$(cat "$COMMANDS")" "reload 1"
+}
+
 test_dry_run_neither_builds_nor_writes() {
     new_fixture dry-run
     mkdir -p "$FIXTURE/bin"
@@ -288,13 +310,14 @@ test_watch_publishes_one_stable_change() {
     assert_file "$MODULES/current.manifest"
 }
 
-TESTS='atomic no-overwrite concurrent dry-run wrong-hash command-rollback malformed watch watch-retry'
+TESTS='atomic no-overwrite concurrent zero-padded dry-run wrong-hash command-rollback malformed watch watch-retry'
 run_test() {
     printf 'TEST %s\n' "$1"
     case $1 in
         atomic) test_atomic_publication ;;
         no-overwrite) test_versioned_no_overwrite ;;
         concurrent) test_concurrent_publishers_do_not_delete_the_winner ;;
+        zero-padded) test_generation_override_rejects_zero_padded_ids ;;
         dry-run) test_dry_run_neither_builds_nor_writes ;;
         wrong-hash) test_wrong_game_hash_is_rejected_before_build ;;
         command-rollback) test_command_failure_restores_previous_manifest ;;

@@ -7,6 +7,13 @@ const DEFAULT_TICK_MS: u64 = 250;
 static TICK_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "windows", test))]
+fn canonical_generation(value: &str) -> Option<u64> {
+    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReloadSelection {
     Latest,
@@ -31,11 +38,8 @@ fn parse_reload_request(line: &str) -> Result<ReloadSelection, String> {
             if parts.next().is_some() {
                 return Err("usage: reload gen <positive-id>".into());
             }
-            let generation = generation
-                .parse::<u64>()
-                .ok()
-                .filter(|generation| *generation != 0)
-                .ok_or("reload gen requires a positive decimal id")?;
+            let generation = canonical_generation(generation)
+                .ok_or("reload gen requires a positive canonical decimal id")?;
             Ok(ReloadSelection::Generation(generation))
         }
         "status" | "latest" => Err("usage: reload status (no generation argument)".into()),
@@ -43,11 +47,8 @@ fn parse_reload_request(line: &str) -> Result<ReloadSelection, String> {
             if parts.next().is_some() {
                 return Err("usage: reload [gen [generation]] | reload status".into());
             }
-            let generation = generation
-                .parse::<u64>()
-                .ok()
-                .filter(|generation| *generation != 0)
-                .ok_or("reload generation must be a positive decimal integer")?;
+            let generation = canonical_generation(generation)
+                .ok_or("reload generation must be a positive canonical decimal integer")?;
             Ok(ReloadSelection::Generation(generation))
         }
     }
@@ -76,8 +77,8 @@ fn parse_versioned_name(name: &str) -> Option<VersionedName> {
     {
         return None;
     }
-    let generation = generation.parse::<u64>().ok()?;
-    (generation != 0).then(|| VersionedName {
+    let generation = canonical_generation(generation)?;
+    Some(VersionedName {
         generation,
         short_sha: short_sha.to_string(),
     })
@@ -159,11 +160,8 @@ fn parse_feature_manifest(text: &str) -> Result<FeatureManifest, String> {
         }
         *slot = value;
     }
-    let generation = values[0]
-        .parse::<u64>()
-        .ok()
-        .filter(|generation| *generation != 0)
-        .ok_or("manifest GENERATION must be positive")?;
+    let generation = canonical_generation(values[0])
+        .ok_or("manifest GENERATION must be positive and canonical")?;
     for sha in [&values[1], &values[3]] {
         if sha.len() != 64
             || !sha
@@ -670,10 +668,11 @@ mod imp {
             }
         }
 
-        fn configure(&mut self, config: HotConfig) {
+        fn configure(&mut self, config: HotConfig) -> Result<(), String> {
             self.config = config;
             self.model.reconfigure(config);
             super::TICK_INTERVAL_MS.store(config.tick_ms, Ordering::Relaxed);
+            let mut first_error = None;
             for generation in [&self.active, &self.previous].into_iter().flatten() {
                 let api = generation.image.api();
                 for setting in config.feature_settings() {
@@ -691,12 +690,16 @@ mod imp {
                     })
                     .unwrap_or(hromatite_abi::STATUS_ERROR);
                     if status != STATUS_OK {
-                        self.last_error =
-                            Some(format!("configure {} failed ({status})", setting.key));
+                        let error = format!("configure {} failed ({status})", setting.key);
+                        if first_error.is_none() {
+                            first_error = Some(error.clone());
+                        }
+                        self.last_error = Some(error);
                     }
                 }
             }
             self.dirty = true;
+            first_error.map_or(Ok(()), Err)
         }
     }
 
@@ -902,11 +905,28 @@ mod imp {
         })
     }
 
+    /// Keep an unrelated resident error (a failed map, a missing module) across a
+    /// successful configuration, but never let a stale configuration error
+    /// outlive the update that fixed it.
+    fn after_config_result(previous: Option<String>, failure: Option<String>) -> Option<String> {
+        match failure {
+            Some(error) => Some(error),
+            None => previous.filter(|error| {
+                !error.starts_with("initial config") && !error.starts_with("configure ")
+            }),
+        }
+    }
+
     fn apply_config_file(runtime: &mut Runtime, config: HotConfig) -> Result<String, String> {
         write_config_file(config)?;
-        runtime.configure(config);
-        runtime.last_error = None;
-        Ok(config_text(config))
+        let previous = runtime.last_error.take();
+        let result = runtime.configure(config);
+        let error = after_config_result(previous, result.as_ref().err().cloned());
+        runtime.last_error = error.clone();
+        match (result, error) {
+            (Err(_), Some(error)) => Err(error),
+            _ => Ok(config_text(config)),
+        }
     }
 
     fn shutdown_retire(generation: ImageGeneration) -> Result<(), String> {
@@ -1282,9 +1302,11 @@ mod tests {
         for bad in [
             "reload gen",
             "reload gen 0",
+            "reload gen 09",
             "reload gen 3 extra",
             "reload latest 3",
             "reload 0",
+            "reload 00",
         ] {
             assert!(parse_reload_request(bad).is_err(), "accepted {bad}");
         }
@@ -1297,6 +1319,7 @@ mod tests {
         assert_eq!(parsed.short_sha, "0123456789ab");
         for bad in [
             "../features-42-0123456789ab.dll",
+            "features-09-0123456789ab.dll",
             "features--1-0123456789ab.dll",
             "features-0-0123456789ab.dll",
             "features-42-0123456789a.dll",

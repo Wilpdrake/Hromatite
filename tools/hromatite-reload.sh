@@ -30,6 +30,11 @@ valid_sha() {
     case $1 in *[!0-9a-f]*) return 1 ;; esac
 }
 
+valid_generation_id() {
+    [ "${#1}" -le 9 ] || return 1
+    case $1 in ''|0*|*[!0-9]*) return 1 ;; esac
+}
+
 valid_shell_path() {
     case $1 in
         /*) ;;
@@ -56,10 +61,7 @@ read_current_manifest() {
         key= value=
     done <"$MANIFEST_FILE"
     [ "$line_number" -eq 5 ] || fail 'malformed current.manifest: expected exactly five fields'
-    case $OLD_GENERATION in
-        ''|*[!0-9]*|0) fail 'malformed current.manifest: invalid GENERATION' ;;
-    esac
-    [ "${#OLD_GENERATION}" -le 9 ] || fail 'malformed current.manifest: GENERATION is too large'
+    valid_generation_id "$OLD_GENERATION" || fail 'malformed current.manifest: invalid GENERATION'
     valid_sha "$OLD_SHA" || fail 'malformed current.manifest: invalid SHA256'
     valid_sha "$OLD_GAME_SHA" || fail 'malformed current.manifest: invalid GAME_SHA256'
     [ "$OLD_ABI" = 1 ] || fail 'malformed current.manifest: unsupported ABI'
@@ -79,7 +81,8 @@ while [ "$#" -gt 0 ]; do
         --dry-run) DRY_RUN=1 ;;
         --generation)
             shift
-            [ "$#" -gt 0 ] || fail '--generation needs a positive integer'
+            valid_generation_id "${1:-}" ||
+                fail '--generation must be canonical decimal (1..999999999, no leading zero)'
             GENERATION_OVERRIDE=$1
             ;;
         -h|--help)
@@ -108,10 +111,7 @@ if [ -e "$MANIFEST_FILE" ]; then
     GENERATION=$((OLD_GENERATION + 1))
 fi
 if [ -n "$GENERATION_OVERRIDE" ]; then
-    case $GENERATION_OVERRIDE in
-        ''|*[!0-9]*|0) fail '--generation needs a positive integer' ;;
-    esac
-    [ "${#GENERATION_OVERRIDE}" -le 9 ] || fail '--generation is too large'
+    valid_generation_id "$GENERATION_OVERRIDE" || fail '--generation must be canonical decimal (1..999999999, no leading zero)'
     GENERATION=$GENERATION_OVERRIDE
 fi
 if [ "$NO_BUILD" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
