@@ -147,7 +147,9 @@ impl EacFeature {
         self.poll_tail(&mut lines);
         if self.auto && self.session.running() && self.session.due(now()) {
             match self.beat(now()) {
-                Ok(_) => {}
+                // A successful beat clears the "same error once" latch, so a
+                // recurring failure is reported again after a recovery.
+                Ok(_) => self.last_error = None,
                 Err(error) => {
                     if self.last_error.as_deref() != Some(error.as_str()) {
                         lines.push(format!("eac: {error}"));
