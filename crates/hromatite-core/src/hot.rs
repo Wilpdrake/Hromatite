@@ -252,6 +252,12 @@ impl HotReload {
         self.config.grace_ms
     }
 
+    /// Apply hot settings atomically. An already-established grace/deadline is
+    /// never extended or shortened retroactively; new timed phases use `config`.
+    pub fn reconfigure(&mut self, config: HotConfig) {
+        self.config = config;
+    }
+
     pub fn request(&mut self, version: u64, now_ms: u64) -> Result<(), HotError> {
         if self
             .active
@@ -584,6 +590,25 @@ mod tests {
                 ..HotConfig::default()
             })
         );
+    }
+
+    #[test]
+    fn reconfiguration_changes_only_future_phase_grace_periods() {
+        let mut hot = HotReload::new(HotConfig::default());
+        hot.request(1, 0).unwrap();
+        hot.begin_loading(0).unwrap();
+        hot.begin_canary(0).unwrap();
+        hot.canary_succeeded(0).unwrap();
+        let original_deadline = hot.deadline_ms();
+        hot.reconfigure(HotConfig {
+            grace_ms: 123,
+            ..HotConfig::default()
+        });
+        assert_eq!(hot.deadline_ms(), original_deadline);
+        assert_eq!(hot.grace_ms(), 123);
+        hot.poll(original_deadline.unwrap()).unwrap();
+        hot.request(2, 400).unwrap();
+        assert_eq!(hot.deadline_ms(), Some(523));
     }
 
     #[test]
