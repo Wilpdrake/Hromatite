@@ -142,7 +142,10 @@ impl JsonlLog {
     /// Open (or create) `path`, rotating at `max_bytes` and keeping `keep` files.
     pub fn with_limits(path: impl AsRef<Path>, max_bytes: u64, keep: usize) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
         let file = open_append(&path)?;

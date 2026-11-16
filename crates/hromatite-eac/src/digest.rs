@@ -167,8 +167,14 @@ mod tests {
     use super::*;
 
     const VECTORS: &[(&[u8], &str)] = &[
-        (b"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-        (b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (
+            b"",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            b"abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
         (
             b"hromatite-feature-v1",
             "916bc79f3ad57db78640c3edaf9e8064cb498779331fd112eee23d892ba4414a",

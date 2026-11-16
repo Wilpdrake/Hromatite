@@ -147,7 +147,11 @@ impl Frame<'_> {
             flags: u16::from_le_bytes([buf[2], buf[3]]),
             session_id: u64::from_le_bytes(buf[4..12].try_into().unwrap_or_default()),
             sequence: u64::from_le_bytes(buf[12..20].try_into().unwrap_or_default()),
-            checksum: u32::from_le_bytes(buf[CHECKSUM_OFFSET..HEADER_LEN].try_into().unwrap_or_default()),
+            checksum: u32::from_le_bytes(
+                buf[CHECKSUM_OFFSET..HEADER_LEN]
+                    .try_into()
+                    .unwrap_or_default(),
+            ),
         };
         let payload = &buf[HEADER_LEN..];
         let mut region = Vec::with_capacity(CHECKSUM_OFFSET + payload.len());
@@ -214,7 +218,10 @@ mod tests {
 
     #[test]
     fn short_and_implausible_buffers_are_rejected_without_panicking() {
-        assert_eq!(Frame::parse(&[0u8; 23], ChecksumKind::Crc32c), Err(CodecError::TooShort(23)));
+        assert_eq!(
+            Frame::parse(&[0u8; 23], ChecksumKind::Crc32c),
+            Err(CodecError::TooShort(23))
+        );
         let mut bytes = [0u8; 24];
         bytes[0..2].copy_from_slice(&9u16.to_le_bytes());
         assert_eq!(

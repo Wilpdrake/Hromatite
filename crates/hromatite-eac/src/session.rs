@@ -229,9 +229,7 @@ impl EacSession {
 /// id comes from the EOS socket handshake; until phase 2 hooks install, any
 /// non-zero 64-bit value is as good as another.
 pub fn derive_session_id(now_ms: u64, epoch: u64) -> u64 {
-    now_ms
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .rotate_left(17)
+    now_ms.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
         ^ epoch.wrapping_mul(0xbf58_476d_1ce4_e5b9)
         | 1
 }

@@ -80,7 +80,9 @@ impl HeartbeatPayload {
 
     /// Parse and (optionally) verify a 120-byte payload.
     pub fn parse(buf: &[u8], mac_key: Option<&[u8]>) -> Result<Self, PayloadError> {
-        let bytes: &[u8; PAYLOAD_LEN] = buf.try_into().map_err(|_| PayloadError::Length(buf.len()))?;
+        let bytes: &[u8; PAYLOAD_LEN] = buf
+            .try_into()
+            .map_err(|_| PayloadError::Length(buf.len()))?;
         let mut integrity_digest = [0u8; 32];
         integrity_digest.copy_from_slice(&bytes[24..56]);
         let mut module_list_hash = [0u8; 32];
@@ -132,7 +134,11 @@ pub fn module_list_hash<'a>(modules: impl IntoIterator<Item = (&'a str, Option<u
     let mut entries: Vec<Vec<u8>> = modules
         .into_iter()
         .map(|(name, size)| {
-            let base = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+            let base = name
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(name)
+                .to_ascii_lowercase();
             let mut record = base.into_bytes();
             if let Some(size) = size {
                 record.push(0);

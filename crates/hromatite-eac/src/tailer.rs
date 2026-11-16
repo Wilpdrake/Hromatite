@@ -173,7 +173,10 @@ mod tests {
         let mut append = OpenOptions::new().append(true).open(&path).expect("append");
         write!(append, "Joining wrld_1234-5678:0001 fault").expect("w");
         append.flush().expect("flush");
-        assert!(tailer.poll().expect("poll").is_empty(), "partial line waits");
+        assert!(
+            tailer.poll().expect("poll").is_empty(),
+            "partial line waits"
+        );
 
         writeln!(append, " but not really").expect("w");
         append.flush().expect("flush");
