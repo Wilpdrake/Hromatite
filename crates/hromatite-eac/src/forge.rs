@@ -147,6 +147,28 @@ fn bump_message_counter(frame: &mut [u8]) {
     }
 }
 
+/// Which live frame becomes the template.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TemplateMode {
+    /// The newest 512-byte frame of any kind (a middle fragment most of the
+    /// time, `Flags = 0`).
+    #[default]
+    Last,
+    /// The newest frame that *starts* a message (`Flags & 1`), so the body
+    /// carries the message header (`total_len`, `inner_ck`, counter, blob).
+    Start,
+}
+
+impl TemplateMode {
+    /// Parse `EAC_FORGE_TEMPLATE` (`last` default, `start` opt-in).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("start") | Some("header") => Self::Start,
+            _ => Self::Last,
+        }
+    }
+}
+
 /// `EAC_FORGE*` knobs, read once at install time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -163,6 +185,8 @@ pub struct Config {
     /// everything) by default, which is the pure "forge carries the session"
     /// experiment.
     pub keep_small: bool,
+    /// `EAC_FORGE_TEMPLATE`.
+    pub template: TemplateMode,
 }
 
 impl Config {
@@ -174,6 +198,7 @@ impl Config {
             interval_ms: INTERVAL_MS,
             body: BodyMode::Stale,
             keep_small: false,
+            template: TemplateMode::Last,
         }
     }
 
@@ -214,6 +239,7 @@ impl Config {
             keep_small: get("EAC_FORGE_KEEP_SMALL")
                 .map(|value| !value.trim().is_empty() && value.trim() != "0")
                 .unwrap_or(false),
+            template: TemplateMode::parse(get("EAC_FORGE_TEMPLATE").as_deref()),
         }
     }
 }
@@ -323,6 +349,7 @@ mod tests {
             "EAC_FORGE_INTERVAL_MS" => Some("50".to_string()),
             "EAC_FORGE_BODY" => Some("bump".to_string()),
             "EAC_FORGE_KEEP_SMALL" => Some("1".to_string()),
+            "EAC_FORGE_TEMPLATE" => Some("start".to_string()),
             _ => None,
         });
         assert_eq!(explicit.after_ms, 90_000);
@@ -330,6 +357,7 @@ mod tests {
         assert_eq!(explicit.interval_ms, MIN_INTERVAL_MS, "clamped up");
         assert_eq!(explicit.body, BodyMode::Bump);
         assert!(explicit.keep_small);
+        assert_eq!(explicit.template, TemplateMode::Start);
         assert!(!none.keep_small);
 
         // `EAC_FORGE_AFTER_MS` alone is enough to switch the forge on.

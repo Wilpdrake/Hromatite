@@ -126,6 +126,8 @@ static FORGE_BUMP: AtomicBool = AtomicBool::new(false);
 /// `EAC_FORGE_KEEP_SMALL`: forward live frames that are not the 512-byte
 /// heartbeat (ACKs, handshake fragments) instead of replacing them too.
 static FORGE_KEEP_SMALL: AtomicBool = AtomicBool::new(false);
+/// `EAC_FORGE_TEMPLATE=start`: keep only a message-start frame as template.
+static FORGE_PREFER_START: AtomicBool = AtomicBool::new(false);
 /// Set once the forge has replaced the live stream; from then on the wrapper
 /// drops live frames and the generator thread owns the cadence.
 static FORGE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -623,6 +625,10 @@ impl Hooks {
         FORGE_INTERVAL_MS.store(forge_config.interval_ms, Ordering::Relaxed);
         FORGE_BUMP.store(forge_config.body == BodyMode::Bump, Ordering::Relaxed);
         FORGE_KEEP_SMALL.store(forge_config.keep_small, Ordering::Relaxed);
+        FORGE_PREFER_START.store(
+            forge_config.template == forge::TemplateMode::Start,
+            Ordering::Relaxed,
+        );
         FORGE_STARTED.store(false, Ordering::Relaxed);
         FORGE_SEEN.store(0, Ordering::Relaxed);
         FORGE_EMITTED.store(0, Ordering::Relaxed);
@@ -1152,7 +1158,10 @@ fn forge_learn(data: &[u8], length: usize) {
     let sid = template.session_id;
     let flags = template.flags;
     let seq = template.last_seq;
-    if let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
+    // `EAC_FORGE_TEMPLATE=start`: a middle fragment has no message header, so
+    // only a start frame can be refreshed field by field (see `BodyMode::Bump`).
+    let store = !FORGE_PREFER_START.load(Ordering::Relaxed) || template.starts_message();
+    if store && let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
         *slot = Some(template);
     }
     if seen <= 3 || seen.is_multiple_of(20) {
