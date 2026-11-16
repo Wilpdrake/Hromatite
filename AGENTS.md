@@ -2972,3 +2972,55 @@ il2cpp одними чтениями памяти (без единого выз�
 - **Осталось.** Фаза 2: установка хуков и сверка эпох с настоящими `[AntiCheatClient]`
   строками; затем live-приёмка в игре (лог JSONL ↔ `eacshim.log` по полям
   `epoch`/`seq`/`dt_ms`). Merge в master — только после явного согласования пользователя.
+
+
+### 2026-11-17 (ночь) — Фаза 2: движок хуков перенесён из C-шима в Rust-payload (живая игра)
+
+- **Ветка `eac-hooks`** (от `master` 35a5c3e), коммиты: `bd2e74e` (rustfmt),
+  `ce0bb69` (движок хуков), `89f26c2` (capture/replay), `1e10c28` (8 хуков EOSSDK),
+  `5579709` (проводка в `Feature::tick` + `eac.hooks`), `d6e2856` (фикс PE-парсера и
+  проба каждый тик), `3d1b216` (stub-тест под wine), `54658d9` (установка хуков из
+  стартового потока резидента). Подробности: `EAC-RE/findings/hooks_rust.md`.
+- **Что сделано.** Порт `shim.c`: декодер длин x64, `prologue_len`, трамплин
+  (rel8 `jcc` → inverse `jcc+0x0C` / `mov rax,imm64` / `jmp rax`; копия пролога;
+  абс. jmp на `entry+total`), `alloc_near` ±512 МБ, 12-байтный патч (атомарный
+  `lock cmpxchg16b`, если окно выровнено), именованная shared-таблица
+  `Local\hromatite_rust_hooktable_v1`. Хуки: `BeginSession`/`EndSession`
+  (эпохи), `AddNotifyMessageToServer` (подмена колбэка игры на свой wrapper:
+  лог каждого исходящего кадра + `u32 len,u32 dt,bytes` в capture-файл; дроп по
+  `EACSHIM_DROP_AFTER_MS`; replay по `EAC_REPLAY=1`), `ReceiveMessageFromServer`
+  (лог входящих), `Protect/Unprotect/GetProtectMessageOutputLength/PollStatus`
+  (только счётчики длин). Команда `eac.hooks [status|install|capture <path>|on|off]`,
+  ключ `eac_hooks`; при отсутствии EOSSDK — лог и выход.
+- **Установка.** Резидент (`hromatite.dll`, стартовый поток) ждёт
+  `EOSSDK-Win64-Shipping.dll` (опрос 50 мс, 20 с) и ставит хуки **до** первого
+  managed-тика: VRChat регистрирует `AddNotifyMessageToServer(25)` один раз и
+  очень рано. Feature-образ при более поздней загрузке видит уже пропатченные
+  входы и забирает их себе (mode 3), поэтому счётчики разделены между образами;
+  исходящий wrapper остаётся в резиденте (у SDK уже сохранён его адрес).
+- **Чем подтверждено (живая игра, реальные логи).**
+  `eac: hooks installed 8/8 on EOSSDK-Win64-Shipping.dll`, у всех `mode=1`,
+  `prologue=12 copied`. `AddNotifyMessageToServer #1 … clientData=0x3 -> wrapper`,
+  notification `0x19` (25). Исходящие кадры: 18 шт / 944 Б, размеры `24`×14 и
+  `116`×4, `dt_ms` 0/15/301/428/498/3012/23 000…; входящие `24`×13, `48`×4.
+  `BeginSession`/`EndSession` каждые ~24–30 с, `Mode=0` — как в C-шиме.
+  Дроп живьём: `EACSHIM_DROP_AFTER_MS=20000` → 8 `[cut] dropped out`, через ~10 с
+  websocket VRChat закрылся (`code=1006`), сессия переоткрывается.
+  `Protect/Unprotect/OutLen/PollStatus` в режиме 1 **не вызываются** (0 хитов),
+  поэтому 22-байтный overhead живьём не наблюдался — только счётчики и stub-тест.
+- **Тесты/сборка.** `cargo test --workspace --target x86_64-unknown-linux-gnu
+  --offline`: abi 3, core 119, dll 5, eac 32+1, features 15 — всё ok.
+  `cargo clippy -p hromatite-eac -p hromatite-features --all-targets` (host и
+  windows) — чисто. `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` — ok. Windows-тесты под Proton wine:
+  `hook_engine` (реальная функция + трамплин + reuse) и `eos_install`
+  (stub-SDK: 8/8 патчей, Begin/End/Poll через трамплины, включая rel8-je пролог
+  stub'а; подмена AddNotify; 24-байтные кадры доходят до колбэка игры и в capture;
+  счётчики длин) — оба `ok`. Именно stub-тест поймал реальный баг: в
+  `IMAGE_EXPORT_DIRECTORY` `Major/MinorVersion` — два WORD, из-за чего
+  `NumberOfNames` читался на 4 байта позже и первый live-инстанс падал (AV,
+  откат generation 1). После фикса generation 2 стабильна.
+- **Что осталось.** Live `EAC_REPLAY=1`; live-проверка `+22` (нужен режим 2/P2P);
+  `EACSHIM_DROP_IN=1`; общий event-queue между резидентом и feature-образом
+  (сейчас счётчики разделены); при выгрузке образа feature без резидента патчи
+  остаются — учитывать при hot-reload. Merge в master — после согласования.
