@@ -599,6 +599,10 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - Любое утверждение о поведении EAC/il2cpp подкреплять логом/файлом; иначе —
   помечать как гипотезу.
 - После обновления VRChat — перегенерировать `symbols.rs` и зафиксировать sha256.
+- **Список команд — только в `crates/hromatite-commands`** (`SPECS`). Оттуда
+  генерируются in-game `help` (resident + образ фич + `eac.*`), палитра TUI,
+  Tab-автодополнение и risk-гейт. Руками списки больше не правим: вторая копия
+  списка — это копия, которая отстаёт.
 
 ---
 
@@ -3283,3 +3287,59 @@ il2cpp одними чтениями памяти (без единого выз�
   и (если сборки нет в `KNOWN`) `buildgen: unknown build …: discovery cached at …`
   плюс файл `hromatite-build-<sha12>.json` в профиле; при неизвестной сборке
   m3 отвечает `no metadata layout for GameAssembly <sha>`, а не падает VEH-ом.
+
+### 2026-11-17 — TUI: прокрутка колесом мыши и генерируемый каталог команд
+
+- Коммит: `f137405` (`feat(console): mouse-wheel scrolling and a generated
+  command catalogue`). Правки только в host-части (TUI) и в текстах `help`
+  payload'а; игровой протокол, тик, GC-guard и hot-reload не тронуты, игра в
+  этой сессии не запускалась.
+- **Колесо мыши.** Драйвер терминала включает SGR-репорт (`?1000h ?1006h`) в
+  `TerminalGuard::enter` и **снимает его в `Drop` до выхода с альтернативного
+  экрана** — иначе шелл пользователя получал бы клики как escape-последовательности.
+  `KeyDecoder` понимает SGR (`ESC [ < b ; x ; y M`) и legacy X10 (`CSI M cb cx cy`),
+  отбрасывает биты модификаторов/движения, отдаёт `Key::ScrollUp`/`ScrollDown`;
+  неразобранный «хвост» остаётся в буфере, одиночный Esc остаётся Esc.
+  `ConsoleModel` крутит по 3 строки на щелчок: лог (пауза follow, возврат к хвосту
+  возобновляет), field manual и выбор в палитре. Смещение клампится по
+  последнему `render::body_rows` — «щелчки в стену» больше не копят невидимый
+  запас (у прежних `PgUp`/`PgDn` был ровно этот баг; теперь они листают страницу
+  тем же клампленным путём). Field manual переехал из рендерера в модель
+  (`model::field_manual`), потому что прокрутке нужно знать число строк.
+- **Генерируемый каталог.** Новый workspace-крейт `crates/hromatite-commands`
+  (чистые данные, без зависимостей, `forbid(unsafe_code)`): одна таблица
+  `SPECS` — `name`, `aliases`, `usage`, `summary` (EN для палитры),
+  `note` (RU для in-game `help`), `risk` (SAFE/ADV/RISK) и `scope`
+  (Resident / Both / Feature). `help_lines(Scope::*)` рендерит `help`,
+  `names()` кормит автодополнение, `find()` резолвит алиасы. От неё теперь
+  генерируются **четыре** места, которые раньше правились руками:
+  `raw/console.rs` (resident `help`), `features/feature.rs` (help образа фич),
+  `features/eac.rs::help` (`eac.*`) и TUI (`commands.rs` → палитра, Tab,
+  risk-гейт). Побочный эффект: палитра наконец видит feature-only команды
+  (`feature`, `eac.*`), которых в ручном списке не было. Порядок таблицы
+  задаёт порядок help и палитры: сначала `help`, затем `pos`/`who`/`esp`,
+  затем чтения памяти, GC, m3, LateUpdate, `feature`/`eac.*`, hot-reload,
+  затем RISK-команды.
+- **Чем подтверждено (реальные прогоны).**
+  - `crates/hromatite-console`: 46 lib + 6 (`hot_reload`) + 3 (`snapshot`)
+    тестов; clippy `-D warnings`; release `x86_64-unknown-linux-gnu`.
+  - корневой workspace (linux-target): abi 8, commands 4, core 133, dll 5,
+    eac 32 + 1, features 15 — всё `ok`; clippy `-D warnings`; release
+    `x86_64-pc-windows-gnu` (`hromatite.dll` 1 913 812 Б,
+    `hromatite_features.dll` 1 527 485 Б).
+  - **PTY-стенд** `tools/test-console-wheel.py` (release-бинарник в реальном
+    pty 110x24, живой лог из 200 строк): 13/13 — включение/снятие mouse-режима,
+    пауза follow и `back 6` после двух щелчков, кламп ровно на `back 183`
+    (200−17 строк тела), возврат к хвосту и FOLLOW, прокрутка manual на
+    коротком терминале (12 строк), палитра с генерируемым списком и фильтром
+    `eac` → `eac.status`.
+  - Сгенерированный `help` снят печатью `help_lines(Scope::Resident)` /
+    `(Scope::Feature)`: 33 и 26 строк, resident не содержит `eac.*`/`feature`,
+    feature не содержит `reload`/`rollback`/`config`/`gct*`.
+- **Что осталось.** Живой приёмки не было (игру не запускали): пункт «список
+  команд обновлялся не вручную» подтверждён тестами и печатью таблицы, но не
+  живым `help` в логе. Проверить в следующем обычном запуске: `[con] > help`
+  отдаёт те же строки, а `: eac.status` в TUI сразу находит команду.
+  `seal`/`panic`/`av`/`gctresume` по-прежнему перечисляются в help, хотя
+  runtime их отклоняет или использует только в отладке — при желании их можно
+  пометить отдельным `scope`, это одна правка в таблице.
