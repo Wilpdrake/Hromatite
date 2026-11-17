@@ -3332,3 +3332,58 @@ il2cpp одними чтениями памяти (без единого выз�
   `~/EAC-RE/tools/{live_run.sh,report_extract.py,make_report_capture.py,xcap_*.py,dump_rva.py}`,
   `evidence/{replayreport_0339,replaywrap_0346,replaywrap2_0351,replaywrap3_0355,replayself_0403,replayself2_0411}/`.
   `~/.hromatite-mode` восстановлен (`81fad7f2…81f3`), игры/Steam-процессов не убито.
+
+### 2026-11-17 (утро) — шаг 2/3 EAC-эмулятора: декодер RaiseEvent, захват event 66, своя отправка через Photon
+
+- **Ветка `eac-emu`**, коммиты: `40e9919` (план `docs/EAC-EMU-STEP2-PLAN.md`),
+  `9517409` (CRC в core), `ddc50ad` (декодер + захват + эмиттер).
+- **Что сделано.** Заглушка `photon::decode_event_params` заменена настоящим
+  декодером `Dictionary<byte,object>`:
+  * смещения полей `entries`/`count` берутся из `m3::fields` (имена
+    `entries`/`count` и `_entries`/`_count` — Mono и .NET Core), адреса полей
+    не хардкодятся;
+  * раскладка `Entry` (`stride`, `key_off`, `value_off`) выбирается **по данным**:
+    кандидат принимается только если в одном массиве нашлись оба ключа 244 и 245
+    (`ENTRY_LAYOUTS = [(0x18,8,0x10),(0x20,8,0x10),(0x10,8,0x0C)]`); успешная
+    раскладка кэшируется в атомиках и сбрасывается, если декод перестал сходиться;
+  * массив il2cpp: `max_length` u32 @ `+0x18`, данные @ `+0x20`; `count` всегда
+    клампится по `max_length` (torn read не уводит за массив);
+  * код события — бокс-байт слота 244 (`value+0x10`), payload — `byte[]` слота 245.
+- **Захват.** Кольцо на 256 событий в core (`RING`), `EAC_EVENT_CAP=<file>` →
+  тик дописывает payload'ы в capture-формате (`u32 len|u32 dt|bytes`) и логирует
+  `event <code> len=… dt=… head=<16 Б hex>`. Копирование payload'а включается
+  только когда есть `EAC_EVENT_CAP` или `EAC_EVENT_SEND` (иначе детур только считает).
+- **Эмиттер (то, что делает это эмулятором).** С первого живого события 66
+  запоминается `Template { this, dict, opts, payload, capacity }`; `emulate_send()`
+  пишет наши байты в **живой managed `byte[]`** (managed аллокацию без il2cpp-API
+  не сделать) и вызывает оригинальный `SendOperation` через трамплин, т.е.
+  `RaiseEvent(253, {244:66, 245:<наши байты>})` уходит из игрового потока, минуя
+  EOSSDK и модуль EAC. Драйвер — `photon::tick()` рядом с `poll()` в `hook::work`:
+  `EAC_EVENT_SEND=<file>` (capture-формат или голый кадр), `_SEND_MS` (default 2000),
+  `_SEND_START`, `_SEND_LOOP` (default on), `_SEND_RETARGET` (default on),
+  `_SEND_SID`, `_SEND_SEQ`; перецелевая привязка пишет `SessionId`/`Sequence` и
+  пересчитывает CRC-32C (`core::crc`, init=0/xorout=0, вектор `123456789 → 0x58e3fa20`).
+- **Почему это переживает позднюю инъекцию.** Managed-хук `SendOperation` ставится
+  по имени из таблицы классов и патчит код метода, а не указатель, который игра
+  кэширует, — в отличие от хука экспорта `AddNotifyMessageToServer` (блокер из
+  прошлой сессии), он ловит вызовы независимо от момента инъекции.
+- **Проверено (офлайн).** `cargo test --workspace --target x86_64-unknown-linux-gnu
+  --offline` → core **146** (+11: декодер на синтетической il2cpp-куче, клэмпы,
+  раскладки-промахи, capture-поток, retarget+CRC, парсер env), eac 59, features 15,
+  abi 3, dll 5 — все ok. `cargo clippy --workspace --all-targets -- -D warnings`
+  чисто на **обоих** таргетах (host и windows-gnu; чтобы host был чистым,
+  windows-only модули получили `#![cfg_attr(not(windows), allow(dead_code))]`, а
+  `hostapi` — без лишнего `return`). `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu --offline` → Finished (в `~/EAC-RE/build-eac`).
+- **Что НЕ подтверждено (нужен живой прогон).**
+  1. Резолв: в логе должна появиться строка `[photon] hooked … method=SendOperation`;
+     затем `[photon] dictionary layout: count+… entry=…` — если её нет, значит
+     `Dictionary`2` ищется не так (смотреть `dictionary probe failed`).
+  2. Действительно ли event 66 несёт 512-Б кадр EAC (а не base64-строку релея) —
+     покажет `head=` в `EAC_EVENT_CAP`; от этого зависит, надо ли base64-обёртка.
+  3. Сама отправка: `emulate_send` вызывает managed-метод из managed-тика (скрытый
+     `MethodInfo*` на стеке); начинать с `_SEND_MS=5000` и 2–3 отправок.
+- **Осталось.** (1) Живой прогон с `EAC_EVENTHOOK=1 EAC_EVENT_CAP=…` и разбор
+  `head`/`len`. (2) `EAC_EVENT_SEND` из того же прогона (нужен шаблон event 66).
+  (3) IAT-хук `AddNotify` (для EOSSDK-кадров при поздней инъекции) и `EAC_EVP` —
+  как было. Merge в master — после согласования.
