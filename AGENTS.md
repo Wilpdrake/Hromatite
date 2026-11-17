@@ -3086,3 +3086,46 @@ il2cpp одними чтениями памяти (без единого выз�
   в одном прогоне (`forge_0206`) поток кадров и лог оборвались на 77-й секунде при
   живом процессе (похоже на залипание в колбэке игры). Свежие 16-Б записи в теле
   (нужен источник хешей) — единственный оставшийся способ «оживить» содержимое.
+
+### 2026-11-17 — feat(eac): `EAC_REPLAY_REPORT=<path>`, реплей целого записанного отчёта (ветка `eac-emu`)
+
+- **Зачем.** `EAC_FORGE` собирает кадр из шаблона одного живого кадра, т.е. всё
+  время повторяет один и тот же 488-Б фрагмент. Живой прогон показал, что тело
+  сервер оценивает (дисконнект 57–77 с). Записанный отчёт — это *последовательность*
+  кадров (117 кадров одного `sid=0x158b`, `report_a_sid158b.bin`), где тела
+  различаются, а первый кадр начинает сообщение (`Flags&1`). Реплей этой
+  последовательности — следующая дешёвая гипотеза.
+- **Коммиты.** `8aaec16` модуль `report` (парсер + retarget + Stream + юнит-тесты),
+  `6c685c8` генератор в `eos` (`EAC_REPLAY_REPORT`).
+- **Что сделано.** `crates/hromatite-eac/src/report.rs`: `Report::from_bytes/load`
+  (формат capture `u32 len | u32 dt_ms | len bytes`, берутся только 512-Б записи;
+  короткие считаются в `skipped`, обрезанный хвост терпится), `Stream`
+  (`EAC_REPLAY_START`, `LOOP`, `reset()` на новый epoch), `retarget(frame, sid, seq,
+  flags)` — перезапись `[4:12]`, `[12:20]`, опционально `[2:4]`, обнуление и
+  пересчёт CRC-32C. В `eos.rs` — статики `REPORT_ENABLED/REPORT_FLAGS_LIVE/
+  REPORT_STREAM/REPORT_STOPPED`, разбор env в `install()` (файл читается один раз,
+  ошибка/пустой отчёт → откат на шаблонный forge), `emit_report_frame`, общий
+  `deliver_frame` (evidence-capture `forge_frames.bin` + колбэк игры). Смена эпохи
+  (`BeginSession`) отматывает поток к `EAC_REPLAY_START`.
+- **Env.** `EAC_REPLAY_REPORT` (путь; включает режим без `EAC_FORGE`),
+  `EAC_REPLAY_AFTER_MS` (по умолчанию 30000), `EAC_REPLAY_MIN_FRAMES` (20),
+  `EAC_REPLAY_START` (0), `EAC_REPLAY_FLAGS=live` (флаги из живого шаблона, иначе
+  из записи), `EAC_REPLAY_REPORT_LOOP=1` (по кругу), каденция — прежняя
+  `EAC_FORGE_INTERVAL_MS` (2007 мс).
+- **Лог.** Строка на слот: `[report] sid=0x.. seq=.. idx=.. of=.. flags=0x..
+  crc=0x.. delivered=.. dt_ms=..` (`dt_ms` — записанный интервал источника;
+  в capture пишется реальный интервал слота). Конец отчёта — один раз
+  `[report] stream exhausted …`.
+- **Проверено (без игры).** `cargo test --workspace --target
+  x86_64-unknown-linux-gnu --offline` — всё ok, `hromatite-eac` 52 теста
+  (в т.ч. 8 новых: загрузка отчёта, пропуск не-512 записей и обрезанный хвост,
+  подмена sid/seq + CRC, `START`, `LOOP`, `reset`, `Config`, разбор реального
+  `report_a_sid158b.bin` = 117 кадров, и два теста `eos`: реплей с перецелевой
+  привязкой + проверка CRC/тела в capture, `FLAGS=live` + LOOP).
+  `cargo clippy -p hromatite-eac --all-targets -- -D warnings` — чисто (host и
+  windows-gnu). `cargo build --workspace --release --target x86_64-pc-windows-gnu
+  --offline` — Finished.
+- **Что осталось.** Живой прогон (не запускался по условию задачи): проверить,
+  держит ли сервер сессию на перецелевой последовательности; если да — снять
+  `EAC_REPLAY_MIN_FRAMES`/`AFTER_MS` и сравнить с шаблонным forge по времени до
+  `code 104`.
