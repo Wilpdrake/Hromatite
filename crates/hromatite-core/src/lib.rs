@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod crc;
 pub mod crypto;
 pub mod gcthreads;
 pub mod hot;
