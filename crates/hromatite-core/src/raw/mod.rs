@@ -19,6 +19,7 @@ pub mod hot;
 pub mod il2cpp;
 pub mod localmap;
 pub mod memory;
+pub mod photon;
 pub mod playerloop;
 pub mod procs;
 pub mod remote;

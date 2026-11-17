@@ -1162,6 +1162,10 @@ fn work() {
     // never creates a worker and never replaces the resident GC guard.
     crate::raw::hot::tick();
 
+    // `EAC_EVENTHOOK=1`: retry the managed Photon hook until Photon is
+    // materialised. Internally throttled and a no-op once attached.
+    crate::raw::photon::poll();
+
     let _ = log::guard("hook::work", || {
         let mut reader = {
             let mut g = match READER.lock() {

@@ -148,6 +148,39 @@ fn install_ac_hooks() {
     }
 }
 
+/// `EAC_EVENTHOOK=1`: first (early, likely too early) attempt at the managed
+/// Photon hook. Photon types are materialised later, so failure here is normal —
+/// `hook::tick` retries through `photon::poll` once the managed runtime is up.
+fn install_photon_hook() {
+    use hromatite_core::photon;
+    if !photon::enabled_outgoing() && !photon::enabled_incoming() {
+        return;
+    }
+    if photon::enabled_outgoing() {
+        match photon::install_outgoing() {
+            Ok(target) => log::log_tag(
+                "photon",
+                &format!(
+                    "early send hook: entry={:#x} MethodInfo={:#x} params={}",
+                    target.entry, target.info, target.parameters
+                ),
+            ),
+            Err(reason) => log::log_tag("photon", &format!("early send hook deferred: {reason}")),
+        }
+    }
+    if photon::enabled_incoming() {
+        match photon::install_incoming() {
+            Ok(target) => log::log_tag(
+                "photon",
+                &format!("early incoming hook: entry={:#x}", target.entry),
+            ),
+            Err(reason) => {
+                log::log_tag("photon", &format!("early incoming hook deferred: {reason}"))
+            }
+        }
+    }
+}
+
 fn attach(hinst: *mut core::ffi::c_void) {
     log::log_tag("dll", "DllMain(PROCESS_ATTACH), managed LateUpdate runtime");
 
@@ -167,6 +200,7 @@ fn attach(hinst: *mut core::ffi::c_void) {
     // Anti-cheat hooks before any managed tick exists: VRChat registers its
     // message-to-server callback early and only once.
     log::guard("install_ac_hooks", install_ac_hooks);
+    log::guard("install_photon_hook", install_photon_hook);
 
     if let Err(error) = validate_modes(
         &env_or("HROMATITE_FRAME_HOOK", "1"),

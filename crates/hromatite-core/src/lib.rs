@@ -27,6 +27,7 @@ pub use raw::hook;
 pub use raw::hot as hot_runtime;
 pub use raw::il2cpp;
 pub use raw::memory as safe;
+pub use raw::photon;
 pub use raw::playerloop;
 pub use raw::procs;
 pub use raw::remote;
