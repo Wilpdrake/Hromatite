@@ -188,7 +188,9 @@ mod tests {
     #[test]
     fn game_hash_is_decoded_not_empty() {
         let hash = super::game_sha_bytes();
-        assert_eq!(&hash[..4], &[0x64, 0x8f, 0x61, 0xb1]);
+        // First four bytes of `symbols::GAMEASSEMBLY_SHA256`; regenerated with
+        // the game build (`tools/symmap.py`).
+        assert_eq!(&hash[..4], &[0x24, 0x57, 0x68, 0xf2]);
         assert_eq!(hex(&hash), crate::symbols::GAMEASSEMBLY_SHA256);
     }
 
