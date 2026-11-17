@@ -852,6 +852,13 @@ impl Hooks {
             }
         }
 
+        // `EAC_M3_PROBE=1`: locate the il2cpp class table of *this* build.
+        if env_flag("EAC_M3_PROBE") {
+            for line in crate::m3probe::probe() {
+                hook_log_blocking(&line);
+            }
+        }
+
         // `EAC_EVP=1`: probe the statically linked BoringSSL inside the SDK.
         // Nothing here is a documented export, so each target is matched by its
         // recorded prologue and skipped on drift. The point is the `Init`
@@ -1220,9 +1227,14 @@ unsafe extern "system" fn message_to_server_wrapper(info: *const MessageInfo) {
         {
             if length as usize == forge::FRAME_LEN {
                 forge_learn(data, length as usize);
-                if forge_begin(ts) {
-                    emit_report_frame(ts);
+                // `forge_begin` re-seeds the sequence from the live template, so
+                // it must run exactly once per epoch: calling it per frame made
+                // every retargeted frame carry `seq=2` (observed in
+                // `replaywrap2`, where the server saw duplicate sequences).
+                if !FORGE_STARTED.load(Ordering::Relaxed) && !forge_begin(ts) {
+                    return;
                 }
+                emit_report_frame(ts);
                 return;
             }
             if !FORGE_KEEP_SMALL.load(Ordering::Relaxed) && FORGE_STARTED.load(Ordering::Relaxed) {

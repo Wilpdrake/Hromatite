@@ -31,6 +31,9 @@ dependencies = [
 [[package]]
 name = "hromatite-eac"
 version = "0.1.0"
+dependencies = [
+ "hromatite-core",
+]
 
 [[package]]
 name = "hromatite-features"

@@ -39,6 +39,8 @@ pub mod eventlog;
 pub mod evp;
 pub mod forge;
 #[allow(unsafe_code)]
+pub mod m3probe;
+#[allow(unsafe_code)]
 pub mod hook;
 pub mod payload;
 pub mod report;
