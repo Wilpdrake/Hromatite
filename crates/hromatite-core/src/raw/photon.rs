@@ -73,6 +73,21 @@ pub const PEER_CANDIDATES: &[(&str, &str)] = &[
     ("", "LoadBalancingPeer"),
 ];
 
+/// Substrings tried when no exact pair of [`PEER_CANDIDATES`] is in the table.
+///
+/// A game update renames things and moves assemblies around; a peer class that
+/// still contains one of these words is a far better guess than "nothing found".
+pub const PEER_NEEDLES: &[&str] =
+    &["PhotonPeer", "LoadBalancingPeer", "PeerBase", "Photon"];
+
+/// Namespace that marks a real Photon type in strategy (b). The filter is
+/// relaxed (name shape only) when the strict pass finds nothing at all: a wrong
+/// class table garbles namespaces before it garbles anything else.
+pub const PEER_NAMESPACE: &str = "ExitGames";
+
+/// Cap of `find_contains` hits per [`PEER_NEEDLES`] entry.
+pub const PEER_CONTAINS_LIMIT: usize = 32;
+
 /// Outgoing method names, in preference order (`SendOperationInternal` and the
 /// older `OpCustom` shape are kept as fallbacks — the live build decides).
 pub const SEND_METHODS: &[&str] = &["SendOperation", "SendOperationInternal", "OpCustom"];
@@ -82,6 +97,22 @@ pub const EVENT_METHODS: &[&str] = &["OnEvent", "OnEventInternal", "OnOperationR
 /// `SendOperation` declares three parameters (`byte`, `Dictionary<byte,object>`,
 /// `SendOptions`); the resolver prefers that arity but never requires it.
 const SEND_PARAMETERS: u8 = 3;
+/// `OnEvent(EventData)` declares exactly one.
+const EVENT_PARAMETERS: u8 = 1;
+
+/// `METHOD_ATTRIBUTE_STATIC`; a peer method is always an instance method.
+pub const FLAG_STATIC: u16 = 0x10;
+/// `IL2CPP_TYPE_VOID` as stored in the return descriptor.
+pub const RETURN_VOID: u32 = 1;
+/// Lowest address that can hold managed code.
+const ENTRY_FLOOR: usize = 0x1_0000;
+/// Bytes read (and sanity-checked) before a method entry is trusted.
+const ENTRY_HEAD: usize = 8;
+/// Minimum alignment an x64 instruction pointer is accepted at; below that the
+/// address is a table offset, not code.
+const ENTRY_MIN_ALIGN: usize = 4;
+/// Alignment IL2CPP's codegen normally uses; anything weaker is logged.
+const ENTRY_GOOD_ALIGN: usize = 16;
 
 /// One resolved managed method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +179,249 @@ pub fn raise_line(hit: u64, tid: u64, params: u64, decoded: Option<(u8, usize)>)
         ),
         None => format!("op=253 hit={hit} tid={tid:#x} params_ptr=0x{params:x}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Class-table shape and method signature (pure, host-testable)
+// ---------------------------------------------------------------------------
+
+/// Is this full name shaped like a real identifier? A wrong class table yields
+/// single letters and punctuation (`"n"`, `">"`, `"ISE"`), so the share of
+/// identifier-shaped names is a cheap "is this even a name table" signal.
+pub fn looks_like_identifier(name: &str) -> bool {
+    let name = name.trim();
+    if name.len() < 2 || name.len() > 512 {
+        return false;
+    }
+    name.split('.').all(|part| {
+        let mut chars = part.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        (first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '`' | '<' | '>' | '/' | '$' | '-' | '+')
+            })
+    })
+}
+
+/// What a class-table scan really saw: enough to tell "Photon is not in the
+/// table" from "this is not a class table at all".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TableStats {
+    /// Classes the table materialised.
+    pub total: usize,
+    /// Names actually sampled for [`TableStats::identifiers`].
+    pub scanned: usize,
+    /// Identifier-shaped names among `scanned`.
+    pub identifiers: usize,
+    /// First five full names, in table order.
+    pub first: Vec<String>,
+    /// Last five full names, in table order.
+    pub last: Vec<String>,
+}
+
+/// Sampling cap: a 200k-entry table must not cost a full string pass twice.
+const STATS_SAMPLE: usize = 4096;
+/// How many names the report keeps at each end.
+const STATS_EDGE: usize = 5;
+
+/// Summarise a flattened class-name list. Pure so the diagnostic format is
+/// testable without a game.
+pub fn table_stats(names: &[String]) -> TableStats {
+    let total = names.len();
+    let stride = (total / STATS_SAMPLE).max(1);
+    let mut scanned = 0usize;
+    let mut identifiers = 0usize;
+    for name in names.iter().step_by(stride) {
+        scanned += 1;
+        if looks_like_identifier(name) {
+            identifiers += 1;
+        }
+    }
+    let first = names.iter().take(STATS_EDGE).cloned().collect();
+    let start = total.saturating_sub(STATS_EDGE);
+    TableStats {
+        total,
+        scanned,
+        identifiers,
+        first,
+        last: names[start.min(total)..].to_vec(),
+    }
+}
+
+/// Does `full` pass the substring strategy? The strict pass wants an
+/// `ExitGames*` namespace; the relaxed pass only wants an identifier shape.
+pub fn contains_candidate(full: &str, needle: &str, relaxed: bool) -> bool {
+    if !full.contains(needle) {
+        return false;
+    }
+    if relaxed {
+        return looks_like_identifier(full);
+    }
+    match full.rsplit_once('.') {
+        Some((ns, _)) => ns.starts_with(PEER_NAMESPACE),
+        None => false,
+    }
+}
+
+/// Multi-line, log-ready summary of a class table.
+pub fn format_table_stats(stats: &TableStats) -> String {
+    let percent = stats
+        .identifiers
+        .checked_mul(100)
+        .and_then(|scaled| scaled.checked_div(stats.scanned))
+        .unwrap_or(0);
+    let mut out = format!(
+        "class table: {} class(es), {percent}% identifier-shaped ({}/{} sampled)",
+        stats.total, stats.identifiers, stats.scanned
+    );
+    out.push_str(&format!("\n  first: {}", join_names(&stats.first)));
+    out.push_str(&format!("\n  last: {}", join_names(&stats.last)));
+    out
+}
+
+fn join_names(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names
+        .iter()
+        .map(|name| if name.is_empty() { "<empty>" } else { name.as_str() })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Largest power of two that divides `entry` (`0` for a null entry). A method
+/// pointer is aligned; a struct offset usually is not.
+pub fn entry_alignment(entry: usize) -> usize {
+    if entry == 0 {
+        0
+    } else {
+        1usize << entry.trailing_zeros()
+    }
+}
+
+/// Is `entry` inside the mapped module `[base, base + size)`?
+pub fn entry_in_image(base: usize, size: usize, entry: usize) -> bool {
+    base != 0 && size != 0 && entry >= base && entry < base.saturating_add(size)
+}
+
+/// Cheap code sanity check: the first bytes must be readable-looking code, not
+/// a zero page or `int3` padding (`CC CC CC…`).
+pub fn code_plausible(head: &[u8]) -> bool {
+    let Some(first) = head.first() else {
+        return false;
+    };
+    *first != 0xCC && *first != 0x00 && head.iter().any(|byte| byte != first)
+}
+
+/// Every chain method that matches an *arity/return* shape: instance method,
+/// `parameters_count == arity`, `return_kind == return_kind` when given, entry at
+/// a plausible address.
+///
+/// This is the name-independent fallback: after a rename the method is still a
+/// non-static three-argument void method on the peer class.
+pub fn signature_candidates(
+    chain: &[(usize, Vec<crate::m3::Method>)],
+    arity: u8,
+    return_kind: Option<u32>,
+) -> Vec<(usize, &crate::m3::Method)> {
+    let mut out = Vec::new();
+    for (class, methods) in chain {
+        for method in methods {
+            if method.flags & FLAG_STATIC != 0
+                || method.parameters_count != arity
+                || method.entry < ENTRY_FLOOR
+                || return_kind.is_some_and(|kind| method.return_kind != kind)
+            {
+                continue;
+            }
+            out.push((*class, method));
+        }
+    }
+    out
+}
+
+/// First item of [`signature_candidates`].
+pub fn pick_by_signature(
+    chain: &[(usize, Vec<crate::m3::Method>)],
+    arity: u8,
+    return_kind: Option<u32>,
+) -> Option<(usize, &crate::m3::Method)> {
+    signature_candidates(chain, arity, return_kind).into_iter().next()
+}
+
+/// Candidate order the resolver uses: the name match first, then every
+/// signature candidate that points at a different entry. A name match that
+/// fails verification therefore falls through to a signature sibling instead of
+/// aborting the resolution.
+pub fn merge_candidates<'a>(
+    by_name: Option<(usize, &'a crate::m3::Method)>,
+    by_signature: Vec<(usize, &'a crate::m3::Method)>,
+) -> Vec<(usize, &'a crate::m3::Method)> {
+    let Some((class, method)) = by_name else {
+        return by_signature;
+    };
+    let entry = method.entry;
+    let mut out = vec![(class, method)];
+    out.extend(
+        by_signature
+            .into_iter()
+            .filter(|(_, candidate)| candidate.entry != entry),
+    );
+    out
+}
+
+/// One log line for a provisional method candidate.
+pub fn candidate_line(full: &str, method: &crate::m3::Method, inside: bool) -> String {
+    format!(
+        "candidate {full}: name={} entry={:#x} arity={} flags={:#x} return_kind={} MethodInfo={:#x} in_image={inside}",
+        method.name,
+        method.entry,
+        method.parameters_count,
+        method.flags,
+        method.return_kind,
+        method.info
+    )
+}
+
+/// One line describing what the resolver settled on, kept for
+/// [`probe_report`] and the status path.
+pub fn choice_line(kind: &str, class: &str, method: &str, resolved: &Resolved) -> String {
+    format!(
+        "{kind}: {class}.{method} entry={:#x} MethodInfo={:#x} params={}",
+        resolved.entry, resolved.info, resolved.parameters
+    )
+}
+
+/// Full diagnostic dump as text: table shape, Photon-like classes, and what the
+/// resolver picked (or why it did not).
+pub fn format_probe_report(
+    stats: &TableStats,
+    like: &[(usize, String)],
+    send: Option<&str>,
+    incoming: Option<&str>,
+) -> String {
+    let mut out = format_table_stats(stats);
+    let listed = if like.is_empty() {
+        "none".to_string()
+    } else {
+        like.iter()
+            .map(|(index, name)| format!("[{index}] {name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    out.push_str(&format!(
+        "\nphoton-like classes ({}): {listed}",
+        like.len()
+    ));
+    out.push('\n');
+    out.push_str(send.unwrap_or("send: not resolved"));
+    out.push('\n');
+    out.push_str(incoming.unwrap_or("incoming: not resolved"));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,66 +1336,260 @@ fn resolve_chain(class: usize) -> Vec<(usize, Vec<crate::m3::Method>)> {
         .collect()
 }
 
+/// Every class the resolver is willing to look at, in preference order.
+///
+/// Three strategies, each tried only when the previous one found nothing:
+///
+/// (a) the exact [`PEER_CANDIDATES`] pairs;
+/// (b) `find_contains` over [`PEER_NEEDLES`], keeping names in the
+///     [`PEER_NAMESPACE`] namespace — and, when even that yields nothing, any
+///     identifier-shaped name containing the needle (a wrong class table
+///     garbles namespaces before it garbles names);
+/// (c) nothing at all, after logging what the table really holds — how many
+///     classes were walked, the first/last five names and how many of them look
+///     like identifiers.
+///
+/// This is the single place to replace with `m3::discover_class` once it lands:
+/// everything downstream only needs the `(typeDefinitionIndex, Il2CppClass*)`
+/// list.
 #[cfg(windows)]
-fn resolve_named(names: &[&str], preferred: Option<u8>) -> Option<Resolved> {
-    let module = crate::procs::own_module(crate::GAME_ASSEMBLY);
-    let Some((base, size)) = module else {
-        log::log_tag(TAG, "GameAssembly.dll is not loaded; nothing to resolve");
-        return None;
-    };
-    let mut seen: Vec<usize> = Vec::new();
-    for (ns, class_name) in PEER_CANDIDATES {
-        let hits = crate::m3::find(ns, class_name, SCAN_LIMIT);
+fn peer_classes() -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    // (a) exact pairs, in PEER_CANDIDATES order.
+    for (ns, name) in PEER_CANDIDATES {
+        let hits = crate::m3::find(ns, name, SCAN_LIMIT);
         if hits.is_empty() {
             log::log_tag(
                 TAG,
-                &format!("candidate ns={ns:?} class={class_name} absent from the class table"),
+                &format!("candidate ns={ns:?} class={name} absent from the class table"),
             );
             continue;
         }
         for (index, class) in hits {
-            if seen.contains(&class) {
-                continue;
+            if !out.iter().any(|(_, known)| *known == class) {
+                out.push((index, class));
             }
-            seen.push(class);
-            let chain = resolve_chain(class);
-            let Some((_, method)) = pick_method(&chain, names, preferred) else {
-                log::log_tag(
-                    TAG,
-                    &format!(
-                        "candidate {} (index {index}, {class:#x}) has none of {names:?}",
-                        crate::m3::class_full_name(class)
-                    ),
-                );
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // (b) substrings. `find_contains` reports the index, `classes` maps it back
+    // to the pointer, so the strict namespace pass and the relaxed pass see the
+    // same candidates.
+    let table = crate::m3::classes(SCAN_LIMIT);
+    let mut relaxed: Vec<(usize, usize)> = Vec::new();
+    for needle in PEER_NEEDLES {
+        for (index, full) in crate::m3::find_contains(needle, SCAN_LIMIT, PEER_CONTAINS_LIMIT) {
+            let Some((_, class)) = table.iter().find(|(at, _)| *at == index) else {
                 continue;
             };
-            if method.entry < base || method.entry >= base.saturating_add(size) {
+            let class = *class;
+            if out.iter().any(|(_, known)| *known == class)
+                || relaxed.iter().any(|(_, known)| *known == class)
+            {
+                continue;
+            }
+            if contains_candidate(&full, needle, false) {
                 log::log_tag(
                     TAG,
                     &format!(
-                        "candidate {} method={} entry {:#x} is outside GameAssembly {base:#x}..{:#x}",
-                        crate::m3::class_full_name(class),
+                        "substring {needle:?} matched {full} (index {index}, {PEER_NAMESPACE} namespace)"
+                    ),
+                );
+                out.push((index, class));
+            } else if contains_candidate(&full, needle, true) {
+                relaxed.push((index, class));
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Namespace filter empty: the table may be the wrong one, so accept a
+    // name-shaped match instead of giving up.
+    for (index, class) in relaxed {
+        let full = crate::m3::class_full_name(class);
+        log::log_tag(
+            TAG,
+            &format!(
+                "substring match {full} (index {index}) has no {PEER_NAMESPACE} namespace; keeping it as a last resort"
+            ),
+        );
+        out.push((index, class));
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // (c) Nothing at all: the single most useful line is what the table holds.
+    let names: Vec<String> = table
+        .iter()
+        .map(|(_, class)| crate::m3::class_full_name(*class))
+        .collect();
+    for line in format_table_stats(&table_stats(&names)).lines() {
+        log::log_tag(TAG, line);
+    }
+    out
+}
+
+/// Host build: `m3` can still be walked, but nothing is loaded, so no class is
+/// ever found.
+#[cfg(not(windows))]
+fn peer_classes() -> Vec<(usize, usize)> {
+    Vec::new()
+}
+
+/// Method candidates of one class chain: the name match first, then — only when
+/// no name matched — every method matching the outgoing/incoming signature.
+///
+/// Every fallback candidate is logged with name/entry/arity/flags, so a wrong
+/// entry is visible *before* it is hooked.
+#[cfg(windows)]
+fn chain_candidates<'a>(
+    full: &str,
+    chain: &'a [(usize, Vec<crate::m3::Method>)],
+    names: &[&str],
+    preferred: Option<u8>,
+    base: usize,
+    size: usize,
+) -> Vec<(usize, &'a crate::m3::Method)> {
+    let by_name = pick_method(chain, names, preferred);
+    let Some(arity) = preferred else {
+        return by_name.into_iter().collect();
+    };
+    // Signature candidates are the fallback for *both* failures: no name match
+    // at all, and a name match whose entry does not verify.
+    let mut found = signature_candidates(chain, arity, Some(RETURN_VOID));
+    if found.is_empty() {
+        if by_name.is_none() {
+            log::log_tag(
+                TAG,
+                &format!(
+                    "candidate {full}: no void method with arity {arity}; relaxing the return type"
+                ),
+            );
+        }
+        found = signature_candidates(chain, arity, None);
+    }
+    match by_name {
+        Some(_) => merge_candidates(by_name, found),
+        None => {
+            log::log_tag(
+                TAG,
+                &format!(
+                    "candidate {full}: none of {names:?}; falling back to the signature (arity {arity}, void, non-static)"
+                ),
+            );
+            for (_, method) in &found {
+                log::log_tag(
+                    TAG,
+                    &candidate_line(full, method, entry_in_image(base, size, method.entry)),
+                );
+            }
+            found
+        }
+    }
+}
+
+/// Read the first bytes of `entry` and check they look like code.
+#[cfg(windows)]
+fn entry_head_ok(entry: usize) -> bool {
+    match crate::safe::read_bytes(entry, ENTRY_HEAD) {
+        Some(head) => code_plausible(&head),
+        None => false,
+    }
+}
+
+#[cfg(windows)]
+fn resolve_named(names: &[&str], preferred: Option<u8>) -> Option<Resolved> {
+    let Some((base, size)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+        log::log_tag(TAG, "GameAssembly.dll is not loaded; nothing to resolve");
+        return None;
+    };
+    let candidates = peer_classes();
+    let mut seen: Vec<usize> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    for (index, class) in candidates {
+        if seen.contains(&class) {
+            continue;
+        }
+        seen.push(class);
+        let full = crate::m3::class_full_name(class);
+        tried.push(full.clone());
+        let chain = resolve_chain(class);
+        // A candidate that fails verification falls through to the next one
+        // instead of aborting the whole resolution.
+        for (owner, method) in chain_candidates(&full, &chain, names, preferred, base, size) {
+            let entry = method.entry;
+            if !entry_in_image(base, size, entry) {
+                log::log_tag(
+                    TAG,
+                    &format!(
+                        "candidate {full} method={} entry {entry:#x} is outside GameAssembly {base:#x}..{:#x}",
                         method.name,
-                        method.entry,
                         base.saturating_add(size)
                     ),
                 );
                 continue;
             }
-            return Some(Resolved {
-                class,
+            let align = entry_alignment(entry);
+            if align < ENTRY_MIN_ALIGN {
+                log::log_tag(
+                    TAG,
+                    &format!(
+                        "candidate {full} method={} entry {entry:#x} is not aligned (2^{align})",
+                        method.name
+                    ),
+                );
+                continue;
+            }
+            if !entry_head_ok(entry) {
+                log::log_tag(
+                    TAG,
+                    &format!(
+                        "candidate {full} method={} entry {entry:#x}: first {ENTRY_HEAD} byte(s) unreadable or not code",
+                        method.name
+                    ),
+                );
+                continue;
+            }
+            if align < ENTRY_GOOD_ALIGN {
+                log::log_tag(
+                    TAG,
+                    &format!(
+                        "candidate {full} method={} entry {entry:#x}: weak alignment 2^{align}",
+                        method.name
+                    ),
+                );
+            }
+            let resolved = Resolved {
+                class: owner,
                 info: method.info,
-                entry: method.entry,
+                entry,
                 parameters: method.parameters_count,
-            });
+            };
+            let line = choice_line(
+                &format!("resolved (index {index})"),
+                &full,
+                &method.name,
+                &resolved,
+            );
+            remember_choice(line.clone());
+            log::log_tag(TAG, &line);
+            return Some(resolved);
         }
     }
-    // Nothing matched: say what the class table actually holds for this name, so
-    // a renamed type (or a wrong table) is visible in one log line.
+    // Nothing matched: say what the class table actually holds, so a renamed type
+    // (or a wrong table) is visible in one log line.
     let like = crate::m3::find_contains("Photon", SCAN_LIMIT, 8);
     log::log_tag(
         TAG,
-        &format!("no peer class matched; Photon-like classes: {like:?}"),
+        &format!(
+            "no peer class matched for {names:?}; tried {} class(es) {tried:?}; Photon-like classes: {like:?}",
+            seen.len()
+        ),
     );
     None
 }
@@ -1139,7 +1607,7 @@ pub fn resolve_send_operation() -> Option<Resolved> {
 /// Resolve the incoming `OnEvent` (see [`EVENT_METHODS`]).
 #[cfg(windows)]
 pub fn resolve_on_event() -> Option<Resolved> {
-    resolve_named(EVENT_METHODS, Some(1))
+    resolve_named(EVENT_METHODS, Some(EVENT_PARAMETERS))
 }
 
 /// Host build: there is no GameAssembly, so resolution must report `None`
@@ -1153,6 +1621,110 @@ pub fn resolve_send_operation() -> Option<Resolved> {
 #[cfg(not(windows))]
 pub fn resolve_on_event() -> Option<Resolved> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics: EAC_EVENT_PROBE and probe_report()
+// ---------------------------------------------------------------------------
+
+/// `EAC_EVENT_PROBE=1`: one diagnostic dump of the class table per session.
+static ENV_PROBE: AtomicU8 = AtomicU8::new(0);
+static PROBE_DONE: AtomicBool = AtomicBool::new(false);
+static LAST_REPORT: Mutex<Option<String>> = Mutex::new(None);
+static LAST_CHOICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// `EAC_EVENT_PROBE=1` asks for the one-shot diagnostic dump.
+pub fn probe_enabled() -> bool {
+    env_flag("EAC_EVENT_PROBE", &ENV_PROBE)
+}
+
+fn remember_choice(line: String) {
+    *LAST_CHOICE.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(line);
+}
+
+/// What the last successful resolution picked, if anything. Feeds
+/// [`status_line`] and [`probe_report`].
+pub fn last_choice() -> Option<String> {
+    LAST_CHOICE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+/// One-shot: `EAC_EVENT_PROBE=1` writes the whole dump to the log the first time
+/// the managed tick runs, whether or not a hook is enabled.
+fn probe_once() {
+    if !probe_enabled() || PROBE_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let report = probe_report();
+    for line in report.lines() {
+        log::log_tag(TAG, line);
+    }
+}
+
+/// The diagnostic dump as text: class-table size, the first/last five full
+/// names, the share of identifier-shaped names, every Photon-like class, and
+/// what the resolver picked (or did not).
+///
+/// This is the entry point the console / `eac.hooks status` code should call;
+/// the result is cached after the first build. Counts as the one-shot dump, so
+/// an explicit call also satisfies `EAC_EVENT_PROBE=1`.
+pub fn probe_report() -> String {
+    if let Some(text) = LAST_REPORT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+    {
+        return text;
+    }
+    PROBE_DONE.store(true, Ordering::Release);
+    let text = build_report();
+    *LAST_REPORT.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(text.clone());
+    text
+}
+
+#[cfg(windows)]
+fn build_report() -> String {
+    let table = crate::m3::classes(SCAN_LIMIT);
+    let names: Vec<String> = table
+        .iter()
+        .map(|(_, class)| crate::m3::class_full_name(*class))
+        .collect();
+    let stats = table_stats(&names);
+    let like = crate::m3::find_contains("Photon", SCAN_LIMIT, 16);
+    let send = resolve_send_operation().map(|resolved| {
+        let class = crate::m3::class_full_name(resolved.class);
+        let method = method_name(resolved.class, resolved.entry, SEND_METHODS);
+        choice_line("send", &class, method, &resolved)
+    });
+    let incoming = resolve_on_event().map(|resolved| {
+        let class = crate::m3::class_full_name(resolved.class);
+        let method = method_name(resolved.class, resolved.entry, EVENT_METHODS);
+        choice_line("incoming", &class, method, &resolved)
+    });
+    format_probe_report(&stats, &like, send.as_deref(), incoming.as_deref())
+}
+
+/// Host build: no class table and no GameAssembly, so say so plainly.
+#[cfg(not(windows))]
+fn build_report() -> String {
+    format!(
+        "photon probe: host build, no GameAssembly; last pick: {}",
+        last_choice().unwrap_or_else(|| "none".to_string())
+    )
+}
+
+/// One line for the console / `eac.hooks status` path.
+pub fn status_line() -> String {
+    let (attached, hits, events) = send_counters();
+    let (in_attached, in_hits) = event_counters();
+    format!(
+        "photon: send={} hits={hits} raise_events={events}; incoming={} hits={in_hits}; last pick: {}",
+        if attached { "hooked" } else { "no" },
+        if in_attached { "hooked" } else { "no" },
+        last_choice().unwrap_or_else(|| "none".to_string())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1959,12 @@ pub fn install_incoming() -> Result<Resolved, String> {
 /// Called from the established managed tick: retries the install until it lands.
 /// Cheap when everything is already attached; `EAC_EVENTHOOK=1` gates it.
 pub fn poll() {
+    // `EAC_EVENT_PROBE=1` is independent of the hooks: the dump is what tells a
+    // wrong class table apart from a renamed type, so it must also run when the
+    // hook itself has nothing to resolve. Guarded, like every other tick body.
+    if probe_enabled() && !PROBE_DONE.load(Ordering::Acquire) {
+        let _ = log::guard("photon::probe", probe_once);
+    }
     let want_out = enabled_outgoing();
     let want_in = enabled_incoming();
     if !want_out && !want_in {
@@ -1545,6 +2123,216 @@ mod tests {
         let (class, picked) = pick_method(&chain, &["SendOperation"], Some(3)).unwrap();
         assert_eq!(class, 0x1000);
         assert_eq!(picked.entry, GA + 0x4000);
+    }
+
+    // -----------------------------------------------------------------
+    // Class candidates and the signature fallback
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_signature_fallback_finds_a_renamed_void_three_argument_method() {
+        // A renamed `SendOperation`: odd name, right shape.
+        let chain = vec![(
+            0x2000usize,
+            vec![
+                method("Frobnicate", GA + 0x2000, 3, 0),          // void, 3 args: the pick
+                method("Frobnicate", GA + 0x2100, 3, 0x10),         // static: rejected
+                method("Frobnicate", GA + 0x2200, 2, 0),            // wrong arity
+            ],
+        )];
+        let (class, picked) = super::pick_by_signature(&chain, 3, Some(super::RETURN_VOID)).unwrap();
+        assert_eq!(class, 0x2000);
+        assert_eq!(picked.entry, GA + 0x2000);
+
+        // A static three-argument method is not a hook target.
+        let statics = vec![(0x2000usize, vec![method("Boom", GA + 0x3000, 3, 0x10)])];
+        assert!(super::pick_by_signature(&statics, 3, Some(super::RETURN_VOID)).is_none());
+        // Nor is an unrelocated (0) entry.
+        let unrelocated = vec![(0x2000usize, vec![method("Boom", 0, 3, 0)])];
+        assert!(super::pick_by_signature(&unrelocated, 3, None).is_none());
+    }
+
+    #[test]
+    fn the_signature_fallback_reports_every_candidate_and_prefers_void() {
+        let mut bool_method = method("Maybe", GA + 0x4000, 3, 0);
+        bool_method.return_kind = 2;
+        let chain = vec![
+            (0x2000usize, vec![bool_method]),
+            (0x2800, vec![method("Send", GA + 0x5000, 3, 0)]),
+        ];
+        // The strict (void) pass only sees the void method.
+        let strict = super::signature_candidates(&chain, 3, Some(super::RETURN_VOID));
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].1.name, "Send");
+        // Relaxed pass sees both, in chain order (derived class first).
+        let all = super::signature_candidates(&chain, 3, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].1.name, "Maybe");
+        assert_eq!(all[1].1.entry, GA + 0x5000);
+        // The incoming arity (1) does not pick a 3-argument method.
+        assert!(super::pick_by_signature(&chain, 1, None).is_none());
+        let line = super::candidate_line("A.B", &chain[1].1[0], true);
+        assert!(line.contains("name=Send"), "{line}");
+        assert!(line.contains(&format!("entry={:#x}", GA + 0x5000)), "{line}");
+        assert!(line.contains("arity=3"), "{line}");
+        assert!(line.contains("in_image=true"), "{line}");
+    }
+
+    #[test]
+    fn a_failed_name_match_falls_through_to_a_signature_sibling() {
+        let chain = vec![(
+            0x2000usize,
+            vec![
+                method("SendOperation", GA + 0x1000, 3, 0),
+                method("SendOperation", GA + 0x2000, 3, 0),
+            ],
+        )];
+        let by_name = super::pick_method(&chain, &["SendOperation"], Some(3));
+        assert_eq!(by_name.map(|(_, m)| m.entry), Some(GA + 0x1000));
+        let sig = super::signature_candidates(&chain, 3, Some(super::RETURN_VOID));
+        let merged = super::merge_candidates(by_name, sig);
+        // The name pick first, the sibling second — never the same entry twice.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].1.entry, GA + 0x1000);
+        assert_eq!(merged[1].1.entry, GA + 0x2000);
+
+        // No name match: the signature list is used as is.
+        let none = super::merge_candidates(None, super::signature_candidates(&chain, 3, None));
+        assert_eq!(none.len(), 2);
+    }
+
+    #[test]
+    fn substring_candidates_need_the_exitgames_namespace_first() {
+        assert!(super::contains_candidate(
+            "ExitGames.Client.Photon.PhotonPeer",
+            "PhotonPeer",
+            false
+        ));
+        assert!(super::contains_candidate(
+            "ExitGames.Client.Photon.LoadBalancingPeer",
+            "LoadBalancingPeer",
+            false
+        ));
+        // Right name, foreign (or broken) namespace: only the relaxed pass.
+        assert!(!super::contains_candidate("PhotonPeer", "PhotonPeer", false));
+        assert!(super::contains_candidate("PhotonPeer", "PhotonPeer", true));
+        assert!(super::contains_candidate(
+            "Assembly-CSharp.PhotonPeer",
+            "PhotonPeer",
+            true
+        ));
+        // Junk names survive neither pass.
+        assert!(!super::contains_candidate(">", "Photon", true));
+        assert!(!super::contains_candidate("n", "Photon", true));
+        // The needle itself must be present.
+        assert!(!super::contains_candidate(
+            "ExitGames.Client.Photon.PeerBase",
+            "PhotonPeer",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_method_entry_is_only_trusted_inside_the_image_and_on_code() {
+        let base = GA;
+        let size = 0x10_0000;
+        assert!(super::entry_in_image(base, size, base + 0x1000));
+        assert!(!super::entry_in_image(base, size, base - 1));
+        assert!(!super::entry_in_image(base, size, base + size));
+        assert!(super::entry_in_image(base, size, base), "the first byte is code");
+
+        assert_eq!(super::entry_alignment(GA + 0x1000), 0x1000);
+        assert_eq!(super::entry_alignment(GA + 0x1002), 2);
+        assert_eq!(super::entry_alignment(0), 0);
+
+        // A real prologue, and the two shapes that are not code.
+        assert!(super::code_plausible(&[0x55, 0x48, 0x89, 0x5C, 0x24, 0x08]));
+        assert!(!super::code_plausible(&[0xCC, 0xCC, 0xCC, 0xCC]));
+        assert!(!super::code_plausible(&[0x00, 0x00, 0x00, 0x00]));
+        assert!(!super::code_plausible(&[]));
+    }
+
+    // -----------------------------------------------------------------
+    // Table diagnostics and the probe report
+    // -----------------------------------------------------------------
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_junk_class_table_is_recognised_by_the_name_share() {
+        let good = super::table_stats(&names(&[
+            "ExitGames.Client.Photon.PhotonPeer",
+            "System.Object",
+            "UnityEngine.Camera",
+            "VRC.SDKBase.VRCPlayerApi",
+            "System.Collections.Generic.Dictionary`2",
+            "ExitGames.Client.Photon.PeerBase",
+        ]));
+        assert_eq!(good.total, 6);
+        assert_eq!(good.identifiers, 6);
+        assert_eq!(good.first.len(), 5, "only the first five are kept");
+        assert_eq!(good.first[0], "ExitGames.Client.Photon.PhotonPeer");
+
+        // The live failure mode: a wrong table, single letters and punctuation.
+        let junk = super::table_stats(&names(&["n", ">", "ISE", "", "a"]));
+        assert_eq!(junk.total, 5);
+        assert_eq!(junk.identifiers, 1, "only 'ISE' has an identifier shape");
+        assert!(super::format_table_stats(&junk).contains("20% identifier-shaped"));
+
+        // More than ten entries: first and last five only.
+        let many: Vec<String> = (0..12).map(|i| format!("Ns.Class{i}")).collect();
+        let stats = super::table_stats(&many);
+        assert_eq!(stats.first.len(), 5);
+        assert_eq!(stats.last.len(), 5);
+        assert_eq!(stats.last[4], "Ns.Class11");
+        assert_eq!(stats.scanned, 12);
+
+        let empty = super::table_stats(&names(&[]));
+        assert_eq!(super::format_table_stats(&empty).matches("none").count(), 2);
+    }
+
+    #[test]
+    fn the_probe_report_names_what_was_found_and_what_was_not() {
+        let stats = super::table_stats(&names(&["ExitGames.Client.Photon.PhotonPeer"]));
+        let like = vec![(7usize, "ExitGames.Client.Photon.PhotonPeer".to_string())];
+        let resolved = super::Resolved {
+            class: 0x1000,
+            info: 0x2000,
+            entry: GA + 0x3000,
+            parameters: 3,
+        };
+        let send = super::choice_line(
+            "send",
+            "ExitGames.Client.Photon.PhotonPeer",
+            "SendOperation",
+            &resolved,
+        );
+        let report = super::format_probe_report(&stats, &like, Some(&send), None);
+        assert!(report.contains("1 class(es)"), "{report}");
+        assert!(report.contains("first: ExitGames.Client.Photon.PhotonPeer"), "{report}");
+        assert!(report.contains("photon-like classes (1): [7]"), "{report}");
+        assert!(report.contains("send: ExitGames.Client.Photon.PhotonPeer.SendOperation"), "{report}");
+        assert!(report.contains(&format!("entry={:#x}", GA + 0x3000)), "{report}");
+        assert!(report.contains("incoming: not resolved"), "{report}");
+
+        let bare = super::format_probe_report(&super::table_stats(&names(&[])), &[], None, None);
+        assert!(bare.contains("photon-like classes (0): none"), "{bare}");
+        assert!(bare.contains("send: not resolved"), "{bare}");
+    }
+
+    #[test]
+    fn the_host_probe_and_status_lines_say_there_is_no_game() {
+        let report = super::probe_report();
+        assert!(report.contains("host build"), "{report}");
+        let status = super::status_line();
+        assert!(status.starts_with("photon: send=no"), "{status}");
+        assert!(status.contains("incoming=no"), "{status}");
+        assert!(status.ends_with("last pick: none"), "{status}");
+        assert_eq!(super::last_choice(), None);
+        // Cached: a second call returns the same text.
+        assert_eq!(super::probe_report(), report);
     }
 
     #[test]
