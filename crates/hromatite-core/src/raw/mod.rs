@@ -18,6 +18,7 @@ pub mod hostapi;
 pub mod hot;
 pub mod il2cpp;
 pub mod localmap;
+pub mod m3dump;
 pub mod memory;
 pub mod memscan;
 pub mod photon;
