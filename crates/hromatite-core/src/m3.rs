@@ -55,7 +55,7 @@ use crate::{procs, safe};
 /// `Il2CppClass**` (s_TypeInfoDefinitionTable) inside GameAssembly `.data` on
 /// the 2026-11-15 build. Kept as a *hint*: the table is rediscovered when the
 /// slot does not validate.
-pub const CLASS_TABLE_RVA: u32 = 0x0e66_c870;
+pub const CLASS_TABLE_RVA: u32 = 0x0e66_f0d0;
 /// `il2cpp_image_get_class` (new build; export-block alignment, 2026-11-17).
 pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_c0a0;
 /// `il2cpp_class_get_fields` (new build).
@@ -68,6 +68,12 @@ pub const CLASS_NS_OFF: usize = 0x18;
 pub const CLASS_METHODS_OFF: usize = 0x50;
 pub const CLASS_FIELDS_OFF: usize = 0x80;
 pub const CLASS_NAME_OFF: usize = 0x98;
+
+/// Bytes between `Il2CppImage` records in the packed image array. Measured
+/// 0x48 on the 2026-11-14 build and 0x50 on 2026-11-17 (verified live by
+/// walking the array from `il2cpp_get_corlib` and reading the assembly names:
+/// only 0x50 yields `mscorlib`, `DataModel`, `UnityEngine.CoreModule`, ...).
+pub const IMAGE_STRIDE: usize = 0x50;
 pub const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
 
 /// `Il2CppImage.name` (short assembly name).
@@ -622,14 +628,15 @@ fn store_discovery(ns: &str, name: &str, hit: ClassHit) {
 }
 
 /// Every `Il2CppImage` reachable by walking the packed image array from the
-/// corlib image (stride 0x48 in both directions), paired with its short name.
+/// corlib image (stride 0x50 in both directions, measured on the 2026-11-17
+/// build; it was 0x48 before), paired with its short name.
 #[cfg(target_os = "windows")]
 fn images_around(corlib: usize) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
     for step in 0i64..768 {
         for sign in [1i64, -1] {
             let index = step * sign;
-            let Some(image) = corlib.checked_add_signed((index * 0x48) as isize) else {
+            let Some(image) = corlib.checked_add_signed((index * IMAGE_STRIDE) as isize) else {
                 continue;
             };
             let Some(name) = safe::read_usize(image + IMAGE_NAME_OFF).and_then(name_at) else {
@@ -1231,7 +1238,8 @@ pub fn methods(class: usize) -> Vec<Method> {
     out
 }
 
-/// `Il2CppImage*` of an assembly. Images are packed with stride 0x48 and the
+/// `Il2CppImage*` of an assembly. Images are packed with stride
+/// [`IMAGE_STRIDE`] (0x50 since the 2026-11-17 build, 0x48 before) and the
 /// `il2cpp_get_corlib` result is *not* the first one (Assembly-CSharp sits four
 /// entries earlier), so the search walks both directions. Exact short names win
 /// over prefixes (`Assembly-CSharp` must not resolve to `Assembly-CSharp-firstpass`).
@@ -1241,7 +1249,7 @@ pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
         for step in 0i64..768 {
             for sign in [1i64, -1] {
                 let idx = step * sign;
-                let Some(img) = corlib_image.checked_add_signed((idx * 0x48) as isize) else {
+                let Some(img) = corlib_image.checked_add_signed((idx * IMAGE_STRIDE as i64) as isize) else {
                     continue;
                 };
                 let name = match safe::read_usize(img + 0x08).and_then(name_at) {

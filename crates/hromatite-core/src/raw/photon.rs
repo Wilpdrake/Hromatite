@@ -76,7 +76,7 @@ pub const PEER_CANDIDATES: &[(&str, &str)] = &[
 /// Assembly the peer class is expected to live in. VRChat compiles its Photon
 /// client into `Assembly-CSharp`; `il2cpp_class_from_name` only needs the image,
 /// and a miss costs one guarded call.
-pub const PEER_ASSEMBLY: &str = "Assembly-CSharp";
+pub const PEER_ASSEMBLIES: &[&str] = &["PhotonClient", "Assembly-CSharp", "Photon", "ExitGames.Client.Photon"];
 
 /// Substrings tried when no exact pair of [`PEER_CANDIDATES`] is in the table.
 ///
@@ -1385,7 +1385,10 @@ fn peer_classes() -> Vec<(usize, usize)> {
     // assembly image, then by locating the name string in memory and proving the
     // surrounding record really is an `Il2CppClass` (see `m3::discover_class`).
     for (ns, name) in PEER_CANDIDATES {
-        if let Some(class) = crate::m3::class_by_name_via_api(ns, name, PEER_ASSEMBLY) {
+        let api_hit = PEER_ASSEMBLIES
+            .iter()
+            .find_map(|assembly| crate::m3::class_by_name_via_api(ns, name, assembly));
+        if let Some(class) = api_hit {
             log::log_tag(
                 TAG,
                 &format!(

@@ -29,7 +29,7 @@ pub const GET_PLAYER_OBJECTS: u64 = 0x0000_0000_6000_d000;
 pub const GET_OBJECT_NAME: u64 = 0x0000_0000_6000_e000;
 
 fn image(address: u64, name: &str, name_address: u64) {
-    fake::map_zeroed(address, 0x48);
+    fake::map_zeroed(address, 0x50);
     fake::put_ascii(name_address, name);
     fake::put_u64(address + 0x08, name_address);
 }
@@ -78,11 +78,11 @@ pub fn install() {
         0x0000_0005_1000_0000,
     );
     image(
-        CORLIB_IMAGE - 4 * 0x48,
+        CORLIB_IMAGE - 4 * 0x50,
         "Assembly-CSharp",
         0x0000_0005_1000_0100,
     );
-    image(CORLIB_IMAGE - 3 * 0x48, "VRCSDKBase", 0x0000_0005_1000_0200);
+    image(CORLIB_IMAGE - 3 * 0x50, "VRCSDKBase", 0x0000_0005_1000_0200);
 
     class(
         167,

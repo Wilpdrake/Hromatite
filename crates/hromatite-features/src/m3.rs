@@ -258,7 +258,7 @@ impl<'a> Metadata<'a> {
             for step in 0i64..768 {
                 for sign in [1i64, -1] {
                     let index = step * sign;
-                    let image = corlib_image.checked_add_signed((index * 0x48) as isize)?;
+                    let image = corlib_image.checked_add_signed((index * 0x50) as isize)?;
                     let name = match self
                         .host
                         .read_usize(image + 0x08)
