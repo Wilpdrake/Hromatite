@@ -25,6 +25,10 @@
 #   HROMATITE_VERIFY_MS=n  how long to wait for a *single* inject to show up
 #                          in hromatite.log (default 3000)
 #   HROMATITE_MODE_RESTORE=0  do not put ~/.hromatite-mode back on exit
+#
+# Exactly one injector runs at a time, and a game pid that already reported
+# `target pid` is never injected twice: a second copy of the payload means a
+# second hook set and a second VEH inside one process.
 
 set -u
 # --- millisecond clock -------------------------------------------------------
@@ -159,6 +163,10 @@ fi
 # the few matches. A process counts only if *its own* argv[0] is the game
 # binary: the wrapper shell's command line also mentions VRChat.exe.
 # Output: "<prio> <pid> <name>" sorted, VRChat.exe (prio 0) first.
+#
+# Start time of this wrapper (jiffies since boot): anything older is a game from
+# a previous launch, which must never be adopted as this run's target.
+SELF_START=$(sed 's/^.*) //' "/proc/$$/stat" 2>/dev/null | awk '{print $20}')
 scan_game_pids() {
     # shellcheck disable=SC2013  # paths of /proc/*/cmdline: no spaces, no newlines
     for f in $(grep -laE 'VRChat\.exe|launch\.exe|start_protected_game\.exe' \
@@ -202,6 +210,16 @@ scan_game_pids() {
             esac
         fi
         [ -n "$hitname" ] || continue
+        # A process that started BEFORE this wrapper is a game from an earlier
+        # launch — usually the one that hung, still holding VRChat.exe. Injecting
+        # into it maps a second payload (second hook set, second VEH) into a dead
+        # session and makes every later log line ambiguous. /proc/PID/stat field
+        # 22 is starttime in clock ticks: subtract the two leading fields.
+        p_start=$(sed 's/^.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $20}')
+        if [ -n "$SELF_START" ] && [ -n "$p_start" ] && [ "$p_start" -lt "$SELF_START" ]; then
+            echo "[hromatite] skip stale pid $p ($hitname, started before this launch)" >>"$LOG"
+            continue
+        fi
         if [ "$hitname" = "vrchat.exe" ]; then prio=0; else prio=1; fi
         # Same prefix only: another Proton app has its own WINEPREFIX.
         wp=$(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p' | head -1)
@@ -254,26 +272,41 @@ scan_game_pids() {
         return 1
     }
 
-    # Ожидание сигнала об инжекте с шагом 100 мс — это не «готовность хуков»,
-    # а факт маппинга образа, который появляется почти сразу.
-    wait_injected() { # $1 milliseconds
-        left=$1
-        while [ "$left" -gt 0 ]; do
-            new_tail | grep -aqE "$INJECTED_PAT" && return 0
-            sleep 0.1 2>/dev/null || sleep 1
-            left=$((left - poll_ms))
-        done
-        return 1
+    # Цели, по которым инжектор уже отчитался в этом запуске: он печатает
+    # `target pid N` до маппинга. Второй образ в том же процессе — это второй
+    # набор хуков и второй VEH, поэтому по этому признаку повторный инжект
+    # в тот же pid запрещён.
+    injected_pids() {
+        new_tail | sed -n 's/.*target pid \([0-9][0-9]*\).*/\1/p' | sort -u | tr '\n' ' '
     }
 
+    # Ожидание сигнала об инжекте с шагом 100 мс — это не «готовность хуков»,
+    # а факт маппинга образа, который появляется почти сразу. Ждём в двух
+    # местах (do_inject и сторож ниже), поэтому период берётся из poll_ms.
     # $1 pid, $2 mode (attach|proton) — runs the injector, waits for the marker.
+    # At most one injector is ever alive: a second one cannot see that the first
+    # is still mapping (Toolhelp can hang for minutes) and would map a second
+    # copy of the payload into the same process.
+    INJ_PID=""
+    INJ_TARGET=""
     do_inject() {
         ipid=$1
         imode=$2
+        case " $(injected_pids) " in
+            *" $ipid "*)
+                echo "[hromatite] skip inject: pid $ipid already reported 'target pid' in this run" >>"$LOG"
+                return 0
+                ;;
+        esac
+        if [ -n "$INJ_PID" ] && kill -0 "$INJ_PID" 2>/dev/null; then
+            echo "[hromatite] skip inject: previous injector (pid $INJ_PID, target $INJ_TARGET) is still running" >>"$LOG"
+            return 1
+        fi
         if [ "$imode" = "proton" ]; then
             echo "[hromatite] inject (proton run) for pid $ipid at +$(rel_ms) ms" >>"$LOG"
             # shellcheck disable=SC2086  # INJECT_ARGS is a word list on purpose
             "$PROTON" run "$EXE" $INJECT_ARGS >>"$LOG" 2>&1 &
+            INJ_PID=$!
         else
             ENVF=$(mktemp)
             # Values contain ';', spaces and '=' (WINEDLLOVERRIDES), so every
@@ -296,9 +329,27 @@ scan_game_pids() {
                 # shellcheck disable=SC2086  # INJECT_ARGS is a word list on purpose
                 exec "$WINE" "$EXE" $INJECT_ARGS
             ) >"$OUT" 2>&1 &
+            INJ_PID=$!
         fi
+        INJ_TARGET=$ipid
         ok=0
-        wait_injected "$verify_ms" && ok=1
+        # Ждём маркер маппинга, но и выход инжектора — тоже событие: если он
+        # завершился, ждать больше нечего, а новый инжектор запускать нельзя,
+        # пока этот жив (см. проверку выше).
+        left=$verify_ms
+        while [ "$left" -gt 0 ]; do
+            new_tail | grep -aqE "$INJECTED_PAT" && {
+                ok=1
+                break
+            }
+            kill -0 "$INJ_PID" 2>/dev/null || break
+            sleep 0.1 2>/dev/null || sleep 1
+            left=$((left - poll_ms))
+        done
+        if [ "$ok" = "0" ]; then
+            # Последний шанс: инжектор мог дописать строку перед самым выходом.
+            new_tail | grep -aqE "$INJECTED_PAT" && ok=1
+        fi
         if [ "$ok" = "1" ]; then
             echo "[hromatite] inject ok for pid $ipid at +$(rel_ms) ms" >>"$LOG"
         else
@@ -328,6 +379,13 @@ scan_game_pids() {
     while [ "$(now_ms)" -lt "$idle_deadline" ]; do
         # Игра уже вышла — искать некого.
         kill -0 "$GAME_PID" 2>/dev/null || break
+        # Предыдущий инжектор ещё жив: второй одновременно с ним нельзя
+        # (Toolhelp под wine умеет висеть минутами, первый может всё ещё
+        # маппить образ). Ждём его, попытки не тратим.
+        if [ -n "$INJ_PID" ] && kill -0 "$INJ_PID" 2>/dev/null; then
+            sleep 0.1 2>/dev/null || sleep 1
+            continue
+        fi
         # First candidate we have not tried yet; awk keeps whole lines intact
         # (a `for x in $(...)` would split "prio pid name" into words).
         hit=$(scan_game_pids | awk -v tied="$tied" 'index(tied, " " $2 " ") == 0 { print; exit }')

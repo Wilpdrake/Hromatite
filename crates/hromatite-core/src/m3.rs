@@ -1,27 +1,33 @@
 //! Unity 6 IL2CPP metadata access for the *current* GameAssembly build.
 //!
-//! The layout below was measured live on 2026-11-15 (sha256 `648f61b1…`) and the
-//! class record itself still validates on the 2026-11-17 build
-//! (`245768f2…`); only the addresses moved:
+//! The layout below was re-measured live on the 2026-11-17 build
+//! (`245768f2…`, process 307646) and differs from the 2026-11-15 build in every
+//! pointer slot except `image`/`namespaze`/`fields` — which is why the previous
+//! constants produced `PhotonPeer absent from the class table`:
 //!
 //! ```text
 //! Il2CppClass +0x00              → const Il2CppImage*
-//!            +0x10              → Il2CppClass* parent
+//!            +0x08              → void* gc_desc
+//!            +0x10              → const char* name          (was +0x98)
 //!            +0x18              → const char* namespaze
-//!            +0x50              → const MethodInfo**  (array of pointers)
-//!            +0x80              → FieldInfo[]         (inline records)
-//!            +0x98              → const char* name
+//!            +0x58              → const MethodInfo** methods (was +0x50)
+//!            +0x80              → property array            (was fields!)
+//!            +0x88              → FieldInfo[] fields        (stride 0x20, was +0x80/0x28)
+//!            +0xa0              → Il2CppClass* parent       (was +0x10)
+//!            +0x120             → uint16 methodsCount
 //!            +0x124             → uint16 fieldsCount
-//! FieldInfo  +0x00              → const Il2CppType*
+//! FieldInfo  +0x00              → const char* name
 //!            +0x08              → int32 offset
-//!            +0x10              → const char* name
-//!            +0x18              → uint32 token
-//!            +0x20              → Il2CppClass* parent        (stride 0x28)
+//!            +0x0c              → uint32 token             (stride 0x20)
+//!            +0x10              → const Il2CppType* type
+//!            +0x18              → Il2CppClass* parent
 //! MethodInfo +0x00              → methodPointer
-//!            +0x18              → const char* name
-//!            +0x20              → const Il2CppType* return_type
-//!            +0x28              → Il2CppClass* klass
+//!            +0x18              → Il2CppClass* klass
+//!            +0x20              → const char* name         (was +0x18)
+//!            +0x28              → const Il2CppType* return_type (was +0x20)
 //!            +0x30              → parameters
+//!            +0x4c              → uint16 flags (0x10 = static)
+//!            +0x52              → uint8 parameters_count
 //! ```
 //!
 //! # Why discovery instead of recorded RVAs
@@ -48,6 +54,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::raw::memscan;
 use crate::{procs, safe};
@@ -65,9 +72,12 @@ pub const CLASS_FROM_NAME_RVA: u32 = 0x00c2_9dc0;
 
 pub const CLASS_IMAGE_OFF: usize = 0x00;
 pub const CLASS_NS_OFF: usize = 0x18;
-pub const CLASS_METHODS_OFF: usize = 0x50;
-pub const CLASS_FIELDS_OFF: usize = 0x80;
-pub const CLASS_NAME_OFF: usize = 0x98;
+pub const CLASS_METHODS_OFF: usize = 0x58;
+pub const CLASS_FIELDS_OFF: usize = 0x88;
+pub const CLASS_NAME_OFF: usize = 0x10;
+/// `Il2CppClass.methods_count`; bounds the `MethodInfo**` array, which is *not*
+/// NULL-terminated on this build (only some records end in a zero slot).
+pub const CLASS_METHODS_COUNT_OFF: usize = 0x120;
 
 /// Bytes between `Il2CppImage` records in the packed image array. Measured
 /// 0x48 on the 2026-11-14 build and 0x50 on 2026-11-17 (verified live by
@@ -78,26 +88,28 @@ pub const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
 
 /// `Il2CppImage.name` (short assembly name).
 const IMAGE_NAME_OFF: usize = 0x08;
+/// `Il2CppImage.fileName` (`<short name>.dll`, measured live at `+0x18`).
+const IMAGE_FILENAME_OFF: usize = 0x18;
 /// Longest class/namespace/image name accepted from memory.
 const MAX_NAME_LEN: usize = 200;
 
-pub const FIELD_STRIDE: usize = 0x28;
-const FIELD_TYPE_OFF: usize = 0x00;
-const FIELD_NAME_OFF: usize = 0x10;
-// Verified by il2cpp_field_get_offset/value/set_value (tools/data/
-// il2cpp-export-names.json): offset is int32 at +0x08; token is at +0x18.
+pub const FIELD_STRIDE: usize = 0x20;
+const FIELD_TYPE_OFF: usize = 0x10;
+const FIELD_NAME_OFF: usize = 0x00;
+// `FieldInfo` (this build): name@0x00, offset:int32@0x08, token@0x0c,
+// type@0x10, parent@0x18. Verified against Camera's 8 fields live.
 const FIELD_OFFSET_OFF: usize = 0x08;
-const FIELD_PARENT_OFF: usize = 0x20;
+const FIELD_PARENT_OFF: usize = 0x18;
 
-const METHOD_NAME_OFF: usize = 0x18;
-const METHOD_RETURN_TYPE_OFF: usize = 0x20;
+pub const METHOD_NAME_OFF: usize = 0x20;
+const METHOD_RETURN_TYPE_OFF: usize = 0x28;
 
 /// Classes the payload has to resolve, plus the class record offsets that may
 /// have moved. Every candidate offset is *confirmed against data*, never
 /// assumed: a patch that shifts `name` to +0x90 costs one extra probe.
-const NAME_OFFSETS: [usize; 6] = [0x98, 0x90, 0xA0, 0x88, 0x80, 0x10];
+const NAME_OFFSETS: [usize; 6] = [0x10, 0x98, 0x90, 0xA0, 0x88, 0x80];
 const NS_OFFSETS: [usize; 4] = [0x18, 0x10, 0x20, 0x08];
-const METHODS_OFFSETS: [usize; 3] = [0x50, 0x58, 0x48];
+const METHODS_OFFSETS: [usize; 3] = [0x58, 0x50, 0x48];
 
 /// Entries scored when a candidate table or record is validated.
 const SCAN_ENTRIES: usize = 32;
@@ -174,11 +186,15 @@ fn pick_offset(candidates: &[usize], confirm: impl Fn(usize) -> bool) -> Option<
 struct TableScore {
     /// Entries that validate as complete `Il2CppClass` records.
     valid: usize,
-    /// Entries that grow relative to their predecessor.
+    /// Entries that grow relative to their predecessor. Diagnostic only: the
+    /// allocator does not hand class records out in ascending order (measured
+    /// 2026-11-17: 21/32 on the real table), so it must not decide acceptance.
     increasing: usize,
     /// Distinct entries among the valid ones.
     unique: usize,
-    /// Valid entries whose name is at least two characters (kills all-`"n"`).
+    /// Valid entries whose name reads back as a real identifier. Diagnostic
+    /// only: il2cpp fills `name` at class initialisation, and uninitialised
+    /// records on this build hold unrelated bytes there.
     long_names: usize,
 }
 
@@ -188,25 +204,71 @@ impl TableScore {
     }
 
     fn accepts(&self, span: usize) -> bool {
-        self.valid * 100 >= span * MIN_VALID_PERCENT
-            && self.increasing * 100 >= span * MIN_VALID_PERCENT
-            && self.unique == self.valid
-            && self.long_names * 2 >= self.valid
+        // Structure and uniqueness decide. Order does not: on 2026-11-17 every
+        // entry of the real `s_TypeInfoDefinitionTable` validated while only
+        // 21 of 32 pointers grew, so an order-based bar rejected the table and
+        // sent the finder into a 1.98M-qword scan that found nothing.
+        self.valid * 100 >= span * MIN_VALID_PERCENT && self.unique == self.valid
     }
+}
+
+/// `Il2CppType.type` out of a descriptor word: 0x00 is END and nothing above
+/// 0x1f is a type code.
+fn type_code_is_valid(word: usize) -> bool {
+    matches!(((word as u32) >> 16) & 0xff, 1..=0x1f)
+}
+
+/// Structural test of one `Il2CppClass` record through injected readers.
+///
+/// Identity comes from structure, **not** from the name: measured live on the
+/// 2026-11-17 build, table indices 1..8 hold perfectly valid records whose
+/// `name` slot still points at unrelated bytes because the game has never
+/// initialized those types. A name-based rule rejects the real table and sends
+/// the discovery pass off into unrelated image arrays.
+fn class_record_like_with<RU, RS>(entry: usize, read_usize: &RU, read_text: &RS) -> bool
+where
+    RU: Fn(usize) -> Option<usize>,
+    RS: Fn(usize) -> Option<String>,
+{
+    if entry < 0x1_0000 {
+        return false;
+    }
+    // +0x00 image back-pointer with its `<short>`/`<short>.dll` pair.
+    let Some(image) = read_usize(entry) else {
+        return false;
+    };
+    if image < 0x1_0000 {
+        return false;
+    }
+    let short = image
+        .checked_add(IMAGE_NAME_OFF)
+        .and_then(read_usize)
+        .and_then(read_text);
+    let file = image
+        .checked_add(IMAGE_FILENAME_OFF)
+        .and_then(read_usize)
+        .and_then(read_text);
+    match (short, file) {
+        (Some(short), Some(file)) if image_names_agree(&short, &file) => {}
+        _ => return false,
+    }
+    // +0x20 byval_arg / +0x30 this_arg `Il2CppType` descriptors: the 4-byte
+    // word at +0x08 of each is `{attrs:16, type:8, mods:6, byref:1, pinned:1}`.
+    entry
+        .checked_add(0x28)
+        .and_then(read_usize)
+        .is_some_and(type_code_is_valid)
+        && entry
+            .checked_add(0x38)
+            .and_then(read_usize)
+            .is_some_and(type_code_is_valid)
 }
 
 /// Score the first `span` entries of `table` through injected readers.
 ///
 /// Injectable on purpose: the whole accept/reject rule is exercised on the host
 /// without a live process.
-fn score_table_with<RU, RS>(
-    table: usize,
-    span: usize,
-    name_off: usize,
-    ns_off: usize,
-    read_usize: &RU,
-    read_text: &RS,
-) -> TableScore
+fn score_table_with<RU, RS>(table: usize, span: usize, read_usize: &RU, read_text: &RS) -> TableScore
 where
     RU: Fn(usize) -> Option<usize>,
     RS: Fn(usize) -> Option<String>,
@@ -228,47 +290,16 @@ where
             score.increasing += 1;
         }
         previous = entry;
-        if entry < 0x1_0000 {
-            continue;
-        }
-        let Some(name_ptr) = entry.checked_add(name_off).and_then(read_usize) else {
-            continue;
-        };
-        let Some(name) = read_text(name_ptr) else {
-            continue;
-        };
-        if !identifier_like(&name) {
-            continue;
-        }
-        let Some(ns_ptr) = entry.checked_add(ns_off).and_then(read_usize) else {
-            continue;
-        };
-        let Some(namespace) = read_text(ns_ptr) else {
-            continue;
-        };
-        if !namespace_like(&namespace) {
-            continue;
-        }
-        // A real record points back at its `Il2CppImage`, whose short name is a
-        // non-empty ASCII identifier. Code pointers in a wrong array do not.
-        let Some(image) = read_usize(entry) else {
-            continue;
-        };
-        if image < 0x1_0000 {
-            continue;
-        }
-        let Some(image_name) = image
-            .checked_add(IMAGE_NAME_OFF)
-            .and_then(read_usize)
-            .and_then(read_text)
-        else {
-            continue;
-        };
-        if !identifier_like(&image_name) {
+        if !class_record_like_with(entry, read_usize, read_text) {
             continue;
         }
         score.valid += 1;
-        if name.len() >= 2 {
+        if entry
+            .checked_add(CLASS_NAME_OFF)
+            .and_then(read_usize)
+            .and_then(read_text)
+            .is_some_and(|name| name.len() >= 2)
+        {
             score.long_names += 1;
         }
         // A repeated record means this is not an array of distinct classes; it
@@ -293,14 +324,7 @@ fn name_at(pointer: usize) -> Option<String> {
 }
 
 fn score_table(table: usize, span: usize) -> TableScore {
-    score_table_with(
-        table,
-        span,
-        CLASS_NAME_OFF,
-        CLASS_NS_OFF,
-        &safe::read_usize,
-        &name_at,
-    )
+    score_table_with(table, span, &safe::read_usize, &name_at)
 }
 
 fn plausible(table: usize, span: usize) -> bool {
@@ -347,6 +371,26 @@ fn image_back_pointer(entry: usize) -> bool {
     safe::read_usize(image + IMAGE_NAME_OFF)
         .and_then(name_at)
         .is_some_and(|text| identifier_like(&text))
+}
+
+/// `<short>.dll` must match the short assembly name.
+///
+/// This is what separates an `Il2CppImage` record from a class record or a
+/// string blob that merely has an identifier at `+0x08`.
+fn image_names_agree(short: &str, file: &str) -> bool {
+    !short.is_empty()
+        && identifier_like(short)
+        && file
+            .strip_suffix(".dll")
+            .or_else(|| file.strip_suffix(".exe"))
+            .is_some_and(|stem| stem == short)
+}
+
+/// Short name of a real `Il2CppImage*`, or `None` if the slot is not one.
+fn plausible_image(image: usize) -> Option<String> {
+    let short = safe::read_usize(image + IMAGE_NAME_OFF).and_then(name_at)?;
+    let file = safe::read_usize(image + IMAGE_FILENAME_OFF).and_then(name_at)?;
+    image_names_agree(&short, &file).then_some(short)
 }
 
 /// Number of leading `MethodInfo` records in `array` that look real: an
@@ -601,6 +645,59 @@ pub fn class_table() -> Option<usize> {
 static API_HIT: Mutex<Option<(String, String, usize)>> = Mutex::new(None);
 static DISCOVERY_HIT: Mutex<Option<(String, String, ClassHit)>> = Mutex::new(None);
 
+// ---------------------------------------------------------------------------
+// Safety latches for foreign il2cpp calls
+// ---------------------------------------------------------------------------
+//
+// Every call below runs Unity's own code on *our* thread and is recovered by a
+// VEH longjmp when it faults. That recovery is a last resort, not a retry
+// mechanism: it abandons Unity's metadata caches mid-update, so a fault means
+// "the arguments or the metadata epoch are wrong — stop calling". Measured
+// 2026-11-17: a 32-fault `il2cpp_image_get_class` sweep ran 0–1 s before the
+// game stopped logging during login, in every run since the sweep landed.
+
+/// Set once a foreign call faulted; the whole API path stays off for the run.
+static API_POISONED: AtomicBool = AtomicBool::new(false);
+/// `HROMATITE_M3_SWEEP=1` opts back into the `il2cpp_image_get_class` sweep.
+static SWEEP_ENABLED: AtomicUsize = AtomicUsize::new(0);
+/// `HROMATITE_M3_DISCOVER=1` opts into the name/heap discovery fallback.
+static DISCOVERY_ENABLED: AtomicUsize = AtomicUsize::new(0);
+
+/// Read a boolean environment switch once and cache it (0 = unknown).
+fn env_switch(name: &str, cache: &AtomicUsize) -> bool {
+    match cache.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var(name).map(|v| v == "1").unwrap_or(false);
+            cache.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+fn sweep_enabled() -> bool {
+    env_switch("HROMATITE_M3_SWEEP", &SWEEP_ENABLED)
+}
+
+fn discovery_enabled() -> bool {
+    env_switch("HROMATITE_M3_DISCOVER", &DISCOVERY_ENABLED)
+}
+
+/// Disable every API-based lookup for the rest of the process, once.
+fn poison_api_call(what: &str) {
+    if !API_POISONED.swap(true, Ordering::AcqRel) {
+        crate::log::log_tag(
+            "m3",
+            &format!(
+                "il2cpp call faulted while {what}: the API path is disabled for this run \
+                 (a longjmp out of Unity's metadata code is not a retry mechanism)"
+            ),
+        );
+    }
+}
+
+
 fn cached_api(ns: &str, name: &str) -> Option<usize> {
     let guard = API_HIT.lock().unwrap_or_else(PoisonError::into_inner);
     match guard.as_ref() {
@@ -630,25 +727,40 @@ fn store_discovery(ns: &str, name: &str, hit: ClassHit) {
 /// Every `Il2CppImage` reachable by walking the packed image array from the
 /// corlib image (stride 0x50 in both directions, measured on the 2026-11-17
 /// build; it was 0x48 before), paired with its short name.
+///
+/// The array is *packed*: leaving it means the walk falls into class records and
+/// string blobs, which read back as plausible names at `+0x08`. Every entry
+/// therefore has to pass [`plausible_image`] (short name **and** matching
+/// `<short>.dll`), and a long run of misses ends that direction. Accepting
+/// anything with a name at `+0x08` is what fed ~300 garbage "images" into
+/// `il2cpp_class_from_name` and produced the `0xc0000005` storm in the
+/// 2026-11-17 11:32 run.
 #[cfg(target_os = "windows")]
 fn images_around(corlib: usize) -> Vec<(usize, String)> {
     let mut out: Vec<(usize, String)> = Vec::new();
-    for step in 0i64..768 {
-        for sign in [1i64, -1] {
-            let index = step * sign;
-            let Some(image) = corlib.checked_add_signed((index * IMAGE_STRIDE as i64) as isize) else {
-                continue;
+    /// Consecutive unusable slots that still count as a hole in the array.
+    const MAX_HOLE: usize = 8;
+    for sign in [1i64, -1] {
+        let mut misses = 0usize;
+        for step in 0i64..768 {
+            let Some(image) = corlib.checked_add_signed((step * sign * IMAGE_STRIDE as i64) as isize)
+            else {
+                break;
             };
-            let Some(name) = safe::read_usize(image + IMAGE_NAME_OFF).and_then(name_at) else {
-                continue;
-            };
-            if name.is_empty() || !identifier_like(&name) {
-                continue;
+            match plausible_image(image) {
+                Some(name) => {
+                    misses = 0;
+                    if !out.iter().any(|(known, _)| *known == image) {
+                        out.push((image, name));
+                    }
+                }
+                None => {
+                    misses += 1;
+                    if misses > MAX_HOLE {
+                        break;
+                    }
+                }
             }
-            if out.iter().any(|(known, _)| *known == image) {
-                continue;
-            }
-            out.push((image, name));
         }
     }
     out
@@ -715,8 +827,31 @@ fn api_lookup(ns: &str, name: &str, assembly: &str) -> Option<usize> {
             images.len()
         ),
     );
+    // il2cpp exports are not callable until the runtime has registered its
+    // metadata: measured 2026-11-17, `class_from_name` issued during the first
+    // seconds of the process faults inside `il2cpp_alloc` (99 AVs caught by the
+    // VEH guard, one per image). `s_TypeInfoDefinitionTable` becoming non-null
+    // is the earliest reliable "metadata is up" signal, so gate on it and let
+    // the caller retry on its own schedule.
+    let table_ready = base
+        .checked_add(CLASS_TABLE_RVA as usize)
+        .and_then(safe::read_usize)
+        .is_some_and(|table| table >= 0x1_0000);
+    if !table_ready {
+        crate::log::log_tag(
+            "m3",
+            &format!(
+                "class_from_name {ns}.{name}: metadata is not initialised yet; deferred without a call"
+            ),
+        );
+        return None;
+    }
+
     let ns_c = memscan::stash_cstr(ns)?;
     let name_c = memscan::stash_cstr(name)?;
+    if API_POISONED.load(Ordering::Acquire) {
+        return None;
+    }
 
     // Path A: the API call. Cheap and materialises the class if needed.
     for (image, image_name) in &images {
@@ -745,40 +880,47 @@ fn api_lookup(ns: &str, name: &str, assembly: &str) -> Option<usize> {
                     "m3",
                     &format!("class_from_name: fault on image {image:#x} ({image_name})"),
                 );
+                poison_api_call("il2cpp_class_from_name");
+                return None;
             }
         }
     }
 
-    // Path B: sweep `il2cpp_image_get_class(image, index)`. The 2026-11-15 run
-    // proved this export works; it also materialises lazily-built types.
-    let mut faults = 0usize;
-    for (image, image_name) in images.iter().take(MAX_SWEEP_IMAGES) {
-        for index in 0..MAX_CLASS_INDEX {
-            let class = match memscan::call2(get_class, *image, index) {
-                Some(class) => class,
-                None => {
-                    faults += 1;
-                    if faults > 32 {
-                        break;
+    // Path B: sweep `il2cpp_image_get_class(image, index)`. Opt-in only: the
+    // export adds `index` to the image's `typeStart` with no bound check, so
+    // every index past the image's type count reads outside the image's
+    // metadata and faults — the exact storm that froze login on 2026-11-17.
+    // `HROMATITE_M3_SWEEP=1` re-enables it for a deliberate experiment, and the
+    // first fault still aborts the whole path.
+    if sweep_enabled() {
+        for (image, image_name) in images.iter().take(MAX_SWEEP_IMAGES) {
+            for index in 0..MAX_CLASS_INDEX {
+                let class = match memscan::call2(get_class, *image, index) {
+                    Some(class) => class,
+                    None => {
+                        crate::log::log_tag(
+                            "m3",
+                            &format!(
+                                "image_get_class: fault on image {image:#x} ({image_name}), index {index}"
+                            ),
+                        );
+                        poison_api_call("il2cpp_image_get_class");
+                        return None;
                     }
+                };
+                if class < 0x10000 {
                     continue;
                 }
-            };
-            if class < 0x10000 {
-                continue;
+                if class_matches(class, ns, name) {
+                    crate::log::log_tag(
+                        "m3",
+                        &format!(
+                            "image_get_class: {ns}.{name} = {class:#x} via image {image:#x} ({image_name}), index {index}"
+                        ),
+                    );
+                    return Some(class);
+                }
             }
-            if class_matches(class, ns, name) {
-                crate::log::log_tag(
-                    "m3",
-                    &format!(
-                        "image_get_class: {ns}.{name} = {class:#x} via image {image:#x} ({image_name}), index {index}"
-                    ),
-                );
-                return Some(class);
-            }
-        }
-        if faults > 32 {
-            break;
         }
     }
     crate::log::log_tag(
@@ -857,6 +999,19 @@ fn heap_spans(anchor: usize) -> Vec<memscan::ScanSpan> {
 /// explains itself.
 pub fn discover_class(ns: &str, name: &str) -> Option<ClassHit> {
     if name.is_empty() {
+        return None;
+    }
+    // Opt-in: this walks every readable region and every pointer to the name
+    // string, i.e. hundreds of MB while the game is loading. It cannot prove a
+    // class either (the 2026-11-17 runs ended in "no candidate confirmed" every
+    // time), so it must not run on its own.
+    if !discovery_enabled() {
+        crate::log::log_tag(
+            "m3",
+            &format!(
+                "discover {ns}.{name}: disabled (set HROMATITE_M3_DISCOVER=1 to scan the heap)"
+            ),
+        );
         return None;
     }
     if let Some(hit) = cached_discovery(ns, name) {
@@ -979,9 +1134,10 @@ pub fn class_at(index: usize) -> Option<usize> {
     (p >= 0x10000 && safe::readable_at(p)).then_some(p)
 }
 
-/// Parent class (`Il2CppClass.parent`, measured at `+0x10` on this build:
-/// Camera → Behaviour → Component → Object → System.Object).
-pub const CLASS_PARENT_OFF: usize = 0x10;
+/// Parent class (`Il2CppClass.parent`, measured at `+0xa0` on this build:
+/// Camera → Behaviour → Component → Object → System.Object). The 2026-11-15
+/// build had it at `+0x10`, which now holds `name`.
+pub const CLASS_PARENT_OFF: usize = 0xa0;
 
 pub fn parent(class: usize) -> Option<usize> {
     let p = safe::read_usize(class + CLASS_PARENT_OFF)?;
@@ -1016,7 +1172,7 @@ pub fn method_in_chain(class: usize, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Class name/namespace (this build: name at +0x98, namespace at +0x18).
+/// Class name/namespace (this build: name at +0x10, namespace at +0x18).
 pub fn class_name(class: usize) -> Option<String> {
     name_at(safe::read_usize(class + CLASS_NAME_OFF)?)
 }
@@ -1201,14 +1357,24 @@ pub struct Method {
     pub flags: u16,
 }
 
-/// Methods of a class (`class+0x50` is an array of `MethodInfo*`).
+/// Methods of a class (`class+0x58` is an array of `MethodInfo*`).
+///
+/// The array is *not* NULL-terminated on this build — Camera's `methods[407]`
+/// is a live pointer, not zero — so the walk is bounded by the class's own
+/// `methods_count` first and only then by the first empty name.
 pub fn methods(class: usize) -> Vec<Method> {
     let mut out = Vec::new();
     let arr = match safe::read_usize(class + CLASS_METHODS_OFF) {
         Some(p) if p >= 0x10000 && safe::readable_at(p) => p,
         _ => return out,
     };
-    for i in 0..4096 {
+    let declared = safe::read_u16(class + CLASS_METHODS_COUNT_OFF).unwrap_or(0) as usize;
+    let limit = if declared == 0 {
+        4096
+    } else {
+        declared.min(4096)
+    };
+    for i in 0..limit {
         let mi = match safe::read_usize(arr + i * 8) {
             Some(p) => p,
             None => break,
@@ -1252,9 +1418,8 @@ pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
                 let Some(img) = corlib_image.checked_add_signed((idx * IMAGE_STRIDE as i64) as isize) else {
                     continue;
                 };
-                let name = match safe::read_usize(img + 0x08).and_then(name_at) {
-                    Some(n) if !n.is_empty() => n,
-                    _ => continue,
+                let Some(name) = plausible_image(img) else {
+                    continue;
                 };
                 let low = name.to_ascii_lowercase();
                 let hit = if exact {
@@ -1275,22 +1440,22 @@ pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASS_NAME_OFF, CLASS_NS_OFF, FIELD_STRIDE, IMAGE_NAME_OFF, MAX_NAME_LEN, NS_OFFSETS,
-        TableScore, class_record_with, field_offset, identifier_like, method_return_kind_with,
-        pick_offset, score_table_with,
+        CLASS_NAME_OFF, CLASS_NS_OFF, FIELD_NAME_OFF, FIELD_STRIDE, IMAGE_FILENAME_OFF,
+        IMAGE_NAME_OFF, MAX_NAME_LEN, NS_OFFSETS, TableScore, class_record_with, field_offset,
+        identifier_like, image_names_agree, method_return_kind_with, pick_offset, score_table_with,
     };
     use std::collections::HashMap;
 
     #[test]
-    fn return_type_uses_slot_0x20_not_class_slot_0x28() {
+    fn return_type_uses_slot_0x28_not_the_name_slot_0x20() {
         const METHOD_INFO: usize = 0x1000;
         const RETURN_TYPE: usize = 0x6fff_f8c6_2f60;
-        const CLASS: usize = 0x3034_4d10;
+        const NAME: usize = 0x6400_0000;
         let kind = method_return_kind_with(
             METHOD_INFO,
             |address| match address {
-                x if x == METHOD_INFO + 0x20 => Some(RETURN_TYPE),
-                x if x == METHOD_INFO + 0x28 => Some(CLASS),
+                x if x == METHOD_INFO + 0x28 => Some(RETURN_TYPE),
+                x if x == METHOD_INFO + 0x20 => Some(NAME),
                 _ => None,
             },
             |address| (address == RETURN_TYPE + 0x08).then_some(0x8001_0000),
@@ -1299,12 +1464,14 @@ mod tests {
     }
 
     #[test]
-    fn field_offset_comes_before_name_and_token_comes_after_it() {
+    fn field_offset_comes_from_the_second_qword_and_the_name_from_the_first() {
         let mut record = [0u8; FIELD_STRIDE];
         record[0x08..0x0c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        record[0x18..0x1c].copy_from_slice(&0x0400_002au32.to_le_bytes());
+        record[0x0c..0x10].copy_from_slice(&0x0400_002au32.to_le_bytes());
         assert_eq!(field_offset(&record), Some(0x1234_5678));
         assert_eq!(field_offset(&record[..0x0b]), None);
+        assert_eq!(FIELD_STRIDE, 0x20);
+        assert_eq!(FIELD_NAME_OFF, 0x00);
     }
 
     #[test]
@@ -1371,6 +1538,8 @@ mod tests {
         mem.put(IMAGE, 0);
         mem.put_text(0x0020_0010, "Assembly-CSharp");
         mem.put(IMAGE + IMAGE_NAME_OFF, 0x0020_0010);
+        mem.put_text(0x0020_0020, "Assembly-CSharp.dll");
+        mem.put(IMAGE + IMAGE_FILENAME_OFF, 0x0020_0020);
         for index in 0..count {
             let class = 0x0100_0000 + index * 0x1000;
             mem.put(TABLE + index * 8, class);
@@ -1382,19 +1551,37 @@ mod tests {
             let ns_ptr = class + 0x500;
             mem.put_text(ns_ptr, "ExitGames.Client.Photon");
             mem.put(class + CLASS_NS_OFF, ns_ptr);
+            // byval_arg / this_arg `Il2CppType` words: type 0x12 = CLASS.
+            mem.put(class + 0x28, 0x0012_0000);
+            mem.put(class + 0x38, 0x2012_0000);
         }
         TABLE
     }
 
     #[test]
-    fn a_real_table_is_accepted_and_all_n_garbage_is_rejected() {
+    fn only_a_matching_short_name_and_file_name_is_an_image() {
+        // Measured on the 2026-11-17 build: corlib "mscorlib"/"mscorlib.dll",
+        // CoreModule "UnityEngine.CoreModule"/"UnityEngine.CoreModule.dll".
+        assert!(image_names_agree("mscorlib", "mscorlib.dll"));
+        assert!(image_names_agree(
+            "UnityEngine.CoreModule",
+            "UnityEngine.CoreModule.dll"
+        ));
+        // The 11:32 run accepted ~300 such slots as images and every
+        // `class_from_name` call on them faulted.
+        assert!(!image_names_agree("Camera", "UnityEngine"));
+        assert!(!image_names_agree("mscorlib", "System.dll"));
+        assert!(!image_names_agree("Camera", "Camera"));
+        assert!(!image_names_agree("", ".dll"));
+    }
+
+    #[test]
+    fn a_real_table_is_accepted_and_structurally_wrong_entries_are_rejected() {
         let mut real = FakeMemory::default();
         let table = build_table(&mut real, 32, |index| format!("Type{index}"));
         let score = score_table_with(
             table,
             32,
-            CLASS_NAME_OFF,
-            CLASS_NS_OFF,
             &|address| real.read_usize(address),
             &|address| real.read_text(address),
         );
@@ -1409,21 +1596,40 @@ mod tests {
         );
         assert!(score.accepts(32));
 
-        // The 2026-11-17 false positive: every entry pointed at a record whose
-        // name and namespace read back as "n".
-        let mut garbage = FakeMemory::default();
-        let table = build_table(&mut garbage, 32, |_| "n".to_string());
+        // Live 2026-11-17: table indices 1..8 are valid records whose `name`
+        // slot still points at unrelated bytes (the type was never
+        // initialised). Structure alone has to carry the verdict.
+        let mut uninitialised = FakeMemory::default();
+        let table = build_table(&mut uninitialised, 32, |_| String::new());
         let score = score_table_with(
             table,
             32,
-            CLASS_NAME_OFF,
-            CLASS_NS_OFF,
-            &|address| garbage.read_usize(address),
-            &|address| garbage.read_text(address),
+            &|address| uninitialised.read_usize(address),
+            &|address| uninitialised.read_text(address),
         );
-        assert_eq!(score.valid, 32, "names are identifier-like");
-        assert_eq!(score.long_names, 0, "but none is a real name");
-        assert!(!score.accepts(32), "all-\"n\" must be rejected");
+        assert_eq!(score.valid, 32, "structure is intact");
+        assert_eq!(score.long_names, 0, "no type name was filled in yet");
+        assert!(score.accepts(32), "an uninitialised table is still the table");
+
+        // The 2026-11-17 false positive: a two-word `{container, entry}` array
+        // whose entries are `.data` records, not classes — no image pair and no
+        // `Il2CppType` words.
+        let mut wrong = FakeMemory::default();
+        const WRONG_TABLE: usize = 0x0030_0000;
+        for index in 0..32 {
+            let record = 0x0031_0000 + index * 0x10;
+            wrong.put(WRONG_TABLE + index * 8, record);
+            wrong.put(record, 0x0a8c);
+            wrong.put(record + 8, 0x8011_0000);
+        }
+        let score = score_table_with(
+            WRONG_TABLE,
+            32,
+            &|address| wrong.read_usize(address),
+            &|address| wrong.read_text(address),
+        );
+        assert_eq!(score.valid, 0, "{score:?}");
+        assert!(!score.accepts(32), "a pair array is not a class table");
     }
 
     #[test]
@@ -1437,8 +1643,6 @@ mod tests {
         let score = score_table_with(
             table_dup,
             32,
-            CLASS_NAME_OFF,
-            CLASS_NS_OFF,
             &|address| duplicated.read_usize(address),
             &|address| duplicated.read_text(address),
         );
@@ -1455,21 +1659,42 @@ mod tests {
         let score = score_table_with(
             table,
             32,
-            CLASS_NAME_OFF,
-            CLASS_NS_OFF,
             &|address| memory.read_usize(address),
             &|address| memory.read_text(address),
         );
         assert!(score.valid < 32, "{score:?}");
         assert!(score.increasing * 100 < 32 * 90, "{score:?}");
-        assert!(!score.accepts(32));
+        assert!(!score.accepts(32), "too many holes for the structural bar");
+    }
+
+    #[test]
+    fn an_unsorted_but_valid_table_is_accepted() {
+        // Live 2026-11-17: the real table is allocated out of order
+        // (`increasing` = 21/32) while every entry is a valid class record.
+        // Reordering two entries must not change the verdict.
+        let mut memory = FakeMemory::default();
+        let table = build_table(&mut memory, 32, |index| format!("Type{index}"));
+        let first = memory.words[&table];
+        let second = memory.words[&(table + 8)];
+        memory.put(table, second);
+        memory.put(table + 8, first);
+        let score = score_table_with(
+            table,
+            32,
+            &|address| memory.read_usize(address),
+            &|address| memory.read_text(address),
+        );
+        assert_eq!(score.valid, 32);
+        assert!(score.unique == 32);
+        assert!(score.increasing < 32, "{score:?}");
+        assert!(score.accepts(32), "allocation order is not a criterion");
     }
 
     #[test]
     fn offsets_are_chosen_by_data_not_by_hardcoded_layout() {
         // The record is laid out with name at +0x90 and namespace at +0x08;
         // `pick_offset` must find them by confirmation, not by the nominal
-        // +0x98/+0x18 defaults.
+        // +0x10/+0x18 defaults.
         assert_eq!(
             pick_offset(&NS_OFFSETS, |offset| offset == 0x08),
             Some(0x08)
