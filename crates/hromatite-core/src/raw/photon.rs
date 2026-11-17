@@ -1116,6 +1116,13 @@ fn resolve_named(names: &[&str], preferred: Option<u8>) -> Option<Resolved> {
             });
         }
     }
+    // Nothing matched: say what the class table actually holds for this name, so
+    // a renamed type (or a wrong table) is visible in one log line.
+    let like = crate::m3::find_contains("Photon", SCAN_LIMIT, 8);
+    log::log_tag(
+        TAG,
+        &format!("no peer class matched; Photon-like classes: {like:?}"),
+    );
     None
 }
 

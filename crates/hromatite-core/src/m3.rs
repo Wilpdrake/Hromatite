@@ -78,23 +78,206 @@ where
         .unwrap_or(u32::MAX)
 }
 
+/// Entries scored when a candidate table is validated.
+const CANDIDATE_SPAN: usize = 64;
+/// Entries scored during the fine pass (cheap, alignment is what it looks for).
+const REFINE_SPAN: usize = 32;
+/// A candidate must look like a real `Il2CppClass**` on this many of the first
+/// [`CANDIDATE_SPAN`] entries *and* grow on this many, otherwise it is noise.
+const MIN_VALID: usize = 24;
+
+/// How many of the first `span` entries point at a plausible `Il2CppClass`.
+fn valid_entries(table: usize, span: usize) -> usize {
+    (0..span)
+        .filter(|index| {
+            let Some(entry) = safe::read_usize(table + index * 8) else {
+                return false;
+            };
+            entry >= 0x1_0000
+                && safe::readable_at(entry)
+                && safe::read_usize(entry + CLASS_NAME_OFF).is_some_and(|name| {
+                    name >= 0x1_0000 && name_at(name).is_some_and(|text| !text.is_empty())
+                })
+        })
+        .count()
+}
+
+/// How many entries are strictly larger than their predecessor. il2cpp allocates
+/// `Il2CppClass` records in type-definition order, so a real table is monotonic;
+/// a run of unrelated pointers (code, vtables) is not.
+fn increasing_entries(table: usize, span: usize) -> usize {
+    let mut count = 0usize;
+    let mut previous = 0usize;
+    for index in 0..span {
+        let Some(entry) = safe::read_usize(table + index * 8) else {
+            break;
+        };
+        if entry > previous {
+            count += 1;
+        }
+        previous = entry;
+    }
+    count
+}
+
+fn score_table(table: usize, span: usize) -> (usize, usize) {
+    (valid_entries(table, span), increasing_entries(table, span))
+}
+
+fn plausible(table: usize) -> bool {
+    if table < 0x1_0000 || !safe::readable_at(table) {
+        return false;
+    }
+    let (valid, increasing) = score_table(table, CANDIDATE_SPAN);
+    valid >= MIN_VALID && increasing >= MIN_VALID
+}
+
+/// Find `s_TypeInfoDefinitionTable` in the *current* build.
+///
+/// The RVA measured on 2026-11-14 (`CLASS_TABLE_RVA`) moved on 2026-11-17 and
+/// VRChat re-randomises it on every patch, so the recorded value is a hint, not
+/// a fact: this walks the whole image coarse (64 KiB) then fine (8 B) and keeps
+/// the best-scoring candidate. Costs a second or two once, in the payload's
+/// release build; the answer is cached for the run.
+fn locate_table(base: usize, size: usize) -> Option<usize> {
+    let legacy = base.checked_add(CLASS_TABLE_RVA as usize)?;
+    // The recorded slot dereferences to the array on the build it was measured
+    // on; a bare array at that RVA is the other shape the same number can mean.
+    if let Some(pointer) = safe::read_usize(legacy)
+        && plausible(pointer)
+    {
+        crate::log::log_tag(
+            "m3",
+            &format!("class table: legacy slot {legacy:#x} -> {pointer:#x}"),
+        );
+        return Some(pointer);
+    }
+    if plausible(legacy) {
+        crate::log::log_tag(
+            "m3",
+            &format!("class table: legacy RVA is the array itself ({legacy:#x})"),
+        );
+        return Some(legacy);
+    }
+
+    // Coarse pass over the image. Nothing outside `[base, base+size)` can be the
+    // array, and the array is at least a few KiB long, so a 64 KiB stride cannot
+    // step over it.
+    let end = base.saturating_add(size).saturating_sub(8);
+    let mut best = (0usize, 0usize, 0usize);
+    let mut at = base;
+    while at < end {
+        let (valid, increasing) = score_table(at, REFINE_SPAN);
+        let total = valid + increasing;
+        if total > best.2 && valid >= MIN_VALID / 2 {
+            best = (at, valid, total);
+        }
+        at += 0x1_0000;
+    }
+    if best.0 == 0 {
+        crate::log::log_tag("m3", "class table: nothing scored in the image");
+        return None;
+    }
+    // Fine pass: the coarse winner sits somewhere inside its 64 KiB window.
+    let from = best.0.saturating_sub(0x1_0000);
+    let to = best.0.saturating_add(0x1_0000);
+    let mut found = 0usize;
+    let mut found_score = 0usize;
+    let mut fine = from & !7;
+    while fine < to {
+        let (valid, increasing) = score_table(fine, REFINE_SPAN);
+        let total = valid + increasing;
+        if total > found_score {
+            found = fine;
+            found_score = total;
+        }
+        fine += 8;
+    }
+    crate::log::log_tag(
+        "m3",
+        &format!(
+            "class table: scanned {size:#x} B, coarse {:#x} ({}/{}), fine {found:#x} (score {found_score})",
+            best.0, best.1, best.2
+        ),
+    );
+    if found != 0 {
+        // Say out loud what the winner actually contains: a plausible-looking
+        // array of the wrong kind is the expensive failure mode here.
+        let mut sample = Vec::new();
+        for index in 0..6 {
+            let Some(class) = safe::read_usize(found + index * 8) else {
+                break;
+            };
+            if class < 0x1_0000 {
+                sample.push(format!("[{index}] null"));
+                continue;
+            }
+            sample.push(format!("[{index}] {}", class_full_name(class)));
+        }
+        let filled = (0..1024)
+            .filter(|index| safe::read_usize(found + index * 8).is_some_and(|p| p >= 0x1_0000))
+            .count();
+        crate::log::log_tag(
+            "m3",
+            &format!(
+                "class table: sample {} (filled {filled}/1024)",
+                sample.join(", ")
+            ),
+        );
+        // Which qwords of a record point at ASCII? That single dump re-measures
+        // the `name`/`namespaze` offsets after a build change.
+        for index in 0..2 {
+            let Some(class) = safe::read_usize(found + index * 8) else {
+                continue;
+            };
+            if class < 0x1_0000 {
+                continue;
+            }
+            let map: Vec<String> = (0..0x110 / 8)
+                .filter_map(|slot| {
+                    let off = slot * 8;
+                    let value = safe::read_usize(class + off)?;
+                    let text = name_at(value)?;
+                    (!text.is_empty()).then(|| format!("+{off:#x}={text:?}"))
+                })
+                .collect();
+            crate::log::log_tag(
+                "m3",
+                &format!("class[{index}]={class:#x} strings {}", map.join(" ")),
+            );
+        }
+    }
+    (found != 0).then_some(found)
+}
+
 /// Resolved class table (cached: the pointer is stable for the run).
 pub fn class_table() -> Option<usize> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CACHE: AtomicUsize = AtomicUsize::new(0);
+    static TRIES: AtomicUsize = AtomicUsize::new(0);
     let cached = CACHE.load(Ordering::Relaxed);
     if cached != 0 {
         return Some(cached);
     }
     let (base, size) = procs::own_module(crate::GAME_ASSEMBLY)?;
+    // The old EXE-only path: the recorded RVA holds a pointer to the array.
     let slot = base.checked_add(CLASS_TABLE_RVA as usize)?;
-    if slot + 8 > base + size && !safe::readable_at(slot) {
+    if safe::readable_at(slot)
+        && let Some(t) = safe::read_usize(slot)
+        && t >= 0x1_0000
+        && safe::readable_at(t)
+        && plausible(t)
+    {
+        CACHE.store(t, Ordering::Relaxed);
+        return Some(t);
+    }
+    // A full scan is no good on every tick: the table fills lazily, so a miss is
+    // retried, but at most once every few calls.
+    let tries = TRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if tries > 1 && !tries.is_multiple_of(8) {
         return None;
     }
-    let t = safe::read_usize(slot)?;
-    if t < 0x10000 || !safe::readable_at(t) {
-        return None;
-    }
+    let t = locate_table(base, size)?;
     CACHE.store(t, Ordering::Relaxed);
     Some(t)
 }
@@ -218,6 +401,36 @@ pub fn find(ns: &str, name: &str, max: usize) -> Vec<(usize, usize)> {
         }
     }
     hits
+}
+
+/// Diagnostics only: every class whose **name contains** `needle`, up to
+/// `limit` hits, with its full `Namespace.Name`. Used when a hook cannot find
+/// its type by exact name after a game update — it says what the table really
+/// holds instead of leaving a bare "not found".
+pub fn find_contains(needle: &str, max: usize, limit: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let Some(table) = class_table() else {
+        return out;
+    };
+    for i in 0..max {
+        let Some(p) = safe::read_usize(table + i * 8) else {
+            break;
+        };
+        if p < 0x10000 || !safe::readable_at(p) {
+            continue;
+        }
+        let Some(name) = class_name(p) else {
+            continue;
+        };
+        if name.is_empty() || !name.contains(needle) {
+            continue;
+        }
+        out.push((i, class_full_name(p)));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 
 pub struct Field {
