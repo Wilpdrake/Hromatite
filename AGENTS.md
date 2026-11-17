@@ -3237,3 +3237,65 @@ il2cpp одними чтениями памяти (без единого выз�
 - **Что осталось (шаг 2+).** Раскладка `Dictionary<byte,object>` (записи
   `(hash,next,key,value)`), извлечение `244`/`245` → `event_code`/payload;
   затем сборка RaiseEvent 66 и вызов `SendOperation` сами.
+
+### 2026-11-17 (ночь, продолжение) — потоковый отчёт, реплей целого отчёта, обновление игры
+
+- **Ветка `eac-emu`** (от `eac-forge`): план `docs/EAC-EMU-PLAN.md` (`f50c254`),
+  затем `eac-tramp` и `eac-photon` влиты merge-коммитами (`ebda9f5`, `cd9a17d`).
+- **Модель heartbeat уточнена** (`~/EAC-RE/findings/report_stream.md`): 512-Б кадр —
+  не самостоятельный heartbeat, а фрагмент сообщения. Сообщение открывается
+  `[total_len, 1, inner_ck, 5, action, 3, u8, u32 per-session]`, дальше 48-байтный
+  per-session блоб и N×16-байтных записей; ничего не зашифровано. Флаг `StartData`
+  стоит раз на сообщение, `EndData` встречается только у коротких. Инструменты:
+  `report_extract.py`, `make_report_capture.py`, `xcap_*.py` в `~/EAC-RE/tools`.
+- **`EAC_REPLAY_REPORT=<path>`** (`8aaec16`, `6c685c8`): реплей записанного отчёта
+  (117 кадров `sid=0x158b`) с перецелевой привязкой `SessionId`/`Sequence` и
+  пересчётом CRC-32C. Env: `EAC_REPLAY_AFTER_MS`, `_MIN_FRAMES`, `_START`,
+  `_REPORT_LOOP`, `_FLAGS=live`, `_FROM_WRAPPER`.
+- **`EAC_REPLAY_FROM_WRAPPER=1`** (`d371198`): доставка из SDK-колбэка, а не из
+  своего потока. Прогон `replayreport_0339` (свой поток) подвесил игру через ~12 с;
+  из SDK-потока (`replaywrap2/3`) игра живёт.
+- **Живые результаты реплея** (`~/EAC-RE/findings/replay_report_test.md`):
+  отчёт чужой сессии доставляется (`delivered=true`, CRC офлайн сходится), но
+  сервер отвергает его через **53–65 с** тем же executive-сообщением
+  «Authentication with the VRChat Anti-Cheat system failed» — быстрее «тишины»
+  (120.5 с) и на уровне шаблонного forge. Значит проверяется содержимое тела
+  (16-Б записи и/или 48-Б блоб), а не формат кадра.
+- **Найденный баг** (`3c06341`): `forge_begin` вызывался на каждый кадр и
+  пересеивал `Sequence` из живого шаблона → все кадры уходили с `seq=2`
+  (прогон `replaywrap2`). Теперь `forge_begin` один раз на эпоху.
+- **Игра обновилась 2026-11-17 02:06**: `GameAssembly.dll` sha256
+  `245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb`
+  (было `648f61b1…`), 253 015 040 Б. `symbols.rs` регенерирован `tools/symmap.py`
+  (`b6e47fb`, артефакт `symbols-245768f25214.json`), тест `hostapi::game_hash…`
+  обновлён на новый префикс. **Карта il2cpp от старого билда мертва**:
+  `EAC_M3_PROBE=1` даёт `legacy table=…e66c870 score=0/32`; грубый скан нашёл
+  кандидата около `rva 0xdee2b48` (30/32), но критерий отбора нужно уточнить
+  (однобуквенные «имена» проходят как валидные).
+- **`HROMATITE_PLAYER_LOOP=1` на новом билде валит игру** через 40–60 с после
+  входа в мир (последняя строка лога — `[GC] Ensuring the heap …`), потому что
+  PlayerLoop-детур ходит по старым RVA. EAC-прогоны делать с
+  `HROMATITE_PLAYER_LOOP=0` — резидентные EAC-хуки от него не зависят.
+- **Поздняя инъекция (>30 с от старта) ловится мимо**: игра кэширует указатель
+  `EOS_AntiCheatClient_AddNotifyMessageToServer`, и хук экспорта уже не
+  вызывается (0 исходящих кадров, `replaywrap_0346`). Для нового билда, похоже,
+  нужен хук по IAT вызывающего модуля.
+- **`EAC_EVP=1`** (`d371198`): 6 целей по RVA из RE (`0x405af0` конструктор
+  протектора, `0xcdb040/0xcdbcb0/0xcdbce0/0xcdbb60/0xcdaf90` BoringSSL), сверка
+  побайтной сигнатуры с DLL на диске, лог `key32`/`iv16` на `Init`-цели.
+  Ставится после EOSSDK-хуков; трамплин теперь перелокализует `call rel32`,
+  поэтому детуры не должны ронять игру (проверка — отдельный прогон).
+- **`EAC_M3_PROBE=1`**: ищет `s_TypeInfoDefinitionTable` нового билда (легаси-RVA,
+  затем скан ±8 МиБ грубо→точно), логирует записи. Нужен для photon-хука.
+- **`EAC_REPLAY_SELF=1`**: перед захватом поток пересобирается из **своей** сессии
+  (из in-memory кольца живых 512-Б кадров, `SELF_RING_MAX=512`), начиная с
+  последнего `StartData`. Проверяет гипотезу ASLR (записи = хеши адресов).
+- **Проверки**: `cargo test --workspace --target x86_64-unknown-linux-gnu
+  --offline` — core 135, eac 59, features 15, abi 3, dll 5 — ok;
+  `clippy -p hromatite-eac -p hromatite-core --all-targets -- -D warnings` чисто;
+  `cargo build --workspace --release --target x86_64-pc-windows-gnu --offline`
+  (в `CARGO_TARGET_DIR=~/EAC-RE/build-eac`, чтобы не трогать файл у запущенной игры).
+- **Осталось.** (1) Результат `EAC_REPLAY_SELF` (прогон идёт). (2) Точный критерий
+  поиска таблицы классов нового билда. (3) IAT-хук `AddNotify` для поздней
+  инъекции. (4) Живая проверка `EAC_EVP` (держатся ли детуры >40 с и что в `key32`).
+  Merge в master — после согласования.
