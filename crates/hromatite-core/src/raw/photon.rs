@@ -73,6 +73,11 @@ pub const PEER_CANDIDATES: &[(&str, &str)] = &[
     ("", "LoadBalancingPeer"),
 ];
 
+/// Assembly the peer class is expected to live in. VRChat compiles its Photon
+/// client into `Assembly-CSharp`; `il2cpp_class_from_name` only needs the image,
+/// and a miss costs one guarded call.
+pub const PEER_ASSEMBLY: &str = "Assembly-CSharp";
+
 /// Substrings tried when no exact pair of [`PEER_CANDIDATES`] is in the table.
 ///
 /// A game update renames things and moves assemblies around; a peer class that
@@ -1368,6 +1373,39 @@ fn peer_classes() -> Vec<(usize, usize)> {
         for (index, class) in hits {
             if !out.iter().any(|(_, known)| *known == class) {
                 out.push((index, class));
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // (a2) The class table is gone after a game update, but the class itself is
+    // still findable: first through `il2cpp_class_from_name` on a materialised
+    // assembly image, then by locating the name string in memory and proving the
+    // surrounding record really is an `Il2CppClass` (see `m3::discover_class`).
+    for (ns, name) in PEER_CANDIDATES {
+        if let Some(class) = crate::m3::class_by_name_via_api(ns, name, PEER_ASSEMBLY) {
+            log::log_tag(
+                TAG,
+                &format!(
+                    "resolved {ns}.{name} through il2cpp_class_from_name -> {class:#x}"
+                ),
+            );
+            if !out.iter().any(|(_, known)| *known == class) {
+                out.push((usize::MAX, class));
+            }
+        }
+        if let Some(hit) = crate::m3::discover_class(ns, name) {
+            log::log_tag(
+                TAG,
+                &format!(
+                    "discovered {ns}.{name} -> {:#x} (name+{:#x}, methods+{:#x})",
+                    hit.class, hit.name_off, hit.methods_off
+                ),
+            );
+            if !out.iter().any(|(_, known)| *known == hit.class) {
+                out.push((hit.index, hit.class));
             }
         }
     }
