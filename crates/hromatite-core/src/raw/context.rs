@@ -167,7 +167,9 @@ fn exception_parts(info: *mut ffi::EXCEPTION_POINTERS) -> (u32, usize) {
     }
     // SAFETY: `rec` is the OS-owned record checked non-null immediately above;
     // both fields are plain integers valid for every bit pattern.
-    (unsafe { (*rec).ExceptionCode }, unsafe { (*rec).ExceptionAddress })
+    (unsafe { (*rec).ExceptionCode }, unsafe {
+        (*rec).ExceptionAddress
+    })
 }
 
 fn exception_info0(info: *mut ffi::EXCEPTION_POINTERS) -> Option<usize> {
@@ -198,7 +200,9 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
     static SEEN: AtomicUsize = AtomicUsize::new(0);
     if !INIT.swap(true, Ordering::Relaxed) {
         ON.store(
-            std::env::var("HROMATITE_LOG_AV").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            std::env::var("HROMATITE_LOG_AV")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             Ordering::Relaxed,
         );
     }
@@ -224,8 +228,7 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
     // from Boehm shows up here first if its exit was an uncaught exception.
     if SEEN.fetch_add(1, Ordering::Relaxed) < cap {
         let tid = crate::raw::sys::current_thread_id();
-        let extra = exception_info0(info)
-            .map_or_else(String::new, |a| format!(" info0={a:#x}"));
+        let extra = exception_info0(info).map_or_else(String::new, |a| format!(" info0={a:#x}"));
         log::log_tag(
             "veh",
             &format!("passing exception {code:#010x} at {addr:#x} tid={tid:#x}{extra} (unguarded)"),
@@ -315,10 +318,7 @@ fn call_with_mode<R>(f: impl FnOnce() -> R, catch_panic: bool) -> Result<R, Faul
         Err(owner) if owner == tid => {}
         Err(_) => {
             if !LOGGED_CONTENTION.swap(true, Ordering::Relaxed) {
-                log::log_tag(
-                    "veh",
-                    "another thread holds the guard — running unguarded",
-                );
+                log::log_tag("veh", "another thread holds the guard — running unguarded");
             }
             return Ok(f());
         }
@@ -464,7 +464,8 @@ pub unsafe fn call3(f: usize, a: usize, b: usize, c: usize) -> Result<usize, Fau
     call_with(|| {
         // SAFETY: f is supplied for this exact Win64 signature; VEH captures
         // this thread before the raw call and handles invalid addresses.
-        let fp: extern "system" fn(usize, usize, usize) -> usize = unsafe { core::mem::transmute(f) };
+        let fp: extern "system" fn(usize, usize, usize) -> usize =
+            unsafe { core::mem::transmute(f) };
         fp(a, b, c)
     })
 }

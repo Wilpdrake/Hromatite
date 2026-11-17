@@ -45,7 +45,8 @@ fn seal_image(
         let n = (size - off).min(PAGE);
         let addr = base + off;
         if let Some((k_lo, k_hi)) = keep
-            && addr >= k_lo && addr < k_hi
+            && addr >= k_lo
+            && addr < k_hi
         {
             off += n;
             continue;
@@ -121,7 +122,9 @@ fn apply_relocs(image: &mut [u8], img: &PeImage, delta: i64) -> usize {
                         patched += 1;
                     }
                 }
-                other => log::log(&format!("manualmap: unhandled reloc type {other} at page {page:#x}")),
+                other => log::log(&format!(
+                    "manualmap: unhandled reloc type {other} at page {page:#x}"
+                )),
             }
         }
         off += blk;
@@ -200,7 +203,9 @@ fn find_export_anywhere(r: &Remote, name: &str) -> Option<(usize, usize)> {
             continue;
         }
         if let Some(a) = r.export(*base, name) {
-            log::log(&format!("find_export_anywhere: {name} in {mname} at {a:#x}"));
+            log::log(&format!(
+                "find_export_anywhere: {name} in {mname} at {a:#x}"
+            ));
             return Some((*base, a));
         }
     }
@@ -227,7 +232,8 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
         let dll = cstr_at(image, name_rva);
         let mut modbase = match procs::module(r.pid, &dll) {
             Some((b, _)) => b,
-            None => remote_load(r, &dll).ok_or_else(|| format!("import: cannot load {dll} in target"))?,
+            None => remote_load(r, &dll)
+                .ok_or_else(|| format!("import: cannot load {dll} in target"))?,
         };
         if !is_pe(r, modbase) {
             // wine apiset stub: LoadLibraryW hands back a fake HMODULE, so the
@@ -249,7 +255,9 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
                     ));
                     modbase = real_base;
                 }
-                None => log::log(&format!("import: {dll} is not a PE at {modbase:#x}, thunks may fail")),
+                None => log::log(&format!(
+                    "import: {dll} is not a PE at {modbase:#x}, thunks may fail"
+                )),
             }
         }
         let mut thunk = if oft != 0 { oft } else { ft };
@@ -358,10 +366,14 @@ pub fn inject_loadlib(pid: u32, dll_win_path: &str) -> Result<usize, String> {
     let k32 = procs::module(pid, "kernel32.dll")
         .map(|(b, _)| b)
         .ok_or("kernel32.dll not found in target")?;
-    let llw = r.export(k32, "LoadLibraryW").ok_or("kernel32!LoadLibraryW unresolved")?;
+    let llw = r
+        .export(k32, "LoadLibraryW")
+        .ok_or("kernel32!LoadLibraryW unresolved")?;
 
     let bytes = crate::raw::sys::wide_bytes(dll_win_path);
-    let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE).ok_or("alloc path failed")?;
+    let arg = r
+        .alloc(bytes.len(), crate::ffi::PAGE_READWRITE)
+        .ok_or("alloc path failed")?;
     if !r.write(arg, &bytes) {
         return Err("write path failed".into());
     }
@@ -402,7 +414,9 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     let delta = base as i64 - img.image_base as i64;
 
     let mut image = vec![0u8; size];
-    let hdr = (img.size_of_headers as usize).min(img.data.len()).min(image.len());
+    let hdr = (img.size_of_headers as usize)
+        .min(img.data.len())
+        .min(image.len());
     image[..hdr].copy_from_slice(&img.data[..hdr]);
     for s in &img.sections {
         let n = s.rsize.min(s.vsize) as usize;
@@ -412,7 +426,11 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         }
     }
 
-    let relocs = if delta != 0 { apply_relocs(&mut image, &img, delta) } else { 0 };
+    let relocs = if delta != 0 {
+        apply_relocs(&mut image, &img, delta)
+    } else {
+        0
+    };
     resolve_imports(&mut image, &img, &r)?;
 
     if opts.erase_headers {
@@ -440,7 +458,10 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
             crate::ffi::PAGE_READWRITE
         };
         if !r.protect(base + s.va as usize, n, prot) {
-            log::log(&format!("manualmap: protect failed for section @{:#x}", s.va));
+            log::log(&format!(
+                "manualmap: protect failed for section @{:#x}",
+                s.va
+            ));
         }
     }
 
@@ -485,15 +506,14 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     // Executable sections only: the shim makes exactly this range `RX` inside the
     // window. Using the `keep` range instead turned `.data` read-only, and the
     // Rust detour faulted on its own statics (measured: `stage=7`, lock stuck).
-    let code = img
-        .sections
-        .iter()
-        .filter(|s| s.is_executable())
-        .fold((usize::MAX, 0usize), |(lo, hi), s| {
+    let code = img.sections.iter().filter(|s| s.is_executable()).fold(
+        (usize::MAX, 0usize),
+        |(lo, hi), s| {
             let l = base + s.va as usize;
             let h = l + s.vsize as usize;
             (lo.min(l), hi.max(h))
-        });
+        },
+    );
     let (code_lo, code_hi) = if code.0 == usize::MAX { (0, 0) } else { code };
     let params = r
         .alloc(48, crate::ffi::PAGE_READWRITE)
@@ -526,7 +546,9 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         .call(stub_mem, 0, wait_ms)
         .ok_or("CreateRemoteThread(stub) failed")?;
     if opts.seal && code == 0x103 {
-        log::log("seal: stub thread still active (0x103), skipping seal to avoid rewriting live code");
+        log::log(
+            "seal: stub thread still active (0x103), skipping seal to avoid rewriting live code",
+        );
     }
 
     log::log(&format!(

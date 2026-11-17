@@ -58,7 +58,6 @@ pub struct MEMORY_BASIC_INFORMATION {
 pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 
-
 // ---- exceptions / vectored handler (plan 2) -------------------------------
 
 pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -193,13 +192,35 @@ unsafe extern "system" {
         ret: *mut u32,
     ) -> i32;
 
-    pub fn ReadProcessMemory(h: HANDLE, base: *const u8, buf: *mut u8, size: usize, read: *mut usize) -> BOOL;
-    pub fn WriteProcessMemory(h: HANDLE, base: *mut u8, buf: *const u8, size: usize, written: *mut usize) -> BOOL;
+    pub fn ReadProcessMemory(
+        h: HANDLE,
+        base: *const u8,
+        buf: *mut u8,
+        size: usize,
+        read: *mut usize,
+    ) -> BOOL;
+    pub fn WriteProcessMemory(
+        h: HANDLE,
+        base: *mut u8,
+        buf: *const u8,
+        size: usize,
+        written: *mut usize,
+    ) -> BOOL;
 
     pub fn VirtualAlloc(addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
     pub fn VirtualAllocEx(h: HANDLE, addr: usize, size: usize, ty: u32, protect: u32) -> *mut u8;
-    pub fn VirtualProtectEx(h: HANDLE, addr: *mut u8, size: usize, newp: u32, old: *mut u32) -> BOOL;
-    pub fn VirtualQuery(addr: *const core::ffi::c_void, mbi: *mut MEMORY_BASIC_INFORMATION, len: usize) -> usize;
+    pub fn VirtualProtectEx(
+        h: HANDLE,
+        addr: *mut u8,
+        size: usize,
+        newp: u32,
+        old: *mut u32,
+    ) -> BOOL;
+    pub fn VirtualQuery(
+        addr: *const core::ffi::c_void,
+        mbi: *mut MEMORY_BASIC_INFORMATION,
+        len: usize,
+    ) -> usize;
 
     pub fn CreateRemoteThread(
         h: HANDLE,
@@ -230,7 +251,10 @@ unsafe extern "system" {
     pub fn LeaveCriticalSection(cs: *mut core::ffi::c_void);
 
     // present in ntdll and forwarders both under Windows and wine
-    pub fn AddVectoredExceptionHandler(first: u32, handler: *const core::ffi::c_void) -> *mut core::ffi::c_void;
+    pub fn AddVectoredExceptionHandler(
+        first: u32,
+        handler: *const core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
     pub fn RemoveVectoredExceptionHandler(handle: *mut core::ffi::c_void) -> u32;
     pub fn SetUnhandledExceptionFilter(filter: *const core::ffi::c_void) -> *mut core::ffi::c_void;
 

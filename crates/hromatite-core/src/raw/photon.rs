@@ -25,7 +25,7 @@
 //! detour's own frame; that is why the live run must be checked for `SendOperation`
 //! returning normally (see §17 of `AGENTS.md`).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::log;
 
@@ -500,7 +500,8 @@ pub fn install_outgoing() -> Result<Resolved, String> {
 pub fn install_incoming() -> Result<Resolved, String> {
     let resolved = resolve_on_event()
         .ok_or_else(|| format!("no {:?} found on a Photon peer class", EVENT_METHODS))?;
-    if EVENT_ATTACHED.load(Ordering::Acquire) && EVENT_ENTRY.load(Ordering::Acquire) == resolved.entry
+    if EVENT_ATTACHED.load(Ordering::Acquire)
+        && EVENT_ENTRY.load(Ordering::Acquire) == resolved.entry
     {
         return Ok(resolved);
     }
@@ -552,7 +553,10 @@ pub fn poll() {
     if !want_out && !want_in {
         return;
     }
-    if !POLLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(POLL_EVERY) {
+    if !POLLS
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(POLL_EVERY)
+    {
         return;
     }
     let attempts = POLLS.load(Ordering::Relaxed) / POLL_EVERY;
@@ -566,9 +570,10 @@ pub fn poll() {
                     target.info, target.entry, target.parameters
                 ),
             ),
-            Err(reason) if loud => {
-                log::log_tag(TAG, &format!("send hook pending (attempt {attempts}): {reason}"))
-            }
+            Err(reason) if loud => log::log_tag(
+                TAG,
+                &format!("send hook pending (attempt {attempts}): {reason}"),
+            ),
             Err(_) => {}
         }
     }
@@ -594,9 +599,9 @@ pub fn poll() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_event_params, event_code_from_slots, hit_line, is_raise_event, op_code,
-        parse_qualified, pick_method, raise_line, should_log, EVENT_EAC_HEARTBEAT,
-        OP_RAISE_EVENT, PARAM_EVENT_CODE,
+        EVENT_EAC_HEARTBEAT, OP_RAISE_EVENT, PARAM_EVENT_CODE, decode_event_params,
+        event_code_from_slots, hit_line, is_raise_event, op_code, parse_qualified, pick_method,
+        raise_line, should_log,
     };
 
     /// Plausible managed code address floor used by the picker (`entry >= 0x10000`).
@@ -686,11 +691,14 @@ mod tests {
     #[test]
     fn preferred_arity_beats_a_static_or_short_overload() {
         let chain = vec![
-            (0x1000usize, vec![
-                method("SendOperation", GA + 0x2000, 4, 0x10), // static: rejected
-                method("SendOperation", GA + 0x3000, 2, 0),
-                method("SendOperation", GA + 0x4000, 3, 0), // preferred arity
-            ]),
+            (
+                0x1000usize,
+                vec![
+                    method("SendOperation", GA + 0x2000, 4, 0x10), // static: rejected
+                    method("SendOperation", GA + 0x3000, 2, 0),
+                    method("SendOperation", GA + 0x4000, 3, 0), // preferred arity
+                ],
+            ),
             (0x1800, vec![method("SendOperation", GA + 0x5000, 1, 0)]),
         ];
         let (class, picked) = pick_method(&chain, &["SendOperation"], Some(3)).unwrap();
@@ -701,11 +709,17 @@ mod tests {
     #[test]
     fn pick_method_falls_back_and_respects_the_name_order() {
         let chain = vec![
-            (0x1000usize, vec![method("SendOperation", GA + 0x2000, 2, 0)]),
-            (0x1800, vec![method("SendOperationInternal", GA + 0x3000, 2, 0)]),
+            (
+                0x1000usize,
+                vec![method("SendOperation", GA + 0x2000, 2, 0)],
+            ),
+            (
+                0x1800,
+                vec![method("SendOperationInternal", GA + 0x3000, 2, 0)],
+            ),
         ];
-        let (_, picked) = pick_method(&chain, &["SendOperation", "SendOperationInternal"], Some(3))
-            .unwrap();
+        let (_, picked) =
+            pick_method(&chain, &["SendOperation", "SendOperationInternal"], Some(3)).unwrap();
         assert_eq!(picked.name, "SendOperation");
         assert_eq!(picked.entry, GA + 0x2000);
         assert!(pick_method(&chain, &["OnEvent"], Some(1)).is_none());

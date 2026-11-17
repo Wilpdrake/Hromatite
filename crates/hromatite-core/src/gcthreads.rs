@@ -30,7 +30,7 @@
 #![forbid(unsafe_code)]
 
 use crate::safe;
-use crate::{procs, GAME_ASSEMBLY};
+use crate::{GAME_ASSEMBLY, procs};
 
 /// Buckets in `GC_threads[]` (`THREAD_TABLE_SZ`, power of two).
 pub const BUCKETS: usize = 256;
@@ -236,8 +236,14 @@ fn module_of(addr: usize) -> String {
 /// story of "SuspendThread loop failed".
 pub fn thread_rows(table: Option<&Table>) -> Vec<String> {
     let tids = live_tids();
-    let mut out = vec![format!("threads: {} live, our tid {:#x}", tids.len(), own_tid())];
-    let gc_ids: Vec<u32> = table.map(|t| t.entries.iter().map(|e| e.id).collect()).unwrap_or_default();
+    let mut out = vec![format!(
+        "threads: {} live, our tid {:#x}",
+        tids.len(),
+        own_tid()
+    )];
+    let gc_ids: Vec<u32> = table
+        .map(|t| t.entries.iter().map(|e| e.id).collect())
+        .unwrap_or_default();
     for tid in tids {
         let start = thread_start_address(tid);
         let (addr, who) = match start {
@@ -311,7 +317,10 @@ pub fn repair(table: &Table) -> Vec<String> {
             guard += 1;
         }
         if guard >= 16 {
-            out.push(format!("record id={:#x}: chain too long, not unlinked", e.id));
+            out.push(format!(
+                "record id={:#x}: chain too long, not unlinked",
+                e.id
+            ));
         }
     }
     out
@@ -396,7 +405,10 @@ pub fn reap() -> Vec<String> {
                 Some((b, _)) => b,
                 None => return out,
             };
-            (ga.wrapping_add(CANDIDATE_RVAS[0] as usize), CANDIDATE_RVAS[0])
+            (
+                ga.wrapping_add(CANDIDATE_RVAS[0] as usize),
+                CANDIDATE_RVAS[0],
+            )
         }
     };
     for bucket in 0..BUCKETS {
@@ -426,7 +438,9 @@ pub fn reap() -> Vec<String> {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    g.get_or_insert_with(std::collections::HashMap::new).get(&id).copied()
+                    g.get_or_insert_with(std::collections::HashMap::new)
+                        .get(&id)
+                        .copied()
                 };
                 let body = worker_body_label(id);
                 let start = start
@@ -435,7 +449,10 @@ pub fn reap() -> Vec<String> {
                 let mut detail = if body.is_empty() {
                     start
                 } else {
-                    format!("{start} body={body} unregister_called={}", worker_unregister_called(id))
+                    format!(
+                        "{start} body={body} unregister_called={}",
+                        worker_unregister_called(id)
+                    )
                 };
                 // `exit_via=ExitThread(0x0)` closes the case: the thread never
                 // returned from its body, so no cleanup call could have run.
@@ -477,9 +494,8 @@ static STARTS: std::sync::Mutex<Option<std::collections::HashMap<u32, usize>>> =
 
 /// Concrete worker body from the shared il2cpp dispatcher. The OS start address
 /// is always the same trampoline; `(entry, arg)` is what identifies the job.
-static WORKER_BODIES: std::sync::Mutex<
-    Option<std::collections::HashMap<u32, (usize, usize)>>,
-> = std::sync::Mutex::new(None);
+static WORKER_BODIES: std::sync::Mutex<Option<std::collections::HashMap<u32, (usize, usize)>>> =
+    std::sync::Mutex::new(None);
 
 static WORKER_UNREGISTERED: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
@@ -487,9 +503,8 @@ static WORKER_UNREGISTERED: std::sync::Mutex<Option<std::collections::HashSet<u3
 /// that terminates through one of these never returns from its body, so the
 /// body's own `GC_unregister_my_thread` call is skipped — that is exactly the
 /// case we need to name when a record leaks.
-static WORKER_EXITS: std::sync::Mutex<
-    Option<std::collections::HashMap<u32, String>>,
-> = std::sync::Mutex::new(None);
+static WORKER_EXITS: std::sync::Mutex<Option<std::collections::HashMap<u32, String>>> =
+    std::sync::Mutex::new(None);
 static WORKER_EVENTS: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
@@ -729,14 +744,17 @@ pub fn watch() -> Vec<String> {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                g.get_or_insert_with(std::collections::HashMap::new).remove(gone)
+                g.get_or_insert_with(std::collections::HashMap::new)
+                    .remove(gone)
             };
             match start {
                 Some(a) => out.push(format!(
                     "thread {gone:#x} exited (start was {a:#x} {})",
                     module_of(a)
                 )),
-                None => out.push(format!("thread {gone:#x} exited (was alive at the previous poll)")),
+                None => out.push(format!(
+                    "thread {gone:#x} exited (was alive at the previous poll)"
+                )),
             }
             if let Some(t) = table.as_ref() {
                 for e in t.entries.iter().filter(|e| e.id == *gone) {
@@ -757,7 +775,8 @@ pub fn watch() -> Vec<String> {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                g.get_or_insert_with(std::collections::HashMap::new).insert(*new, a);
+                g.get_or_insert_with(std::collections::HashMap::new)
+                    .insert(*new, a);
             }
             let who = start.map(module_of).unwrap_or_default();
             match start {
@@ -768,7 +787,9 @@ pub fn watch() -> Vec<String> {
                         .map(|t| t.entries.iter().any(|e| e.id == *new))
                         .unwrap_or(false)
                 )),
-                None => out.push(format!("thread {new:#x} started (start address unavailable)")),
+                None => out.push(format!(
+                    "thread {new:#x} started (start address unavailable)"
+                )),
             }
         }
     }
@@ -790,8 +811,14 @@ pub fn resume_all(table: &Table) -> Vec<String> {
             continue;
         }
         match crate::raw::sys::resume_thread(e.handle) {
-            Some(v) => out.push(format!("ResumeThread(id {:#x}, h {:#x}) -> {v:#x}", e.id, e.handle)),
-            None => out.push(format!("ResumeThread(id {:#x}) could not be resolved/called", e.id)),
+            Some(v) => out.push(format!(
+                "ResumeThread(id {:#x}, h {:#x}) -> {v:#x}",
+                e.id, e.handle
+            )),
+            None => out.push(format!(
+                "ResumeThread(id {:#x}) could not be resolved/called",
+                e.id
+            )),
         }
     }
     out
@@ -837,7 +864,9 @@ mod tests {
 
     #[test]
     fn worker_registry_resolves_a_reaped_tid_to_its_real_body() {
-        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = REGISTRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tid = 0xf00d_0042;
         note_worker_body(tid, 0xbd1ca0, 0x1234);
         assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
@@ -845,8 +874,16 @@ mod tests {
         note_unregister(tid);
         assert!(worker_unregister_called(tid));
         let events = drain_worker_events();
-        assert!(events.iter().any(|e| e.contains("worker start") && e.contains("fn=0xbd1ca0")));
-        assert!(events.iter().any(|e| e.contains("unregister") && e.contains("fn=0xbd1ca0")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("worker start") && e.contains("fn=0xbd1ca0"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("unregister") && e.contains("fn=0xbd1ca0"))
+        );
         assert!(drain_worker_events().is_empty());
         prune_worker_bodies(&[], &[tid]);
         assert_eq!(worker_body(tid), Some((0xbd1ca0, 0x1234)));
@@ -858,7 +895,9 @@ mod tests {
 
     #[test]
     fn removal_and_exit_hooks_name_the_leaking_path() {
-        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = REGISTRY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tid = 0xf00d_0043;
         note_worker_body(tid, 0xbe81a0, 0x55);
         assert_eq!(worker_exit_via(tid), None);
@@ -890,7 +929,7 @@ mod tests {
 
     #[test]
     fn only_a_signalled_thread_object_is_safe_to_reap() {
-        use super::{alive_from_wait_result, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use super::{WAIT_OBJECT_0, WAIT_TIMEOUT, alive_from_wait_result};
 
         assert_eq!(alive_from_wait_result(Some(WAIT_OBJECT_0)), Some(false));
         assert_eq!(alive_from_wait_result(Some(WAIT_TIMEOUT)), Some(true));

@@ -391,7 +391,8 @@ fn build_trampoline(
             } else {
                 *chunk
                     .get(ro)
-                    .ok_or_else(|| format!("rel8 field at +{off} truncated"))? as i8 as i64
+                    .ok_or_else(|| format!("rel8 field at +{off} truncated"))? as i8
+                    as i64
             };
             let absolute = target as i64 + (off + ins.len) as i64 + disp;
             if branch_into_prologue(target, span, off, ins.len, disp) {
@@ -427,7 +428,14 @@ fn build_trampoline(
                         let at = code.len();
                         // FF 15/FF 25 [rip+disp32] — the disp32 is filled in
                         // below, once the slots have an address.
-                        code.extend_from_slice(&[0xFF, if kind == "call-slot" { 0x15 } else { 0x25 }, 0, 0, 0, 0]);
+                        code.extend_from_slice(&[
+                            0xFF,
+                            if kind == "call-slot" { 0x15 } else { 0x25 },
+                            0,
+                            0,
+                            0,
+                            0,
+                        ]);
                         slots.push((at + 2, absolute as u64));
                         relocs.push(Reloc {
                             off,
@@ -824,17 +832,16 @@ fn prepare_span(target: usize, min: usize) -> Option<Prep> {
 
     // relocated copy: every rel8/rel32 and every rip-relative disp32 (+ the
     // absolute jump back to `target + prologue`) comes out of one builder
-    let (code, relocs) =
-        match build_trampoline(&head, &insns, target, tramp, target + prologue) {
-            Ok(v) => v,
-            Err(why) => {
-                log::log_tag(
-                    "hook",
-                    &format!("prepare: {target:#x} trampoline relocation failed: {why}"),
-                );
-                return None;
-            }
-        };
+    let (code, relocs) = match build_trampoline(&head, &insns, target, tramp, target + prologue) {
+        Ok(v) => v,
+        Err(why) => {
+            log::log_tag(
+                "hook",
+                &format!("prepare: {target:#x} trampoline relocation failed: {why}"),
+            );
+            return None;
+        }
+    };
     // One line per rewritten instruction: a live log then shows exactly which
     // bytes of the prologue were adjusted and where they now point.
     for r in &relocs {
@@ -2706,7 +2713,11 @@ mod tests {
         assert_eq!(&code[14..16], &[0xFF, 0x25]);
         // `ff 25 00000000` is six bytes; the absolute address follows it.
         let back = u64::from_le_bytes(code[20..28].try_into().unwrap());
-        assert_eq!(back as usize, BASE + span, "the copy jumps back after the span");
+        assert_eq!(
+            back as usize,
+            BASE + span,
+            "the copy jumps back after the span"
+        );
     }
 
     #[test]
@@ -2729,7 +2740,10 @@ mod tests {
         // Slots live right after the absolute jump back (14 bytes at code[15]).
         assert_eq!(slot, tramp + 15 + 14);
         let stored = u64::from_le_bytes(code[29..37].try_into().unwrap());
-        assert_eq!(stored as usize, callee, "the slot holds the absolute callee");
+        assert_eq!(
+            stored as usize, callee,
+            "the slot holds the absolute callee"
+        );
     }
 
     #[test]

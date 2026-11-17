@@ -108,7 +108,12 @@ pub fn before_unhook() -> bool {
 /// reinstall cannot silently promise a complete guard or drop pending decisions.
 pub fn after_unhook(hooks: &[(usize, bool)]) {
     let ga = MODULE_BASE.load(Ordering::Acquire);
-    let attached = |target: usize| ga != 0 && hooks.iter().any(|(candidate, detached)| *candidate == target && !*detached);
+    let attached = |target: usize| {
+        ga != 0
+            && hooks
+                .iter()
+                .any(|(candidate, detached)| *candidate == target && !*detached)
+    };
     ENTRY_ATTACHED.store(attached(ga + GC_SUSPEND_ENTRY_RVA), Ordering::Release);
     SKIP_ATTACHED.store(attached(ga + GC_SKIP_CLOSE_RVA), Ordering::Release);
     AFTER_ATTACHED.store(attached(ga + GC_AFTER_UNLINK_RVA), Ordering::Release);
@@ -207,8 +212,7 @@ impl DecisionBook {
     }
 }
 
-static CLOSE_DECISIONS: std::sync::Mutex<DecisionBook> =
-    std::sync::Mutex::new(DecisionBook::new());
+static CLOSE_DECISIONS: std::sync::Mutex<DecisionBook> = std::sync::Mutex::new(DecisionBook::new());
 
 fn begin_close(record: usize) -> CloseChoice {
     if DETACHING.load(Ordering::Acquire) || !READY.load(Ordering::Acquire) {
@@ -364,7 +368,9 @@ unsafe fn skip_close_route(_handle: ffi::HANDLE, record: usize) -> usize {
     #[cfg(target_os = "windows")]
     // SAFETY: partial-install fallback must preserve the original close and
     // still continue at c417f6 rather than return to GC_remove_thread's caller.
-    unsafe { ffi::CloseHandle(_handle) };
+    unsafe {
+        ffi::CloseHandle(_handle)
+    };
     ga + GC_UNLINKED_NEXT_RVA
 }
 
@@ -489,7 +495,9 @@ fn next_after_abort(ga: usize, next: usize) -> (usize, usize) {
 }
 
 fn abort_address(ga: usize, code: u32, address: usize) -> bool {
-    ga != 0 && code == 0x8000_0003 && (address == ga + GC_RESUME_ABORT_RVA || address == ga + GC_SUSPEND_ABORT_RVA)
+    ga != 0
+        && code == 0x8000_0003
+        && (address == ga + GC_RESUME_ABORT_RVA || address == ga + GC_SUSPEND_ABORT_RVA)
 }
 
 /// Last-resort recovery of an exact Boehm fatal, while the owner thread still
@@ -526,7 +534,8 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
         return false;
     }
     // SAFETY: RBX offset is the mingw-measured 0x90 field in that CONTEXT.
-    let candidate = unsafe { core::ptr::read_unaligned(context.add(WIN64_CONTEXT_RBX).cast::<usize>()) };
+    let candidate =
+        unsafe { core::ptr::read_unaligned(context.add(WIN64_CONTEXT_RBX).cast::<usize>()) };
     let base = THREADS_BASE.load(Ordering::Acquire);
     // SAFETY: the active owner holds Boehm's lock, so pointer validation cannot
     // race a record removal/free. A stale RBX is not dereferenced on a miss.
@@ -631,7 +640,10 @@ pub fn install() -> bool {
     if crate::symbols::GAMEASSEMBLY_SHA256
         != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
     {
-        log::log_tag("gct", "entry guard disabled: unsupported GameAssembly build");
+        log::log_tag(
+            "gct",
+            "entry guard disabled: unsupported GameAssembly build",
+        );
         return false;
     }
     let Some((ga, _)) = procs::own_module(crate::GAME_ASSEMBLY) else {
@@ -652,7 +664,10 @@ pub fn install() -> bool {
             && exact_bytes(after, AFTER_UNLINK_SIGNATURE.len()).as_deref()
                 != Some(AFTER_UNLINK_SIGNATURE.as_slice()))
     {
-        log::log_tag("gct", "entry guard: one or more live signatures do not match");
+        log::log_tag(
+            "gct",
+            "entry guard: one or more live signatures do not match",
+        );
         return false;
     }
     let Some(skip_prep) = stored_prep(&SKIP_PREP, skip) else {
@@ -676,10 +691,19 @@ pub fn install() -> bool {
     AFTER_ORIG.store(after_prep.trampoline, Ordering::Release);
     ENTRY_ORIG.store(entry_prep.trampoline, Ordering::Release);
 
-    if !install_attached(skip_prep, defer_close_detour as *const () as usize, &SKIP_ATTACHED)
-        || !install_attached(after_prep, close_after_unlink_detour as *const () as usize, &AFTER_ATTACHED)
-        || !install_attached(entry_prep, suspend_entry_detour as *const () as usize, &ENTRY_ATTACHED)
-    {
+    if !install_attached(
+        skip_prep,
+        defer_close_detour as *const () as usize,
+        &SKIP_ATTACHED,
+    ) || !install_attached(
+        after_prep,
+        close_after_unlink_detour as *const () as usize,
+        &AFTER_ATTACHED,
+    ) || !install_attached(
+        entry_prep,
+        suspend_entry_detour as *const () as usize,
+        &ENTRY_ATTACHED,
+    ) {
         reset_install();
         return false;
     }
@@ -758,7 +782,10 @@ mod tests {
     #[test]
     fn abort_resume_uses_saved_next_instead_of_freed_current_record() {
         let ga = 0x6fff_eaa1_0000;
-        assert_eq!(next_after_abort(ga, 0x1234_5000), (0x1234_5000, ga + GC_PROCESS_RECORD_RVA));
+        assert_eq!(
+            next_after_abort(ga, 0x1234_5000),
+            (0x1234_5000, ga + GC_PROCESS_RECORD_RVA)
+        );
         assert_eq!(next_after_abort(ga, 0), (0, ga + GC_ADVANCE_BUCKET_RVA));
         assert!(!can_recover_boehm_abort(false, 0x123, 0x123));
         assert!(!can_recover_boehm_abort(true, 0x123, 0x456));

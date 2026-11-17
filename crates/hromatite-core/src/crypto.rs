@@ -143,7 +143,11 @@ mod tests {
         xor_page(7, &mut buf);
         for i in 0..8 {
             for j in 0..8 {
-                assert_eq!(buf[i * 8 + j], buf[j], "byte {i}*8+{j} broke the 8-byte period");
+                assert_eq!(
+                    buf[i * 8 + j],
+                    buf[j],
+                    "byte {i}*8+{j} broke the 8-byte period"
+                );
             }
         }
     }

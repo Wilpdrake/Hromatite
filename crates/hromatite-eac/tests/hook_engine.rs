@@ -134,7 +134,10 @@ static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" fn probe_detour(a: u64) -> u64 {
     PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
     let trampoline = PROBE_TRAMPOLINE.load(Ordering::Acquire);
-    assert_ne!(trampoline, 0, "detour ran before the trampoline was published");
+    assert_ne!(
+        trampoline, 0,
+        "detour ran before the trampoline was published"
+    );
     // SAFETY: the trampoline is the relocated prologue of `tramp_probe` and ends
     // in an absolute jump back into its body, so it has the same ABI.
     let original: unsafe extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(trampoline) };
@@ -158,8 +161,9 @@ fn a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs() {
     assert_eq!(hook::prologue_len(head), Some(13));
 
     // SAFETY: see above; both addresses live for the whole process.
-    let installed = unsafe { hook::install(entry, probe_detour as *const () as usize, "tramp_probe") }
-        .expect("install");
+    let installed =
+        unsafe { hook::install(entry, probe_detour as *const () as usize, "tramp_probe") }
+            .expect("install");
     assert_eq!(installed.mode, 1);
     assert_eq!(installed.copied, 13);
     assert!(
@@ -177,5 +181,9 @@ fn a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs() {
         assert_eq!(tramp_probe(0), 7, "original body through the trampoline");
         assert_eq!(tramp_probe(35), 42, "the callee's value plus the argument");
     }
-    assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 2, "both calls hit the detour");
+    assert_eq!(
+        PROBE_CALLS.load(Ordering::SeqCst),
+        2,
+        "both calls hit the detour"
+    );
 }
