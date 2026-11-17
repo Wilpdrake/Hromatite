@@ -444,7 +444,7 @@ fn method_name(class: usize, entry: usize, names: &'static [&'static str]) -> &'
 #[cfg(windows)]
 fn hook_line(tag: &str, resolved: &Resolved, name: &str, rva: usize) -> String {
     format!(
-        "{tag} hooked {} method={name} MethodInfo={:#x} entry={:#x} (GA+{rva:#x}) params={}",
+        "hooked {} method={name} MethodInfo={:#x} entry={:#x} (GA+{rva:#x}) params={} kind={tag}",
         crate::m3::class_full_name(resolved.class),
         resolved.info,
         resolved.entry,

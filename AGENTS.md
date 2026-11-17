@@ -3086,3 +3086,56 @@ il2cpp одними чтениями памяти (без единого выз�
   в одном прогоне (`forge_0206`) поток кадров и лог оборвались на 77-й секунде при
   живом процессе (похоже на залипание в колбэке игры). Свежие 16-Б записи в теле
   (нужен источник хешей) — единственный оставшийся способ «оживить» содержимое.
+
+### 2026-11-17 — feat(photon): каркас хука на managed-события Photon (ветка `eac-photon`)
+
+- **Зачем.** Следующий шаг после `EAC_FORGE`: не подделывать кадры EAC, а
+  увидеть события VRChat на уровне Photon (`SendOperation` opCode 253 =
+  RaiseEvent; в словаре `244` = код события, `245` = payload, код `66` = EAC
+  heartbeat) и потом суметь поднять событие 66 сами. Это **шаг 1**: только
+  резолв → inline-хук → лог сырых аргументов → честный форвард. Инъекции нет.
+- **Коммиты** (ветка `eac-photon`, master не тронут): `29e7690` модуль
+  `raw/photon.rs` + вызов `photon::poll` из managed-тика, `3b61270` ранний
+  установ из resident-старта под `EAC_EVENTHOOK=1`.
+- **Что сделано.** `crates/hromatite-core/src/raw/photon.rs`:
+  `resolve_send_operation()`/`resolve_on_event()` (m3, без вызовов il2cpp API),
+  `install_outgoing()`/`install_incoming()`, детуры `send_operation_detour`
+  (rcx=this, rdx=opCode, r8=Dictionary, r9=SendOptions; форвард всех четырёх в
+  трамплин) и `on_event_detour` (this + EventData), счётчики
+  `send_counters()`/`event_counters()`, `poll()` для ленивого ретрая из тика.
+  Логирование ограничено: первые 50 вызовов, дальше каждый 200-й; RaiseEvent
+  пишется как `[photon] op=253 hit=.. params_ptr=0x..`. Для 253 заложена
+  заглушка `decode_event_params(ptr) -> Option<(code, len, payload)>` с TODO
+  (раскладку `Dictionary<byte,object>` ещё не мерили) и чистая
+  `event_code_from_slots`.
+- **Кандидаты (перебираются по порядку, отказ логируется по каждому).**
+  `("ExitGames.Client.Photon","PhotonPeer")`, `("","PhotonPeer")`,
+  `("ExitGames.Client.Photon","LoadBalancingPeer")`, `("","LoadBalancingPeer")`;
+  методы `SendOperation` → `SendOperationInternal` → `OpCustom` (для входящих
+  `OnEvent` → `OnEventInternal` → `OnOperationResponse`). Предпочитается арность
+  3 (`byte`, `Dictionary`, `SendOptions`), но не требуется; static (`flags & 0x10`)
+  и `entry < 0x10000` отбрасываются, entry обязан лежать внутри GameAssembly.
+- **Флаги.** `EAC_EVENTHOOK=1` — исходящие, `EAC_EVENTHOOK_IN=1` — входящие.
+  Попытка на старте (`install_photon_hook` в `dll`) почти всегда «deferred»:
+  типы Photon материализуются позже, дальше ретраит `photon::poll` из
+  managed-тика (~10 с, лог только каждый 6-й провал, чтобы не залить файл).
+- **Проверено (без игры).** `cargo test --workspace --target
+  x86_64-unknown-linux-gnu --offline` → 129 (core, +10 новых) + 41 (eac) + 15
+  (features) ok; `cargo clippy --workspace --all-targets -- -D warnings` чисто на
+  host и на `x86_64-pc-windows-gnu`; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu --offline` → Finished.
+- **Что проверить в живом прогоне.** (1) Резолв: в логе должна быть строка
+  `[photon] hooked <класс> method=SendOperation MethodInfo=.. entry=..
+  (GA+rva) params=3 kind=send`; если `params` ≠ 3 — имя/арность другие, смотреть строки
+  `candidate ... has none of ...`. (2) Живость: `hit=` строки идут с частотой
+  кадров, а `op=253` — только при реальных событиях (не каждый кадр).
+  (3) **Главный риск**: скрытый `MethodInfo*` — 5-й слот, он уже на стеке, и
+  после перехода через детур стек-аргумент смещён на размер нашего фрейма. Если
+  тело `SendOperation` его читает, игра упадёт/вернёт мусор. Проверять по тому,
+  что игра продолжает работать и `bool`-результат не ломает отправку: сначала
+  прогнать в мире без событий 30–60 с, потом с событиями (Udon/аватар).
+  (4) `SendOptions` в r9 — если на билде он передаётся указателем (struct > 8 Б),
+  форвард всё равно байтовый, но это надо увидеть в логе по `send_opts`.
+- **Что осталось (шаг 2+).** Раскладка `Dictionary<byte,object>` (записи
+  `(hash,next,key,value)`), извлечение `244`/`245` → `event_code`/payload;
+  затем сборка RaiseEvent 66 и вызов `SendOperation` сами.
