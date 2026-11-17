@@ -145,6 +145,75 @@ unsafe extern "C" fn probe_detour(a: u64) -> u64 {
     unsafe { original(a) }
 }
 
+// `test rcx,rcx ; je .zero ; mov eax,42 ; ret ; .zero: mov eax,7 ; ret` — a
+// rel8 `jcc` whose target sits *inside* the 12-byte patch window. The copy must
+// turn it into `je +14 ; jmp [rip+0] <copy+11>` and still take the branch.
+core::arch::global_asm!(
+    r#"
+    .text
+    .globl branch_probe
+branch_probe:
+    test rcx, rcx
+    je 2f
+    mov eax, 42
+    ret
+2:
+    mov eax, 7
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn branch_probe(a: u64) -> u64;
+}
+
+static BRANCH_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn branch_detour(a: u64) -> u64 {
+    let trampoline = BRANCH_TRAMPOLINE.load(Ordering::Acquire);
+    assert_ne!(
+        trampoline, 0,
+        "detour ran before the trampoline was published"
+    );
+    // SAFETY: the trampoline is the relocated prologue of `branch_probe` and
+    // ends in an absolute jump back into its body.
+    let original: unsafe extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(trampoline) };
+    // SAFETY: same ABI and same single integer argument as the interrupted call.
+    unsafe { original(a) }
+}
+
+#[test]
+fn a_rel8_jcc_pointing_into_the_patch_window_is_relocated_and_still_branches() {
+    let entry = branch_probe as *const () as usize;
+    // SAFETY: the entry is a readable 16-byte prologue of our own assembly.
+    let head = unsafe { std::slice::from_raw_parts(entry as *const u8, 16) };
+    assert_eq!(head[0..3], [0x48, 0x85, 0xC9], "test rcx,rcx");
+    assert_eq!(head[3], 0x74, "the prologue really contains a rel8 jcc");
+    // 3 + 2 + 5 + 1 + 5 = 16 bytes: the copied span reaches past the jump back.
+    assert_eq!(hook::prologue_len(head), Some(16));
+
+    // SAFETY: see above; both addresses live for the whole process.
+    let installed =
+        unsafe { hook::install(entry, branch_detour as *const () as usize, "branch_probe") }
+            .expect("install");
+    assert_eq!(installed.copied, 16);
+    assert_eq!(installed.insns, 5, "five whole instructions copied");
+    assert_eq!(installed.relocs, 1, "only the jcc moved");
+    assert!(
+        installed.note.starts_with("jcc-abs+3->"),
+        "the rel8 jcc must become an absolute one, got '{}'",
+        installed.note
+    );
+    BRANCH_TRAMPOLINE.store(installed.tramp, Ordering::Release);
+
+    // SAFETY: `branch_probe` is our own global_asm function with the declared
+    // signature; its entry now jumps to `branch_detour`, which forwards on.
+    unsafe {
+        assert_eq!(branch_probe(1), 42, "non-zero rcx falls through the jcc");
+        assert_eq!(branch_probe(0), 7, "rcx == 0 takes the relocated branch");
+    }
+}
+
 #[test]
 fn a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs() {
     // SAFETY: `tramp_probe` is a real function entry in this image (global_asm
@@ -167,10 +236,12 @@ fn a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs() {
     assert_eq!(installed.mode, 1);
     assert_eq!(installed.copied, 13);
     assert!(
-        installed.note.starts_with("call+5->"),
+        installed.note.starts_with("call-rel32+5->"),
         "the rel32 call must be relocated, got '{}'",
         installed.note
     );
+    assert_eq!(installed.insns, 3, "three copied instructions");
+    assert_eq!(installed.relocs, 1, "exactly one rewrite");
     PROBE_TRAMPOLINE.store(installed.tramp, Ordering::Release);
 
     // The callee returns 7; a mis-relocated `call` would land at `tramp+10+disp`
