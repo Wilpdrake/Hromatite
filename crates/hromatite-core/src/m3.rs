@@ -636,7 +636,7 @@ fn images_around(corlib: usize) -> Vec<(usize, String)> {
     for step in 0i64..768 {
         for sign in [1i64, -1] {
             let index = step * sign;
-            let Some(image) = corlib.checked_add_signed((index * IMAGE_STRIDE) as isize) else {
+            let Some(image) = corlib.checked_add_signed((index * IMAGE_STRIDE as i64) as isize) else {
                 continue;
             };
             let Some(name) = safe::read_usize(image + IMAGE_NAME_OFF).and_then(name_at) else {
