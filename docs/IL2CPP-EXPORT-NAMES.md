@@ -205,7 +205,7 @@ bsearch `0xc53f7c` с токенами `+0x11c` / `+0x48` / `+0x18`.
 
 | Что | Прошлая сборка | Эта сборка |
 |---|---|---|
-| `Il2CppClass.parent` | `+0x10` | **`+0xa0`** |
+| `Il2CppClass.parent` | `+0x10` | **`+0xa0`** (проверено тремя обходчиками родителя) |
 | `Il2CppClass.fields` / stride `FieldInfo` | `+0x80` / `0x28` | **`+0x88` / `0x20`** (`name@0`, `offset@8`, `type@0x10`) |
 | `Il2CppClass.properties` / stride `PropertyInfo` | `+0x90` / `0x28` | **`+0x80` / `0x30`**, `name@+0x10` |
 | `Il2CppClass.methods` | `+0x50` | **`+0x58`** (`method_count@+0x120`) |
@@ -216,6 +216,14 @@ bsearch `0xc53f7c` с токенами `+0x11c` / `+0x48` / `+0x18`.
 Следствия для живого рантайма: прежние `m3`-константы (`parent`, `fields`, `methods`,
 `MethodInfo.name`) на этой сборке **неверны**; их надо переносить вместе с обновлением
 `symbols.rs` и адресов GC-guard.
+
+### Уточнение по `+0x10`
+
+Старая складка `class_get_parent` + `field_get_name` на `+0x10` в новой сборке
+распалась: родитель уехал на `+0xa0` (`0x12c750`), а по `+0x10` теперь лежит
+**`FieldInfo.type`** — это доказано `il2cpp_field_get_value` (`0xbbe020`), который
+берёт указатель типа из `[field+0x10]` и читает флаги по `[type+0x8]`. Поэтому
+`0x8ace0` назван `il2cpp_field_get_type` (имя поля — `FieldInfo+0`).
 
 ### Что не названо (4 адреса, в Ghidra — plate-комментарий)
 

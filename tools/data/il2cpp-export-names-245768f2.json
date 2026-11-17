@@ -15,7 +15,7 @@
   "surviving_export_names": "3 addresses kept un-obfuscated names (il2cpp_free, il2cpp_gchandle_get_target, il2cpp_native_stack_trace) and the transfer predicted exactly those 3 (3/3).",
   "layout_changes_in_this_build": [
    "Il2CppClass.parent moved +0x10 -> +0xa0 (three parent-chain walkers agree)",
-   "Il2CppClass.fields +0x80 -> +0x88, FieldInfo stride 0x28 -> 0x20 {name@0, offset@8, type@0x10}",
+   "Il2CppClass.fields +0x80 -> +0x88, FieldInfo stride 0x28 -> 0x20 {name@0, offset@8, type@0x10, token@0x18}",
    "Il2CppClass.properties +0x90 -> +0x80, PropertyInfo stride 0x30, name@+0x10",
    "Il2CppClass.methods +0x50 -> +0x58 (method_count @+0x120), interfaces @+0x90 (count @+0x12c)",
    "MethodInfo.name +0x18 -> +0x20; token @+0x48, flags @+0x4c, param_count @+0x52 unchanged"
@@ -142,9 +142,9 @@
     "XTPQdFmATHC",
     "wLAfFeIwFAw"
    ],
-   "real_name": "il2cpp_field_get_name",
+   "real_name": "il2cpp_field_get_type",
    "confidence": "transfer:layout-shifted",
-   "evidence": "old build folded class_get_parent+field_get_name at +0x10; parent moved to +0xa0",
+   "evidence": "FieldInfo in this build is {name@0, offset@8, type@0x10, token@0x18} stride 0x20; il2cpp_field_get_value @0xbbe020 reads the type pointer at [field+0x10] and the flags at [type+0x8], so this +0x10 getter is il2cpp_field_get_type (4 export names fold here). Old build's +0x10 fold was class_get_parent+field_get_name; parent moved to +0xa0.",
    "renamed_in_ghidra": true
   },
   {
@@ -211,7 +211,7 @@
    ],
    "real_name": "il2cpp_class_get_parent",
    "confidence": "transfer:layout-shifted",
-   "evidence": "klass+0xa0 is walked as parent by property/field/method-from-name in this build",
+   "evidence": "klass+0xa0 is walked as parent by class_get_property_from_name, class_get_field_from_name and class_get_method_from_name; the old build read parent at +0x10",
    "renamed_in_ghidra": true
   },
   {
