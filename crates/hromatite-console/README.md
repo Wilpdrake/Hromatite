@@ -14,6 +14,13 @@ game log is stale or the payload is not answering.
 - **F4 or `:`** opens a searchable command palette. Every entry has syntax,
   a description and a `SAFE`, `ADV` or `RISK` label. Commands that need
   arguments are inserted into the prompt instead of being sent incomplete.
+  The list is **generated** from `hromatite-commands`, the same table the
+  payload builds its in-game `help` from, so palette, Tab completion, risk gate
+  and payload help never drift apart. Adding a command there is the only edit.
+- **The mouse wheel scrolls** the log (three rows per notch), the field manual
+  and the palette selection; PgUp/PgDn page by one screen. Scrolling back pauses
+  follow, reaching the tail resumes it, and the offset is clamped so a notch at
+  the top never banks invisible backlog.
 - **`RISK` commands require two Enter presses**, both when selected from the
   palette and when typed directly. Editing or Esc cancels confirmation. This is
   only a host-side guard around existing payload commands.
@@ -42,7 +49,8 @@ prefix under `~/.local/share/Steam`. The usual paths are:
 | Up / Down | Command history (with draft preservation), or palette selection |
 | Tab | Complete a payload `help` command; show ambiguous matches |
 | Ctrl-R, or `/` on empty input | Incrementally filter the in-memory log; Enter accepts |
-| PgUp / PgDn | Scroll; pausing/resuming follow is explicit in the status row |
+| PgUp / PgDn | Page the log, the palette or the field manual; pausing/resuming follow is explicit in the status row |
+| Mouse wheel | Three-row scroll of the log, the field manual or the palette selection |
 | F1, or `help` / `?` + Enter | Open/close the local field manual and file paths |
 | F2 | Pause/resume following new lines |
 | F3 | Toggle errors + GC filter |
@@ -70,4 +78,5 @@ cargo test --manifest-path crates/hromatite-console/Cargo.toml \
 `DEMO // SYNTHETIC`, paths identify the fixture in F1, and command/telemetry
 actions never touch live files. `--snapshot` emits one plain frame without
 entering termios or the alternate screen. The only third-party dependency is
-`unicode-width`; the small binary uses manual Linux termios/ioctl FFI.
+`unicode-width`; the command table comes from the local `hromatite-commands`
+crate, and the small binary uses manual Linux termios/ioctl FFI.

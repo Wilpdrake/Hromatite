@@ -1,217 +1,73 @@
-//! Payload command catalogue shared by completion and the interactive palette.
+//! Command catalogue shared by completion, the interactive palette and the
+//! risk gate.
+//!
+//! The table itself lives in `hromatite_commands`, the same crate the resident
+//! runtime and the hot-reloaded feature image build their in-game `help` from.
+//! Nothing is copied by hand here: adding a command to that table updates the
+//! payload help, the palette, Tab completion and the confirmation rules at once.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Risk {
-    ReadOnly,
-    Advanced,
-    Dangerous,
+pub use hromatite_commands::{Risk, SPECS, Scope, Spec};
+
+/// Historical name for the palette row type; the data now comes from the
+/// payload's own table.
+pub type CommandSpec = Spec;
+
+/// Resolve a typed name (or alias) to its declaration.
+pub fn command(name: &str) -> Option<&'static Spec> {
+    hromatite_commands::find(name)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CommandSpec {
-    pub name: &'static str,
-    pub usage: &'static str,
-    pub summary: &'static str,
-    pub risk: Risk,
-}
-
-impl CommandSpec {
-    pub fn takes_arguments(self) -> bool {
-        // Optional arguments do not need a template detour: selecting
-        // `reload [generation]` still follows the normal two-Enter risk flow.
-        self.usage.contains('<')
-    }
-}
-
-macro_rules! commands {
-    ($(($name:literal, $usage:literal, $summary:literal, $risk:ident)),+ $(,)?) => {
-        pub const CATALOG: &[CommandSpec] = &[
-            $(CommandSpec { name: $name, usage: $usage, summary: $summary, risk: Risk::$risk }),+
-        ];
-    };
-}
-
-// Read-only operational commands stay at the top. Everything here describes an
-// existing payload command; the host console adds no new in-game capability.
-commands![
-    (
-        "pos",
-        "pos",
-        "camera position and local transform",
-        ReadOnly
-    ),
-    (
-        "who",
-        "who",
-        "list players, ids and world positions",
-        ReadOnly
-    ),
-    (
-        "esp",
-        "esp",
-        "project players into screen coordinates",
-        ReadOnly
-    ),
-    ("late", "late", "managed LateUpdate tick health", ReadOnly),
-    ("gct", "gct", "Boehm GC thread records", ReadOnly),
-    (
-        "threads",
-        "threads",
-        "process threads and start addresses",
-        ReadOnly
-    ),
-    ("help", "help", "open the local field manual", ReadOnly),
-    ("?", "?", "alias for the local field manual", ReadOnly),
-    (
-        "q",
-        "q <addr> [count]",
-        "read qwords at an address",
-        Advanced
-    ),
-    (
-        "qword",
-        "qword <addr> [count]",
-        "alias for qword reads",
-        Advanced
-    ),
-    (
-        "b",
-        "b <addr> [count]",
-        "read bytes at an address",
-        Advanced
-    ),
-    (
-        "bytes",
-        "bytes <addr> [count]",
-        "alias for byte reads",
-        Advanced
-    ),
-    ("s", "s <addr>", "read an ASCII string", Advanced),
-    ("ws", "ws <addr>", "read a UTF-16 string", Advanced),
-    (
-        "m3f",
-        "m3f <namespace> [name]",
-        "find materialized classes",
-        Advanced
-    ),
-    (
-        "m3c",
-        "m3c <class>",
-        "inspect class fields and methods",
-        Advanced
-    ),
-    (
-        "m3l",
-        "m3l <assembly> [filter] [max]",
-        "enumerate an assembly",
-        Advanced
-    ),
-    (
-        "m3s",
-        "m3s <filter>",
-        "search materialized class names",
-        Advanced
-    ),
-    ("m3i", "m3i <assembly>", "resolve an IL2CPP image", Advanced),
-    (
-        "reload",
-        "reload [generation]",
-        "activate latest or select an immutable feature generation",
-        Dangerous
-    ),
-    (
-        "rollback",
-        "rollback",
-        "return to the previous feature generation",
-        Dangerous
-    ),
-    (
-        "config",
-        "config show|reload|set <key> <value>",
-        "inspect/reload config; config set requires confirmation",
-        Advanced
-    ),
-    (
-        "latec",
-        "latec",
-        "list valid LateUpdate candidates",
-        Advanced
-    ),
-    ("gctfix", "gctfix", "repair stale Boehm records", Dangerous),
-    (
-        "gctresume",
-        "gctresume",
-        "resume GC records after inspection",
-        Dangerous
-    ),
-    (
-        "latehook",
-        "latehook <#index|class>",
-        "replace the managed tick anchor",
-        Dangerous
-    ),
-    (
-        "guard",
-        "guard <addr>",
-        "probe guarded exception handling",
-        Dangerous
-    ),
-    (
-        "call",
-        "call <addr> [args]",
-        "invoke a native function",
-        Dangerous
-    ),
-    (
-        "wq",
-        "wq <addr> <hex64>",
-        "write one qword to game memory",
-        Dangerous
-    ),
-    (
-        "wb",
-        "wb <addr> <hexbytes>",
-        "write bytes to game memory",
-        Dangerous
-    ),
-    (
-        "panic",
-        "panic [message]",
-        "intentionally panic the payload command",
-        Dangerous
-    ),
-    (
-        "av",
-        "av [addr]",
-        "intentionally trigger an access violation",
-        Dangerous
-    ),
-    ("seal", "seal", "request payload image sealing", Dangerous),
-    ("quit", "quit", "stop the payload console", Dangerous),
-];
-
-pub fn command(name: &str) -> Option<&'static CommandSpec> {
-    CATALOG.iter().find(|item| item.name == name)
+/// Every accepted spelling, for completion.
+pub fn names() -> Vec<&'static str> {
+    hromatite_commands::names()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOG, Risk, command};
+    use super::{Risk, SPECS, command, names};
 
     #[test]
-    fn useful_commands_lead_and_destructive_commands_are_explicit() {
-        assert_eq!(CATALOG[0].name, "pos");
-        assert_eq!(CATALOG[1].name, "who");
-        assert_eq!(command("who").unwrap().risk, Risk::ReadOnly);
+    fn every_listed_command_resolves_and_keeps_its_risk() {
+        for spec in SPECS {
+            assert_eq!(command(spec.name).unwrap().name, spec.name);
+            assert!(!spec.summary.is_empty(), "{} has no summary", spec.name);
+            assert!(!spec.usage.is_empty(), "{} has no usage", spec.name);
+        }
+        assert_eq!(command("pos").unwrap().risk, Risk::ReadOnly);
         assert_eq!(command("q").unwrap().risk, Risk::Advanced);
         assert_eq!(command("wq").unwrap().risk, Risk::Dangerous);
         assert_eq!(command("call").unwrap().risk, Risk::Dangerous);
-        assert!(CATALOG.iter().all(|item| !item.summary.is_empty()));
-        for name in crate::input::COMMANDS {
+        assert_eq!(command("?").unwrap().name, "help");
+        assert_eq!(command("qword").unwrap().name, "q");
+        assert!(command("no-such-command").is_none());
+    }
+
+    #[test]
+    fn completion_and_palette_see_the_same_generated_names() {
+        let listed = names();
+        for spec in SPECS {
             assert!(
-                command(name).is_some(),
-                "palette lost payload command {name}"
+                listed.contains(&spec.name),
+                "{} missing from names",
+                spec.name
             );
+            for alias in spec.aliases {
+                assert!(listed.contains(alias), "alias {alias} missing from names");
+                assert_eq!(command(alias).unwrap().name, spec.name);
+            }
+        }
+        // Every name the shell offers must be a palette entry or its alias, so
+        // Tab can never complete something the palette cannot describe.
+        for name in listed {
+            assert!(command(name).is_some(), "completion offers unknown {name}");
+        }
+    }
+
+    #[test]
+    fn the_console_palette_covers_feature_only_commands_too() {
+        // These used to be missing because the palette was typed by hand.
+        for name in ["feature", "eac.status", "eac.hooks"] {
+            assert!(command(name).is_some(), "{name} is not in the palette");
         }
     }
 }

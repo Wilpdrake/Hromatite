@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "hromatite-commands"
+version = "0.1.0"
+
+[[package]]
 name = "hromatite-console"
 version = "0.1.0"
 dependencies = [
+ "hromatite-commands",
  "unicode-width",
 ]
 

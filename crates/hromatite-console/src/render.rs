@@ -35,6 +35,14 @@ pub struct Frame {
     pub cursor: (usize, usize),
 }
 
+/// Rows available to the body: everything between the three status rows and the
+/// rule, and the filter/input/footer rows at the bottom. The terminal driver
+/// reports the same number back to the model so scrolling clamps at exactly the
+/// height the frame draws.
+pub fn body_rows(height: usize) -> usize {
+    height.saturating_sub(7)
+}
+
 pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height: u16) -> Frame {
     if width < 24 || height < 8 {
         let w = width as usize;
@@ -143,7 +151,7 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     styles[3] = Style::Dim;
 
     let body_start = 4;
-    let body_len = height.saturating_sub(body_start + 3);
+    let body_len = body_rows(height);
     let body = model.window(body_len);
     for (offset, line) in body.iter().enumerate() {
         let formatted = if line.tag == "raw" {
@@ -216,23 +224,13 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
             .log_bytes
             .map(human_bytes)
             .unwrap_or_else(|| "--".into());
-        let help = [
-            " FIELD MANUAL // help / ? / F1; Esc closes".to_string(),
-            " local view: works without a live payload answer".into(),
-            " enter send | tab complete | up/down command history".into(),
-            " F4 or : payload commands | / or Ctrl-R log filter".into(),
-            " F2 follow | F3 errors+GC | PgUp/PgDn scrollback".into(),
-            " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
-            " F7 reload (second Enter confirms) | F8 clear view only".into(),
-            " Ctrl-C quit | Esc back".into(),
-            " RISK commands require a second Enter; edits cancel it".into(),
-            " channel append-only; no new game threads or sockets".into(),
-            format!(" log {} ({bytes})", context.log_path),
-            format!(" cmd {}", context.command_path),
-        ];
-        for (offset, text) in help.iter().enumerate().take(body_len) {
+        let help = crate::model::field_manual(&context.log_path, &bytes, &context.command_path);
+        let start = model
+            .help_scroll()
+            .min(help.len().saturating_sub(body_len.max(1)));
+        for (offset, text) in help.iter().skip(start).take(body_len).enumerate() {
             put(&mut lines[body_start + offset], text, width);
-            styles[body_start + offset] = if offset == 0 {
+            styles[body_start + offset] = if start == 0 && offset == 0 {
                 Style::Accent
             } else {
                 Style::Status
@@ -288,7 +286,7 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     let cursor = (input_row, (prompt_width + cursor_columns).min(width - 1));
 
     let help = if model.notice().is_empty() {
-        "F1 help  F4 commands  F5 refresh  F6 auto  / search  PgUp scroll  Esc back".into()
+        "F1 help  F4 commands  F5 refresh  F6 auto  / search  wheel/PgUp scroll  Esc back".into()
     } else {
         model.notice().to_string()
     };

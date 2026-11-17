@@ -1,12 +1,14 @@
 //! Testable UI state: filtering, scrolling, telemetry and key handling.
 
-use crate::commands::{CATALOG, CommandSpec, Risk, command};
+use crate::commands::{Risk, SPECS, Spec, command};
 use crate::hot::{HotStatus, parse_hot_status};
 use crate::input::{History, Key, complete};
 use crate::parser::{LineKind, LogLine, parse_line};
 use std::collections::{BTreeSet, VecDeque};
 
 const MAX_LINES: usize = 20_000;
+/// Rows a single mouse-wheel notch moves, matching the usual terminal default.
+const WHEEL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -45,6 +47,10 @@ pub struct ConsoleModel {
     auto_refresh: bool,
     auto_suspended: bool,
     show_help: bool,
+    help_scroll: usize,
+    /// Rows the last frame could show in the log body; scrolling needs it to
+    /// clamp, so a wheel notch never piles up an invisible backlog.
+    viewport: usize,
     player_ids: BTreeSet<u64>,
     reported_players: Option<usize>,
     esp_seen: bool,
@@ -81,6 +87,8 @@ impl ConsoleModel {
             auto_refresh: false,
             auto_suspended: false,
             show_help: false,
+            help_scroll: 0,
+            viewport: 20,
             player_ids: BTreeSet::new(),
             reported_players: None,
             esp_seen: false,
@@ -183,6 +191,7 @@ impl ConsoleModel {
             }
             if self.show_help {
                 self.show_help = false;
+                self.help_scroll = 0;
                 return Action::None;
             }
             return match self.mode {
@@ -199,11 +208,20 @@ impl ConsoleModel {
         if cancelled_confirmation {
             self.notice = "dangerous command cancelled".into();
         }
+        // Wheel and page keys scroll whatever list is on screen (log, palette or
+        // field manual), so they run before the help gate swallows keys.
+        if matches!(key, Key::ScrollUp | Key::ScrollDown | Key::PgUp | Key::PgDn) {
+            self.scroll_view(key);
+            return Action::None;
+        }
         if self.show_help && key != Key::F(1) {
             return Action::None;
         }
         match key {
-            Key::F(1) => self.show_help = !self.show_help,
+            Key::F(1) => {
+                self.show_help = !self.show_help;
+                self.help_scroll = 0;
+            }
             Key::F(2) => {
                 self.follow = !self.follow;
                 if self.follow {
@@ -258,16 +276,6 @@ impl ConsoleModel {
             }
             Key::Char(':') if self.mode == Mode::Command && self.active.is_empty() => {
                 self.begin_palette()
-            }
-            Key::PgUp => {
-                self.follow = false;
-                self.scroll_back = self.scroll_back.saturating_add(1);
-            }
-            Key::PgDn => {
-                self.scroll_back = self.scroll_back.saturating_sub(1);
-                if self.scroll_back == 0 {
-                    self.follow = true;
-                }
             }
             Key::Tab if self.mode == Mode::Command => {
                 let completed = complete(&self.active);
@@ -375,7 +383,76 @@ impl ConsoleModel {
         self.completions.clear();
     }
 
-    fn prepare_submission(&mut self, submitted: String) -> Action {
+    /// Rows the log body shows; the terminal driver reports it once per frame so
+    /// scrolling can clamp instead of banking invisible offsets.
+    pub fn set_viewport(&mut self, rows: usize) {
+        self.viewport = rows.max(1);
+        self.scroll_back = self.scroll_back.min(self.max_scroll_back());
+        self.help_scroll = self.help_scroll.min(self.max_help_scroll());
+    }
+
+    fn max_scroll_back(&self) -> usize {
+        self.visible_lines().len().saturating_sub(self.viewport)
+    }
+
+    fn max_help_scroll(&self) -> usize {
+        field_manual("", "--", "")
+            .len()
+            .saturating_sub(self.viewport)
+    }
+
+    /// One wheel notch, one page, or nothing at all, applied to whatever list is
+    /// currently on screen.
+    fn scroll_view(&mut self, key: Key) {
+        if self.show_help {
+            let by = if matches!(key, Key::PgUp | Key::PgDn) {
+                self.viewport.max(2) - 1
+            } else {
+                WHEEL_ROWS
+            };
+            let up = matches!(key, Key::ScrollUp | Key::PgUp);
+            let max = self.max_help_scroll();
+            self.help_scroll = if up {
+                (self.help_scroll + by).min(max)
+            } else {
+                self.help_scroll.saturating_sub(by)
+            };
+            self.notice = if max == 0 {
+                "field manual fits on screen".into()
+            } else {
+                format!("field manual {}/{max} rows", self.help_scroll)
+            };
+            return;
+        }
+        if self.mode == Mode::Palette {
+            let count = self.palette_entries().len();
+            if count > 0 {
+                self.palette_selection = if matches!(key, Key::ScrollUp | Key::PgUp) {
+                    (self.palette_selection + count - 1) % count
+                } else {
+                    (self.palette_selection + 1) % count
+                };
+            }
+            return;
+        }
+        let by = if matches!(key, Key::PgUp | Key::PgDn) {
+            self.viewport.max(2) - 1
+        } else {
+            WHEEL_ROWS
+        };
+        let max = self.max_scroll_back();
+        if matches!(key, Key::ScrollUp | Key::PgUp) {
+            self.scroll_back = (self.scroll_back + by).min(max);
+        } else {
+            self.scroll_back = self.scroll_back.saturating_sub(by);
+        }
+        self.follow = self.scroll_back == 0;
+        if max == 0 {
+            self.notice = "log fits on screen — nothing to scroll".into();
+        }
+    }
+
+    pub fn prepare_submission(&mut self, submitted: String) -> Action {
         if matches!(submitted.as_str(), "help" | "?") {
             self.pending_confirmation = None;
             self.mode = Mode::Command;
@@ -384,6 +461,7 @@ impl ConsoleModel {
             self.completions.clear();
             self.notice = "local field manual — Esc closes".into();
             self.show_help = true;
+            self.help_scroll = 0;
             return Action::None;
         }
         let name = submitted.split_whitespace().next().unwrap_or("");
@@ -475,23 +553,24 @@ impl ConsoleModel {
         self.palette_selection
     }
 
-    pub fn palette_entries(&self) -> Vec<&'static CommandSpec> {
+    pub fn palette_entries(&self) -> Vec<&'static Spec> {
         if self.mode != Mode::Palette {
             return Vec::new();
         }
         let query = self.active.to_lowercase();
-        CATALOG
+        SPECS
             .iter()
             .filter(|item| {
                 query.is_empty()
                     || item.name.contains(&query)
+                    || item.aliases.iter().any(|alias| alias.contains(&query))
                     || item.usage.to_lowercase().contains(&query)
                     || item.summary.to_lowercase().contains(&query)
             })
             .collect()
     }
 
-    pub fn selected_palette_command(&self) -> Option<&'static CommandSpec> {
+    pub fn selected_palette_command(&self) -> Option<&'static Spec> {
         self.palette_entries().get(self.palette_selection).copied()
     }
 
@@ -517,6 +596,12 @@ impl ConsoleModel {
 
     pub fn help_visible(&self) -> bool {
         self.show_help
+    }
+
+    /// First manual row currently shown; the renderer clamps it by its own body
+    /// height, the model clamps it by the last reported viewport.
+    pub fn help_scroll(&self) -> usize {
+        self.help_scroll
     }
 
     pub fn auto_suspended(&self) -> bool {
@@ -571,6 +656,28 @@ fn next_char(text: &str, cursor: usize) -> usize {
         .chars()
         .next()
         .map_or(cursor, |ch| cursor + ch.len_utf8())
+}
+
+/// The local field manual. It lives in the model (not the renderer) because
+/// scrolling needs to know how many rows it has.
+///
+/// The manual describes the host UI only; the payload command list is generated
+/// from `hromatite_commands` and shown by the palette (F4).
+pub fn field_manual(log_path: &str, log_size: &str, command_path: &str) -> Vec<String> {
+    vec![
+        " FIELD MANUAL // help / ? / F1; Esc closes".to_string(),
+        " local view: works without a live payload answer".into(),
+        " enter send | tab complete | up/down command history".into(),
+        " F4 or : payload commands | / or Ctrl-R log filter".into(),
+        " F2 follow | F3 errors+GC | PgUp/PgDn and wheel scroll".into(),
+        " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
+        " F7 reload (second Enter confirms) | F8 clear view only".into(),
+        " Ctrl-C quit | Esc back".into(),
+        " RISK commands require a second Enter; edits cancel it".into(),
+        " channel append-only; no new game threads or sockets".into(),
+        format!(" log {log_path} ({log_size})"),
+        format!(" cmd {command_path}"),
+    ]
 }
 
 fn parse_feature_log(message: &str) -> Option<(u64, u64)> {
@@ -672,6 +779,7 @@ mod tests {
     #[test]
     fn search_scroll_and_follow_are_independent() {
         let mut m = model();
+        m.set_viewport(2);
         m.handle(Key::CtrlR);
         assert_eq!(m.mode(), Mode::Search);
         m.set_active_text("fatal");
@@ -687,6 +795,62 @@ mod tests {
     }
 
     #[test]
+    fn the_mouse_wheel_scrolls_the_log_by_a_notch_and_clamps_at_both_ends() {
+        let mut m = model();
+        m.ingest((0..20).map(|i| format!("[{i}] [con] line {i}")));
+        m.set_viewport(5);
+        let max_back = 24 - 5;
+        m.handle(Key::ScrollUp);
+        assert!(!m.follow());
+        assert_eq!(m.scroll_back(), 3);
+        for _ in 0..50 {
+            m.handle(Key::ScrollUp);
+        }
+        assert_eq!(
+            m.scroll_back(),
+            max_back,
+            "wheel must not bank hidden offsets"
+        );
+        assert!(!m.follow());
+        for _ in 0..50 {
+            m.handle(Key::ScrollDown);
+        }
+        assert_eq!(m.scroll_back(), 0);
+        assert!(m.follow(), "scrolling back to the tail resumes follow");
+    }
+
+    #[test]
+    fn the_mouse_wheel_scrolls_the_field_manual_and_the_palette_selection() {
+        let mut m = ConsoleModel::new(false);
+        m.set_viewport(4);
+        m.handle(Key::F(1));
+        assert!(m.help_visible());
+        m.handle(Key::ScrollUp);
+        assert!(m.help_scroll() > 0, "wheel must move the manual");
+        let manual_rows = crate::model::field_manual("", "--", "").len();
+        for _ in 0..40 {
+            m.handle(Key::ScrollUp);
+        }
+        assert_eq!(m.help_scroll(), manual_rows - 4);
+        m.handle(Key::ScrollDown);
+        assert_eq!(m.help_scroll(), manual_rows - 7);
+        // Esc still closes the manual even after scrolling it.
+        assert_eq!(m.handle(Key::Esc), Action::None);
+        assert!(!m.help_visible());
+        assert_eq!(m.help_scroll(), 0);
+
+        m.handle(Key::F(4));
+        assert_eq!(m.palette_selection(), 0);
+        m.handle(Key::ScrollDown);
+        assert_eq!(m.palette_selection(), 1);
+        m.handle(Key::ScrollUp);
+        assert_eq!(m.palette_selection(), 0);
+        // Wrapping matches Up/Down so a wheel never dead-ends the palette.
+        m.handle(Key::ScrollUp);
+        assert_eq!(m.palette_selection(), m.palette_entries().len() - 1);
+    }
+
+    #[test]
     fn enter_history_and_palette_produce_submissions() {
         let mut m = model();
         m.handle(Key::Char('p'));
@@ -697,7 +861,11 @@ mod tests {
         assert_eq!(m.active_text(), "pos");
         m.handle(Key::F(4));
         m.handle(Key::Down);
-        assert_eq!(m.handle(Key::Enter), Action::Submit("who".into()));
+        assert_eq!(m.palette_selection(), 1);
+        // The palette order is the generated table's order, so follow it instead
+        // of hard-coding a second copy of the list in the test.
+        let second = crate::commands::SPECS[1].name.to_string();
+        assert_eq!(m.handle(Key::Enter), Action::Submit(second));
         assert_eq!(m.handle(Key::CtrlC), Action::Exit);
         assert_eq!(m.handle(Key::Esc), Action::Exit);
         assert_eq!(m.handle(Key::F(5)), Action::Refresh);

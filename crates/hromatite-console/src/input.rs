@@ -1,43 +1,16 @@
-//! Keyboard decoding, command history and completion over the payload's help set.
+//! Keyboard and mouse decoding, command history and completion over the
+//! payload's generated command table.
 
+use crate::commands::names;
 use std::collections::VecDeque;
 
-pub const COMMANDS: &[&str] = &[
-    "help",
-    "?",
-    "q",
-    "qword",
-    "b",
-    "bytes",
-    "s",
-    "ws",
-    "gct",
-    "threads",
-    "gctfix",
-    "gctresume",
-    "call",
-    "wq",
-    "wb",
-    "guard",
-    "m3f",
-    "m3c",
-    "m3l",
-    "m3s",
-    "m3i",
-    "latec",
-    "latehook",
-    "late",
-    "pos",
-    "who",
-    "esp",
-    "reload",
-    "rollback",
-    "config",
-    "panic",
-    "av",
-    "seal",
-    "quit",
-];
+/// Every accepted spelling, generated from `hromatite_commands::SPECS`.
+///
+/// Completion is not maintained by hand: a command added to the payload table
+/// appears here (and in the palette) without another edit.
+pub fn command_names() -> Vec<&'static str> {
+    names()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -54,6 +27,10 @@ pub enum Key {
     End,
     PgUp,
     PgDn,
+    /// One mouse-wheel notch away from the tail of the log.
+    ScrollUp,
+    /// One mouse-wheel notch back towards the tail of the log.
+    ScrollDown,
     F(u8),
     CtrlR,
     CtrlC,
@@ -114,10 +91,9 @@ impl KeyDecoder {
     pub fn timeout(&mut self) -> Vec<Key> {
         if self.pending.as_slice() == b"\x1b" {
             self.pending.clear();
-            vec![Key::Esc]
-        } else {
-            Vec::new()
+            return vec![Key::Esc];
         }
+        Vec::new()
     }
 }
 
@@ -148,12 +124,29 @@ fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
     if bytes[1] != b'[' {
         return Some((Key::Esc, 1));
     }
+    // Legacy X10 mouse report: CSI M <cb> <cx> <cy>, all bytes offset by 32.
+    if bytes.get(2) == Some(&b'M') {
+        if bytes.len() < 6 {
+            return None;
+        }
+        let button = bytes[3].wrapping_sub(32);
+        return Some((wheel_key(button), 6));
+    }
     // Position 1 is `[`, also in the final-byte range, so locate from position 2.
     let end = bytes[2..]
         .iter()
         .position(|b| (0x40..=0x7e).contains(b))
         .map(|p| p + 2)?;
     let body = std::str::from_utf8(&bytes[2..end]).ok()?;
+    // SGR mouse report: ESC [ < b ; x ; y M (press) or m (release).
+    if let Some(parameters) = body.strip_prefix('<') {
+        let button = parameters
+            .split(';')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(u16::MAX);
+        return Some((wheel_key(button as u8), end + 1));
+    }
     let key = match (body, bytes[end]) {
         ("", b'A') => Key::Up,
         ("", b'B') => Key::Down,
@@ -175,6 +168,19 @@ fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
         _ => Key::Ignore,
     };
     Some((key, end + 1))
+}
+
+/// Keep only the wheel axes out of a mouse button byte: bits 2–4 are modifiers
+/// (shift/meta/ctrl) and bit 5 marks motion, neither of which changes the axis.
+fn wheel_key(button: u8) -> Key {
+    if button & 0b0010_0000 != 0 {
+        return Key::Ignore;
+    }
+    match button & 0b0100_0011 {
+        64 => Key::ScrollUp,
+        65 => Key::ScrollDown,
+        _ => Key::Ignore,
+    }
 }
 
 pub struct History {
@@ -256,9 +262,8 @@ pub fn complete(input: &str) -> Completion {
             matches: Vec::new(),
         };
     }
-    let matches: Vec<_> = COMMANDS
-        .iter()
-        .copied()
+    let matches: Vec<_> = command_names()
+        .into_iter()
         .filter(|candidate| candidate.starts_with(prefix))
         .collect();
     let text = match matches.as_slice() {
@@ -282,7 +287,66 @@ pub fn complete(input: &str) -> Completion {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, Completion, History, Key, KeyDecoder, complete};
+    use super::{Completion, History, Key, KeyDecoder, command_names, complete};
+
+    #[test]
+    fn completion_is_generated_from_the_payload_table() {
+        let names = command_names();
+        for required in [
+            "pos",
+            "who",
+            "esp",
+            "help",
+            "?",
+            "q",
+            "qword",
+            "b",
+            "bytes",
+            "s",
+            "ws",
+            "gct",
+            "threads",
+            "gctfix",
+            "gctresume",
+            "call",
+            "wq",
+            "wb",
+            "guard",
+            "m3f",
+            "m3c",
+            "m3l",
+            "m3s",
+            "m3i",
+            "loopc",
+            "loop",
+            "latec",
+            "latehook",
+            "late",
+            "reload",
+            "rollback",
+            "config",
+            "panic",
+            "av",
+            "seal",
+            "quit",
+            "feature",
+            "eac.status",
+            "eac.hooks",
+        ] {
+            assert!(names.contains(&required), "completion lost {required}");
+        }
+        // No duplicates, and nothing outside the payload table.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "duplicate command names");
+        for name in names {
+            assert!(
+                hromatite_commands::find(name).is_some(),
+                "completion offers {name}, which the payload does not declare"
+            );
+        }
+    }
 
     #[test]
     fn history_preserves_draft_and_deduplicates_commands() {
@@ -312,48 +376,43 @@ mod tests {
     }
 
     #[test]
-    fn completion_matches_current_raw_console_help() {
-        assert_eq!(
-            COMMANDS,
-            &[
-                "help",
-                "?",
-                "q",
-                "qword",
-                "b",
-                "bytes",
-                "s",
-                "ws",
-                "gct",
-                "threads",
-                "gctfix",
-                "gctresume",
-                "call",
-                "wq",
-                "wb",
-                "guard",
-                "m3f",
-                "m3c",
-                "m3l",
-                "m3s",
-                "m3i",
-                "latec",
-                "latehook",
-                "late",
-                "pos",
-                "who",
-                "esp",
-                "reload",
-                "rollback",
-                "config",
-                "panic",
-                "av",
-                "seal",
-                "quit",
-            ]
-        );
+    fn completion_follows_the_generated_table_and_ignores_unknown_prefixes() {
         assert_eq!(complete("m3i").text, "m3i ");
         assert!(complete("find").matches.is_empty());
+        assert_eq!(complete("qw").matches, vec!["qword"]);
+    }
+
+    #[test]
+    fn mouse_wheel_notches_decode_from_sgr_and_legacy_reports() {
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(
+            decoder.feed(b"\x1b[<64;12;7M\x1b[<65;12;7M"),
+            vec![Key::ScrollUp, Key::ScrollDown]
+        );
+        // Modifier bits must not hide the axis, motion and other buttons are ignored.
+        assert_eq!(
+            decoder.feed(b"\x1b[<68;1;1M\x1b[<35;1;1M\x1b[<0;3;4M\x1b[<0;3;4m"),
+            vec![Key::ScrollUp, Key::Ignore, Key::Ignore, Key::Ignore]
+        );
+        assert_eq!(
+            decoder.feed(&[0x1b, b'[', b'M', 32 + 64, 40, 20]),
+            vec![Key::ScrollUp]
+        );
+        assert_eq!(
+            decoder.feed(&[0x1b, b'[', b'M', 32 + 65, 40, 20]),
+            vec![Key::ScrollDown]
+        );
+    }
+
+    #[test]
+    fn a_split_mouse_report_waits_and_a_bare_escape_stays_an_escape() {
+        let mut decoder = KeyDecoder::default();
+        assert!(decoder.feed(b"\x1b[<6").is_empty());
+        assert_eq!(decoder.feed(b"4;1;1M"), vec![Key::ScrollUp]);
+        assert!(decoder.feed(b"\x1b[<64;1;1").is_empty());
+        assert_eq!(decoder.feed(b"M"), vec![Key::ScrollUp]);
+        // Escape followed by a letter is still Escape plus that letter.
+        assert_eq!(decoder.feed(b"\x1bM"), vec![Key::Esc, Key::Char('M')]);
     }
 
     #[test]

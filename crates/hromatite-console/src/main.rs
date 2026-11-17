@@ -6,7 +6,7 @@ use hromatite_console::demo;
 use hromatite_console::fileio::{CommandWriter, LogTail};
 use hromatite_console::input::KeyDecoder;
 use hromatite_console::model::{Action, ConsoleModel};
-use hromatite_console::render::{RenderContext, ansi_frame, render};
+use hromatite_console::render::{RenderContext, ansi_frame, body_rows, render};
 use hromatite_console::telemetry::AutoRefresh;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Read, Write};
@@ -101,6 +101,7 @@ fn interactive(
             }
         }
         let (width, height) = terminal_size();
+        model.set_viewport(body_rows(height as usize));
         if (width, height) != last_size {
             write!(stdout, "\x1b[2J")?;
             last_size = (width, height);
@@ -247,7 +248,10 @@ impl TerminalGuard {
             return Err(io::Error::last_os_error());
         }
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25h\x1b[2J")?;
+        // 1049 alternate screen, cursor on. 1000+1006 turn on mouse reporting in
+        // SGR form so the wheel can scroll the log; Shift+drag still selects text
+        // in terminals that reserve plain selection for the application.
+        write!(stdout, "\x1b[?1049h\x1b[?25h\x1b[?1000h\x1b[?1006h\x1b[2J")?;
         stdout.flush()?;
         Ok(Self { original })
     }
@@ -256,7 +260,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[0m\x1b[?25h\x1b[?1049l");
+        // Release mouse reporting before leaving the alternate screen, otherwise
+        // the operator's shell would keep receiving clicks as escape sequences.
+        let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
         // SAFETY: original came from tcgetattr on this same fd and is still live.
         let _ = unsafe { tcsetattr(0, 0, &self.original) };

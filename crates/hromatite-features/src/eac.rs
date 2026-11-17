@@ -344,18 +344,13 @@ impl EacFeature {
     }
 
     fn help(&self) -> Vec<String> {
-        [
-            "eac.status                     — epoch, sid, counters, gap, paths",
-            "eac.begin [sid]                — open an anti-cheat epoch (per room)",
-            "eac.tick                       — emit one heartbeat now",
-            "eac.end [reason]               — close the epoch (session_end record)",
-            "eac.hooks [install|capture <path>|on|off] — EOSSDK hook status",
-            "eac.log <path>                 — JSONL event log (32 MiB, 2 files)",
-            "eac.tail <path>                — mirror output_log room markers",
-        ]
-        .iter()
-        .map(|line| (*line).to_string())
-        .collect()
+        // Generated from the shared command table: every `eac.*` entry is listed
+        // once, with the same wording the host palette shows.
+        hromatite_commands::SPECS
+            .iter()
+            .filter(|spec| spec.name.starts_with("eac."))
+            .map(|spec| spec.help_line())
+            .collect()
     }
 
     fn status_lines(&self) -> Vec<String> {
