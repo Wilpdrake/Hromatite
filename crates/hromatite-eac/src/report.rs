@@ -547,5 +547,35 @@ mod tests {
             u64::from_le_bytes(first.data[4..12].try_into().expect("8 bytes")),
             0x158b
         );
+
+        // The whole recorded stream retargets to another session: every frame
+        // keeps its body, takes the new identity and gets a CRC that verifies.
+        let mut stream = Stream::new(Report::load(path).expect("report"), 0, false);
+        let mut bodies = std::collections::HashSet::new();
+        let mut count = 0usize;
+        while let Some(slot) = stream.next_frame() {
+            let out = retarget(&slot.data, 0x42, 1_000 + count as u64, None).expect("frame");
+            assert_eq!(&out[HEADER_LEN..], &slot.data[HEADER_LEN..], "body kept");
+            assert_eq!(
+                u64::from_le_bytes(out[4..12].try_into().expect("8 bytes")),
+                0x42,
+                "frame {count} retargeted"
+            );
+            let mut zeroed = out.clone();
+            zeroed[CHECKSUM_OFFSET..HEADER_LEN].fill(0);
+            assert_eq!(
+                crc32c_eac(&zeroed),
+                u32::from_le_bytes(
+                    out[CHECKSUM_OFFSET..HEADER_LEN]
+                        .try_into()
+                        .expect("4 bytes")
+                ),
+                "frame {count} checksum"
+            );
+            bodies.insert(out[HEADER_LEN..].to_vec());
+            count += 1;
+        }
+        assert_eq!(count, 117, "every recorded frame replays");
+        assert!(bodies.len() > 1, "the report's bodies actually differ");
     }
 }
