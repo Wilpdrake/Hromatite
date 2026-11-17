@@ -1040,6 +1040,33 @@ mod tests {
     }
 
     #[test]
+    fn call_rel32_in_prologue_targets_the_original_callee() {
+        // The BoringSSL `__chkstk` entry shape measured live on
+        // `EVP_EncryptInit_ex`: `mov eax,0x28 ; call rel32 ; sub rsp,0x28`.
+        // The relocated copy must call the *original* callee.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let callee = base + 5 + 5 + 0x40;
+
+        let mut code = [0x90u8; 14];
+        code[0..5].copy_from_slice(&[0xB8, 0x28, 0x00, 0x00, 0x00]);
+        code[5] = 0xE8;
+        code[6..10].copy_from_slice(&(callee as i64 - (base + 10) as i64).to_le_bytes()[..4]);
+        code[10..14].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+        let built = build_trampoline(&mut page, base, &code, 14).expect("relocate");
+        assert_eq!(built.note, "call+5");
+        assert_eq!(&page[5], &0xE8);
+        let disp = i32::from_le_bytes(page[6..10].try_into().unwrap());
+        assert_eq!(
+            (page_addr + 5 + 5) as i64 + i64::from(disp),
+            callee as i64,
+            "the relocated call must still reach the original callee"
+        );
+    }
+
+    #[test]
     fn abs_jmp_round_trips_through_looks_patched() {
         let bytes = abs_jmp(0x1234_5678_9ABC_DEF0);
         assert_eq!(looks_patched(&bytes), Some(0x1234_5678_9ABC_DEF0));
