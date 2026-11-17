@@ -173,16 +173,22 @@ impl Feature {
         if matches!(command.as_str(), "pos" | "who" | "esp") && !self.telemetry {
             return self.disabled(&command);
         }
-        if M3_COMMANDS.contains(&command.as_str()) {
-            let (lines, status) = {
-                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
-                crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+        if M3_COMMANDS.contains(&command.as_str()) || matches!(command.as_str(), "pos" | "who" | "esp") {
+            let Some(mut metadata) = Metadata::new(&self.host, &mut self.metadata_cache) else {
+                return self.respond(
+                    [format!(
+                        "{command}: no metadata layout for GameAssembly {}",
+                        self.host.game_sha_hex()
+                    )],
+                    STATUS_NOT_READY,
+                );
             };
-            return self.respond(lines, status);
-        }
-        if matches!(command.as_str(), "pos" | "who" | "esp") {
-            let (lines, status) = {
-                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
+            let (lines, status) = if M3_COMMANDS.contains(&command.as_str()) {
+                if matches!(command.as_str(), "pos" | "who" | "esp") && !self.telemetry {
+                    return self.disabled(&command);
+                }
+                crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+            } else {
                 crate::telemetry::dispatch(&mut metadata, &mut self.telemetry_cache, &command)
             };
             return self.respond(lines, status);

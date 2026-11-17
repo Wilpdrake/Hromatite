@@ -2,9 +2,9 @@
 
 use crate::test_support as fake;
 
-pub const CLASS_TABLE_RVA: u64 = 0x0e66_c870;
-pub const IMAGE_GET_CLASS_RVA: u64 = 0x00c2_a330;
-pub const CORLIB_GETTER_RVA: u64 = 0x00c2_7f00;
+pub const CLASS_TABLE_RVA: u64 = 0x0e66_f0d0;
+pub const IMAGE_GET_CLASS_RVA: u64 = 0x00c2_c0a0;
+pub const CORLIB_GETTER_RVA: u64 = 0x00c2_9c70;
 pub const CLASS_TABLE: u64 = 0x0000_0003_0000_0000;
 pub const CORLIB_IMAGE: u64 = 0x0000_0005_0002_0000;
 pub const CAMERA_CLASS: u64 = 0x0000_0004_0001_0000;
@@ -47,15 +47,15 @@ fn class(index: usize, address: u64, namespace: &str, name: &str, methods: &[(&s
     let infos = address + 0x1000;
     fake::map_zeroed(array, (methods.len() as u64 + 1) * 8);
     fake::map_zeroed(infos, methods.len() as u64 * 0x100);
-    fake::put_u64(address + 0x50, array);
+    fake::put_u64(address + 0x58, array);
     for (method_index, (method_name, entry)) in methods.iter().enumerate() {
         let info = infos + method_index as u64 * 0x100;
         fake::put_u64(array + method_index as u64 * 8, info);
         fake::put_u64(info, *entry);
         fake::put_ascii(info + 0x80, method_name);
-        fake::put_u64(info + 0x18, info + 0x80);
-        fake::put_u64(info + 0x20, 0x0000_0004_2000_0000);
-        fake::put_u64(info + 0x28, address);
+        fake::put_u64(info + 0x20, info + 0x80);
+        fake::put_u64(info + 0x28, 0x0000_0004_2000_0000);
+        fake::put_u64(info + 0x30, address);
         fake::put_u16(
             info + 0x4c,
             if *method_name == "get_main" { 0x10 } else { 0 },
@@ -134,20 +134,20 @@ pub fn install() {
         "Object",
         &[("get_name", GET_OBJECT_NAME)],
     );
-    fake::put_u64(CAMERA_CLASS + 0x10, COMPONENT_CLASS);
-    fake::put_u64(TRANSFORM_CLASS + 0x10, COMPONENT_CLASS);
+    fake::put_u64(CAMERA_CLASS + 0xa0, COMPONENT_CLASS);
+    fake::put_u64(TRANSFORM_CLASS + 0xa0, COMPONENT_CLASS);
 
-    // One complete measured FieldInfo record at class+0x80, count at +0x124.
+    // One complete FieldInfo record at class+0x88, stride 0x20, count at +0x124.
     let fields = CAMERA_CLASS + 0x2000;
-    fake::map_zeroed(fields, 0x28);
-    fake::put_u64(CAMERA_CLASS + 0x80, fields);
+    fake::map_zeroed(fields, 0x20);
+    fake::put_u64(CAMERA_CLASS + 0x88, fields);
     fake::put_u16(CAMERA_CLASS + 0x124, 1);
-    fake::put_u64(fields, 0x0000_0004_2000_1000);
-    fake::put_u32(fields + 0x08, 0x40);
+    // FieldInfo of the newest build: name@0, offset@8, type@0x10, token@0x18.
     fake::put_ascii(CAMERA_CLASS + 0x2100, "m_FieldOfView");
-    fake::put_u64(fields + 0x10, CAMERA_CLASS + 0x2100);
+    fake::put_u64(fields, CAMERA_CLASS + 0x2100);
+    fake::put_u32(fields + 0x08, 0x40);
+    fake::put_u64(fields + 0x10, 0x0000_0004_2000_1000);
     fake::put_u32(fields + 0x18, 0x0400_002a);
-    fake::put_u64(fields + 0x20, CAMERA_CLASS);
 
     fake::on_call(ga + CORLIB_GETTER_RVA, fake::returning(CORLIB_IMAGE));
     fake::on_call(

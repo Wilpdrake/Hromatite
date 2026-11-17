@@ -3115,3 +3115,57 @@ il2cpp одними чтениями памяти (без единого выз�
   т.е. `FieldInfo` = `{name@0, offset@8, type@0x10, token@0x18}` (stride 0x20), и
   `+0x10` — это тип, а не имя. Имя поля лежит в `FieldInfo+0`. Итог не меняется:
   207 переименований, 222 из 226 адресов названы, 4 неназванных — те же.
+
+### 2026-11-17 — Зашитые константы вынесены в дескриптор сборки + динамическое разрешение
+
+- Коммит: см. следующий (`feat(build): select per-build anchors from the loaded image`).
+- **Зачем.** После обновления игры (§ записи выше) выяснилось, что все адреса
+  лежали константами в четырёх местах и каждая из них — мина под следующей
+  сборкой: `raw/gcguard.rs` (11 RVAs + 3 байтовых сигнатуры), `raw/hook.rs`
+  (call-site GetThreadContext, threads, unregister/remove, дисплейсмент в
+  `expected`), `features/m3.rs` (3 RVA + 9 смещений структур), `symbols.rs`
+  (251 экспорт, генерируется), плюс литералы sha в гейтах.
+- **Что теперь.** Единственный источник чисел — `crates/hromatite-abi/src/build.rs`:
+  `GcAnchors` (remove/skip/unlinked_next/after_unlink/suspend_entry/context_call/
+  process_record/resume_abort/suspend_abort/advance_bucket/threads/thread_list_cs),
+  `Il2cppAnchors` (get_corlib, image_get_class, class_table) и `Layout`
+  (parent/namespace/methods/fields/name/fields_count + `FieldInfo`
+  name/type/offset/parent + stride + MethodInfo name/return_type/parameters/flags/
+  param_count). Таблица `KNOWN` содержит обе сборки — `648f61b1…` (verified) и
+  `245768f2…` (verified=false, причина в `note`), выбор по sha256 модуля.
+- **Динамика.** `core/buildinfo.rs` выбирает дескриптор по sha из `symbols.rs`;
+  `raw/discover.rs` умеет вывести якоря из самого образа, если сборка неизвестна:
+  сообщение `"SuspendThread loop failed"` в `.rdata` → xref-ы `lea` → вход
+  `GC_suspend_all` (расстояния +0x70/+0xb2/+0xdb/+0x145/+0x24a внутри функции
+  одинаковы в обеих сборках), `49 8B 1C F6` (`mov rbx,[r14+rsi*8]`) → функция
+  удаления записи и `GC_threads[]`, `mov rax,[rip+d]; lea rsi,[rax+rdi*8]` →
+  `s_TypeInfoDefinitionTable`, тело `il2cpp_image_get_class`, а `il2cpp_get_corlib`
+  — единственный геттер, чей глобал указывает на образ с `+0x8 == "mscorlib"`.
+- **Чем подтверждено.** Все пять правил проверены на ДВУХ сборках офлайн:
+  remove_thread (0xc417b0 / 0xc43520), threads (0xe6bb180 / 0xe6bd8a0),
+  class_table (0xe66c870 / 0xe66f0d0), image_get_class (0xc2a330 / 0xc2c0a0) —
+  совпадают с тем, что снято вручную в Ghidra. Пять unit-тестов на синтетических
+  буферах (`raw::discover::tests`), тест консистентности расстояний внутри
+  функций в `hromatite-abi::build::tests`, тест «descriptor существует для
+  скомпилированного sha» в `buildinfo`.
+- **Гейты вместо литералов.** `gcguard::install`, `hook::install_gc_context_guard`
+  и `features/m3` больше не сравнивают sha с зашитой строкой: они спрашивают
+  дескриптор (или discovery) и **отказываются ставить патч**, если якорей нет.
+  Сигнатуры теперь проверяются по форме (`call [rip]`, `lea rax,[rip]`,
+  три `mov [rsp+d8], reg`), а не сравнением с байтами одной сборки.
+  `m3` в фичах берёт RVA/смещения из дескриптора по sha, который резидент
+  отдаёт в `HostApiV1`; при неизвестной сборке отвечает
+  `no metadata layout for GameAssembly <sha>` и `STATUS_NOT_READY`.
+- **Проверено.** host: abi 7, core 127 (+5 discover, +4 build, +3 buildinfo),
+  dll 5, eac 32+1, features 15 — все ok; `cargo clippy --workspace --all-targets
+  --release` чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` — ok (`hromatite.dll` 1 885 923 Б,
+  `hromatite_features.dll` 1 510 055 Б). `symbols.rs` перегенерирован на новую
+  сборку (`tools/symmap.py`), побочный `symbols-245768f25214.json` добавлен.
+- **Что осталось.** (1) `gc.thread_list_cs` новой сборки выведен (table−0xa0),
+  а не доказан — при первом живом прогоне смотреть лог `discover:`/`entry GC
+  guard installed`; (2) `layout.method_return_type` для новой сборки следует из
+  сдвига `name` (+8) — проверить живьём на `LateUpdate`-селекторе; (3)
+  `playerloop.rs` и worker-trace по-прежнему привязаны к `648f61b1…` и на новой
+  сборке честно отказываются — их RVAs надо внести в дескриптор отдельным шагом;
+  (4) в `discover` нет вывода `WORKER_DISPATCH_RVA`/`GC_UNREGISTER_RVA`.

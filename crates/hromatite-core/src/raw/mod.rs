@@ -10,6 +10,7 @@
 //! `Result` remain the only contract for rejected addresses and OS failures.
 
 pub mod console;
+pub mod discover;
 pub mod context;
 pub mod ffi;
 pub mod gcguard;

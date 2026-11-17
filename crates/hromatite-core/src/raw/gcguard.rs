@@ -10,28 +10,49 @@ use crate::raw::hook::{Prep, patch, prepare, register};
 use crate::{ffi, log, procs};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-const GC_REMOVE_THREAD_RVA: usize = 0xc417b0;
-const GC_SKIP_CLOSE_RVA: usize = 0xc417f0;
-const GC_AFTER_UNLINK_RVA: usize = 0xc41818;
-const GC_UNLINKED_NEXT_RVA: usize = 0xc417f6;
-const GC_SUSPEND_ENTRY_RVA: usize = 0xc41a20;
-const GC_RESUME_ABORT_RVA: usize = 0xc41afb;
-const GC_SUSPEND_ABORT_RVA: usize = 0xc41b65;
-const GC_PROCESS_RECORD_RVA: usize = 0xc41a90;
-const GC_ADVANCE_BUCKET_RVA: usize = 0xc41c6a;
-const GC_THREADS_RVA: usize = 0x0e6b_b180;
-const THREAD_LIST_CS_RVA: usize = 0x0e6b_b100;
+// Absolute addresses for the build we actually attached to. Everything below is
+// filled once in `install()` from `hromatite_abi::build` (keyed by the module
+// hash) or, for an unknown build, from `raw::discover`. A zero value always
+// means "not resolved" and every user treats it as "do nothing".
+static REMOVE_THREAD_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SKIP_CLOSE_ADDR: AtomicUsize = AtomicUsize::new(0);
+static UNLINKED_NEXT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static AFTER_UNLINK_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SUSPEND_ENTRY_ADDR: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_RECORD_ADDR: AtomicUsize = AtomicUsize::new(0);
+static RESUME_ABORT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SUSPEND_ABORT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static ADVANCE_BUCKET_ADDR: AtomicUsize = AtomicUsize::new(0);
 const WIN64_CONTEXT_RBX: usize = 0x90;
 const WIN64_CONTEXT_RIP: usize = 0xf8;
 
-const SKIP_CLOSE_SIGNATURE: [u8; 6] = [0xff, 0x15, 0x92, 0x78, 0xac, 0x0a];
-const AFTER_UNLINK_SIGNATURE: [u8; 7] = [0x48, 0x8d, 0x05, 0x41, 0xaf, 0xa2, 0x0d];
-const SUSPEND_ENTRY_SIGNATURE: [u8; 15] = [
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
-];
+/// Byte counts the detours need at each site. The *contents* are build specific
+/// (relocated displacements), so only shapes are checked; the numeric sites
+/// themselves come from the build descriptor.
+const SKIP_CLOSE_LEN: usize = 6;
+const AFTER_UNLINK_LEN: usize = 7;
+const SUSPEND_ENTRY_LEN: usize = 15;
 
+/// `call qword ptr [rip+disp32]` — the CloseHandle call site.
+pub(crate) fn valid_skip_close(bytes: &[u8]) -> bool {
+    bytes.len() == SKIP_CLOSE_LEN && bytes[0] == 0xff && bytes[1] == 0x15
+}
+
+/// `lea rax,[rip+disp32]` — the sentinel check right after the unlink.
+pub(crate) fn valid_after_unlink(bytes: &[u8]) -> bool {
+    bytes.len() == AFTER_UNLINK_LEN && bytes[0..3] == [0x48, 0x8d, 0x05]
+}
+
+/// The collector entry is `mov [rsp+d8],rbx; mov [rsp+d8],reg; mov [rsp+d8],reg`.
 pub(crate) fn valid_gc_suspend_entry(bytes: &[u8]) -> bool {
-    bytes == SUSPEND_ENTRY_SIGNATURE
+    // Three consecutive 5-byte stores: `48 89 <modrm> 24 <disp8>`.
+    bytes.len() == SUSPEND_ENTRY_LEN
+        && bytes[0..2] == [0x48, 0x89]
+        && bytes[3] == 0x24
+        && bytes[5..7] == [0x48, 0x89]
+        && bytes[8] == 0x24
+        && bytes[10..12] == [0x48, 0x89]
+        && bytes[13] == 0x24
 }
 
 static ENTRY_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -109,9 +130,9 @@ pub fn before_unhook() -> bool {
 pub fn after_unhook(hooks: &[(usize, bool)]) {
     let ga = MODULE_BASE.load(Ordering::Acquire);
     let attached = |target: usize| ga != 0 && hooks.iter().any(|(candidate, detached)| *candidate == target && !*detached);
-    ENTRY_ATTACHED.store(attached(ga + GC_SUSPEND_ENTRY_RVA), Ordering::Release);
-    SKIP_ATTACHED.store(attached(ga + GC_SKIP_CLOSE_RVA), Ordering::Release);
-    AFTER_ATTACHED.store(attached(ga + GC_AFTER_UNLINK_RVA), Ordering::Release);
+    ENTRY_ATTACHED.store(attached(SUSPEND_ENTRY_ADDR.load(Ordering::Acquire)), Ordering::Release);
+    SKIP_ATTACHED.store(attached(SKIP_CLOSE_ADDR.load(Ordering::Acquire)), Ordering::Release);
+    AFTER_ATTACHED.store(attached(AFTER_UNLINK_ADDR.load(Ordering::Acquire)), Ordering::Release);
     // Latch detachment until install() completes every GC target again. A late
     // pre-emitted detour therefore cannot admit a new decision after detach.
     DETACHING.store(true, Ordering::Release);
@@ -239,8 +260,13 @@ unsafe fn terminate_record_by_tid(id: u32) {
     }
     // SAFETY: id was read from a record currently linked under Boehm's list
     // lock. GC_remove_thread(tid) owns close+unlink+free for this exact build.
-    let f: unsafe extern "system" fn(u32) =
-        unsafe { core::mem::transmute(ga + GC_REMOVE_THREAD_RVA) };
+    let remove = REMOVE_THREAD_ADDR.load(Ordering::Acquire);
+    if remove == 0 {
+        return;
+    }
+    // SAFETY: `remove` is the GC_remove_thread entry of the build we patched,
+    // whose signature is `void(DWORD tid)` on every supported build.
+    let f: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(remove) };
     // SAFETY: id belongs to this exact linked record under the list lock.
     unsafe { f(id) };
 }
@@ -353,9 +379,12 @@ unsafe extern "system" fn suspend_entry_detour() {
 /// original fallback trampoline when protection is not fully installed.
 unsafe fn skip_close_route(_handle: ffi::HANDLE, record: usize) -> usize {
     let _flight = Flight::new();
-    let ga = MODULE_BASE.load(Ordering::Acquire);
+    let unlinked_next = UNLINKED_NEXT_ADDR.load(Ordering::Acquire);
+    if unlinked_next == 0 {
+        return SKIP_ORIG.load(Ordering::Acquire);
+    }
     if begin_close(record) == CloseChoice::Skip {
-        return ga + GC_UNLINKED_NEXT_RVA;
+        return unlinked_next;
     }
     let original = SKIP_ORIG.load(Ordering::Acquire);
     if original != 0 {
@@ -365,7 +394,7 @@ unsafe fn skip_close_route(_handle: ffi::HANDLE, record: usize) -> usize {
     // SAFETY: partial-install fallback must preserve the original close and
     // still continue at c417f6 rather than return to GC_remove_thread's caller.
     unsafe { ffi::CloseHandle(_handle) };
-    ga + GC_UNLINKED_NEXT_RVA
+    unlinked_next
 }
 
 /// Naked continuation is mandatory: replacing a CALL with a JMP supplies no
@@ -477,19 +506,22 @@ unsafe fn linked_by_pointer(base: usize, candidate: usize) -> Option<LinkedRecor
     None
 }
 
-fn next_after_abort(ga: usize, next: usize) -> (usize, usize) {
+fn next_after_abort(_ga: usize, next: usize) -> (usize, usize) {
     if next != 0 {
         // Skip the removed record's "mov rbx,[rbx]" entirely: the saved next
         // pointer is inserted into RBX before the ordinary per-record checks.
-        (next, ga + GC_PROCESS_RECORD_RVA)
+        (next, PROCESS_RECORD_ADDR.load(Ordering::Acquire))
     } else {
         // No list node remains: advance the bucket index, with no stale RBX read.
-        (0, ga + GC_ADVANCE_BUCKET_RVA)
+        (0, ADVANCE_BUCKET_ADDR.load(Ordering::Acquire))
     }
 }
 
-fn abort_address(ga: usize, code: u32, address: usize) -> bool {
-    ga != 0 && code == 0x8000_0003 && (address == ga + GC_RESUME_ABORT_RVA || address == ga + GC_SUSPEND_ABORT_RVA)
+fn abort_address(_ga: usize, code: u32, address: usize) -> bool {
+    code == 0x8000_0003
+        && address != 0
+        && (address == RESUME_ABORT_ADDR.load(Ordering::Acquire)
+            || address == SUSPEND_ABORT_ADDR.load(Ordering::Acquire))
 }
 
 /// Last-resort recovery of an exact Boehm fatal, while the owner thread still
@@ -628,29 +660,32 @@ pub fn install() -> bool {
         return true;
     }
     reset_install();
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
-        log::log_tag("gct", "entry guard disabled: unsupported GameAssembly build");
-        return false;
-    }
-    let Some((ga, _)) = procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, gasize)) = procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "entry guard disabled: GameAssembly is not loaded");
         return false;
     };
-    let entry = ga + GC_SUSPEND_ENTRY_RVA;
-    let skip = ga + GC_SKIP_CLOSE_RVA;
-    let after = ga + GC_AFTER_UNLINK_RVA;
+    let Some(anchors) = crate::buildinfo::gc_anchors(ga, gasize) else {
+        log::log_tag(
+            "gct",
+            "entry guard disabled: this GameAssembly build has no GC anchors",
+        );
+        return false;
+    };
+    let entry = ga + anchors.suspend_entry as usize;
+    let skip = ga + anchors.skip_close as usize;
+    let after = ga + anchors.after_unlink as usize;
     if (ENTRY_PREP.load(Ordering::Acquire) == 0
-        && exact_bytes(entry, SUSPEND_ENTRY_SIGNATURE.len())
+        && exact_bytes(entry, SUSPEND_ENTRY_LEN)
             .map(|head| valid_gc_suspend_entry(&head))
             != Some(true))
         || (SKIP_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(skip, SKIP_CLOSE_SIGNATURE.len()).as_deref()
-                != Some(SKIP_CLOSE_SIGNATURE.as_slice()))
+            && exact_bytes(skip, SKIP_CLOSE_LEN)
+                .map(|head| valid_skip_close(&head))
+                != Some(true))
         || (AFTER_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(after, AFTER_UNLINK_SIGNATURE.len()).as_deref()
-                != Some(AFTER_UNLINK_SIGNATURE.as_slice()))
+            && exact_bytes(after, AFTER_UNLINK_LEN)
+                .map(|head| valid_after_unlink(&head))
+                != Some(true))
     {
         log::log_tag("gct", "entry guard: one or more live signatures do not match");
         return false;
@@ -664,14 +699,21 @@ pub fn install() -> bool {
     let Some(entry_prep) = stored_prep(&ENTRY_PREP, entry) else {
         return false;
     };
-    if skip_prep.prologue != SKIP_CLOSE_SIGNATURE.len()
-        || after_prep.prologue != AFTER_UNLINK_SIGNATURE.len()
-    {
+    if skip_prep.prologue != SKIP_CLOSE_LEN || after_prep.prologue != AFTER_UNLINK_LEN {
         return false;
     }
     MODULE_BASE.store(ga, Ordering::Release);
-    THREADS_BASE.store(ga + GC_THREADS_RVA, Ordering::Release);
-    THREAD_LIST_CS.store(ga + THREAD_LIST_CS_RVA, Ordering::Release);
+    REMOVE_THREAD_ADDR.store(ga + anchors.remove_thread as usize, Ordering::Release);
+    SKIP_CLOSE_ADDR.store(skip, Ordering::Release);
+    UNLINKED_NEXT_ADDR.store(ga + anchors.unlinked_next as usize, Ordering::Release);
+    AFTER_UNLINK_ADDR.store(after, Ordering::Release);
+    SUSPEND_ENTRY_ADDR.store(entry, Ordering::Release);
+    PROCESS_RECORD_ADDR.store(ga + anchors.process_record as usize, Ordering::Release);
+    RESUME_ABORT_ADDR.store(ga + anchors.resume_abort as usize, Ordering::Release);
+    SUSPEND_ABORT_ADDR.store(ga + anchors.suspend_abort as usize, Ordering::Release);
+    ADVANCE_BUCKET_ADDR.store(ga + anchors.advance_bucket as usize, Ordering::Release);
+    THREADS_BASE.store(ga + anchors.threads as usize, Ordering::Release);
+    THREAD_LIST_CS.store(ga + anchors.thread_list_cs as usize, Ordering::Release);
     SKIP_ORIG.store(skip_prep.trampoline, Ordering::Release);
     AFTER_ORIG.store(after_prep.trampoline, Ordering::Release);
     ENTRY_ORIG.store(entry_prep.trampoline, Ordering::Release);
@@ -758,8 +800,10 @@ mod tests {
     #[test]
     fn abort_resume_uses_saved_next_instead_of_freed_current_record() {
         let ga = 0x6fff_eaa1_0000;
-        assert_eq!(next_after_abort(ga, 0x1234_5000), (0x1234_5000, ga + GC_PROCESS_RECORD_RVA));
-        assert_eq!(next_after_abort(ga, 0), (0, ga + GC_ADVANCE_BUCKET_RVA));
+        PROCESS_RECORD_ADDR.store(ga + 0x70, Ordering::Relaxed);
+        ADVANCE_BUCKET_ADDR.store(ga + 0x24a, Ordering::Relaxed);
+        assert_eq!(next_after_abort(ga, 0x1234_5000), (0x1234_5000, ga + 0x70));
+        assert_eq!(next_after_abort(ga, 0), (0, ga + 0x24a));
         assert!(!can_recover_boehm_abort(false, 0x123, 0x123));
         assert!(!can_recover_boehm_abort(true, 0x123, 0x456));
         assert!(can_recover_boehm_abort(true, 0x123, 0x123));
@@ -789,10 +833,13 @@ mod tests {
         SKIP_ATTACHED.store(true, Ordering::Relaxed);
         AFTER_ATTACHED.store(true, Ordering::Relaxed);
         ENTRY_ATTACHED.store(true, Ordering::Relaxed);
+        SKIP_CLOSE_ADDR.store(ga + 0x40, Ordering::Relaxed);
+        AFTER_UNLINK_ADDR.store(ga + 0x68, Ordering::Relaxed);
+        SUSPEND_ENTRY_ADDR.store(ga + 0x270, Ordering::Relaxed);
         after_unhook(&[
-            (ga + GC_SKIP_CLOSE_RVA, false),
-            (ga + GC_AFTER_UNLINK_RVA, true),
-            (ga + GC_SUSPEND_ENTRY_RVA, true),
+            (ga + 0x40, false),
+            (ga + 0x68, true),
+            (ga + 0x270, true),
         ]);
         assert!(SKIP_ATTACHED.load(Ordering::Relaxed));
         assert!(!AFTER_ATTACHED.load(Ordering::Relaxed));

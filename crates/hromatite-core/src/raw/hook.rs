@@ -1062,11 +1062,16 @@ fn work() {
 /// `test eax,eax` and `jne`. The trampoline carries all three instructions;
 /// live and synthetic results therefore share Boehm's original success branch
 /// instead of falling into its retry loop.
-const GC_CONTEXT_CALL_RVA: usize = 0xc41ad2;
-const GC_CONTEXT_CALL_SIGNATURE: [u8; 8] = [0xff, 0x15, 0x60, 0x78, 0xac, 0x0a, 0x85, 0xc0];
+/// The site itself is per build (`GcAnchors::context_call`); only the shape is
+/// stable: `call qword [rip+disp32]; test eax,eax`.
+const GC_CONTEXT_CALL_PROLOGUE: usize = 8;
 
 fn valid_gc_context_call_site(bytes: &[u8]) -> bool {
-    bytes.starts_with(&GC_CONTEXT_CALL_SIGNATURE)
+    bytes.len() >= GC_CONTEXT_CALL_PROLOGUE
+        && bytes[0] == 0xff
+        && bytes[1] == 0x15
+        && bytes[6] == 0x85
+        && bytes[7] == 0xc0
 }
 
 static GC_CONTEXT_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -1122,8 +1127,6 @@ unsafe fn write_synthetic_dead_context_raw(context: *mut u8) {
         core::ptr::write_unaligned(context.add(WIN64_CONTEXT_FLAGS).cast::<u32>(), flags);
     }
 }
-
-const GC_THREADS_RVA: usize = 0x0e6b_b180;
 
 /// Find and unlink the record owning `handle` while Boehm holds its stop-world
 /// lock. Every access is a direct unaligned scalar access into static table /
@@ -1256,20 +1259,18 @@ pub unsafe extern "system" fn gc_context_detour() -> ! {
 
 #[allow(dead_code)]
 fn install_legacy_gc_context_guard() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
-        log::log_tag(
-            "gct",
-            "inline guard disabled: RVA/signature belongs to another GameAssembly build",
-        );
-        return false;
-    }
-    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, size)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "inline guard disabled: GameAssembly is not loaded");
         return false;
     };
-    let target = ga.wrapping_add(GC_CONTEXT_CALL_RVA);
+    let Some(anchors) = crate::buildinfo::gc_anchors(ga, size) else {
+        log::log_tag(
+            "gct",
+            "inline guard disabled: this GameAssembly build has no GC anchors",
+        );
+        return false;
+    };
+    let target = ga.wrapping_add(anchors.context_call as usize);
     let Some(head) = crate::safe::read_bytes(target, 14) else {
         log::log_tag(
             "gct",
@@ -1298,7 +1299,7 @@ fn install_legacy_gc_context_guard() -> bool {
         );
         return false;
     }
-    let table_base = ga.wrapping_add(GC_THREADS_RVA);
+    let table_base = ga.wrapping_add(anchors.threads as usize);
     // Resolve the table once. The hot path only performs a zero-timeout wait,
     // direct scalar memory accesses and lock-free counter updates.
     GC_THREADS_BASE.store(table_base, Ordering::Release);
@@ -1536,7 +1537,7 @@ pub fn install_gc_worker_trace() -> bool {
     {
         log::log_tag(
             "gct",
-            "worker trace disabled: RVA map belongs to another GameAssembly build",
+            "worker trace disabled: dispatcher/unregister RVAs are only known for build 648f61b1",
         );
         return false;
     }
@@ -2340,7 +2341,9 @@ mod tests {
 
         assert!(valid_gc_context_call_site(&loaded));
         assert_eq!(prologue_len(&loaded, 14), Some(14));
-        for index in 0..8 {
+        // The displacement belongs to the build; only the opcode and the
+        // test/jne shape must hold.
+        for index in [0usize, 1, 6, 7] {
             let mut changed = loaded;
             changed[index] ^= 1;
             assert!(
