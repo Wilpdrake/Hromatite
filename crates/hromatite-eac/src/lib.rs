@@ -19,6 +19,9 @@
 //!   epochs come from `BeginSession`/`EndSession`, every outgoing frame is
 //!   captured, and `ProtectMessage` lengths are counted (the 22-byte proof).
 //! * [`capture`] — the binary capture/replay format (`u32 len, u32 dt_ms, bytes`).
+//! * [`forge`] — `EAC_FORGE`: 512-byte heartbeats rebuilt from a live template.
+//! * [`report`] — `EAC_REPLAY_REPORT`: replay a whole recorded report instead,
+//!   retargeted to the live `SessionId`/`Sequence` with a fresh CRC.
 //!
 //! Only `hook`/`eos` contain `unsafe`; every block carries a `// SAFETY:`
 //! justification and stays inside the two `#[allow(unsafe_code)]` modules.
@@ -36,6 +39,7 @@ pub mod forge;
 #[allow(unsafe_code)]
 pub mod hook;
 pub mod payload;
+pub mod report;
 pub mod session;
 pub mod tailer;
 
