@@ -5,8 +5,11 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-/// `il2cpp_get_corlib` (`wYRnnMQuvvH`) on GameAssembly sha256 `648f61b1…`.
-const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_7f00;
+/// `il2cpp_get_corlib` (`wYRnnMQuvvH`). Moved by the 2026-11-17 patch; the new
+/// value comes from aligning the export block of both builds (182 of 184 gaps
+/// identical, two anchors — `il2cpp_gchandle_get_target` and
+/// `il2cpp_native_stack_trace` — map onto themselves).
+const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_9c70;
 
 fn corlib_getter_addr(base: usize, size: usize) -> Option<usize> {
     let address = base.checked_add(CORLIB_IMAGE_GETTER_RVA as usize)?;
