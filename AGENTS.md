@@ -3180,3 +3180,64 @@ il2cpp одними чтениями памяти (без единого выз�
   `create_function` в Ghidra) и **таблица-оракул** с эталонными значениями обеих
   сборок (`648f61b1…`, `245768f2…`) для регрессии генератора.
 - Ничего в коде не менялось; это документ-задание для следующего исполнителя.
+
+### 2026-11-17 — buildgen: офлайн-генератор per-build чисел (офлайн-половина готова)
+
+- Коммиты: **`a22b903`** (`feat(buildgen): derive every per-build anchor from
+  GameAssembly.dll`), **`c167f00`** (`chore(build): regenerate the descriptor
+  with buildgen and pin the oracle`).
+- **Что сделано.** `tools/buildgen.py` (stdlib, без внешних зависимостей)
+  собирает из файла `GameAssembly.dll` весь дескриптор сборки:
+  * экспортная карта — через `export_transfer.py` (якоря + монотонный DP +
+    изоморфизм графа вызовов), пишется `tools/data/il2cpp-export-names-<sha12>.json`;
+    если карта для этого sha уже лежит в `tools/data`, перенос не повторяется;
+  * 12 GC-якорей: `GC_threads[]` — цель `lea r14,[rip]` перед
+    `49 8B 1C F6`; `remove_thread` — откат до `0xCC`-паддинга; `skip_close`
+    проверяется по импорту (`call [IAT]`, слот = `CloseHandle`), `unlinked_next`
+    = +6, `after_unlink` = `48 8D 05`; `GC_suspend_all` — от xref'ов на строку
+    `SuspendThread loop failed` (−0x128), внутри проверяются `FF 15` (слот =
+    `GetThreadContext`), два `int3`, `add r15,8`, и кросс-чек: `lea r15` == threads,
+    `lea r12` == threads+0x800;
+  * 3 il2cpp-якоря: слот `s_TypeInfoDefinitionTable` (`mov rax,[rip]; lea
+    rsi,[rax+rdi*8]`), тело `image_get_class` (должно быть экспортом),
+    `get_corlib` — единственный naked-геттер, чей глобал больше 4 ГиБ (остальные
+    два отдают малые константы: `0x10000` — pool chunk, `50000000`);
+  * раскладки: `class_fields`/`class_methods` — нагрузка перед `48 89 07`
+    (публикация итератора), `fields_count` — `cmp word [class+disp],0`,
+    `field_stride` — `add rax,imm8` / `shl rcx,5` / `lea r,[r9+imm8]`
+    (все три формы встречаются: старая сборка 0x28 через lea, новая 0x20 через shl),
+    `field_name` — загрузка перед strcmp в `class_get_field_from_name`,
+    `field_type` — `mov r,[rdx+d]` перед `test dword [type+8],0x20000000` в
+    `field_get_value`, `field_offset` — `movsxd rax,[rcx+0x8]`,
+    `method_name/flags/param_count` — из `class_get_method_from_name`,
+    `method_parameters/param_count` — из `method_get_param`.
+- **Найденная ошибка в существующей карте (ICF).** На `245768f2…` перенесённое имя
+  `il2cpp_class_get_parent` указывает на `0x8ace0` — это тело `mov rax,[rcx+0x10]`,
+  т.е. `field_get_name`, а настоящий `class_get_parent` = `0x12c750` (`[rcx+0xa0]`).
+  Поэтому `class_parent` теперь берётся **из обхода родителя**
+  (`mov rbx,[rbx+disp]; test rbx,rbx` в `class_get_method_from_name`), а имя
+  используется только как сверка; расхождение пишется в `note`. Аналогично
+  `field_parent`: перенесённый `il2cpp_field_get_parent` даёт `0x20`, что не
+  влезает в `FieldInfo` новой сборки (stride 0x20) → `0` + note (в новой сборке
+  родителя поля нет, есть token@0x18).
+- **Чем подтверждено (реальные прогоны).** Обе сборки воспроизведены **точно**
+  по таблице-оракулу из задания:
+  * `648f61b1…`: все 12 GC (0xc417b0…0xe6bb100), 3 il2cpp
+    (0xc27f00 / 0xc2a330 / 0xe66c870), layout 0x10/0x18/0x50/0x80/0x98/0x124/0x28,
+    field 0x10/0x00/0x08/0x20, method 0x18/0x20/0x30/0x4c/0x52;
+  * `245768f2…`: 0xc43520…0xe6bd800, 0xc29c70 / 0xc2c0a0 / 0xe66f0d0,
+    layout 0xa0/0x18/0x58/0x88/0x98/0x124/0x20, field 0x00/0x10/0x08/0x00,
+    method 0x20/0x28/0x30/0x4c/0x52.
+  `tools/test_buildgen.py` — **11/11** (сканеры на синтетике + оба оракула);
+  `cargo test -p hromatite-abi` — **8/8** (новый тест оракула в `build.rs`);
+  host-тесты воркспейса: abi 8, core 127, dll 5, eac 32, features 15 — зелёные;
+  `cargo clippy --workspace --all-targets --release` — чисто;
+  `cargo build --workspace --release --target x86_64-pc-windows-gnu` — OK.
+- **Что осталось (рантайм-половина задания):** резидент пока не пишет кэш
+  `%USERPROFILE%\hromatite-build-<sha12>.json` и не логирует `buildgen: …`;
+  `raw::discover` по-прежнему со своими константами-расстояниями.  Отдельным
+  шагом: при старте считать sha, брать дескриптор из кэша, иначе `discover`,
+  иначе **не ставить патч** (fail closed).  Второй хвост — вывести
+  `GetCurrentPlayerLoop` / worker-dispatch / `GC_unregister` (сейчас последний
+  выводится как единственный вызывающий `remove_thread`: 0xc41920 / 0xc43734,
+  а `class_from_type` берётся из карты имён).
