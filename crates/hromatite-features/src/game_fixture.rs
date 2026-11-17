@@ -3,8 +3,8 @@
 use crate::test_support as fake;
 
 pub const CLASS_TABLE_RVA: u64 = 0x0e66_c870;
-pub const IMAGE_GET_CLASS_RVA: u64 = 0x00c2_a330;
-pub const CORLIB_GETTER_RVA: u64 = 0x00c2_7f00;
+pub const IMAGE_GET_CLASS_RVA: u64 = 0x00c2_c0a0;
+pub const CORLIB_GETTER_RVA: u64 = 0x00c2_9c70;
 pub const CLASS_TABLE: u64 = 0x0000_0003_0000_0000;
 pub const CORLIB_IMAGE: u64 = 0x0000_0005_0002_0000;
 pub const CAMERA_CLASS: u64 = 0x0000_0004_0001_0000;

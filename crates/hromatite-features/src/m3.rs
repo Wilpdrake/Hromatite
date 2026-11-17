@@ -7,8 +7,8 @@ use crate::memory::parse_addr;
 use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 
 pub const CLASS_TABLE_RVA: u32 = 0x0e66_c870;
-pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_a330;
-pub const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_7f00;
+pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_c0a0;
+pub const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_9c70;
 pub const CLASS_MAX: usize = 120_000;
 
 const CLASS_PARENT_OFF: usize = 0x10;
