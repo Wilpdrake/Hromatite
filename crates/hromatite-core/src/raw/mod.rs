@@ -16,6 +16,7 @@ pub mod gcguard;
 pub mod hook;
 pub mod hostapi;
 pub mod hot;
+pub mod iat;
 pub mod il2cpp;
 pub mod localmap;
 pub mod memory;

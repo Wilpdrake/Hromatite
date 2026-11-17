@@ -26,6 +26,7 @@ pub use raw::context as veh;
 pub use raw::ffi;
 pub use raw::hook;
 pub use raw::hot as hot_runtime;
+pub use raw::iat;
 pub use raw::il2cpp;
 pub use raw::memory as safe;
 pub use raw::photon;

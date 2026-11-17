@@ -110,6 +110,16 @@ const DEFAULT_DROP_MS: u64 = 0;
 
 /// Trampoline per hook slot; written once at install, read by every handler.
 static TRAMPS: [AtomicUsize; HK_COUNT] = [const { AtomicUsize::new(0) }; HK_COUNT];
+/// Original export address recovered from a caller's IAT slot.
+///
+/// The IAT walk records what used to sit in the slot, so a handler still reaches
+/// the real function when the inline patch of the export entry never landed (or
+/// landed after the game had already cached the pointer).
+static IAT_ORIG: [AtomicUsize; HK_COUNT] = [const { AtomicUsize::new(0) }; HK_COUNT];
+/// Slots the IAT walk patched, kept for a repeated [`install_iat`] call.
+static IAT_SLOTS: AtomicUsize = AtomicUsize::new(0);
+/// Set once the module walk ran, so a second caller does not re-walk or re-log.
+static IAT_TRIED: AtomicBool = AtomicBool::new(false);
 /// Calls seen per hook slot.
 static CALLS: [AtomicU64; HK_COUNT] = [const { AtomicU64::new(0) }; HK_COUNT];
 static OUT_MESSAGES: AtomicU64 = AtomicU64::new(0);
@@ -589,6 +599,9 @@ impl Hooks {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "-".to_string()),
         )];
+        // `EAC_IAT=1` evidence: which caller slots hold a detour and what they
+        // held before, so a live run can tell an IAT hit from an export hit.
+        lines.push(hromatite_core::iat::status());
         lines.push(format!(
             "eac.hooks: out={} in={} forwarded={} dropped={} replayed={} forged={} \
              seen512={} forge_seq={} begins={} ends={} addnotify={} protect={} \
@@ -793,16 +806,7 @@ impl Hooks {
             // message pump in the first live run (`EAC_FORGE=1`, zero frames).
         }
 
-        let handlers: [usize; HK_COUNT] = [
-            hook_begin as *const () as usize,
-            hook_end as *const () as usize,
-            hook_receive as *const () as usize,
-            hook_protect as *const () as usize,
-            hook_unprotect as *const () as usize,
-            hook_outlen as *const () as usize,
-            hook_add_notify as *const () as usize,
-            hook_poll_status as *const () as usize,
-        ];
+        let handlers = handlers();
 
         let mut reports = Vec::with_capacity(HK_COUNT);
         hook_log_blocking(&format!(
@@ -872,6 +876,15 @@ impl Hooks {
             }
         }
 
+        // `EAC_IAT=1`: also rewrite the *callers'* import slots. An inline patch
+        // of the export entry is only seen by a game that has not cached the
+        // pointer yet; VRChat caches `AddNotifyMessageToServer` about 20 s in,
+        // so a late injection needs the IAT hop to see any outbound frame.
+        if env_flag("EAC_IAT") {
+            let patched = install_iat();
+            hook_log_blocking(&format!("[iat] {patched} slot(s) now hold a detour"));
+        }
+
         // `EAC_M3_PROBE=1`: locate the il2cpp class table of *this* build.
         if env_flag("EAC_M3_PROBE") {
             for line in crate::m3probe::probe() {
@@ -912,11 +925,128 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------- iat
+
+/// Detours in [`EXPORTS`] order.
+///
+/// The inline install and the IAT walk have to agree on one handler per slot, so
+/// both read this table instead of keeping their own copy.
+#[cfg(windows)]
+fn handlers() -> [usize; HK_COUNT] {
+    [
+        hook_begin as *const () as usize,
+        hook_end as *const () as usize,
+        hook_receive as *const () as usize,
+        hook_protect as *const () as usize,
+        hook_unprotect as *const () as usize,
+        hook_outlen as *const () as usize,
+        hook_add_notify as *const () as usize,
+        hook_poll_status as *const () as usize,
+    ]
+}
+
+/// Emit one IAT line where a live run can find it: the hook log (next to the
+/// frame evidence) and `hromatite.log`.
+fn iat_line(line: &str) {
+    hook_log_blocking(line);
+    hromatite_core::log::log_tag("iat", line);
+}
+
+/// `EAC_IAT=1`: rewrite the EOSSDK import slots of every loaded module.
+///
+/// The inline hook of an export entry only wins if the game has not cached that
+/// pointer yet. VRChat registers `AddNotifyMessageToServer` ~20 s into the
+/// session and then calls through the cached value, which is why a late
+/// injection captured 0 outbound frames; the caller's IAT slot is re-read on
+/// every call, so patching it is immune to that cache.
+///
+/// Returns the number of slots that hold a detour. Idempotent, and a no-op
+/// outside the Windows target.
+pub fn install_iat() -> usize {
+    if IAT_TRIED.swap(true, Ordering::SeqCst) {
+        return IAT_SLOTS.load(Ordering::Relaxed);
+    }
+    #[cfg(windows)]
+    let patched = iat_install();
+    #[cfg(not(windows))]
+    let patched = 0;
+    IAT_SLOTS.store(patched, Ordering::Relaxed);
+    hook_log_blocking(&format!("[iat] patched {patched} slots"));
+    patched
+}
+
+/// Windows body of [`install_iat`].
+#[cfg(windows)]
+fn iat_install() -> usize {
+    use hromatite_core::iat;
+    let handlers = handlers();
+    // The three game modules first, then every other module of the process: an
+    // EOS plugin can live in a module we have never heard of, and the walk is
+    // cheap (one header read per module).
+    let mut names: Vec<String> = vec![
+        hromatite_core::GAME_EXE.to_string(),
+        hromatite_core::GAME_ASSEMBLY.to_string(),
+        hromatite_core::UNITY_PLAYER.to_string(),
+    ];
+    for (name, _, _) in hromatite_core::procs::modules(std::process::id()) {
+        if !names.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+            names.push(name);
+        }
+    }
+    let wanted: Vec<(&str, usize)> = EXPORTS.iter().copied().zip(handlers).collect();
+    let mut patched = 0usize;
+    for module in names {
+        // The SDK's own imports are the export entries already patched above;
+        // intercepting them again only risks re-entering a handler from its body.
+        if module.eq_ignore_ascii_case(EOSSDK) {
+            continue;
+        }
+        if !iat::module_imports(&module, EOSSDK) {
+            continue;
+        }
+        match iat::patch_module(&module, EOSSDK, &wanted) {
+            Ok(outcomes) => {
+                let mut found = 0usize;
+                for outcome in outcomes {
+                    if outcome.slot == 0 {
+                        continue; // this module simply does not import it
+                    }
+                    found += 1;
+                    if outcome.ok {
+                        patched += 1;
+                        // Keep the first real original: a later "already
+                        // patched" outcome would only record our own detour.
+                        if outcome.old != outcome.new
+                            && let Some(index) =
+                                EXPORTS.iter().position(|name| *name == outcome.func)
+                        {
+                            let _ = IAT_ORIG[index].compare_exchange(
+                                0,
+                                outcome.old,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    iat_line(&format!("[iat] {}", outcome.line(&module, EOSSDK)));
+                }
+                iat_line(&format!("[iat] {module}: {found} slot(s)"));
+            }
+            Err(reason) => iat_line(&format!("[iat] {module}: {reason}")),
+        }
+    }
+    patched
+}
+
 fn reset_state() {
     let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     for tramp in &TRAMPS {
         tramp.store(0, Ordering::Relaxed);
     }
+    // `IAT_ORIG` is *not* cleared: those slots already point at our handlers, so
+    // forgetting the original would leave a caller's next frame unrouted between
+    // this reset and the export patches below. A stale address still names the
+    // real function, which is exactly what the fallback needs.
     for calls in &CALLS {
         calls.store(0, Ordering::Relaxed);
     }
@@ -1074,7 +1204,13 @@ type Fn6 = unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64;
 /// `index` must be a hooked slot whose trampoline is published, and the caller
 /// must pass the original argument registers unchanged.
 unsafe fn call_tramp(index: usize, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
-    let tramp = TRAMPS[index].load(Ordering::Acquire);
+    let mut tramp = TRAMPS[index].load(Ordering::Acquire);
+    if tramp == 0 {
+        // IAT-only install (or a caller intercepted before the export patch
+        // landed): fall back to the address the caller's slot held, which is the
+        // real function and needs no relocation.
+        tramp = IAT_ORIG[index].load(Ordering::Acquire);
+    }
     if tramp == 0 {
         return 0;
     }
