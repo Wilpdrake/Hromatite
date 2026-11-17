@@ -819,7 +819,12 @@ impl Hooks {
                                 detail: if installed.copied == 0 {
                                     "reused trampoline".to_string()
                                 } else {
-                                    format!("prologue={} copied", installed.copied)
+                                    // the whole list, so a live log shows every
+                                    // relative field the trampoline had to move
+                                    format!(
+                                        "prologue={} copied, reloc[{}]",
+                                        installed.copied, installed.note
+                                    )
                                 },
                                 tramp: installed.tramp,
                             });

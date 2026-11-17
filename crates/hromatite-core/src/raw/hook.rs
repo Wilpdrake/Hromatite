@@ -313,6 +313,22 @@ fn adjusted_disp32(original: i32, delta: i64) -> Option<i32> {
     (original as i64 - delta).try_into().ok()
 }
 
+/// One relative field that the trampoline copy had to rewrite. Kept as data (not
+/// a log line) so the same builder is usable from host unit tests, which have
+/// no log file, and `prepare` can log exactly what it patched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reloc {
+    /// Offset of the instruction inside the copied prologue.
+    pub off: usize,
+    /// What was rewritten: `rel32`, `rel8`, `rip32`, `call-slot` or `jmp-slot`.
+    pub kind: &'static str,
+    /// Original displacement (`rel8`/`rel32`) or original absolute operand
+    /// address (`rip32`).
+    pub from: i64,
+    /// Displacement (or absolute branch target, for `*-slot`) written instead.
+    pub to: i64,
+}
+
 fn write_mode(offset_in_16: usize) -> Option<u8> {
     match offset_in_16 {
         0..=3 => Some(8),
@@ -324,6 +340,167 @@ fn write_mode(offset_in_16: usize) -> Option<u8> {
 fn branch_into_prologue(target: usize, prologue: usize, off: usize, len: usize, disp: i64) -> bool {
     let absolute = target as i64 + (off + len) as i64 + disp;
     absolute >= target as i64 && absolute < target as i64 + prologue as i64
+}
+
+/// Copy the decoded prologue to `tramp`, relocating every relative field.
+///
+/// The copy of `head[..span]` will live at `tramp`; the original code lives at
+/// `target`. Every relative field is re-encoded for the new address:
+///
+/// * `rel8` (`jcc`, `jmp`, `loop`) — same byte, displacement shifted by
+///   `-delta`; if it no longer reaches, the caller must find a closer page;
+/// * `rel32` (`call`, `jmp`, `jcc`) — same encoding while the new displacement
+///   fits i32. A `call`/`jmp` whose target left ±2 GiB is re-encoded as
+///   `FF 15`/`FF 25` `[rip+disp32]` over an 8-byte absolute slot parked *after*
+///   the jump back, so the branch is position independent again;
+/// * `rip`-relative `disp32` (any ModRM with `mod=00, rm=101`, which includes
+///   `FF /2` `call [rip+x]` and `FF /4` `jmp [rip+x]`) — displacement shifted by
+///   `-delta`; a `disp32` that cannot reach from the trampoline is a hard
+///   failure (the caller tries another page).
+///
+/// Returns the finished image (copy + absolute jump to `resume` + slots) and one
+/// [`Reloc`] per rewritten field, or the reason the prologue cannot be moved.
+fn build_trampoline(
+    head: &[u8],
+    insns: &[Insn],
+    target: usize,
+    tramp: usize,
+    resume: usize,
+) -> Result<(Vec<u8>, Vec<Reloc>), String> {
+    let delta = tramp as i64 - target as i64;
+    let span: usize = insns.iter().map(|i| i.len).sum();
+    let mut code: Vec<u8> = Vec::with_capacity(96);
+    let mut relocs: Vec<Reloc> = Vec::new();
+    // (offset of the FF 15/FF 25 disp32 inside `code`, absolute jump target)
+    let mut slots: Vec<(usize, u64)> = Vec::new();
+    let mut off = 0usize;
+
+    for ins in insns {
+        let chunk = head
+            .get(off..off + ins.len)
+            .ok_or_else(|| format!("instruction at +{off} runs past the snapshot"))?;
+        if let Some((ro, bits)) = ins.rel {
+            let disp = if bits == 32 {
+                i32::from_le_bytes(
+                    chunk
+                        .get(ro..ro + 4)
+                        .ok_or_else(|| format!("rel32 field at +{off} truncated"))?
+                        .try_into()
+                        .map_err(|_| format!("rel32 field at +{off} truncated"))?,
+                ) as i64
+            } else {
+                *chunk
+                    .get(ro)
+                    .ok_or_else(|| format!("rel8 field at +{off} truncated"))? as i8 as i64
+            };
+            let absolute = target as i64 + (off + ins.len) as i64 + disp;
+            if branch_into_prologue(target, span, off, ins.len, disp) {
+                return Err(format!(
+                    "relative branch at +{off} targets the overwritten prologue ({absolute:#x})"
+                ));
+            }
+            if bits == 32 {
+                match adjusted_disp32(disp as i32, delta) {
+                    Some(v) => {
+                        let at = code.len();
+                        code.extend_from_slice(chunk);
+                        code[at + ro..at + ro + 4].copy_from_slice(&v.to_le_bytes());
+                        relocs.push(Reloc {
+                            off,
+                            kind: "rel32",
+                            from: disp,
+                            to: i64::from(v),
+                        });
+                    }
+                    None => {
+                        // `call rel32`/`jmp rel32` that no longer reaches: branch
+                        // through an absolute slot instead of giving up.
+                        let kind = match chunk.first() {
+                            Some(0xE8) => "call-slot",
+                            Some(0xE9) => "jmp-slot",
+                            _ => {
+                                return Err(format!(
+                                    "rel32 branch at +{off} out of reach and not a call/jmp"
+                                ));
+                            }
+                        };
+                        let at = code.len();
+                        // FF 15/FF 25 [rip+disp32] — the disp32 is filled in
+                        // below, once the slots have an address.
+                        code.extend_from_slice(&[0xFF, if kind == "call-slot" { 0x15 } else { 0x25 }, 0, 0, 0, 0]);
+                        slots.push((at + 2, absolute as u64));
+                        relocs.push(Reloc {
+                            off,
+                            kind,
+                            from: disp,
+                            to: absolute,
+                        });
+                    }
+                }
+            } else {
+                let v = disp - delta;
+                if v < i8::MIN as i64 || v > i8::MAX as i64 {
+                    return Err(format!(
+                        "rel8 branch at +{off} needs a closer page (would be {v})"
+                    ));
+                }
+                let at = code.len();
+                code.extend_from_slice(chunk);
+                code[at + ro] = v as i8 as u8;
+                relocs.push(Reloc {
+                    off,
+                    kind: "rel8",
+                    from: disp,
+                    to: v,
+                });
+            }
+        } else if let Some(ro) = ins.rip {
+            let disp = i32::from_le_bytes(
+                chunk
+                    .get(ro..ro + 4)
+                    .ok_or_else(|| format!("rip disp32 at +{off} truncated"))?
+                    .try_into()
+                    .map_err(|_| format!("rip disp32 at +{off} truncated"))?,
+            ) as i64;
+            let absolute = target as i64 + (off + ins.len) as i64 + disp;
+            let v = adjusted_disp32(disp as i32, delta).ok_or_else(|| {
+                format!("rip-relative operand at +{off} ({absolute:#x}) is out of disp32 reach")
+            })?;
+            let at = code.len();
+            code.extend_from_slice(chunk);
+            code[at + ro..at + ro + 4].copy_from_slice(&v.to_le_bytes());
+            relocs.push(Reloc {
+                off,
+                kind: "rip32",
+                from: absolute,
+                to: i64::from(v),
+            });
+        } else {
+            code.extend_from_slice(chunk);
+        }
+        off += ins.len;
+    }
+    if off != span {
+        return Err(format!("decoded {off} bytes but the span is {span}"));
+    }
+
+    // absolute jump back: ff 25 00000000 <qword resume>
+    let body = code.len();
+    code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+    code.extend_from_slice(&(resume as u64).to_le_bytes());
+    // slots live after the jump back, so the fall-through never reaches them
+    let slot_base = body + 14;
+    for (index, (field, _absolute)) in slots.iter().enumerate() {
+        let slot_addr = tramp as i64 + (slot_base + 8 * index) as i64;
+        let next = tramp as i64 + (*field as i64 + 4);
+        let disp = i32::try_from(slot_addr - next)
+            .map_err(|_| format!("slot {index} is out of disp32 reach of its call"))?;
+        code[*field..*field + 4].copy_from_slice(&disp.to_le_bytes());
+    }
+    for (_, absolute) in &slots {
+        code.extend_from_slice(&absolute.to_le_bytes());
+    }
+    Ok((code, relocs))
 }
 
 /// Nearest `MEM_FREE` region within rel32 reach, via `VirtualQuery` (cheap: one
@@ -644,74 +821,55 @@ fn prepare_span(target: usize, min: usize) -> Option<Prep> {
     }
     let alloc_size = PAGE_SIZE;
     let tramp = alloc_near(target, alloc_size)?;
-    let delta = tramp as i64 - target as i64;
 
-    // relocated copy: fix rel8/rel32 and rip-relative disp32 by the shift
-    let mut code: Vec<u8> = Vec::with_capacity(64);
-    let mut off = 0usize;
-    for ins in &insns {
-        let mut chunk = head[off..off + ins.len].to_vec();
-        if let Some((ro, bits)) = ins.rel {
-            let displacement = if bits == 32 {
-                i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?) as i64
-            } else {
-                chunk[ro] as i8 as i64
-            };
-            if branch_into_prologue(target, prologue, off, ins.len, displacement) {
+    // relocated copy: every rel8/rel32 and every rip-relative disp32 (+ the
+    // absolute jump back to `target + prologue`) comes out of one builder
+    let (code, relocs) =
+        match build_trampoline(&head, &insns, target, tramp, target + prologue) {
+            Ok(v) => v,
+            Err(why) => {
                 log::log_tag(
                     "hook",
-                    &format!(
-                        "prepare: relative branch at {target:#x}+{off} targets the overwritten prologue, refusing"
-                    ),
+                    &format!("prepare: {target:#x} trampoline relocation failed: {why}"),
                 );
                 return None;
             }
-            if bits == 32 {
-                let Some(v) = adjusted_disp32(
-                    i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?),
-                    delta,
-                ) else {
-                    log::log_tag(
-                        "hook",
-                        &format!("prepare: rel32 at {target:#x}+{off} out of range"),
-                    );
-                    return None;
-                };
-                chunk[ro..ro + 4].copy_from_slice(&v.to_le_bytes());
-            } else {
-                let v = chunk[ro] as i8 as i64 - delta;
-                if v < i8::MIN as i64 || v > i8::MAX as i64 {
-                    log::log_tag(
-                        "hook",
-                        &format!(
-                            "prepare: rel8 at {target:#x}+{off} needs a closer page, refusing"
-                        ),
-                    );
-                    return None;
-                }
-                chunk[ro] = v as i8 as u8;
-            }
+        };
+    // One line per rewritten instruction: a live log then shows exactly which
+    // bytes of the prologue were adjusted and where they now point.
+    for r in &relocs {
+        match r.kind {
+            "rip32" => log::log_tag(
+                "hook",
+                &format!(
+                    "prepare: {target:#x}+{:<2} rip-relative operand {:#x} -> disp {:+}",
+                    r.off, r.from, r.to
+                ),
+            ),
+            "call-slot" | "jmp-slot" => log::log_tag(
+                "hook",
+                &format!(
+                    "prepare: {target:#x}+{:<2} {} absolute {:#x} (rel32 did not reach)",
+                    r.off, r.kind, r.to
+                ),
+            ),
+            kind => log::log_tag(
+                "hook",
+                &format!(
+                    "prepare: {target:#x}+{:<2} {kind} disp {:+} -> {:+}",
+                    r.off, r.from, r.to
+                ),
+            ),
         }
-        if let Some(ro) = ins.rip {
-            let Some(v) = adjusted_disp32(
-                i32::from_le_bytes(chunk[ro..ro + 4].try_into().ok()?),
-                delta,
-            ) else {
-                log::log_tag(
-                    "hook",
-                    &format!("prepare: rip disp at {target:#x}+{off} out of range"),
-                );
-                return None;
-            };
-            chunk[ro..ro + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        code.extend_from_slice(&chunk);
-        off += ins.len;
     }
-    // absolute jump back: ff 25 00000000 <qword target+prologue>
-    code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
-    let back = (target + prologue) as u64;
-    code.extend_from_slice(&back.to_le_bytes());
+    log::log_tag(
+        "hook",
+        &format!(
+            "prepare: {target:#x} prologue {prologue}B ({} insn, {} relocated) copied to {tramp:#x}",
+            insns.len(),
+            relocs.len()
+        ),
+    );
     if code.len() > RELAY_OFF {
         log::log_tag(
             "hook",
@@ -2498,5 +2656,149 @@ mod tests {
         assert!(!can_recover_boehm_abort(true, 0x123, 0x456));
         assert!(!can_recover_boehm_abort(true, 0, 0x123));
         assert!(can_recover_boehm_abort(true, 0x123, 0x123));
+    }
+
+    // ---- prologue relocation ------------------------------------------------
+
+    const BASE: usize = 0x1_0000_1000;
+
+    /// Build a trampoline image for `head` (span chosen by `decode_span`).
+    fn build(head: &[u8], min: usize, target: usize, tramp: usize) -> (Vec<u8>, Vec<Reloc>, usize) {
+        let (span, insns) = decode_span(head, min).expect("decodable prologue");
+        let (code, relocs) =
+            build_trampoline(head, &insns, target, tramp, target + span).expect("relocate");
+        (code, relocs, span)
+    }
+
+    #[test]
+    fn call_rel32_in_the_prologue_is_relocated_to_the_original_callee() {
+        // `mov eax,0x28 ; call rel32 ; sub rsp,0x28` — the BoringSSL `__chkstk`
+        // entry shape seen on `EVP_EncryptInit_ex`, 14 bytes.
+        let callee = BASE + 0x200;
+        let mut head = [0u8; 14];
+        head[0..5].copy_from_slice(&[0xB8, 0x28, 0, 0, 0]);
+        head[5] = 0xE8;
+        head[6..10].copy_from_slice(&((callee as i64 - (BASE + 10) as i64) as i32).to_le_bytes());
+        head[10..14].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+        let tramp = BASE + 0x1000;
+        let (code, relocs, span) = build(&head, 12, BASE, tramp);
+        assert_eq!(span, 14, "the whole call must be inside the copy");
+        assert_eq!(relocs.len(), 1);
+        assert_eq!(relocs[0].off, 5);
+        assert_eq!(relocs[0].kind, "rel32");
+
+        // The copy starts with the untouched `mov`, then a relocated `call`.
+        assert_eq!(&code[0..5], &[0xB8, 0x28, 0, 0, 0]);
+        assert_eq!(code[5], 0xE8);
+        let disp = i32::from_le_bytes(code[6..10].try_into().unwrap()) as i64;
+        assert_eq!(
+            (tramp + 5 + 5) as i64 + disp,
+            callee as i64,
+            "the relocated call must still reach the original callee"
+        );
+        // `sub rsp,0x28` follows at its new offset, then the absolute jump back.
+        assert_eq!(&code[10..14], &[0x48, 0x83, 0xEC, 0x28]);
+        assert_eq!(&code[14..16], &[0xFF, 0x25]);
+        // `ff 25 00000000` is six bytes; the absolute address follows it.
+        let back = u64::from_le_bytes(code[20..28].try_into().unwrap());
+        assert_eq!(back as usize, BASE + span, "the copy jumps back after the span");
+    }
+
+    #[test]
+    fn call_rel32_beyond_reach_goes_through_an_absolute_slot() {
+        // A trampoline more than 2 GiB away: the rel32 `call` cannot be re-encoded
+        // in place, so it becomes `FF 15 [rip+disp32]` over an 8-byte slot.
+        let callee = BASE + 0x200;
+        let mut head = [0u8; 14];
+        head[0..5].copy_from_slice(&[0xB8, 0x28, 0, 0, 0]);
+        head[5] = 0xE8;
+        head[6..10].copy_from_slice(&((callee as i64 - (BASE + 10) as i64) as i32).to_le_bytes());
+        head[10..14].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+        let tramp = BASE + 0x9000_0000;
+        let (code, relocs, _) = build(&head, 12, BASE, tramp);
+        assert_eq!(relocs[0].kind, "call-slot");
+        assert_eq!(&code[5..7], &[0xFF, 0x15], "call qword ptr [rip+disp32]");
+        let disp = i32::from_le_bytes(code[7..11].try_into().unwrap()) as i64;
+        let slot = ((tramp + 5 + 6) as i64 + disp) as usize;
+        // Slots live right after the absolute jump back (14 bytes at code[15]).
+        assert_eq!(slot, tramp + 15 + 14);
+        let stored = u64::from_le_bytes(code[29..37].try_into().unwrap());
+        assert_eq!(stored as usize, callee, "the slot holds the absolute callee");
+    }
+
+    #[test]
+    fn rip_relative_operands_keep_resolving_to_the_same_address() {
+        // `mov rax,[rip+0x300] ; lea rcx,[rip+0x400] ; ret` — both operands must
+        // resolve to their *original* absolute addresses from the copy.
+        let mut head = [0u8; 15];
+        head[0..3].copy_from_slice(&[0x48, 0x8B, 0x05]);
+        head[3..7].copy_from_slice(&0x300i32.to_le_bytes());
+        head[7..10].copy_from_slice(&[0x48, 0x8D, 0x0D]);
+        head[10..14].copy_from_slice(&0x400i32.to_le_bytes());
+        head[14] = 0xC3;
+
+        let tramp = BASE + 0x2000;
+        let (code, relocs, span) = build(&head, 12, BASE, tramp);
+        assert_eq!(span, 14, "two 7-byte instructions already cover 12 bytes");
+        assert_eq!(relocs.len(), 2);
+        assert!(relocs.iter().all(|r| r.kind == "rip32"));
+
+        // `mov rax,[rip+x]` is 7 bytes at copy offset 0.
+        let mov_disp = i32::from_le_bytes(code[3..7].try_into().unwrap()) as i64;
+        assert_eq!(
+            (tramp + 7) as i64 + mov_disp,
+            (BASE + 7 + 0x300) as i64,
+            "the data operand must not move with the trampoline"
+        );
+        // `lea rcx,[rip+x]` is 7 bytes at copy offset 7.
+        let lea_disp = i32::from_le_bytes(code[10..14].try_into().unwrap()) as i64;
+        assert_eq!(
+            (tramp + 14) as i64 + lea_disp,
+            (BASE + 14 + 0x400) as i64,
+            "the lea target must not move with the trampoline"
+        );
+    }
+
+    #[test]
+    fn jcc_rel8_is_still_relocated_and_reaches_the_same_target() {
+        // `test rcx,rcx ; jz +0x20` (5 bytes): the rel8 target is outside the
+        // prologue, so the branch byte is shifted by -delta and keeps its target.
+        let head = [0x48, 0x85, 0xC9, 0x74, 0x20, 0x90, 0x90];
+        let tramp = BASE + 0x10;
+        let (code, relocs, span) = build(&head, 5, BASE, tramp);
+        assert_eq!(span, 5);
+        assert_eq!(relocs[0].kind, "rel8");
+        assert_eq!(&code[..3], &[0x48, 0x85, 0xC9]);
+        assert_eq!(code[3], 0x74);
+        let disp = code[4] as i8 as i64;
+        assert_eq!(disp, 0x20 - 0x10, "the byte shifts by -delta");
+        assert_eq!(
+            (tramp + 5) as i64 + disp,
+            (BASE + 5 + 0x20) as i64,
+            "the jz target must be unchanged in absolute terms"
+        );
+    }
+
+    #[test]
+    fn rel8_branch_that_a_far_trampoline_cannot_reach_is_refused() {
+        let head = [0x48, 0x85, 0xC9, 0x74, 0x20];
+        let (span, insns) = decode_span(&head, 5).expect("decodable");
+        let err = build_trampoline(&head, &insns, BASE, BASE + 0x4000, BASE + span)
+            .expect_err("rel8 cannot reach 16 KiB away");
+        assert!(err.contains("rel8"), "{err}");
+    }
+
+    #[test]
+    fn prologue_never_splits_an_instruction() {
+        // 5 bytes land inside `sub rsp,0x128` (7 bytes) — the span must round up.
+        let head = [0x48, 0x81, 0xEC, 0x28, 0x01, 0x00, 0x00, 0xC3];
+        assert_eq!(prologue_len(&head, 5), Some(7));
+        // ...and inside a rip-relative `mov` (7 bytes) too.
+        let head = [0x48, 0x8B, 0x05, 0x10, 0x00, 0x00, 0x00, 0xC3];
+        assert_eq!(prologue_len(&head, 5), Some(7));
+        // A truncated decode at the end of the snapshot is not accepted.
+        assert_eq!(prologue_len(&[0x48, 0x81, 0xEC, 0x28], 5), None);
     }
 }
