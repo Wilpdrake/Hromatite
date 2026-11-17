@@ -1169,6 +1169,10 @@ fn work() {
     // never creates a worker and never replaces the resident GC guard.
     crate::raw::hot::tick();
 
+    // `EAC_M3_DUMP=<dir>`: one-shot raw dump of every candidate class table,
+    // so a post-update layout change can be read offline instead of guessed.
+    crate::raw::m3dump::tick();
+
     // `EAC_EVENTHOOK=1`: retry the managed Photon hook until Photon is
     // materialised. Internally throttled and a no-op once attached.
     crate::raw::photon::poll();
