@@ -176,6 +176,22 @@ static REPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `EAC_REPLAY_FROM_WRAPPER=1`: deliver from the SDK callback thread instead
 /// of a generator thread (the latter deadlocks the game's message pump).
 static REPORT_FROM_WRAPPER: AtomicBool = AtomicBool::new(false);
+/// `EAC_REPLAY_SELF=1`: at takeover, replay the *current* session's own stream
+/// from its last message start, taken out of the live capture file. This is the
+/// ASLR hypothesis: if the 16-byte records hash memory addresses, only frames
+/// of the same process can validate.
+static REPORT_SELF: AtomicBool = AtomicBool::new(false);
+/// Capture path of the running epoch, so `EAC_REPLAY_SELF` can read it back.
+static CAPTURE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// In-memory copy of the live 512-byte frames of this epoch.
+///
+/// `EAC_REPLAY_SELF` cannot read the capture file back: the writer holds it open
+/// under Wine and a second read only ever saw one frame (`replayself_0403`).
+/// Keeping the last `SELF_RING_MAX` frames in memory costs ~250 KiB and is the
+/// same data the stream needs.
+static SELF_RING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// How many live frames the ring keeps (≈ 17 minutes at 2007 ms).
+const SELF_RING_MAX: usize = 512;
 /// `EAC_REPLAY_FLAGS=live`: `Flags` come from the live template, not the file.
 static REPORT_FLAGS_LIVE: AtomicBool = AtomicBool::new(false);
 /// The report being replayed, or `None` outside `EAC_REPLAY_REPORT` runs.
@@ -644,6 +660,9 @@ impl Hooks {
         // that entry (a mode-3 reuse) no Begin event reaches this copy, so the
         // install moment is the fallback epoch start.
         SESSION_START_MS.store(now_ms(), Ordering::Relaxed);
+        if let Ok(mut slot) = CAPTURE_PATH.lock() {
+            *slot = Some(capture_path.clone());
+        }
         let sink = Sink {
             capture: CaptureFile::open(&capture_path).ok(),
             log: LogFile::open(log_path),
@@ -692,6 +711,7 @@ impl Hooks {
         // same reason. A failed load degrades to the template forge.
         REPORT_ENABLED.store(report_config.is_some(), Ordering::Relaxed);
         REPORT_FROM_WRAPPER.store(env_flag("EAC_REPLAY_FROM_WRAPPER"), Ordering::Relaxed);
+        REPORT_SELF.store(env_flag("EAC_REPLAY_SELF"), Ordering::Relaxed);
         REPORT_STOPPED.store(false, Ordering::Relaxed);
         REPORT_FLAGS_LIVE.store(
             report_config
@@ -1214,6 +1234,17 @@ unsafe extern "system" fn message_to_server_wrapper(info: *const MessageInfo) {
             }
         }
 
+        // Keep the live heartbeat frames for `EAC_REPLAY_SELF`.
+        if length as usize == forge::FRAME_LEN
+            && let Ok(mut ring) = SELF_RING.try_lock()
+        {
+            ring.push(data.to_vec());
+            let excess = ring.len().saturating_sub(SELF_RING_MAX);
+            if excess > 0 {
+                ring.drain(..excess);
+            }
+        }
+
         // `EAC_REPLAY_FROM_WRAPPER=1`: deliver from *this* thread, i.e. inside
         // the very callback the game registered, instead of from our own. A
         // separate thread deadlocked the game ~12 s after the takeover
@@ -1388,6 +1419,9 @@ fn forge_begin(now: u64) -> bool {
         return false;
     };
     let template = &learned.template;
+    if REPORT_SELF.load(Ordering::Relaxed) {
+        self_stream(template.session_id);
+    }
     let seq = template.next_seq();
     FORGE_NEXT_SEQ.store(seq, Ordering::Relaxed);
     FORGE_STARTED.store(true, Ordering::Release);
@@ -1424,6 +1458,61 @@ fn forge_begin(now: u64) -> bool {
         ));
     }
     true
+}
+
+/// Rebuild the replay stream out of this session's **own** captured frames.
+///
+/// The 16-byte records are the one part of the body the server can compare
+/// against something it knows, and if they hash memory (addresses included),
+/// frames of another process can never validate. This keeps the whole message
+/// the live module produced in *this* epoch, from its last `StartData` to the
+/// takeover point, and replays it with a fresh `Sequence`.
+fn self_stream(sid: u64) {
+    let Ok(ring) = SELF_RING.lock() else {
+        return;
+    };
+    let source = ring.clone();
+    drop(ring);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut started = false;
+    for data in source.iter() {
+        if data.len() != forge::FRAME_LEN {
+            continue;
+        }
+        let live = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
+        if live != sid {
+            continue;
+        }
+        let flags = u16::from_le_bytes([data[2], data[3]]);
+        if flags & forge::FLAG_START != 0 {
+            buf.clear();
+            started = true;
+        }
+        if !started {
+            continue;
+        }
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(data);
+    }
+    let report = report::Report::from_bytes(&buf);
+    if report.len() < 4 {
+        hook_log(format!(
+            "[report] self: only {} frames captured for sid=0x{sid:x} (ring={})",
+            report.len(),
+            source.len()
+        ));
+        return;
+    }
+    let total = report.len();
+    let bytes = buf.len();
+    if let Ok(mut slot) = REPORT_STREAM.lock() {
+        *slot = Some(report::Stream::new(report, 0, true));
+    }
+    hook_log_blocking(&format!(
+        "[report] self stream sid=0x{sid:x} frames={total} bytes={bytes} ring={}",
+        source.len()
+    ));
 }
 
 /// Forget the template when a new `BeginSession` opens the next epoch.
