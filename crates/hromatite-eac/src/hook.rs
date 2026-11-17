@@ -527,7 +527,7 @@ pub struct TableEntry {
 }
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     //! Minimal Win32 surface. No external crates: these are the declarations the
     //! shim used, and everything here is `extern "system"` (win64 ABI).
 

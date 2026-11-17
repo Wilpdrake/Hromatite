@@ -35,6 +35,8 @@ pub mod digest;
 #[allow(unsafe_code)]
 pub mod eos;
 pub mod eventlog;
+#[allow(unsafe_code)]
+pub mod evp;
 pub mod forge;
 #[allow(unsafe_code)]
 pub mod hook;

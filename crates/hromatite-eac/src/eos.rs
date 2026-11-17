@@ -173,6 +173,9 @@ static FORGE_CAPTURE: Mutex<Option<CaptureFile>> = Mutex::new(None);
 // thread's template learning.
 /// True when a recorded report is being replayed instead of building frames.
 static REPORT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// `EAC_REPLAY_FROM_WRAPPER=1`: deliver from the SDK callback thread instead
+/// of a generator thread (the latter deadlocks the game's message pump).
+static REPORT_FROM_WRAPPER: AtomicBool = AtomicBool::new(false);
 /// `EAC_REPLAY_FLAGS=live`: `Flags` come from the live template, not the file.
 static REPORT_FLAGS_LIVE: AtomicBool = AtomicBool::new(false);
 /// The report being replayed, or `None` outside `EAC_REPLAY_REPORT` runs.
@@ -270,7 +273,7 @@ impl LogFile {
 }
 
 /// Log a line from a handler without ever blocking the SDK thread.
-fn hook_log(line: impl AsRef<str>) {
+pub(crate) fn hook_log(line: impl AsRef<str>) {
     if let Ok(mut sink) = SINK.try_lock()
         && let Some(sink) = sink.as_mut()
     {
@@ -688,6 +691,7 @@ impl Hooks {
         // filesystem, and `install` already reads the replay capture for the
         // same reason. A failed load degrades to the template forge.
         REPORT_ENABLED.store(report_config.is_some(), Ordering::Relaxed);
+        REPORT_FROM_WRAPPER.store(env_flag("EAC_REPLAY_FROM_WRAPPER"), Ordering::Relaxed);
         REPORT_STOPPED.store(false, Ordering::Relaxed);
         REPORT_FLAGS_LIVE.store(
             report_config
@@ -845,6 +849,21 @@ impl Hooks {
                     detail: "export not found".to_string(),
                     tramp: 0,
                 }),
+            }
+        }
+
+        // `EAC_EVP=1`: probe the statically linked BoringSSL inside the SDK.
+        // Nothing here is a documented export, so each target is matched by its
+        // recorded prologue and skipped on drift. The point is the `Init`
+        // shape, whose `r9` is the AES-256-GCM key the protector really uses.
+        if env_flag("EAC_EVP") {
+            // SAFETY: `module` is the base of the loaded EOSSDK module, checked
+            // non-null above, and stays mapped for the process lifetime.
+            let evp_reports = unsafe { crate::evp::install(module as isize) };
+            let ok = evp_reports.iter().filter(|report| report.ok).count();
+            hook_log_blocking(&format!("[evp] installed {ok}/{}", evp_reports.len()));
+            for report in &evp_reports {
+                hook_log_blocking(&format!("[evp]{}", report.line()));
             }
         }
         Ok(reports)
@@ -1188,6 +1207,38 @@ unsafe extern "system" fn message_to_server_wrapper(info: *const MessageInfo) {
             }
         }
 
+        // `EAC_REPLAY_FROM_WRAPPER=1`: deliver from *this* thread, i.e. inside
+        // the very callback the game registered, instead of from our own. A
+        // separate thread deadlocked the game ~12 s after the takeover
+        // (`replayreport_0339` stopped logging with the process spinning, and
+        // `forge_0206` showed the same shape): the game's message pump is not
+        // reentrant from a foreign thread. Cadence becomes the live stream's
+        // ~2 s, which is exactly the module's cadence while it is alive.
+        if REPORT_FROM_WRAPPER.load(Ordering::Relaxed)
+            && REPORT_ENABLED.load(Ordering::Relaxed)
+            && FORGE_AFTER_MS.load(Ordering::Relaxed) != 0
+        {
+            if length as usize == forge::FRAME_LEN {
+                forge_learn(data, length as usize);
+                if forge_begin(ts) {
+                    emit_report_frame(ts);
+                }
+                return;
+            }
+            if !FORGE_KEEP_SMALL.load(Ordering::Relaxed) && FORGE_STARTED.load(Ordering::Relaxed) {
+                // The takeover owns the heartbeat channel; only the small
+                // control frames would still be forwarded, and only when
+                // `EAC_FORGE_KEEP_SMALL=1`. Keep both variants.
+                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped <= 20 || dropped.is_multiple_of(50) {
+                    hook_log(format!(
+                        "[report] live small frame dropped len={length} dropped={dropped}"
+                    ));
+                }
+                return;
+            }
+        }
+
         // `EAC_FORGE=1`: learn the heartbeat while the live stream is still
         // real, and from the moment the generator takes over let it own the
         // channel — a forwarded live frame would carry a `Sequence` the
@@ -1385,6 +1436,11 @@ fn forge_reset_epoch() {
 /// Start the generator thread once. It owns the cadence, so the heartbeat
 /// survives even if the EAC module stops calling the wrapper.
 fn spawn_forge_loop() {
+    if REPORT_FROM_WRAPPER.load(Ordering::Relaxed) {
+        // The wrapper itself advances the stream on every live heartbeat; a
+        // second generator would double-deliver and re-introduce the deadlock.
+        return;
+    }
     if FORGE_THREAD.swap(true, Ordering::SeqCst) {
         return;
     }
