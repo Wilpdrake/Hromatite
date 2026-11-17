@@ -31,16 +31,51 @@
 //! recorded bytes, which is the whole point: those are what the live session
 //! could not produce.
 //!
-//! Pure `std`, no atomics and no FFI: `eos` owns the clock, the environment and
-//! the delivery, this file owns the bytes.
+//! # `EAC_FORGE_STREAM=<path>` — the whole report, not one replay
+//!
+//! `EAC_REPLAY_REPORT` above is fidelity replay: the recorded bytes go out as
+//! they were, only the live identity is swapped in. `EAC_FORGE_STREAM` is the
+//! *generator*: the recording is treated as one message
+//! ([`Report::messages`]), and every frame is rebuilt — `Flags` with
+//! `StartData` on the first and `EndData` on the last frame of the message,
+//! `Sequence` strictly +1 from the generator's base, and the 32-byte message
+//! header of the first frame patched (`total_len` from the frame count,
+//! `counter` +1 per message, `nonce` +1 per report, `action`/`mode`/`kind` as
+//! recorded, per-session blob ours in the `notes`/`bump` modes). `nonce`,
+//! `counter` and the blob are the fields a frame source can actually keep
+//! *consistent* with the message it declares, which is what `EAC_FORGE`'s
+//! one-fragment-per-heartbeat never did (`findings/report_stream.md` §2).
+//!
+//! Two transports carry the result:
+//!
+//! * `EAC_FORGE_VIA=wrapper` (default) — the existing EOSSDK takeover: `eos`
+//!   pulls one frame per slot through [`Stream::next_frame`] and hands it to the
+//!   game's `MessageToServer` callback, exactly like `EAC_REPLAY_REPORT`;
+//! * `EAC_FORGE_VIA=photon` — a sender thread of our own renders the same
+//!   stream into the ring of [`crate::forge::push_frame`] and calls
+//!   [`hromatite_core::photon::emulate_send`], i.e. `RaiseEvent(253, {244: 66,
+//!   245: frame})` straight from the managed `PhotonPeer`. No EOS module and no
+//!   EOSSDK callback is involved, so the cadence has to come from the thread.
+//!   `EAC_FORGE_SPOOL=<path>` additionally appends every frame in capture
+//!   format, which is what `EAC_EVENT_SEND=<path>` (photon's own
+//!   `tick_send`) reads.
+//!
+//! Everything is `std`; the only shared state is the ring, and `eos` still owns
+//! the clock and the wrapper delivery.
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::capture::Frame;
 use crate::digest::crc32c_eac;
-use crate::forge::{CHECKSUM_OFFSET, FRAME_LEN, HEADER_LEN};
+use crate::forge::{
+    self, CHECKSUM_OFFSET, FLAG_END, FLAG_START, FRAME_LEN, HEADER_LEN, MSG_BLOB_LEN,
+    MSG_HEADER_LEN, StreamBody, StreamConfig, TotalMode, Via,
+};
 
 /// Default `EAC_REPLAY_AFTER_MS`: how long the live stream stays real.
 pub const DEFAULT_AFTER_MS: u64 = 30_000;
@@ -56,6 +91,12 @@ pub struct Report {
     skipped: usize,
     /// A record header or payload was cut off by the end of the file.
     truncated: bool,
+    /// Frame ranges of the messages the recording holds, split on `StartData`.
+    messages: Vec<Range<usize>>,
+    /// Set when `EAC_FORGE_STREAM` asked for a generated stream out of this
+    /// report; [`Stream::new`] then rebuilds every frame instead of replaying
+    /// it.
+    generator: Option<GenConfig>,
 }
 
 impl Report {
@@ -87,15 +128,80 @@ impl Report {
             at = end;
         }
         report.truncated = report.truncated || at < bytes.len();
+        report.messages = split_messages(&report.frames);
         report
     }
 
     /// Read and parse a report file.
+    ///
+    /// `EAC_FORGE_STREAM` is read here, once, at install time: when it names
+    /// this same file the report is armed as a generator source and
+    /// [`Stream::new`] rebuilds every frame instead of replaying it. With the
+    /// variable unset the report behaves exactly as before.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
         let mut file = File::open(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        Ok(Self::from_bytes(&bytes))
+        let mut report = Self::from_bytes(&bytes);
+        if let Some(config) = StreamConfig::parse(|name| std::env::var(name).ok()) {
+            if config.path == path {
+                forge::note(format!(
+                    "stream: armed {} frames={} messages={} body={} loop={} via={} total={}",
+                    path.display(),
+                    report.len(),
+                    report.messages().len(),
+                    config.body.as_str(),
+                    config.looping,
+                    config.via.as_str(),
+                    config.total.as_str()
+                ));
+                report.generator = Some(GenConfig::from_stream(&config));
+            } else {
+                forge::note(format!(
+                    "stream: EAC_FORGE_STREAM={} but loading {}; replaying as recorded",
+                    config.path.display(),
+                    path.display()
+                ));
+            }
+        }
+        Ok(report)
+    }
+
+    /// Parse a report from raw bytes and arm it as a stream source with `generator`.
+    ///
+    /// The explicit counterpart of the `EAC_FORGE_STREAM` path in
+    /// [`Report::load`], used by the tests and by anything that already knows
+    /// what it wants.
+    pub fn stream_from_bytes(bytes: &[u8], generator: GenConfig) -> Self {
+        let mut report = Self::from_bytes(bytes);
+        report.generator = Some(generator);
+        report
+    }
+
+    /// Length of the message `index` covers, in frames.
+    pub fn message_len(&self, index: usize) -> Option<usize> {
+        self.messages.get(index).map(Range::len)
+    }
+
+    /// Frame ranges of the messages in this report, in recorded order.
+    pub fn messages(&self) -> &[Range<usize>] {
+        &self.messages
+    }
+
+    /// True when this report was armed as an `EAC_FORGE_STREAM` source.
+    pub fn generates(&self) -> bool {
+        self.generator.is_some()
+    }
+
+    /// The generator configuration this report carries, if any.
+    pub fn generator(&self) -> Option<&GenConfig> {
+        self.generator.as_ref()
+    }
+
+    /// The recorded frame `index`, header included.
+    pub fn frame(&self, index: usize) -> Option<&[u8]> {
+        self.frames.get(index).map(|frame| frame.data.as_slice())
     }
 
     /// Number of replayable 512-byte frames.
@@ -132,6 +238,428 @@ impl Report {
     }
 }
 
+/// Split the recorded frames into messages on `StartData` (flag bit 0).
+///
+/// Every capture of `~/EAC-RE/evidence` shows exactly one `StartData` per
+/// report and none inside it, so a message is `[start..next_start)`. A
+/// recording that begins mid-message (a capture cut in the middle) yields a
+/// leading range that has no header of its own — the generator reads whatever
+/// the first frame of the range carries.
+fn split_messages(frames: &[Frame]) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    if frames.is_empty() {
+        return out;
+    }
+    let mut start = 0usize;
+    for (index, frame) in frames.iter().enumerate() {
+        let flags = u16::from_le_bytes([frame.data[2], frame.data[3]]);
+        if flags & FLAG_START != 0 && index > start {
+            out.push(start..index);
+            start = index;
+        }
+    }
+    out.push(start..frames.len());
+    out
+}
+
+/// Message boundary flags: `StartData` on the first frame, `EndData` on the
+/// last, every other bit kept from the recording.
+///
+/// The recording never shows `EndData` on a long report (the run ends before
+/// the report does, `findings/report_stream.md` §4.4), but a message that
+/// declares `total_len` and then simply stops is exactly what a receiver has to
+/// guess about — so the generator marks the boundary instead of hiding it.
+fn boundary_flags(source: u16, first: bool, last: bool) -> u16 {
+    let keep = source & !(FLAG_START | FLAG_END);
+    keep | if first { FLAG_START } else { 0 } | if last { FLAG_END } else { 0 }
+}
+
+/// How the `EAC_FORGE_STREAM` generator renders a recorded report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenConfig {
+    /// `EAC_FORGE_STREAM_BODY`.
+    pub body: StreamBody,
+    /// `EAC_FORGE_STREAM_LOOP`: start a new report instead of stopping.
+    pub looping: bool,
+    /// `EAC_FORGE_VIA`.
+    pub via: Via,
+    /// `EAC_FORGE_SID`: `SessionId` to write; `None` keeps the recording's.
+    pub session: Option<u64>,
+    /// `EAC_FORGE_SEQ`: first `Sequence`.
+    pub seq: Option<u64>,
+    /// `EAC_FORGE_NONCE`: first nonce; `None` continues the recording's.
+    pub nonce: Option<u32>,
+    /// `EAC_FORGE_COUNTER`: first message counter.
+    pub counter: Option<u32>,
+    /// `EAC_FORGE_BLOB`: the 48 bytes to write in the `notes`/`bump` modes.
+    pub blob: Option<[u8; MSG_BLOB_LEN]>,
+    /// `EAC_FORGE_STREAM_TOTAL`.
+    pub total: TotalMode,
+    /// Cadence of the Photon sender thread.
+    pub interval_ms: u64,
+    /// `EAC_FORGE_SPOOL`: capture-format copy of every emitted frame.
+    pub spool: Option<PathBuf>,
+}
+
+impl GenConfig {
+    /// The render settings of a parsed [`StreamConfig`].
+    pub fn from_stream(config: &StreamConfig) -> Self {
+        Self {
+            body: config.body,
+            looping: config.looping,
+            via: config.via,
+            session: config.session,
+            seq: config.seq,
+            nonce: config.nonce,
+            counter: config.counter,
+            blob: config.blob,
+            total: config.total,
+            interval_ms: config.interval_ms,
+            spool: config.spool.clone(),
+        }
+    }
+
+    /// Read `EAC_FORGE_STREAM*` from the process environment.
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        StreamConfig::parse(get).map(|config| Self::from_stream(&config))
+    }
+
+    /// Default render settings for a test or an explicit caller.
+    pub fn plain() -> Self {
+        Self {
+            body: StreamBody::Copy,
+            looping: false,
+            via: Via::Wrapper,
+            session: None,
+            seq: None,
+            nonce: None,
+            counter: None,
+            blob: None,
+            total: TotalMode::Frames,
+            interval_ms: forge::INTERVAL_MS,
+            spool: None,
+        }
+    }
+}
+
+/// Renders a recorded report as our own message stream.
+///
+/// Pure state machine, no locks and no I/O: [`Stream::next_frame`] owns one
+/// behind its mutex, and the Photon sender thread owns a second one built from
+/// the same report, so both transports produce the same bytes.
+#[derive(Clone, Debug)]
+pub struct Generator {
+    /// Recorded 512-byte frames, header included.
+    frames: Vec<Vec<u8>>,
+    /// Message ranges inside [`Generator::frames`].
+    messages: Vec<Range<usize>>,
+    /// Recorded message header of each message (zeroed when absent).
+    headers: Vec<forge::MessageHeader>,
+    body: StreamBody,
+    looping: bool,
+    total: TotalMode,
+    /// `SessionId` of the recording, used when no `EAC_FORGE_SID` is given.
+    recorded_session: u64,
+    /// `SessionId` we write (`EAC_FORGE_SID` wins).
+    session: u64,
+    /// Next `Sequence`.
+    seq: u64,
+    nonce: u32,
+    counter: u32,
+    /// The per-session blob to write in the `notes`/`bump` modes.
+    blob: [u8; MSG_BLOB_LEN],
+    msg: usize,
+    pos: usize,
+    emitted: u64,
+    loops: u64,
+    finished: bool,
+}
+
+impl Generator {
+    /// Build a generator from a parsed report; `None` when it has no frame.
+    pub fn new(report: &Report, config: &GenConfig) -> Option<Self> {
+        if report.frames.is_empty() {
+            return None;
+        }
+        let messages = if report.messages.is_empty() {
+            split_messages(&report.frames)
+        } else {
+            report.messages.clone()
+        };
+        let headers = messages
+            .iter()
+            .map(|range| {
+                report
+                    .frames
+                    .get(range.start)
+                    .and_then(|frame| forge::MessageHeader::parse(&frame.data[HEADER_LEN..]))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let first = report.frames.first()?;
+        let recorded_session = u64::from_le_bytes(first.data[4..12].try_into().ok()?);
+        let recorded_seq = u64::from_le_bytes(first.data[12..20].try_into().ok()?);
+        let session = config.session.unwrap_or(recorded_session);
+        let seq = config.seq.unwrap_or_else(|| recorded_seq.wrapping_add(1));
+        let nonce = config
+            .nonce
+            .unwrap_or_else(|| headers.first().map(|h| h.nonce).unwrap_or(0));
+        let counter = config
+            .counter
+            .unwrap_or_else(|| headers.first().map(|h| h.counter).unwrap_or(1));
+        let blob = config
+            .blob
+            .unwrap_or_else(|| forge::session_blob(session, nonce));
+        Some(Self {
+            frames: report.frames.iter().map(|f| f.data.clone()).collect(),
+            messages,
+            headers,
+            body: config.body,
+            looping: config.looping,
+            total: config.total,
+            recorded_session,
+            session,
+            seq,
+            nonce,
+            counter,
+            blob,
+            msg: 0,
+            pos: 0,
+            emitted: 0,
+            loops: 0,
+            finished: false,
+        })
+    }
+
+    /// Messages the recording holds.
+    pub fn messages(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Frames of the message currently being rendered.
+    pub fn message_len(&self) -> usize {
+        self.messages.get(self.msg).map(Range::len).unwrap_or(0)
+    }
+
+    /// Offset inside the current message.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Frames emitted so far.
+    pub fn emitted(&self) -> u64 {
+        self.emitted
+    }
+
+    /// Times the recording was restarted.
+    pub fn loops(&self) -> u64 {
+        self.loops
+    }
+
+    /// True once a non-looping generator ran out of frames.
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Frames left before the current pass ends.
+    pub fn remaining(&self) -> usize {
+        let left = self.message_len().saturating_sub(self.pos);
+        let rested: usize = self
+            .messages
+            .iter()
+            .skip(self.msg + 1)
+            .map(Range::len)
+            .sum();
+        left + rested
+    }
+
+    /// `SessionId` the generator writes (`EAC_FORGE_SID` or the recording's).
+    pub fn session(&self) -> u64 {
+        self.session
+    }
+
+    /// `SessionId` the recording itself carries.
+    pub fn recorded_session(&self) -> u64 {
+        self.recorded_session
+    }
+
+    /// The nonce the *next* message will carry.
+    pub fn nonce(&self) -> u32 {
+        self.nonce
+    }
+
+    /// The counter the *next* message will carry.
+    pub fn counter(&self) -> u32 {
+        self.counter
+    }
+
+    /// Restart at the first message, continuing the nonce/counter sequence.
+    pub fn rewind(&mut self) {
+        self.msg = 0;
+        self.pos = 0;
+        self.finished = false;
+        self.loops = 0;
+    }
+
+    /// Begin the next report: `nonce` +1, `counter` +1, blob re-derived.
+    fn next_report(&mut self) -> bool {
+        if !self.looping {
+            self.finished = true;
+            return false;
+        }
+        self.loops = self.loops.wrapping_add(1);
+        self.nonce = self.nonce.wrapping_add(1);
+        self.counter = self.counter.wrapping_add(1);
+        self.blob = forge::session_blob(self.session, self.nonce);
+        self.msg = 0;
+        self.pos = 0;
+        true
+    }
+
+    /// Render the next frame of the stream.
+    ///
+    /// `None` when the report is exhausted and `EAC_FORGE_STREAM_LOOP` is off.
+    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.messages.get(self.msg) {
+                Some(range) if self.pos < range.len() => break,
+                Some(_) => {
+                    // A message ended: the next one starts with its own counter
+                    // and `StartData`.
+                    self.msg += 1;
+                    self.pos = 0;
+                    if self.msg < self.messages.len() {
+                        self.counter = self.counter.wrapping_add(1);
+                        continue;
+                    }
+                    if !self.next_report() {
+                        return None;
+                    }
+                    continue;
+                }
+                None => {
+                    if !self.next_report() {
+                        return None;
+                    }
+                }
+            }
+        }
+        let range = self.messages.get(self.msg)?.clone();
+        let length = range.len();
+        let first = self.pos == 0;
+        let last = self.pos + 1 == length;
+        let index = range.start + self.pos;
+        let mut body = self.frames.get(index)?[HEADER_LEN..].to_vec();
+
+        if first {
+            let mut header = self.headers.get(self.msg).copied().unwrap_or_default();
+            header.total_len = match self.total {
+                TotalMode::Frames => forge::message_total_len(length),
+                TotalMode::Recorded => header.total_len,
+            };
+            header.counter = self.counter;
+            header.nonce = self.nonce;
+            let blob = if self.body.owns_blob() {
+                Some(self.blob)
+            } else {
+                None
+            };
+            header.write(&mut body, blob.as_ref());
+        }
+        if self.body.bumps_records() {
+            // The message header sits in front of the records only in the frame
+            // that starts the message.
+            let first_record = if first { MSG_HEADER_LEN } else { 0 };
+            forge::bump_records(&mut body, first_record, self.emitted as u32 + 1);
+        }
+
+        let source_flags =
+            u16::from_le_bytes([self.frames.get(index)?[2], self.frames.get(index)?[3]]);
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let frame = forge::seal_frame(
+            self.session,
+            seq,
+            boundary_flags(source_flags, first, last),
+            &body,
+        );
+        self.pos += 1;
+        self.emitted = self.emitted.wrapping_add(1);
+        debug_assert_eq!(frame.len(), FRAME_LEN);
+        Some(frame)
+    }
+}
+
+/// Spawn the Photon sender once per process (`EAC_FORGE_VIA=photon`).
+///
+/// The thread owns its own [`Generator`], pushes every frame into the ring of
+/// [`forge::push_frame`] and drains it through
+/// [`hromatite_core::photon::emulate_send`], so the cadence is ours rather than
+/// the live stream's — nothing else runs when the EOS module is gone.
+fn spawn_photon_sender(report: &Report, config: &GenConfig) {
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    if !config.via.uses_photon() || SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(mut generator) = Generator::new(report, config) else {
+        SPAWNED.store(false, Ordering::SeqCst);
+        return;
+    };
+    let interval = config.interval_ms.max(50);
+    let spool = config.spool.clone();
+    let frames = generator.messages();
+    let total = report.len();
+    forge::note(format!(
+        "photon sender: messages={frames} frames={total} sid=0x{:x} recorded_sid=0x{:x} \
+         interval={interval} ms body={} loop={} spool={}",
+        generator.session(),
+        generator.recorded_session(),
+        config.body.as_str(),
+        config.looping,
+        spool
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    let spawned = std::thread::Builder::new()
+        .name("eac-report-photon".to_string())
+        .spawn(move || {
+            let mut unarmed = 0u64;
+            loop {
+                let Some(frame) = generator.next_frame() else {
+                    forge::note(format!(
+                        "photon sender: stream exhausted after {} frame(s), loops={}",
+                        generator.emitted(),
+                        generator.loops()
+                    ));
+                    return;
+                };
+                if let Some(path) = spool.as_ref()
+                    && let Err(error) = forge::append_spool(path, interval as u32, &frame)
+                {
+                    forge::note(format!("photon sender: spool {error}"));
+                }
+                forge::push_frame(frame);
+                let delivery = forge::pump_photon();
+                if delivery.unarmed {
+                    unarmed += 1;
+                    if unarmed <= 3 || unarmed.is_multiple_of(60) {
+                        forge::note(format!(
+                            "photon sender: no live event 66 template yet ({unarmed} frame(s) \
+                             queued, ring={})",
+                            forge::ring_len()
+                        ));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(interval));
+            }
+        });
+    if spawned.is_err() {
+        SPAWNED.store(false, Ordering::SeqCst);
+        forge::note("photon sender: thread spawn failed");
+    }
+}
+
 /// One `EAC_REPLAY_*` frame handed out by a [`Stream`], already copied out of
 /// the report so the caller can retarget it without holding the lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +676,11 @@ pub struct Slot {
 
 /// Cursor over a [`Report`]: hands out frames in order and restarts at `start`
 /// when looping.
+///
+/// With `EAC_FORGE_STREAM` armed the frames it hands out are not the recorded
+/// bytes but freshly built ones ([`Generator`]); `index`/`of` then describe the
+/// position inside the message being rendered, and `wraps` counts finished
+/// reports.
 #[derive(Debug)]
 pub struct Stream {
     report: Report,
@@ -156,16 +689,39 @@ pub struct Stream {
     looping: bool,
     finished: bool,
     wraps: u64,
+    generator: Option<Generator>,
 }
 
 impl Stream {
     /// A stream starting at `start` (clamped into the report) that either
     /// restarts at `start` once the report ends (`looping`) or stops.
+    ///
+    /// A report armed by [`Report::load`] with `EAC_FORGE_STREAM` gets a
+    /// [`Generator`] instead of the plain cursor — and then `start`
+    /// (`EAC_REPLAY_START`) is ignored, because a generated stream always starts
+    /// at the first message of the recording. `EAC_FORGE_VIA=photon`
+    /// additionally starts the report's Photon sender thread (once per
+    /// process: a second stream is another epoch, not a second emitter).
     pub fn new(report: Report, start: usize, looping: bool) -> Self {
         let start = if report.frames.is_empty() {
             0
         } else {
             start.min(report.frames.len() - 1)
+        };
+        let generator = match report.generator.as_ref() {
+            Some(config) => {
+                spawn_photon_sender(&report, config);
+                Generator::new(&report, config)
+            }
+            None => None,
+        };
+        let looping = if generator.is_some() {
+            report
+                .generator
+                .as_ref()
+                .is_some_and(|config| config.looping)
+        } else {
+            looping
         };
         Self {
             report,
@@ -174,7 +730,13 @@ impl Stream {
             looping,
             finished: false,
             wraps: 0,
+            generator,
         }
+    }
+
+    /// True when this stream builds frames instead of replaying them.
+    pub fn generates(&self) -> bool {
+        self.generator.is_some()
     }
 
     /// Frames in the report.
@@ -204,7 +766,10 @@ impl Stream {
 
     /// Frames left before the report would end.
     pub fn remaining(&self) -> usize {
-        self.report.frames.len().saturating_sub(self.cursor)
+        match self.generator.as_ref() {
+            Some(generator) => generator.remaining(),
+            None => self.report.frames.len().saturating_sub(self.cursor),
+        }
     }
 
     /// True once a non-looping stream ran out of frames.
@@ -218,14 +783,40 @@ impl Stream {
         self.cursor = self.start;
         self.finished = false;
         self.wraps = 0;
+        if let Some(generator) = self.generator.as_mut() {
+            generator.rewind();
+        }
     }
 
-    /// Take the next recorded frame.
+    /// Take the next frame.
     ///
     /// Returns `None` only when the report is empty or a non-looping stream is
     /// exhausted; the first `None` sets [`Stream::finished`], later calls keep
     /// returning `None` without further logging on the caller's side.
     pub fn next_frame(&mut self) -> Option<Slot> {
+        if let Some(generator) = self.generator.as_mut() {
+            let index = generator.position();
+            let of = generator.message_len();
+            // Take the frame first, then mirror the state *even on exhaustion*:
+            // `eos` reads `finished()` to log the stop exactly once.
+            let frame = generator.next_frame();
+            self.cursor = generator.position();
+            self.wraps = generator.loops();
+            self.finished = generator.finished();
+            let frame = frame?;
+            let dt_ms = self
+                .report
+                .frames
+                .get(index)
+                .map(|frame| frame.dt_ms)
+                .unwrap_or(forge::INTERVAL_MS as u32);
+            return Some(Slot {
+                index,
+                of,
+                dt_ms,
+                data: frame,
+            });
+        }
         if self.report.frames.is_empty() {
             self.finished = true;
             return None;
@@ -289,18 +880,34 @@ pub struct Config {
     pub after_ms: u64,
     /// `EAC_REPLAY_MIN_FRAMES`, default [`DEFAULT_MIN_FRAMES`].
     pub min_frames: u64,
+    /// `EAC_FORGE_STREAM*`, when that mode asked for this report: the parsed
+    /// [`StreamConfig`] plus the render settings it implies.
+    pub stream: Option<StreamConfig>,
 }
 
 impl Config {
-    /// Parse the environment; `None` when `EAC_REPLAY_REPORT` is absent or
-    /// blank (then the generator keeps building frames from the template).
+    /// Parse the environment; `None` when neither `EAC_REPLAY_REPORT` nor
+    /// `EAC_FORGE_STREAM` is set (then the generator keeps building frames from
+    /// the template).
+    ///
+    /// `EAC_FORGE_STREAM=<path>` is the same takeover with a different frame
+    /// source, so it arms the same machinery: the path doubles as the report
+    /// path, `EAC_FORGE_STREAM_LOOP` as the loop switch, and the stream's own
+    /// deadline/readiness knobs win over the `EAC_REPLAY_*` ones (which stay the
+    /// fallback, as before).
     ///
     /// Takes a lookup so the function is testable without the process
     /// environment, exactly like [`crate::forge::Config::parse`].
     pub fn parse(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let stream = StreamConfig::parse(&get);
         let path = get("EAC_REPLAY_REPORT")
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())?;
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                stream
+                    .as_ref()
+                    .map(|config| config.path.display().to_string())
+            })?;
         let flag = |name: &str| {
             get(name)
                 .map(|value| {
@@ -314,15 +921,20 @@ impl Config {
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .unwrap_or(default)
         };
+        let (stream_loop, stream_after, stream_min) = stream
+            .as_ref()
+            .map(|config| (config.looping, config.after_ms, config.min_frames))
+            .unwrap_or((false, DEFAULT_AFTER_MS, DEFAULT_MIN_FRAMES));
         Some(Self {
             path: PathBuf::from(path),
-            looping: flag("EAC_REPLAY_REPORT_LOOP"),
+            looping: flag("EAC_REPLAY_REPORT_LOOP") || stream_loop,
             flags_live: get("EAC_REPLAY_FLAGS")
                 .map(|value| value.trim().eq_ignore_ascii_case("live"))
                 .unwrap_or(false),
             start: number("EAC_REPLAY_START", 0) as usize,
-            after_ms: number("EAC_REPLAY_AFTER_MS", DEFAULT_AFTER_MS),
-            min_frames: number("EAC_REPLAY_MIN_FRAMES", DEFAULT_MIN_FRAMES),
+            after_ms: number("EAC_REPLAY_AFTER_MS", stream_after),
+            min_frames: number("EAC_REPLAY_MIN_FRAMES", stream_min),
+            stream,
         })
     }
 }
@@ -524,6 +1136,476 @@ mod tests {
         assert_eq!(explicit.start, 5);
         assert_eq!(explicit.after_ms, 1_000);
         assert_eq!(explicit.min_frames, 3);
+    }
+
+    // ---------------------------------------------------------- stream mode
+
+    /// The live capture every invariant below is proven against.
+    const REAL_CAPTURE: &str = "/home/wilpdrake/EAC-RE/evidence/control_0009/capture.bin";
+
+    /// The whole recorded report of that capture (message 1, 117 frames).
+    const REPORT_FULL: &str = "/home/wilpdrake/EAC-RE/evidence/report_full/report_a_sid158b.bin";
+
+    fn real_capture() -> Option<Vec<u8>> {
+        std::fs::read(REAL_CAPTURE).ok()
+    }
+
+    fn crc_holds(frame: &[u8]) -> bool {
+        if frame.len() != FRAME_LEN {
+            return false;
+        }
+        let stored = u32::from_le_bytes(
+            frame[CHECKSUM_OFFSET..HEADER_LEN]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let mut zeroed = frame.to_vec();
+        zeroed[CHECKSUM_OFFSET..HEADER_LEN].fill(0);
+        crc32c_eac(&zeroed) == stored
+    }
+
+    fn flags_of(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[2], frame[3]])
+    }
+
+    fn seq_of(frame: &[u8]) -> u64 {
+        u64::from_le_bytes(frame[12..20].try_into().expect("8 bytes"))
+    }
+
+    fn sid_of(frame: &[u8]) -> u64 {
+        u64::from_le_bytes(frame[4..12].try_into().expect("8 bytes"))
+    }
+
+    /// Every invariant the model claims about a recorded report, checked on one
+    /// file. Returns the number of individual assertions that held.
+    ///
+    /// The model (`findings/report_stream.md`, `frame_structure.md`) says:
+    ///
+    /// 1. the stream is made of `Version == 2` 512-byte frames, each with a
+    ///    CRC-32C (init/xorout 0) over the frame with the field zeroed;
+    /// 2. `StartData` (bit 0) marks the first frame of a report and appears
+    ///    exactly once per report — never inside it;
+    /// 3. `Sequence` only grows, +1 per frame that the capture actually holds
+    ///    (a dropped record leaves a gap, never a rewind);
+    /// 4. the frame that starts a report carries the 32-byte plaintext message
+    ///    header: `mode == 5`, `kind == 3`, `counter == 1` for the first report,
+    ///    a per-report `nonce` and a per-session 48-byte blob constant across
+    ///    the session's reports;
+    /// 5. `total_len` is the byte count of a *block* of whole 488-byte
+    ///    fragments plus a partial tail, so it decomposes as
+    ///    `k * 488 + tail` with `1 <= tail <= 488`.
+    fn validate_recorded(report: &Report) -> usize {
+        let mut checks = 0usize;
+        assert_eq!(report.len(), 121, "512-byte frames in the capture");
+        assert_eq!(report.skipped(), 49, "24/144-byte ACK and protect frames");
+        assert!(!report.truncated(), "the capture ends on a record boundary");
+        checks += 3;
+
+        // (1) every frame is a Version 2 frame with a valid CRC.
+        for index in 0..report.len() {
+            let frame = report.frame(index).expect("frame");
+            assert_eq!(
+                u16::from_le_bytes([frame[0], frame[1]]),
+                2,
+                "frame {index} version"
+            );
+            assert!(crc_holds(frame), "frame {index} CRC-32C");
+            checks += 2;
+        }
+
+        // (2) StartData exactly once per report, never inside one.
+        let starts: Vec<usize> = (0..report.len())
+            .filter(|index| flags_of(report.frame(*index).expect("frame")) & FLAG_START != 0)
+            .collect();
+        assert_eq!(starts, vec![0, 117], "two reports: 117 + 4 recorded frames");
+        assert_eq!(report.messages(), &[0..117, 117..121], "message ranges");
+        checks += 3;
+
+        // (3) Sequence only grows; a gap is a lost record, not a rewind.
+        let mut gaps = 0usize;
+        for index in 1..report.len() {
+            let previous = seq_of(report.frame(index - 1).expect("frame"));
+            let current = seq_of(report.frame(index).expect("frame"));
+            assert!(current > previous, "frame {index}: {previous} -> {current}");
+            if current != previous + 1 {
+                gaps += 1;
+            }
+            checks += 1;
+        }
+        assert_eq!(gaps, 6, "six records lost to capture epochs");
+        checks += 1;
+        // The two reports are exactly one report apart (144 frames of slot).
+        assert_eq!(
+            seq_of(report.frame(117).expect("frame")) - seq_of(report.frame(0).expect("frame")),
+            144,
+            "report period"
+        );
+        checks += 1;
+
+        // (4) the message header of both starts.
+        let first = forge::MessageHeader::parse(&report.frame(0).expect("frame")[HEADER_LEN..])
+            .expect("first header");
+        let second = forge::MessageHeader::parse(&report.frame(117).expect("frame")[HEADER_LEN..])
+            .expect("second header");
+        assert_eq!(first.mode, 5);
+        assert_eq!(first.kind, 3);
+        assert_eq!(first.counter, 1, "first report of the session");
+        assert_eq!(second.counter, 1, "counter restarts per report here");
+        assert_eq!(first.action, 13, "first report action");
+        assert_eq!(second.action, 4, "later report action");
+        assert_ne!(first.nonce, second.nonce, "nonce is per report");
+        checks += 7;
+
+        let blob_a = forge::recorded_blob(&report.frame(0).expect("frame")[HEADER_LEN..])
+            .expect("first blob");
+        let blob_b = forge::recorded_blob(&report.frame(117).expect("frame")[HEADER_LEN..])
+            .expect("second blob");
+        assert_eq!(blob_a, blob_b, "the per-session blob is constant");
+        assert_eq!(
+            &blob_a[..4],
+            &first.blob.to_le_bytes(),
+            "blob starts at 0x1C"
+        );
+        checks += 2;
+
+        // (5) `total_len` is a byte count of whole fragments plus a tail.
+        for (name, header) in [("first", first), ("second", second)] {
+            let total = header.total_len as usize;
+            let found = (1..=8usize)
+                .filter_map(|k| {
+                    let tail = total.checked_sub(k * 488)?;
+                    (1..=488).contains(&tail).then_some((k, tail))
+                })
+                .next();
+            assert_eq!(
+                found,
+                Some(if name == "first" { (3, 128) } else { (4, 350) }),
+                "{name} total_len {total:#x}"
+            );
+            checks += 1;
+        }
+
+        // The cadence the generator reproduces.
+        let mut dts: Vec<u32> = report.dt_ms().collect();
+        dts.sort_unstable();
+        assert_eq!(dts[dts.len() / 2], 2_007, "median inter-frame interval");
+        checks += 1;
+        checks
+    }
+
+    #[test]
+    fn the_real_capture_holds_every_invariant_the_stream_model_claims() {
+        let Some(bytes) = real_capture() else {
+            return; // the evidence tree is optional on other machines
+        };
+        let report = Report::from_bytes(&bytes);
+        let checks = validate_recorded(&report);
+        println!(
+            "{REAL_CAPTURE}: {} frames, {} message(s), {checks} invariants held",
+            report.len(),
+            report.messages().len()
+        );
+        assert!(checks >= 250, "the validator ran, not short-circuited");
+    }
+
+    #[test]
+    fn the_generator_renders_the_recorded_report_as_one_consistent_message() {
+        let Some(bytes) = real_capture() else {
+            return;
+        };
+        let recorded = Report::from_bytes(&bytes);
+        let mut config = GenConfig::plain();
+        config.session = Some(0x0bad_c0de);
+        config.seq = Some(1_000);
+        let mut generator = Generator::new(&recorded, &config).expect("the capture has frames");
+        assert_eq!(generator.messages(), 2);
+        assert_eq!(generator.message_len(), 117);
+        assert_eq!(generator.session(), 0x0bad_c0de);
+        assert_eq!(generator.nonce(), 0x94bb_79c6, "continues the recording");
+        assert_eq!(generator.counter(), 1);
+
+        let mut frames = Vec::new();
+        while let Some(frame) = generator.next_frame() {
+            if frames.len() == 117 {
+                break;
+            }
+            frames.push(frame);
+        }
+        assert_eq!(frames.len(), 117, "one message, no loop");
+        assert!(generator.finished() || frames.len() == 117);
+
+        let mut checks = 0usize;
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.len(), FRAME_LEN);
+            assert!(crc_holds(frame), "frame {index} CRC");
+            assert_eq!(sid_of(frame), 0x0bad_c0de, "frame {index} session");
+            assert_eq!(seq_of(frame), 1_000 + index as u64, "frame {index} seq +1");
+            let flags = flags_of(frame);
+            assert_eq!(
+                flags & FLAG_START != 0,
+                index == 0,
+                "StartData only on the first frame"
+            );
+            assert_eq!(
+                flags & FLAG_END != 0,
+                index == 116,
+                "EndData only on the last frame"
+            );
+            checks += 6;
+        }
+
+        // The body is the recording's, byte for byte, outside the 32-byte
+        // message header of the first frame.
+        let source = recorded.frame(0).expect("frame");
+        // Everything after the message header is the recording's.
+        assert_eq!(
+            &frames[0][HEADER_LEN + MSG_HEADER_LEN..],
+            &source[HEADER_LEN + MSG_HEADER_LEN..],
+            "records untouched in copy mode"
+        );
+        for (index, frame) in frames.iter().enumerate().take(117).skip(1) {
+            assert_eq!(
+                &frame[HEADER_LEN..],
+                &recorded.frame(index).expect("frame")[HEADER_LEN..],
+                "frame {index} body is the recording's"
+            );
+            checks += 1;
+        }
+
+        let header =
+            forge::MessageHeader::parse(&frames[0][HEADER_LEN..]).expect("generated header");
+        assert_eq!(
+            header.total_len,
+            117 * FRAME_LEN as u32 - HEADER_LEN as u32,
+            "total_len follows the frame count"
+        );
+        assert_eq!(header.counter, 1);
+        assert_eq!(header.nonce, 0x94bb_79c6);
+        assert_eq!(header.action, 13, "action as recorded");
+        assert_eq!(header.mode, 5);
+        assert_eq!(header.kind, 3);
+        assert_eq!(
+            forge::recorded_blob(&frames[0][HEADER_LEN..]),
+            forge::recorded_blob(&source[HEADER_LEN..]),
+            "copy mode keeps the recorded blob"
+        );
+        checks += 8;
+
+        // The EOSSDK path composes: `eos` retargets whatever the stream hands it
+        // to the *live* session, which must keep our flags and body and only
+        // move the identity (that is `retarget`, unchanged).
+        let live = retarget(&frames[0], 0xfeed_face, 4_242, None).expect("512-byte frame");
+        assert_eq!(sid_of(&live), 0xfeed_face);
+        assert_eq!(seq_of(&live), 4_242);
+        assert_eq!(flags_of(&live), flags_of(&frames[0]), "flags kept");
+        assert_eq!(&live[HEADER_LEN..], &frames[0][HEADER_LEN..], "body kept");
+        assert!(crc_holds(&live), "retarget reseals the checksum");
+        checks += 6;
+
+        println!("generator: 117-frame message, {checks} invariants held");
+        assert!(checks >= 700);
+    }
+
+    #[test]
+    fn looping_starts_a_new_report_with_fresh_nonce_and_counter() {
+        // A report that holds exactly one message, so frame 117 is the wrap.
+        let Some(bytes) = std::fs::read(REPORT_FULL).ok() else {
+            return;
+        };
+        let recorded = Report::from_bytes(&bytes);
+        let mut config = GenConfig::plain();
+        config.looping = true;
+        config.session = Some(0x158b);
+        let mut generator = Generator::new(&recorded, &config).expect("frames");
+        let base_nonce = generator.nonce();
+
+        let mut frames = Vec::new();
+        for _ in 0..(117 + 4 + 1) {
+            frames.push(generator.next_frame().expect("frame"));
+        }
+        // 117 frames of report 1, then report 2 starts at frame 117 again.
+        assert_eq!(generator.loops(), 1, "one wrap");
+        let second = &frames[117];
+        assert_ne!(second.as_slice(), frames[0].as_slice());
+        let header = forge::MessageHeader::parse(&second[HEADER_LEN..]).expect("header");
+        assert_eq!(
+            header.nonce,
+            base_nonce.wrapping_add(1),
+            "nonce++ per report"
+        );
+        assert_eq!(header.counter, 2, "counter +1 per message");
+        assert_eq!(flags_of(second) & FLAG_START, FLAG_START, "StartData again");
+        assert_eq!(
+            header.total_len,
+            117 * FRAME_LEN as u32 - HEADER_LEN as u32,
+            "total_len of the repeated report"
+        );
+        // Sequence keeps growing across the wrap.
+        assert_eq!(seq_of(second), seq_of(&frames[116]) + 1);
+        assert_eq!(seq_of(&frames[118]), seq_of(second) + 1);
+        assert!(crc_holds(second));
+        // The recorded blob is still the recording's (`copy`).
+        assert_eq!(
+            forge::recorded_blob(&second[HEADER_LEN..]),
+            forge::recorded_blob(&frames[0][HEADER_LEN..])
+        );
+    }
+
+    #[test]
+    fn the_notes_mode_swaps_only_the_per_session_blob() {
+        let Some(bytes) = real_capture() else {
+            return;
+        };
+        let recorded = Report::from_bytes(&bytes);
+        let mut config = GenConfig::plain();
+        config.body = StreamBody::Notes;
+        config.session = Some(0x158b);
+        let mut generator = Generator::new(&recorded, &config).expect("frames");
+        let first = generator.next_frame().expect("frame");
+        let second = generator.next_frame().expect("frame");
+
+        let blob = forge::recorded_blob(&first[HEADER_LEN..]).expect("blob");
+        let recorded_blob =
+            forge::recorded_blob(&recorded.frame(0).expect("frame")[HEADER_LEN..]).expect("blob");
+        assert_ne!(blob, recorded_blob, "our blob, not the recording's");
+        assert_eq!(
+            blob,
+            forge::session_blob(0x158b, 0x94bb_79c6),
+            "ours is derived from the session and the nonce"
+        );
+        let header = forge::MessageHeader::parse(&first[HEADER_LEN..]).expect("header");
+        assert_eq!(
+            &blob[..4],
+            &header.blob.to_le_bytes(),
+            "0x1C is the blob's head"
+        );
+        // Only the 48 blob bytes differ inside the header.
+        let source = recorded.frame(0).expect("frame");
+        // `total_len` is ours (frame count), everything else before the blob is
+        // the recording's.
+        assert_eq!(
+            &first[HEADER_LEN + forge::MSG_COUNTER_OFF..HEADER_LEN + forge::MSG_BLOB_OFF],
+            &source[HEADER_LEN + forge::MSG_COUNTER_OFF..HEADER_LEN + forge::MSG_BLOB_OFF]
+        );
+        assert_eq!(
+            &first[HEADER_LEN + forge::MSG_BLOB_OFF + MSG_BLOB_LEN..],
+            &source[HEADER_LEN + forge::MSG_BLOB_OFF + MSG_BLOB_LEN..],
+            "the records after the blob are untouched"
+        );
+        // The next frame carries no header at all (not a message start).
+        assert_eq!(
+            &second[HEADER_LEN..],
+            &recorded.frame(1).expect("frame")[HEADER_LEN..],
+            "a middle fragment is the recording's"
+        );
+    }
+
+    #[test]
+    fn the_bump_mode_makes_a_looped_report_differ_without_touching_frames_midway() {
+        let Some(bytes) = real_capture() else {
+            return;
+        };
+        let recorded = Report::from_bytes(&bytes);
+        let mut config = GenConfig::plain();
+        config.body = StreamBody::Bump;
+        config.looping = true;
+        let mut generator = Generator::new(&recorded, &config).expect("frames");
+        let first = generator.next_frame().expect("frame");
+        let second = generator.next_frame().expect("frame");
+        let source_first = recorded.frame(0).expect("frame");
+        let source_second = recorded.frame(1).expect("frame");
+
+        // The first frame differs in the blob and in every record's tail.
+        assert_ne!(&first[HEADER_LEN..], &source_first[HEADER_LEN..]);
+        assert!(crc_holds(&first));
+        // A middle fragment has no header, so it differs only in the records —
+        // and nowhere before the first record boundary.
+        assert_ne!(&second[HEADER_LEN..], &source_second[HEADER_LEN..]);
+        let records_start = HEADER_LEN;
+        assert_eq!(
+            &second[HEADER_LEN..HEADER_LEN],
+            &source_second[HEADER_LEN..HEADER_LEN]
+        );
+        assert_ne!(
+            &second[records_start + 12..records_start + 16],
+            &source_second[records_start + 12..records_start + 16],
+            "the first record's tail moved"
+        );
+        assert!(crc_holds(&second));
+    }
+
+    #[test]
+    fn the_stream_config_arms_the_report_for_generation() {
+        let config = Config::parse(|name| match name {
+            "EAC_FORGE_STREAM" => Some(REPORT_FULL.to_string()),
+            "EAC_FORGE_STREAM_LOOP" => Some("1".to_string()),
+            "EAC_FORGE_STREAM_BODY" => Some("notes".to_string()),
+            "EAC_FORGE_STREAM_AFTER_MS" => Some("45000".to_string()),
+            _ => None,
+        })
+        .expect("stream mode arms the replay machinery");
+        assert_eq!(config.path, PathBuf::from(REPORT_FULL));
+        assert!(config.looping);
+        let stream = config.stream.expect("stream knobs");
+        assert_eq!(stream.body, StreamBody::Notes);
+        assert!(stream.looping);
+        assert_eq!(config.after_ms, 45_000, "stream deadline wins");
+
+        // Backwards compatibility: `EAC_REPLAY_REPORT` alone still arms the
+        // plain replay and nothing else.
+        let replay = Config::parse(|name| match name {
+            "EAC_REPLAY_REPORT" => Some(REPORT_FULL.to_string()),
+            _ => None,
+        })
+        .expect("replay mode");
+        assert!(replay.stream.is_none());
+        assert_eq!(replay.after_ms, DEFAULT_AFTER_MS);
+
+        // And a report loaded by path without `EAC_FORGE_STREAM` does not
+        // generate anything, even when the file exists.
+        if let Ok(report) = Report::load(REPORT_FULL) {
+            assert!(!report.generates(), "plain replay stays plain");
+        }
+    }
+
+    #[test]
+    fn the_photon_via_renders_into_the_ring_of_the_emitter() {
+        let Some(bytes) = real_capture() else {
+            return;
+        };
+        let mut config = GenConfig::plain();
+        config.via = Via::Photon;
+        config.session = Some(0x158b);
+        config.interval_ms = 50;
+        let report = Report::stream_from_bytes(&bytes, config);
+        crate::forge::clear_ring();
+        let before = crate::forge::ring_pushed();
+        // `Stream::new` is where `eos` arms the source, so that is where the
+        // sender thread has to start.
+        let _stream = Stream::new(report, 0, false);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::forge::ring_pushed() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            crate::forge::ring_pushed() > before,
+            "the sender queued at least one frame"
+        );
+        let lines = crate::forge::take_log();
+        assert!(
+            lines.iter().any(|line| line.contains("photon sender")),
+            "the sender logged its arming: {lines:?}"
+        );
+        let queued = crate::forge::drain_frames();
+        assert!(!queued.is_empty());
+        let first = &queued[0];
+        assert_eq!(first.len(), FRAME_LEN);
+        assert_eq!(sid_of(first), 0x158b, "frames are ready to send");
+        assert!(crc_holds(first), "the emitter gets sealed frames");
+        assert_eq!(flags_of(first) & FLAG_START, FLAG_START, "StartData");
+        assert!(seq_of(first) >= 2, "sequence continues the recording");
+        crate::forge::clear_ring();
     }
 
     #[test]

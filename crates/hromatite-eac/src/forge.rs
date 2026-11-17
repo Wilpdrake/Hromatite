@@ -19,8 +19,35 @@
 //! fragment of a long integrity report); repeating the last fragment is the
 //! cheapest hypothesis and the live run is what decides it.
 //!
-//! The module is pure `std` and has no atomics: `eos` owns the clock, the
-//! environment and the delivery, this file owns the bytes.
+//! # The whole-report stream
+//!
+//! `EAC_FORGE_STREAM=<path>` (see [`StreamConfig`]) is different in kind: the
+//! heartbeat is not a self-contained frame but a *fragment of a long report*
+//! (144 frames, ~70 KiB, ~288 s at 2007 ms), and the report starts with a
+//! plaintext 32-byte message header ([`MessageHeader`]) inside the body of the
+//! frame that carries `StartData`. A frame source that emits one recorded
+//! fragment forever therefore lies about `total_len`, about the message counter
+//! and about the per-session blob. The stream mode renders a whole recorded
+//! report as one message: `total_len`, `counter`, `nonce`, the boundary flags
+//! ([`FLAG_START`]/[`FLAG_END`]) and the per-session blob are ours, the 488-byte
+//! bodies stay the recording's unless [`StreamBody::Notes`] or
+//! [`StreamBody::Bump`] asks
+//! otherwise.
+//!
+//! Two transports can carry those frames: the EOSSDK `MessageToServer` callback
+//! (the existing `EAC_FORGE` path, driven by `eos`) and the managed Photon
+//! emitter ([`Via::Photon`], [`pump_photon`]) which does not touch EOSSDK at
+//! all. The ring between generator and emitter ([`push_frame`]) is this file's
+//! only shared state.
+//!
+//! The rest of the module is pure `std`: `eos` owns the clock, the environment
+//! and the wrapper delivery, this file owns the bytes.
+
+use std::collections::VecDeque;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::digest::crc32c_eac;
 
@@ -147,6 +174,24 @@ pub fn build_frame(template: &Template, seq: u64, mode: BodyMode) -> Vec<u8> {
     frame
 }
 
+/// Assemble a frame out of a prepared body and seal its checksum.
+///
+/// The body is used as given (it may already carry a rewritten message header),
+/// so this is the constructor the whole-report stream uses, while
+/// [`build_frame`] is the one-fragment forge.
+pub fn seal_frame(session_id: u64, seq: u64, flags: u16, body: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
+    frame.extend_from_slice(&VERSION.to_le_bytes());
+    frame.extend_from_slice(&flags.to_le_bytes());
+    frame.extend_from_slice(&session_id.to_le_bytes());
+    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&[0u8; 4]); // checksum placeholder
+    frame.extend_from_slice(body);
+    let crc = crc32c_eac(&frame);
+    frame[CHECKSUM_OFFSET..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    frame
+}
+
 /// Write `counter` into the `u32` at `frame[HEADER_LEN + 0x18]`.
 ///
 /// The body is a message header only when the frame starts one, so the caller
@@ -238,6 +283,13 @@ impl Config {
             number("EAC_FORGE_AFTER_MS")
         };
         let interval = number("EAC_FORGE_INTERVAL_MS");
+        // `EAC_FORGE_STREAM=<path>` alone is enough to arm the generator: the
+        // report path is read by `report::Config`, but the deadline and the
+        // readiness knob belong here so a stream run does not need EAC_FORGE=1.
+        let mut after_ms = after_ms;
+        if after_ms == 0 && get("EAC_FORGE_STREAM").is_some_and(|value| !value.trim().is_empty()) {
+            after_ms = DEFAULT_AFTER_MS;
+        }
         Self {
             after_ms,
             min_frames: number("EAC_FORGE_MIN_FRAMES"),
@@ -253,6 +305,559 @@ impl Config {
             template: TemplateMode::parse(get("EAC_FORGE_TEMPLATE").as_deref()),
         }
     }
+}
+
+// ===========================================================================
+// Whole-report stream (`EAC_FORGE_STREAM=<path>`)
+// ===========================================================================
+
+/// Length of the plaintext message header carried by the body of the frame that
+/// starts a report (`StartData`). Verified on every capture in
+/// `~/EAC-RE/evidence` (`findings/report_stream.md` §1).
+pub const MSG_HEADER_LEN: usize = 0x20;
+/// `+0x00 u32` — declared length of the message block.
+pub const MSG_TOTAL_LEN_OFF: usize = 0x00;
+/// `+0x04 u32` — message counter; `1` for the first report of every session.
+pub const MSG_COUNTER_OFF: usize = 0x04;
+/// `+0x08 u32` — per-report nonce (differs between the two reports of one
+/// session, constant inside one report).
+pub const MSG_NONCE_OFF: usize = 0x08;
+/// `+0x0C u32` — constant `5` in every observed report (unknown meaning).
+pub const MSG_MODE_OFF: usize = 0x0C;
+/// `+0x10 u32` — report action (`13` first report, `4` the following ones).
+pub const MSG_ACTION_OFF: usize = 0x10;
+/// `+0x14 u32` — constant `3` in every observed report (unknown meaning).
+pub const MSG_KIND_OFF: usize = 0x14;
+/// `+0x18 u8` — per-report flags byte (`0x16` / `0x23` in `control_0009`).
+pub const MSG_FLAGS_OFF: usize = 0x18;
+/// `+0x1C` — 48-byte per-session blob (constant inside one session, different
+/// between sessions; `findings/frame_structure.md` §5).
+pub const MSG_BLOB_OFF: usize = 0x1C;
+/// Length of that blob.
+pub const MSG_BLOB_LEN: usize = 48;
+/// Length of one integrity record inside a message.
+pub const RECORD_LEN: usize = 16;
+/// `Flags` bit 1: this frame ends a logical message.
+pub const FLAG_END: u16 = 0x0002;
+
+/// Declared message length for a report carried by `frames` full frames.
+///
+/// Each frame contributes [`BODY_LEN`] bytes, so `frames * 512 - 24` — the
+/// formula the recorded headers follow whenever the last frame is full. The
+/// recording also shows *partial* tails (`0x638` = 3x488 + 128, `0x8fe` =
+/// 4x488 + 350), i.e. the field is a byte count of the block, not a frame
+/// count; [`TotalMode`] keeps both hypotheses reachable.
+pub fn message_total_len(frames: usize) -> u32 {
+    (frames * FRAME_LEN - HEADER_LEN) as u32
+}
+
+/// How the 32-byte message header's `total_len` is produced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TotalMode {
+    /// `frames * 512 - 24` for the frames we actually emit (the documented
+    /// hypothesis; default).
+    #[default]
+    Frames,
+    /// Copy the recorded value from the source report byte for byte.
+    Recorded,
+}
+
+impl TotalMode {
+    /// Parse `EAC_FORGE_STREAM_TOTAL` (`frames` default, `recorded` opt-in).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("recorded") | Some("copy") | Some("src") => Self::Recorded,
+            _ => Self::Frames,
+        }
+    }
+
+    /// Lowercase name for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frames => "frames",
+            Self::Recorded => "recorded",
+        }
+    }
+}
+
+/// What happens to the recorded 488-byte body of every emitted frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamBody {
+    /// Recorded body, byte for byte (the replay fidelity mode).
+    #[default]
+    Copy,
+    /// Recorded body, but the 48-byte per-session blob is replaced by one
+    /// derived from the *live* `SessionId` (or `EAC_FORGE_BLOB=<hex>`).
+    Notes,
+    /// `Notes` plus a per-frame increment of the trailing `u32` of every
+    /// 16-byte record, so the records are not byte-identical when a report is
+    /// repeated by `EAC_FORGE_STREAM_LOOP=1`.
+    Bump,
+}
+
+impl StreamBody {
+    /// Parse `EAC_FORGE_STREAM_BODY` (`copy` default, `notes`/`bump` opt-in).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("notes") | Some("blob") => Self::Notes,
+            Some("bump") | Some("fresh") => Self::Bump,
+            _ => Self::Copy,
+        }
+    }
+
+    /// Lowercase name for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Notes => "notes",
+            Self::Bump => "bump",
+        }
+    }
+
+    /// True when the per-session blob is ours rather than the recording's.
+    pub fn owns_blob(self) -> bool {
+        !matches!(self, Self::Copy)
+    }
+
+    /// True when the integrity records are nudged per frame.
+    pub fn bumps_records(self) -> bool {
+        matches!(self, Self::Bump)
+    }
+}
+
+/// Transport that carries the generated frames out of the process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Via {
+    /// The EOSSDK `MessageToServer` callback (the existing `EAC_FORGE` path).
+    #[default]
+    Wrapper,
+    /// The managed `PhotonPeer.SendOperation` RaiseEvent emitter
+    /// ([`hromatite_core::photon::emulate_send`]) — no EOS module involved.
+    Photon,
+    /// Both: the wrapper path *and* the Photon ring.
+    Both,
+}
+
+impl Via {
+    /// Parse `EAC_FORGE_VIA` (`wrapper` default, `photon`, `both`).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("photon") | Some("event") | Some("raise") => Self::Photon,
+            Some("both") | Some("all") => Self::Both,
+            _ => Self::Wrapper,
+        }
+    }
+
+    /// Lowercase name for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wrapper => "wrapper",
+            Self::Photon => "photon",
+            Self::Both => "both",
+        }
+    }
+
+    /// True when the frames also go into the Photon ring.
+    pub fn uses_photon(self) -> bool {
+        matches!(self, Self::Photon | Self::Both)
+    }
+}
+
+/// The plaintext 32-byte message header of a report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageHeader {
+    /// `+0x00` — declared block length.
+    pub total_len: u32,
+    /// `+0x04` — message counter.
+    pub counter: u32,
+    /// `+0x08` — per-report nonce.
+    pub nonce: u32,
+    /// `+0x0C` — constant `5`.
+    pub mode: u32,
+    /// `+0x10` — report action.
+    pub action: u32,
+    /// `+0x14` — constant `3`.
+    pub kind: u32,
+    /// `+0x18` — per-report flags byte.
+    pub flags: u8,
+    /// `+0x1C` — first `u32` of the 48-byte per-session blob.
+    pub blob: u32,
+}
+
+/// Little-endian `u32` at `at`, or `None` when `buf` is too short.
+fn u32_at(buf: &[u8], at: usize) -> Option<u32> {
+    let bytes: [u8; 4] = buf.get(at..at + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Write a little-endian `u32`, silently doing nothing when the slot is short.
+fn put_u32(buf: &mut [u8], at: usize, value: u32) {
+    if let Some(slot) = buf.get_mut(at..at + 4) {
+        slot.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+impl MessageHeader {
+    /// Parse the header at the start of a `StartData` frame's body.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < MSG_HEADER_LEN {
+            return None;
+        }
+        Some(Self {
+            total_len: u32_at(body, MSG_TOTAL_LEN_OFF)?,
+            counter: u32_at(body, MSG_COUNTER_OFF)?,
+            nonce: u32_at(body, MSG_NONCE_OFF)?,
+            mode: u32_at(body, MSG_MODE_OFF)?,
+            action: u32_at(body, MSG_ACTION_OFF)?,
+            kind: u32_at(body, MSG_KIND_OFF)?,
+            flags: body[MSG_FLAGS_OFF],
+            blob: u32_at(body, MSG_BLOB_OFF)?,
+        })
+    }
+
+    /// Write the header back into `body`.
+    ///
+    /// `blob` is the full 48-byte per-session blob: `None` keeps whatever the
+    /// recording had after the first `u32`, `Some` overwrites all 48 bytes (the
+    /// `notes`/`bump` modes). Returns `false` when `body` is too short.
+    pub fn write(&self, body: &mut [u8], blob: Option<&[u8; MSG_BLOB_LEN]>) -> bool {
+        if body.len() < MSG_HEADER_LEN {
+            return false;
+        }
+        put_u32(body, MSG_TOTAL_LEN_OFF, self.total_len);
+        put_u32(body, MSG_COUNTER_OFF, self.counter);
+        put_u32(body, MSG_NONCE_OFF, self.nonce);
+        put_u32(body, MSG_MODE_OFF, self.mode);
+        put_u32(body, MSG_ACTION_OFF, self.action);
+        put_u32(body, MSG_KIND_OFF, self.kind);
+        body[MSG_FLAGS_OFF] = self.flags;
+        put_u32(body, MSG_BLOB_OFF, self.blob);
+        if let Some(blob) = blob
+            && let Some(slot) = body.get_mut(MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN)
+        {
+            slot.copy_from_slice(blob);
+        }
+        true
+    }
+}
+
+/// The 48-byte per-session blob of a message start, if the body carries one.
+pub fn recorded_blob(body: &[u8]) -> Option<[u8; MSG_BLOB_LEN]> {
+    body.get(MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN)?
+        .try_into()
+        .ok()
+}
+
+/// A per-session blob of our own, derived from `session_id` and `nonce`.
+///
+/// The recorded blob is 48 bytes of session material that a stranger cannot
+/// mint; this is a deterministic stand-in with the same shape (`notes`/`bump`),
+/// so a live run tells us whether the server actually compares it.
+pub fn session_blob(session_id: u64, nonce: u32) -> [u8; MSG_BLOB_LEN] {
+    let mut state = session_id
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(u64::from(nonce).wrapping_mul(0xbf58_476d_1ce4_e5b9));
+    let mut out = [0u8; MSG_BLOB_LEN];
+    for chunk in out.chunks_mut(8) {
+        // SplitMix64: cheap, deterministic, no dependency.
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let bytes = z.to_le_bytes();
+        let len = chunk.len().min(8);
+        chunk[..len].copy_from_slice(&bytes[..len]);
+    }
+    out
+}
+
+/// Add `delta` to the trailing `u32` of every whole 16-byte record of `body`.
+///
+/// `EAC_FORGE_STREAM_BODY=bump` uses this so a looped report is not a
+/// byte-identical copy of the previous pass. Whether the server's records are
+/// hashes (and therefore indifferent to a +n on their tail) or counters is
+/// exactly what a live run answers.
+pub fn bump_records(body: &mut [u8], first_record: usize, delta: u32) {
+    let mut at = first_record;
+    while at + RECORD_LEN <= body.len() {
+        let tail = at + RECORD_LEN - 4;
+        if let Some(value) = u32_at(body, tail) {
+            put_u32(body, tail, value.wrapping_add(delta));
+        }
+        at += RECORD_LEN;
+    }
+}
+
+// --------------------------------------------------------------- config
+
+/// `EAC_FORGE_STREAM*` knobs: a whole recorded report rendered as our own
+/// stream, one frame per slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamConfig {
+    /// `EAC_FORGE_STREAM`: capture-format file holding the recorded report.
+    pub path: PathBuf,
+    /// `EAC_FORGE_STREAM_BODY`.
+    pub body: StreamBody,
+    /// `EAC_FORGE_STREAM_LOOP=1`: start a new report when the recording ends.
+    pub looping: bool,
+    /// `EAC_FORGE_VIA`.
+    pub via: Via,
+    /// `EAC_FORGE_SID`: `SessionId` to write; `None` keeps the recording's (the
+    /// EOSSDK path overrides it with the live one anyway).
+    pub session: Option<u64>,
+    /// `EAC_FORGE_SEQ`: first `Sequence` of our stream.
+    pub seq: Option<u64>,
+    /// `EAC_FORGE_NONCE`: first nonce; `None` continues the recording's.
+    pub nonce: Option<u32>,
+    /// `EAC_FORGE_COUNTER`: first message counter; `None` continues the
+    /// recording's.
+    pub counter: Option<u32>,
+    /// `EAC_FORGE_BLOB`: 48 bytes of per-session material as hex.
+    pub blob: Option<[u8; MSG_BLOB_LEN]>,
+    /// `EAC_FORGE_STREAM_TOTAL`.
+    pub total: TotalMode,
+    /// `EAC_FORGE_STREAM_MS`, clamped like [`Config::interval_ms`].
+    pub interval_ms: u64,
+    /// `EAC_FORGE_SPOOL`: append every emitted frame here (capture format), so
+    /// `EAC_EVENT_SEND=<that file>` can hand the same bytes to
+    /// `photon::tick_send`.
+    pub spool: Option<PathBuf>,
+    /// `EAC_FORGE_STREAM_AFTER_MS` (falls back to `EAC_FORGE_AFTER_MS`).
+    pub after_ms: u64,
+    /// `EAC_FORGE_STREAM_MIN_FRAMES`.
+    pub min_frames: u64,
+}
+
+impl StreamConfig {
+    /// Parse the environment; `None` when `EAC_FORGE_STREAM` is absent or blank.
+    ///
+    /// Takes a lookup so the function is testable without the process
+    /// environment, exactly like [`Config::parse`].
+    pub fn parse(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let path = get("EAC_FORGE_STREAM")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let number = |name: &str| -> Option<u64> {
+            get(name).and_then(|value| {
+                let value = value.trim();
+                value
+                    .strip_prefix("0x")
+                    .map(|hex| u64::from_str_radix(hex, 16).ok())
+                    .unwrap_or_else(|| value.parse::<u64>().ok())
+            })
+        };
+        let flag = |name: &str| {
+            get(name)
+                .map(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value != "0"
+                })
+                .unwrap_or(false)
+        };
+        let interval = number("EAC_FORGE_STREAM_MS").unwrap_or(0);
+        Some(Self {
+            path: PathBuf::from(path),
+            body: StreamBody::parse(get("EAC_FORGE_STREAM_BODY").as_deref()),
+            looping: flag("EAC_FORGE_STREAM_LOOP"),
+            via: Via::parse(get("EAC_FORGE_VIA").as_deref()),
+            session: number("EAC_FORGE_SID"),
+            seq: number("EAC_FORGE_SEQ"),
+            nonce: number("EAC_FORGE_NONCE").map(|value| value as u32),
+            counter: number("EAC_FORGE_COUNTER").map(|value| value as u32),
+            blob: get("EAC_FORGE_BLOB").and_then(|value| parse_blob(value.trim())),
+            total: TotalMode::parse(get("EAC_FORGE_STREAM_TOTAL").as_deref()),
+            interval_ms: if interval == 0 {
+                INTERVAL_MS
+            } else {
+                interval.clamp(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+            },
+            spool: get("EAC_FORGE_SPOOL")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            after_ms: number("EAC_FORGE_STREAM_AFTER_MS")
+                .or_else(|| number("EAC_FORGE_AFTER_MS"))
+                .unwrap_or(DEFAULT_AFTER_MS),
+            min_frames: number("EAC_FORGE_STREAM_MIN_FRAMES")
+                .or_else(|| number("EAC_FORGE_MIN_FRAMES"))
+                .unwrap_or(0),
+        })
+    }
+}
+
+/// Exactly 48 bytes of hex (96 digits) → the per-session blob.
+fn parse_blob(value: &str) -> Option<[u8; MSG_BLOB_LEN]> {
+    let digits: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    let digits = digits.strip_prefix("0x").unwrap_or(&digits);
+    if digits.len() != MSG_BLOB_LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; MSG_BLOB_LEN];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digits[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+// ----------------------------------------------------- photon delivery ring
+
+/// Capacity of the ring between the stream generator and the Photon sender: a
+/// full report (144 frames) plus slack.
+pub const RING_MAX: usize = 256;
+/// Lines kept by [`take_log`] (the module has no logger of its own: the EOS
+/// hook owns that one, and a frame source must not depend on it).
+pub const LOG_MAX: usize = 1024;
+
+static RING: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
+static PUSHED: AtomicU64 = AtomicU64::new(0);
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+static PHOTON_SENT: AtomicU64 = AtomicU64::new(0);
+static PHOTON_FAILED: AtomicU64 = AtomicU64::new(0);
+static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Append a line to the in-memory log (bounded, oldest dropped first).
+pub fn note(line: impl Into<String>) {
+    if let Ok(mut log) = LOG.lock() {
+        log.push(line.into());
+        let excess = log.len().saturating_sub(LOG_MAX);
+        if excess > 0 {
+            log.drain(..excess);
+        }
+    }
+}
+
+/// Take every line [`note`] recorded since the last call.
+pub fn take_log() -> Vec<String> {
+    LOG.lock()
+        .map(|mut log| log.drain(..).collect())
+        .unwrap_or_default()
+}
+
+/// Frames pushed into the ring since the process started.
+pub fn ring_pushed() -> u64 {
+    PUSHED.load(Ordering::Relaxed)
+}
+
+/// Frames the ring had to drop because the sender could not keep up.
+pub fn ring_dropped() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
+/// Frames the Photon emitter accepted / rejected.
+pub fn photon_counters() -> (u64, u64) {
+    (
+        PHOTON_SENT.load(Ordering::Relaxed),
+        PHOTON_FAILED.load(Ordering::Relaxed),
+    )
+}
+
+/// Number of frames waiting in the ring.
+pub fn ring_len() -> usize {
+    RING.lock().map(|ring| ring.len()).unwrap_or(0)
+}
+
+/// Drop everything in the ring (a new session epoch starts from scratch).
+pub fn clear_ring() {
+    if let Ok(mut ring) = RING.lock() {
+        ring.clear();
+    }
+}
+
+/// Queue one ready-to-send frame. Returns `false` when it did not fit.
+pub fn push_frame(frame: Vec<u8>) -> bool {
+    let Ok(mut ring) = RING.lock() else {
+        return false;
+    };
+    if ring.len() >= RING_MAX {
+        ring.pop_front();
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    ring.push_back(frame);
+    PUSHED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Take everything queued, oldest first.
+pub fn drain_frames() -> Vec<Vec<u8>> {
+    RING.lock()
+        .map(|mut ring| ring.drain(..).collect())
+        .unwrap_or_default()
+}
+
+/// What one [`pump_photon`] pass achieved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Delivery {
+    /// Frames the emitter accepted.
+    pub sent: u64,
+    /// Frames it rejected; they go back to the front of the ring.
+    pub failed: u64,
+    /// True when no live event-66 template was known yet, so nothing was tried.
+    pub unarmed: bool,
+}
+
+/// Hand every queued frame to the managed Photon emitter.
+///
+/// This is the transport that does not touch EOSSDK at all: the bytes are
+/// written into the live `byte[]` captured from the game's own
+/// `RaiseEvent(253, {244: 66, 245: payload})` and the original `SendOperation`
+/// is called through its trampoline ([`hromatite_core::photon::emulate_send`]).
+pub fn pump_photon() -> Delivery {
+    if hromatite_core::photon::template().is_none() {
+        return Delivery {
+            unarmed: true,
+            ..Delivery::default()
+        };
+    }
+    let frames = drain_frames();
+    let mut delivery = Delivery::default();
+    let mut failed = VecDeque::new();
+    for frame in frames {
+        match hromatite_core::photon::emulate_send(&frame) {
+            Ok(_) => {
+                delivery.sent += 1;
+                PHOTON_SENT.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(reason) => {
+                delivery.failed += 1;
+                PHOTON_FAILED.fetch_add(1, Ordering::Relaxed);
+                if PHOTON_FAILED.load(Ordering::Relaxed).is_multiple_of(10) {
+                    note(format!("photon send failed: {reason}"));
+                }
+                failed.push_back(frame);
+            }
+        }
+    }
+    if !failed.is_empty()
+        && let Ok(mut ring) = RING.lock()
+    {
+        for frame in failed.into_iter().rev() {
+            ring.push_front(frame);
+        }
+        let excess = ring.len().saturating_sub(RING_MAX);
+        if excess > 0 {
+            ring.drain(..excess);
+            DROPPED.fetch_add(excess as u64, Ordering::Relaxed);
+        }
+    }
+    delivery
+}
+
+/// Append one frame to `path` in the capture format (`u32 len | u32 dt | bytes`).
+///
+/// `EAC_FORGE_SPOOL` uses it so the very same ring can also be handed to
+/// `photon::tick_send` through `EAC_EVENT_SEND=<path>`; that reader parses the
+/// file once, so the spool is what a *second* pass would pick up.
+pub fn append_spool(path: &Path, dt_ms: u32, frame: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut record = Vec::with_capacity(8 + frame.len());
+    record.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    record.extend_from_slice(&dt_ms.to_le_bytes());
+    record.extend_from_slice(frame);
+    file.write_all(&record)
 }
 
 #[cfg(test)]
@@ -377,5 +982,225 @@ mod tests {
         });
         assert!(after_only.enabled());
         assert_eq!(after_only.after_ms, 15_000);
+    }
+
+    /// A body carrying a message header with known fields.
+    fn body_with_header() -> Vec<u8> {
+        let header = MessageHeader {
+            total_len: 0x638,
+            counter: 1,
+            nonce: 0x94bb_79c6,
+            mode: 5,
+            action: 13,
+            kind: 3,
+            flags: 0x16,
+            blob: 0x1ee3_a0ff,
+        };
+        let mut body = vec![0xA5u8; BODY_LEN];
+        assert!(header.write(&mut body, None));
+        body
+    }
+
+    #[test]
+    fn the_message_header_parses_and_rewrites_field_by_field() {
+        let mut body = body_with_header();
+        let parsed = MessageHeader::parse(&body).expect("32-byte header");
+        assert_eq!(parsed.total_len, 0x638);
+        assert_eq!(parsed.counter, 1, "first report of a session");
+        assert_eq!(parsed.nonce, 0x94bb_79c6);
+        assert_eq!(parsed.mode, 5);
+        assert_eq!(parsed.action, 13, "action of the first report");
+        assert_eq!(parsed.kind, 3);
+        assert_eq!(parsed.flags, 0x16);
+        assert_eq!(parsed.blob, 0x1ee3_a0ff);
+
+        // The rest of the 48-byte blob is untouched by a plain write.
+        let mut rewritten = body.clone();
+        let mut next = parsed;
+        next.total_len = 0x11280;
+        next.counter = 2;
+        next.nonce = parsed.nonce.wrapping_add(1);
+        assert!(next.write(&mut rewritten, None));
+        let again = MessageHeader::parse(&rewritten).expect("header");
+        assert_eq!(again.total_len, 0x11280);
+        assert_eq!(again.counter, 2);
+        assert_eq!(again.nonce, 0x94bb_79c7, "nonce advances per report");
+        assert_eq!(again.action, 13, "action stays the recording's");
+        assert_eq!(&rewritten[MSG_HEADER_LEN..], &body[MSG_HEADER_LEN..]);
+
+        // A blob of ours replaces all 48 recorded bytes.
+        let ours = session_blob(0x158b, 7);
+        let before = recorded_blob(&body).expect("recorded blob");
+        assert!(next.write(&mut rewritten, Some(&ours)));
+        assert_eq!(recorded_blob(&rewritten), Some(ours));
+        assert_ne!(ours, before, "our blob is not the recording's");
+
+        assert!(MessageHeader::parse(&body[..31]).is_none(), "short body");
+        assert!(!next.write(&mut body[..8], None), "short body");
+    }
+
+    #[test]
+    fn the_declared_length_is_the_frame_count_times_512_minus_the_header() {
+        assert_eq!(message_total_len(1), 488);
+        assert_eq!(message_total_len(4), 2_024, "4 * 512 - 24");
+        assert_eq!(message_total_len(144), 144 * 512 - 24, "a full report");
+        assert_eq!(message_total_len(144), 73_704);
+        // The recording's two headers are byte counts of a *partial* block,
+        // which is why `TotalMode::Recorded` exists as the fidelity variant.
+        assert_eq!(3 * 488 + 128, 1_592, "0x638 of control_0009");
+        assert_eq!(4 * 488 + 350, 2_302, "0x8fe of control_0009");
+    }
+
+    #[test]
+    fn our_blob_is_deterministic_and_bound_to_the_session_and_nonce() {
+        let a = session_blob(0x158b, 1);
+        assert_eq!(a, session_blob(0x158b, 1), "same inputs, same blob");
+        assert_ne!(a, session_blob(0x158b, 2), "nonce changes the blob");
+        assert_ne!(a, session_blob(0x158c, 1), "session changes the blob");
+        assert_ne!(&a[..8], &[0u8; 8][..], "not all zeroes");
+    }
+
+    #[test]
+    fn bumping_records_only_touches_the_trailing_counter() {
+        let mut body: Vec<u8> = (0..BODY_LEN).map(|i| i as u8).collect();
+        let original = body.clone();
+        bump_records(&mut body, MSG_HEADER_LEN, 7);
+        // Everything up to the first record (the message header) is untouched.
+        assert_eq!(&body[..MSG_HEADER_LEN], &original[..MSG_HEADER_LEN]);
+        let mut at = MSG_HEADER_LEN;
+        let mut touched = 0usize;
+        while at + RECORD_LEN <= BODY_LEN {
+            let head = at..at + RECORD_LEN - 4;
+            let tail = at + RECORD_LEN - 4..at + RECORD_LEN;
+            assert_eq!(&body[head.clone()], &original[head], "record head intact");
+            let expected = original[tail.clone()]
+                .try_into()
+                .map(u32::from_le_bytes)
+                .expect("4 bytes")
+                .wrapping_add(7);
+            assert_eq!(
+                u32::from_le_bytes(body[tail].try_into().expect("4 bytes")),
+                expected,
+                "record at {at} nudged"
+            );
+            touched += 1;
+            at += RECORD_LEN;
+        }
+        assert_eq!(touched, (BODY_LEN - MSG_HEADER_LEN) / RECORD_LEN);
+    }
+
+    #[test]
+    fn the_stream_config_defaults_to_copy_from_the_recording() {
+        assert!(
+            StreamConfig::parse(|_| None).is_none(),
+            "no path, no stream"
+        );
+
+        let config = StreamConfig::parse(|name| match name {
+            "EAC_FORGE_STREAM" => Some(" /tmp/a.bin ".to_string()),
+            _ => None,
+        })
+        .expect("path set");
+        assert_eq!(config.path, PathBuf::from("/tmp/a.bin"));
+        assert_eq!(config.body, StreamBody::Copy);
+        assert_eq!(config.via, Via::Wrapper);
+        assert_eq!(config.total, TotalMode::Frames);
+        assert_eq!(config.interval_ms, INTERVAL_MS);
+        assert_eq!(config.after_ms, DEFAULT_AFTER_MS);
+        assert!(!config.looping);
+        assert!(config.session.is_none());
+
+        let explicit = StreamConfig::parse(|name| match name {
+            "EAC_FORGE_STREAM" => Some("/tmp/a.bin".to_string()),
+            "EAC_FORGE_STREAM_BODY" => Some("bump".to_string()),
+            "EAC_FORGE_STREAM_LOOP" => Some("1".to_string()),
+            "EAC_FORGE_VIA" => Some("photon".to_string()),
+            "EAC_FORGE_SID" => Some("0x158b".to_string()),
+            "EAC_FORGE_SEQ" => Some("900".to_string()),
+            "EAC_FORGE_NONCE" => Some("17".to_string()),
+            "EAC_FORGE_COUNTER" => Some("4".to_string()),
+            "EAC_FORGE_STREAM_TOTAL" => Some("recorded".to_string()),
+            "EAC_FORGE_STREAM_MS" => Some("50".to_string()),
+            "EAC_FORGE_SPOOL" => Some("/tmp/spool.bin".to_string()),
+            "EAC_FORGE_STREAM_AFTER_MS" => Some("5000".to_string()),
+            _ => None,
+        })
+        .expect("path set");
+        assert_eq!(explicit.body, StreamBody::Bump);
+        assert!(explicit.body.owns_blob());
+        assert!(explicit.body.bumps_records());
+        assert!(explicit.looping);
+        assert_eq!(explicit.via, Via::Photon);
+        assert!(explicit.via.uses_photon());
+        assert_eq!(explicit.session, Some(0x158b));
+        assert_eq!(explicit.seq, Some(900));
+        assert_eq!(explicit.nonce, Some(17));
+        assert_eq!(explicit.counter, Some(4));
+        assert_eq!(explicit.total, TotalMode::Recorded);
+        assert_eq!(explicit.interval_ms, MIN_INTERVAL_MS, "clamped up");
+        assert_eq!(explicit.spool, Some(PathBuf::from("/tmp/spool.bin")));
+        assert_eq!(explicit.after_ms, 5_000);
+
+        // The blob knob wants exactly 48 bytes of hex.
+        let hex = "ab".repeat(MSG_BLOB_LEN);
+        let with_blob = StreamConfig::parse(|name| match name {
+            "EAC_FORGE_STREAM" => Some("/tmp/a.bin".to_string()),
+            "EAC_FORGE_BLOB" => Some(hex.clone()),
+            _ => None,
+        })
+        .expect("path set");
+        assert_eq!(with_blob.blob, Some([0xABu8; MSG_BLOB_LEN]));
+        let short = StreamConfig::parse(|name| match name {
+            "EAC_FORGE_STREAM" => Some("/tmp/a.bin".to_string()),
+            "EAC_FORGE_BLOB" => Some("abcd".to_string()),
+            _ => None,
+        })
+        .expect("path set");
+        assert_eq!(short.blob, None, "a short blob is ignored, not fatal");
+
+        // `EAC_FORGE_STREAM` alone arms the template forge's deadline too.
+        let forge = Config::parse(false, |name| {
+            (name == "EAC_FORGE_STREAM").then(|| "/tmp/a.bin".to_string())
+        });
+        assert!(forge.enabled(), "the stream is a forge mode of its own");
+        assert_eq!(forge.after_ms, DEFAULT_AFTER_MS);
+    }
+
+    #[test]
+    fn the_ring_queues_frames_and_reports_an_unarmed_emitter() {
+        clear_ring();
+        let before = ring_pushed();
+        assert!(push_frame(vec![0x11; FRAME_LEN]));
+        assert!(push_frame(vec![0x22; FRAME_LEN]));
+        // Another test may run the Photon sender thread in parallel, so the
+        // ring is checked by content, not by exact counts.
+        assert!(ring_len() >= 2);
+        assert!(ring_pushed() >= before + 2);
+        let frames = drain_frames();
+        assert!(frames.contains(&vec![0x11; FRAME_LEN]));
+        assert!(frames.contains(&vec![0x22; FRAME_LEN]));
+        assert_eq!(ring_len(), 0);
+
+        // Host builds have no managed `SendOperation`, and no live event-66
+        // template has been captured, so the pass reports "not armed" and
+        // leaves the ring alone.
+        push_frame(vec![0x33; FRAME_LEN]);
+        let delivery = pump_photon();
+        assert!(delivery.unarmed);
+        assert_eq!(delivery.sent, 0);
+        assert_eq!(ring_len(), 1, "nothing consumed while unarmed");
+        clear_ring();
+
+        // The ring is bounded: the oldest frame goes.
+        for index in 0..=RING_MAX {
+            push_frame(vec![index as u8; FRAME_LEN]);
+        }
+        assert_eq!(ring_len(), RING_MAX, "the ring is bounded");
+        let dropped = drain_frames();
+        assert!(
+            dropped.len() == RING_MAX,
+            "the ring never holds more than RING_MAX"
+        );
+        clear_ring();
     }
 }
