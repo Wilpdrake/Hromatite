@@ -49,6 +49,17 @@ fn player_loop_requested(value: Option<&str>) -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// `EAC_IAT=1` (off by default): also patch the callers' EOSSDK import slots.
+///
+/// Off by default because the IAT walk touches other modules' pages; when it is
+/// on, the resident thread runs it as soon as EOSSDK is loaded, before any
+/// managed tick exists.
+fn iat_requested(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result<(), String> {
     if frame_hook != "1" {
         return Err(
@@ -139,6 +150,13 @@ fn install_ac_hooks() {
             "EOSSDK not loaded yet; hooks stay pending on the tick",
         );
         return;
+    }
+    // `EAC_IAT=1`: rewrite the callers' import slots *first*. The game caches the
+    // export pointer it resolved ~20 s in, so an inline patch of the export entry
+    // may already be too late; the caller's IAT slot is re-read on every call.
+    if iat_requested(std::env::var("EAC_IAT").ok().as_deref()) {
+        let slots = hromatite_eac::eos::install_iat();
+        log::log_tag("iat", &format!("patched {slots} slots"));
     }
     let mut hooks = hromatite_eac::Hooks::new();
     let line = hooks.install_now();
@@ -307,7 +325,9 @@ pub extern "system" fn DllMain(
 
 #[cfg(test)]
 mod tests {
-    use super::{player_loop_requested, require_gc_guard, select_late_update, validate_modes};
+    use super::{
+        iat_requested, player_loop_requested, require_gc_guard, select_late_update, validate_modes,
+    };
     use hromatite_core::lateupdate::Selector;
 
     #[test]
@@ -317,6 +337,16 @@ mod tests {
         assert!(!player_loop_requested(Some("0")));
         assert!(player_loop_requested(Some("1")));
         assert!(player_loop_requested(Some("true")));
+    }
+
+    #[test]
+    fn the_iat_walk_is_opt_in_only() {
+        assert!(!iat_requested(None));
+        assert!(!iat_requested(Some("")));
+        assert!(!iat_requested(Some("  ")));
+        assert!(!iat_requested(Some("0")));
+        assert!(iat_requested(Some("1")));
+        assert!(iat_requested(Some(" 1 ")));
     }
 
     #[test]
