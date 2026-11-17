@@ -813,25 +813,31 @@ impl SendState {
 }
 
 static SEND: Mutex<SendState> = Mutex::new(SendState::new());
-static CAP_PARSE_TRIED: AtomicBool = AtomicBool::new(false);
+static WANT_PAYLOADS: AtomicU8 = AtomicU8::new(0);
 static CAP_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 /// Does anybody want the payload bytes? Both the capture file and the emitter
 /// need them; without either, the detour only counts hits.
+///
+/// Cached after the first call: this runs on every RaiseEvent, and the
+/// environment does not change under a running game.
 fn wants_payloads() -> bool {
-    if !CAP_PARSE_TRIED.load(Ordering::Relaxed) {
-        CAP_PARSE_TRIED.store(true, Ordering::Relaxed);
-        let path = std::env::var("EAC_EVENT_CAP")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        *CAP_PATH.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
+    match WANT_PAYLOADS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let path = std::env::var("EAC_EVENT_CAP")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let capture = path.is_some();
+            *CAP_PATH.lock().unwrap_or_else(|poison| poison.into_inner()) = path;
+            let want =
+                capture || std::env::var("EAC_EVENT_SEND").is_ok_and(|value| !value.trim().is_empty());
+            WANT_PAYLOADS.store(if want { 1 } else { 2 }, Ordering::Relaxed);
+            want
+        }
     }
-    let capture = CAP_PATH
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .is_some();
-    capture || std::env::var("EAC_EVENT_SEND").is_ok()
 }
 
 /// Append captured events to `EAC_EVENT_CAP` in the capture format and log the
