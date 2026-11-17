@@ -15,6 +15,12 @@
 //!   `EAC_FORGE_AFTER_MS`, every live frame is replaced by a synthesized one
 //!   (same `SessionId`/`Flags`/body, next `Sequence`, fresh CRC-32C) at the
 //!   measured 2007 ms cadence, from a thread of our own.
+//! * `EAC_REPLAY_REPORT=<path>` ([`crate::report`]) keeps that generator and the
+//!   takeover, but each slot takes the *next recorded frame* of a whole 512-byte
+//!   report instead of rebuilding one frame from the template: only
+//!   `SessionId`, `Sequence` and the CRC are rewritten for the live session, so
+//!   the recorded bodies (message starts, inner checksums, counters) stay
+//!   intact.
 //! * `ReceiveMessageFromServer` observes inbound frames and can drop them after
 //!   the same deadline (`EACSHIM_DROP_IN=1`).
 //!
@@ -47,6 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering}
 use crate::capture::{CaptureFile, Frame, hex_prefix, read_frames};
 use crate::clock::now_ms;
 use crate::forge::{self, BodyMode, Template};
+use crate::report;
 
 /// Mutable forge state that belongs to one learned frame.
 #[derive(Clone)]
@@ -157,6 +164,22 @@ static FORGE_THREAD: AtomicBool = AtomicBool::new(false);
 /// must advance across emissions, not restart from the learned value.
 static FORGE_TEMPLATE: Mutex<Option<Learned>> = Mutex::new(None);
 static FORGE_CAPTURE: Mutex<Option<CaptureFile>> = Mutex::new(None);
+
+// ------------------------------------------------------------------ report
+//
+// `EAC_REPLAY_REPORT=<path>`: the same generator thread, but the frame it emits
+// comes from a recorded report instead of the template. The report and its
+// cursor live under their own mutex, so a slow reader never blocks the SDK
+// thread's template learning.
+/// True when a recorded report is being replayed instead of building frames.
+static REPORT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// `EAC_REPLAY_FLAGS=live`: `Flags` come from the live template, not the file.
+static REPORT_FLAGS_LIVE: AtomicBool = AtomicBool::new(false);
+/// The report being replayed, or `None` outside `EAC_REPLAY_REPORT` runs.
+static REPORT_STREAM: Mutex<Option<report::Stream>> = Mutex::new(None);
+/// Set once the report ran out (`EAC_REPLAY_REPORT_LOOP` off), so the
+/// exhaustion line reaches the log exactly once per epoch.
+static REPORT_STOPPED: AtomicBool = AtomicBool::new(false);
 
 /// One `(ClientData, callback)` pair registered by the game.
 struct Bind {
@@ -632,8 +655,18 @@ impl Hooks {
 
         // `EAC_FORGE=1`: parse once, publish into atomics, open the evidence
         // capture for the synthesized frames and start the generator thread.
-        let forge_config =
+        let mut forge_config =
             forge::Config::parse(env_flag("EAC_FORGE"), |name| std::env::var(name).ok());
+        // `EAC_REPLAY_REPORT=<path>`: the same generator and the same takeover,
+        // but each slot emits the next recorded frame. Its own deadline and
+        // readiness knobs (`EAC_REPLAY_AFTER_MS`, `EAC_REPLAY_MIN_FRAMES`)
+        // replace the forge ones, because a report run must still learn the
+        // live `SessionId` before it can retarget anything.
+        let report_config = report::Config::parse(|name| std::env::var(name).ok());
+        if let Some(config) = report_config.as_ref() {
+            forge_config.after_ms = config.after_ms;
+            forge_config.min_frames = config.min_frames;
+        }
         FORGE_AFTER_MS.store(forge_config.after_ms, Ordering::Relaxed);
         FORGE_MIN_FRAMES.store(forge_config.min_frames, Ordering::Relaxed);
         FORGE_INTERVAL_MS.store(forge_config.interval_ms, Ordering::Relaxed);
@@ -651,6 +684,60 @@ impl Hooks {
         if let Ok(mut slot) = FORGE_TEMPLATE.lock() {
             *slot = None;
         }
+        // The report itself is read here, once: a handler must never touch the
+        // filesystem, and `install` already reads the replay capture for the
+        // same reason. A failed load degrades to the template forge.
+        REPORT_ENABLED.store(report_config.is_some(), Ordering::Relaxed);
+        REPORT_STOPPED.store(false, Ordering::Relaxed);
+        REPORT_FLAGS_LIVE.store(
+            report_config
+                .as_ref()
+                .map(|config| config.flags_live)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
+        if let Ok(mut slot) = REPORT_STREAM.lock() {
+            *slot = None;
+        }
+        if let Some(config) = report_config.as_ref() {
+            match report::Report::load(&config.path) {
+                Ok(loaded) if loaded.is_empty() => {
+                    REPORT_ENABLED.store(false, Ordering::Relaxed);
+                    hook_log_blocking(&format!(
+                        "[report] {} has no 512-byte frame (skipped={}); \
+                         falling back to the template forge",
+                        config.path.display(),
+                        loaded.skipped()
+                    ));
+                }
+                Ok(loaded) => {
+                    let frames = loaded.len();
+                    let skipped = loaded.skipped();
+                    let truncated = loaded.truncated();
+                    if let Ok(mut slot) = REPORT_STREAM.lock() {
+                        *slot = Some(report::Stream::new(loaded, config.start, config.looping));
+                    }
+                    hook_log_blocking(&format!(
+                        "[report] armed path={} frames={frames} skipped={skipped} \
+                         truncated={truncated} start={} loop={} flags={} after_ms={} \
+                         min_frames={}",
+                        config.path.display(),
+                        config.start,
+                        config.looping,
+                        if config.flags_live { "live" } else { "file" },
+                        config.after_ms,
+                        config.min_frames
+                    ));
+                }
+                Err(error) => {
+                    REPORT_ENABLED.store(false, Ordering::Relaxed);
+                    hook_log_blocking(&format!(
+                        "[report] cannot read {}: {error}; falling back to the template forge",
+                        config.path.display()
+                    ));
+                }
+            }
+        }
         if forge_config.enabled() {
             let forge_path = std::env::var_os("HROMATITE_EAC_FORGE_CAPTURE")
                 .map(PathBuf::from)
@@ -664,7 +751,12 @@ impl Hooks {
                 *slot = CaptureFile::open(&forge_path).ok();
             }
             hook_log_blocking(&format!(
-                "[forge] armed after_ms={} min_frames={} interval_ms={} body={:?} out={}",
+                "[forge] armed mode={} after_ms={} min_frames={} interval_ms={} body={:?} out={}",
+                if REPORT_ENABLED.load(Ordering::Relaxed) {
+                    "report"
+                } else {
+                    "template"
+                },
                 forge_config.after_ms,
                 forge_config.min_frames,
                 forge_config.interval_ms,
@@ -1232,8 +1324,13 @@ fn forge_begin(now: u64) -> bool {
     FORGE_NEXT_SEQ.store(seq, Ordering::Relaxed);
     FORGE_STARTED.store(true, Ordering::Release);
     hook_log_blocking(&format!(
-        "[forge] start sid=0x{:x} flags=0x{:x} from_seq={seq} seen={} after_ms={} \
+        "[forge] start mode={} sid=0x{:x} flags=0x{:x} from_seq={seq} seen={} after_ms={} \
          interval_ms={} body={:?} uptime_ms={}",
+        if REPORT_ENABLED.load(Ordering::Relaxed) {
+            "report"
+        } else {
+            "template"
+        },
         template.session_id,
         template.flags,
         FORGE_SEEN.load(Ordering::Relaxed),
@@ -1246,6 +1343,18 @@ fn forge_begin(now: u64) -> bool {
         },
         now.saturating_sub(SESSION_START_MS.load(Ordering::Relaxed)),
     ));
+    if REPORT_ENABLED.load(Ordering::Relaxed)
+        && let Ok(stream) = REPORT_STREAM.lock()
+        && let Some(stream) = stream.as_ref()
+    {
+        hook_log_blocking(&format!(
+            "[report] start idx={} of={} loop={} remaining={}",
+            stream.cursor(),
+            stream.total(),
+            stream.looping(),
+            stream.remaining(),
+        ));
+    }
     true
 }
 
@@ -1256,6 +1365,15 @@ fn forge_reset_epoch() {
     FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
     if let Ok(mut slot) = FORGE_TEMPLATE.try_lock() {
         *slot = None;
+    }
+    // A recorded report belongs to one `SessionId`; the next room starts it
+    // over from `EAC_REPLAY_START` rather than resuming mid-report.
+    REPORT_STOPPED.store(false, Ordering::Relaxed);
+    if REPORT_ENABLED.load(Ordering::Relaxed)
+        && let Ok(mut slot) = REPORT_STREAM.try_lock()
+        && let Some(stream) = slot.as_mut()
+    {
+        stream.reset();
     }
 }
 
@@ -1310,7 +1428,14 @@ fn first_client_data() -> *mut c_void {
 }
 
 /// Build one heartbeat and hand it to the game's `MessageToServer` callback.
+///
+/// With `EAC_REPLAY_REPORT` the frame is the next recorded one instead (see
+/// [`emit_report_frame`]); everything after the bytes are chosen is shared.
 fn emit_forge_frame(now: u64) {
+    if REPORT_ENABLED.load(Ordering::Relaxed) {
+        emit_report_frame(now);
+        return;
+    }
     let Ok(mut slot) = FORGE_TEMPLATE.lock() else {
         return;
     };
@@ -1332,6 +1457,100 @@ fn emit_forge_frame(now: u64) {
     drop(slot);
     debug_assert_eq!(frame.len(), forge::FRAME_LEN);
     let crc = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]);
+    let (delivered, dt) = deliver_frame(&frame, now);
+    let count = FORGE_EMITTED.load(Ordering::Relaxed);
+    hook_log(format!(
+        "[forge] sid=0x{sid:x} seq={seq} crc=0x{crc:08x} len=512 flags=0x{flags:x} \
+         n={count} counter={counter} dt_ms={dt} delivered={delivered}"
+    ));
+}
+
+/// Emit the next recorded frame of the `EAC_REPLAY_REPORT` stream.
+///
+/// Only `SessionId`, `Sequence` and the checksum belong to the live session, so
+/// the recorded body (message start, inner checksums, counters) survives
+/// untouched — that is the whole point of replaying a report instead of
+/// rebuilding one fragment forever. `dt_ms` in the log line is the *recorded*
+/// inter-frame time of the source report; the capture file keeps the real
+/// emission spacing.
+fn emit_report_frame(now: u64) {
+    // The live identity comes from the learned template, so the report's
+    // frames land in *this* session. Take it and drop the lock: the report has
+    // its own.
+    let live = {
+        let Ok(slot) = FORGE_TEMPLATE.lock() else {
+            return;
+        };
+        let Some(learned) = slot.as_ref() else {
+            return;
+        };
+        (learned.template.session_id, learned.template.flags)
+    };
+    let flags_override = REPORT_FLAGS_LIVE.load(Ordering::Relaxed).then_some(live.1);
+    let next = {
+        let Ok(mut slot) = REPORT_STREAM.lock() else {
+            return;
+        };
+        let Some(stream) = slot.as_mut() else {
+            return;
+        };
+        match stream.next_frame() {
+            Some(next) => next,
+            None => {
+                // Log the stop once; the thread keeps its cadence and stays
+                // alive, so a later `BeginSession` resets and resumes.
+                if !stream.finished() {
+                    return;
+                }
+                let (index, of, wraps, looping) = (
+                    stream.cursor(),
+                    stream.total(),
+                    stream.wraps(),
+                    stream.looping(),
+                );
+                drop(slot);
+                if REPORT_STOPPED.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                hook_log(format!(
+                    "[report] stream exhausted idx={index} of={of} wraps={wraps} \
+                     loop={looping} delivered={}",
+                    FORGE_EMITTED.load(Ordering::Relaxed)
+                ));
+                return;
+            }
+        }
+    };
+    let seq = FORGE_NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let Some(frame) = report::retarget(&next.data, live.0, seq, flags_override) else {
+        hook_log(format!(
+            "[report] idx={} of={} len={} is not a 512-byte frame; skipped",
+            next.index,
+            next.of,
+            next.data.len()
+        ));
+        return;
+    };
+    debug_assert_eq!(frame.len(), forge::FRAME_LEN);
+    let crc = u32::from_le_bytes(
+        frame[forge::CHECKSUM_OFFSET..forge::HEADER_LEN]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    let flags = u16::from_le_bytes([frame[2], frame[3]]);
+    let (delivered, _) = deliver_frame(&frame, now);
+    hook_log(format!(
+        "[report] sid=0x{:x} seq={seq} idx={} of={} flags=0x{flags:x} crc=0x{crc:08x} \
+         delivered={delivered} dt_ms={}",
+        live.0, next.index, next.of, next.dt_ms
+    ));
+}
+
+/// Append `frame` to the evidence capture and hand it to the game callback.
+///
+/// Returns `(delivered, dt_ms)`: whether a callback was bound, and the real
+/// spacing since the previous emission (the capture file's `dt_ms`).
+fn deliver_frame(frame: &[u8], now: u64) -> (bool, u32) {
     let previous = FORGE_LAST_MS.swap(now, Ordering::Relaxed);
     let dt = if previous == 0 {
         0
@@ -1344,7 +1563,7 @@ fn emit_forge_frame(now: u64) {
     if let Ok(mut slot) = FORGE_CAPTURE.lock()
         && let Some(capture) = slot.as_mut()
     {
-        let _ = capture.append(dt, &frame);
+        let _ = capture.append(dt, frame);
     }
 
     let info = MessageInfo {
@@ -1366,11 +1585,7 @@ fn emit_forge_frame(now: u64) {
         }
         None => false,
     };
-    let count = FORGE_EMITTED.load(Ordering::Relaxed);
-    hook_log(format!(
-        "[forge] sid=0x{sid:x} seq={seq} crc=0x{crc:08x} len=512 flags=0x{flags:x} \
-         n={count} counter={counter} dt_ms={dt} delivered={delivered}"
-    ));
+    (delivered, dt)
 }
 
 /// Replay one captured frame into the game callback when it is due.
@@ -1776,6 +1991,10 @@ mod tests {
         FORGE_NEXT_SEQ.store(0, Ordering::Relaxed);
         FORGE_LAST_MS.store(0, Ordering::Relaxed);
         *FORGE_TEMPLATE.lock().expect("template lock") = None;
+        REPORT_ENABLED.store(false, Ordering::Relaxed);
+        REPORT_FLAGS_LIVE.store(false, Ordering::Relaxed);
+        REPORT_STOPPED.store(false, Ordering::Relaxed);
+        *REPORT_STREAM.lock().expect("report lock") = None;
     }
 
     /// Stand-in for the game's callback: records one delivery.
@@ -1922,6 +2141,193 @@ mod tests {
         let mut zeroed = frame.clone();
         zeroed[20..24].copy_from_slice(&[0; 4]);
         assert_eq!(crate::digest::crc32c_eac(&zeroed), stored);
+        BINDS[0].function.store(0, Ordering::Relaxed);
+        BIND_COUNT.store(0, Ordering::Relaxed);
+        forge_state_reset();
+    }
+
+    /// Two recorded frames: the first starts a message, the second continues
+    /// it. `tag` makes their bodies distinguishable.
+    fn recorded_report(session: u64, tags: [u8; 2]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, tag) in tags.into_iter().enumerate() {
+            let template = Template {
+                session_id: session,
+                flags: if index == 0 { forge::FLAG_START } else { 0 },
+                last_seq: index as u64 + 1,
+                body: vec![tag; forge::BODY_LEN],
+            };
+            let frame = forge::build_frame(&template, index as u64 + 1, BodyMode::Stale);
+            report::record(&mut bytes, index as u32 * 2_007, &frame);
+        }
+        bytes
+    }
+
+    fn capture_path(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "hromatite-eac-report-{tag}-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn the_report_mode_retargets_recorded_frames_and_keeps_their_bodies() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        forge_state_reset();
+        DELIVERED.store(0, Ordering::Relaxed);
+        DELIVERED_LEN.store(0, Ordering::Relaxed);
+        BINDS[0].client_data.store(0x44, Ordering::Relaxed);
+        BINDS[0]
+            .function
+            .store(recording_callback as *const () as usize, Ordering::Relaxed);
+        BIND_COUNT.store(1, Ordering::Relaxed);
+
+        let recorded = recorded_report(0x158b, [0xA1, 0xB2]);
+        let path = capture_path("replay");
+        *FORGE_CAPTURE.lock().expect("capture lock") = CaptureFile::open(&path).ok();
+        *REPORT_STREAM.lock().expect("report lock") = Some(report::Stream::new(
+            report::Report::from_bytes(&recorded),
+            0,
+            false,
+        ));
+        REPORT_ENABLED.store(true, Ordering::Relaxed);
+        FORGE_NEXT_SEQ.store(100, Ordering::Relaxed);
+
+        // The live session is a different one than the recording.
+        let mut live = Template::from_frame(&forge_frame(0xCC)).expect("template");
+        live.session_id = 0x77aa;
+        live.flags = forge::FLAG_START;
+        *FORGE_TEMPLATE.lock().expect("template lock") = Some(Learned {
+            template: live,
+            bump: false,
+            counter: 0,
+        });
+
+        emit_forge_frame(1_000);
+        emit_forge_frame(3_000);
+        assert_eq!(
+            DELIVERED.load(Ordering::Relaxed),
+            2,
+            "both frames delivered"
+        );
+        assert_eq!(DELIVERED_LEN.load(Ordering::Relaxed), 512);
+        assert_eq!(FORGE_NEXT_SEQ.load(Ordering::Relaxed), 102, "seq advances");
+
+        // The evidence capture holds exactly what was handed over: recorded
+        // bodies, live `SessionId`, running `Sequence`, valid CRCs.
+        let frames = crate::capture::read_frames(&path).expect("capture");
+        assert_eq!(frames.len(), 2);
+        let source = report::Report::from_bytes(&recorded);
+        for (index, frame) in frames.iter().enumerate() {
+            let data = &frame.data;
+            assert_eq!(data.len(), forge::FRAME_LEN);
+            assert_eq!(
+                &data[24..],
+                source.body(index).expect("recorded frame"),
+                "the recorded body survives byte for byte"
+            );
+            assert_eq!(
+                u64::from_le_bytes(data[4..12].try_into().expect("8 bytes")),
+                0x77aa,
+                "retargeted to the live session"
+            );
+            assert_eq!(
+                u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+                100 + index as u64,
+                "the sequence continues the live one"
+            );
+            let mut zeroed = data.clone();
+            zeroed[forge::CHECKSUM_OFFSET..forge::HEADER_LEN].fill(0);
+            assert_eq!(
+                crate::digest::crc32c_eac(&zeroed),
+                u32::from_le_bytes(
+                    data[forge::CHECKSUM_OFFSET..forge::HEADER_LEN]
+                        .try_into()
+                        .expect("4 bytes")
+                ),
+                "the CRC covers the retargeted frame"
+            );
+        }
+        // `EAC_REPLAY_FLAGS` is off: the recording's own flags are kept.
+        assert_eq!(
+            u16::from_le_bytes([frames[0].data[2], frames[0].data[3]]),
+            forge::FLAG_START
+        );
+        assert_eq!(
+            u16::from_le_bytes([frames[1].data[2], frames[1].data[3]]),
+            0,
+            "the second recorded frame is a continuation, not a start"
+        );
+
+        // No loop: the third slot has nothing left to say and delivers nothing.
+        emit_forge_frame(5_000);
+        assert_eq!(DELIVERED.load(Ordering::Relaxed), 2, "stream exhausted");
+        assert!(REPORT_STOPPED.load(Ordering::Relaxed));
+        emit_forge_frame(7_000);
+        assert_eq!(DELIVERED.load(Ordering::Relaxed), 2, "stays stopped");
+
+        *FORGE_CAPTURE.lock().expect("capture lock") = None;
+        let _ = std::fs::remove_file(&path);
+        BINDS[0].function.store(0, Ordering::Relaxed);
+        BIND_COUNT.store(0, Ordering::Relaxed);
+        forge_state_reset();
+    }
+
+    #[test]
+    fn the_report_mode_can_take_the_live_flags_and_loops_when_asked() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        forge_state_reset();
+        DELIVERED.store(0, Ordering::Relaxed);
+        BINDS[0].client_data.store(0x55, Ordering::Relaxed);
+        BINDS[0]
+            .function
+            .store(recording_callback as *const () as usize, Ordering::Relaxed);
+        BIND_COUNT.store(1, Ordering::Relaxed);
+
+        let recorded = recorded_report(0x158b, [0xD1, 0xD2]);
+        let path = capture_path("loop");
+        *FORGE_CAPTURE.lock().expect("capture lock") = CaptureFile::open(&path).ok();
+        let mut stream = report::Stream::new(report::Report::from_bytes(&recorded), 1, true);
+        // Prove the loop at the stream level first: idx 1, then back to 1.
+        assert_eq!(stream.next_frame().expect("frame 1").index, 1);
+        assert_eq!(stream.next_frame().expect("wrapped").index, 1);
+        stream.reset();
+        *REPORT_STREAM.lock().expect("report lock") = Some(stream);
+
+        REPORT_ENABLED.store(true, Ordering::Relaxed);
+        REPORT_FLAGS_LIVE.store(true, Ordering::Relaxed);
+        FORGE_NEXT_SEQ.store(7, Ordering::Relaxed);
+
+        let mut live = Template::from_frame(&forge_frame(0xCC)).expect("template");
+        live.session_id = 0x9001;
+        live.flags = forge::FLAG_START;
+        *FORGE_TEMPLATE.lock().expect("template lock") = Some(Learned {
+            template: live,
+            bump: false,
+            counter: 0,
+        });
+
+        emit_forge_frame(1_000);
+        emit_forge_frame(3_000);
+        emit_forge_frame(5_000);
+        assert_eq!(DELIVERED.load(Ordering::Relaxed), 3, "the loop never stops");
+
+        let frames = crate::capture::read_frames(&path).expect("capture");
+        assert_eq!(frames.len(), 3);
+        for frame in &frames {
+            assert_eq!(
+                u16::from_le_bytes([frame.data[2], frame.data[3]]),
+                forge::FLAG_START,
+                "EAC_REPLAY_FLAGS=live overrides the recording"
+            );
+        }
+        // Frame 1 is the continuation; its body is what the loop replays.
+        assert_eq!(&frames[0].data[24..], &vec![0xD2u8; forge::BODY_LEN][..]);
+
+        *FORGE_CAPTURE.lock().expect("capture lock") = None;
+        let _ = std::fs::remove_file(&path);
         BINDS[0].function.store(0, Ordering::Relaxed);
         BIND_COUNT.store(0, Ordering::Relaxed);
         forge_state_reset();
