@@ -15,6 +15,10 @@
 //!
 //! Enable with `EAC_EVP=1`; the trampoline engine must relocate `call rel32`
 //! (see `crate::hook`), otherwise these detours crash the game after ~40 s.
+// Every target of this module is a Win32 code patch; on the host the
+// bookkeeping statics are simply unused.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 

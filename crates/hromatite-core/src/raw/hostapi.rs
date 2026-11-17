@@ -103,7 +103,7 @@ extern "system" fn host_guarded_call(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (args, result);
-        return STATUS_ERROR;
+        STATUS_ERROR
     }
     #[cfg(target_os = "windows")]
     {

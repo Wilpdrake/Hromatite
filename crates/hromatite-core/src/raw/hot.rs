@@ -18,6 +18,7 @@ fn canonical_generation(value: &str) -> Option<u64> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 enum ReloadSelection {
     Latest,
     Generation(u64),

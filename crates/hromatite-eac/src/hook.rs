@@ -24,6 +24,10 @@
 //! A named shared section (`Local\hromatite_rust_hooktable_v1`) records
 //! `{target -> trampoline, handler}` so a second injection into the same process
 //! reuses the existing trampoline instead of re-hooking already patched bytes.
+// Every target of this module is a Win32 code patch; on the host the
+// bookkeeping statics are simply unused.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 
 /// Bytes overwritten at the target entry.
 pub const PATCH_LEN: usize = 12;

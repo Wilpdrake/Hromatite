@@ -1173,6 +1173,10 @@ fn work() {
     // materialised. Internally throttled and a no-op once attached.
     crate::raw::photon::poll();
 
+    // Same switch: drain captured RaiseEvent payloads and, when `EAC_EVENT_SEND`
+    // is set, push our own event 66 through the game's own Photon transport.
+    crate::raw::photon::tick();
+
     let _ = log::guard("hook::work", || {
         let mut reader = {
             let mut g = match READER.lock() {
