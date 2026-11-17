@@ -26,7 +26,23 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
+/// SHA-256 of the build the features are talking to.
+///
+/// It must describe the *loaded* module, not the source tree: after a game
+/// update the compiled `symbols.rs` is stale, and a feature that keys its
+/// struct layout on the old SHA would read the new binary with the old offsets.
+/// `buildinfo` validates the compiled descriptor against the image first (no
+/// hashing on the normal path) and falls back to hashing only when it moved.
 pub(crate) fn game_sha_bytes() -> [u8; 32] {
+    if let Some(hex) = crate::buildinfo::loaded_sha_hex()
+        && let Some(bytes) = crate::buildinfo::decode_sha_hex(hex)
+    {
+        return bytes;
+    }
+    compiled_sha_bytes()
+}
+
+fn compiled_sha_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
     let text = crate::symbols::GAMEASSEMBLY_SHA256.as_bytes();
     for (index, slot) in out.iter_mut().enumerate() {
