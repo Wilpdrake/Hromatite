@@ -3299,3 +3299,36 @@ il2cpp одними чтениями памяти (без единого выз�
   поиска таблицы классов нового билда. (3) IAT-хук `AddNotify` для поздней
   инъекции. (4) Живая проверка `EAC_EVP` (держатся ли детуры >40 с и что в `key32`).
   Merge в master — после согласования.
+
+### 2026-11-17 (ночь, итог сессии) — статус прогонов и что мешает дальше
+
+- **`EAC_REPLAY_SELF`** (`f220225`): поток для реплея пересобирается из **своей**
+  сессии, но не из файла, а из in-memory кольца живых 512-Б кадров
+  (`SELF_RING`/`SELF_RING_MAX=512`, ~17 мин). Причина: файл capture под Wine
+  нельзя прочитать параллельно с записью — прогон `replayself_0403` дал
+  `[report] self: only 1 frames captured for sid=0x528f`, и ушёл обычный отчёт
+  из файла (тот же кик, 53 с).
+- **Прогон `replayself2_0411` — нерешающий (не наш вывод о сервере, а сбой
+  инъекции).** Игра в мире 400 с, кика и диалога нет (`0` executive-сообщений),
+  но исходящих кадров **ноль**: в логе только `[msg] in …` (входящий хук жив),
+  `capture.bin` 0 байт, строк `[session]`/`[cut] AddNotify` нет. Т.е. `BeginSession`
+  и `AddNotifyMessageToServer` игра вызвала **до** патча (кэшированный указатель),
+  и наш wrapper не получил ни одного 512-Б кадра → `EAC_REPLAY_SELF` не сработал.
+  Тот же класс отказа, что `replaywrap_0346`.
+- **Вывод по инъекции (главный блокер).** Хук экспорта `EOSSDK` ловит вызов только
+  если патч стоит **до** первого обращения игры к этому экспорту. Инъекция
+  приезжает через 10–80 с после старта (wrapper ждёт wine-pid + 3 с + ожидание
+  LIVE-строки), а игра регистрирует колбэк на ~20-й секунде. Нужен либо
+  инжект раньше (уменьшить задержку в `hromatite-launch.sh`, не ждать LIVE),
+  либо хук по **IAT вызывающего модуля** (`EOS_AntiCheatClient_AddNotifyMessageToServer`
+  в таблице импорта `VRChat.exe`/`GameAssembly.dll`), который переживает
+  кэширование.
+- **Состояние ветки `eac-emu`** (не смержена, master `78d8122` чист):
+  `3c06341` фикс `Sequence`, `f220225` self-ring, `40b2d46` §17, `d007…` нет;
+  `cargo test --workspace --target x86_64-unknown-linux-gnu --offline` — core 135,
+  eac 59, features 15, abi 3, dll 5 ok; clippy `-D warnings` чисто; release
+  windows-gnu собирается в `~/EAC-RE/build-eac`.
+- **Артефакты**: `~/EAC-RE/findings/{report_stream.md,replay_report_test.md}`,
+  `~/EAC-RE/tools/{live_run.sh,report_extract.py,make_report_capture.py,xcap_*.py,dump_rva.py}`,
+  `evidence/{replayreport_0339,replaywrap_0346,replaywrap2_0351,replaywrap3_0355,replayself_0403,replayself2_0411}/`.
+  `~/.hromatite-mode` восстановлен (`81fad7f2…81f3`), игры/Steam-процессов не убито.
