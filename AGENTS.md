@@ -3086,3 +3086,60 @@ il2cpp одними чтениями памяти (без единого выз�
   в одном прогоне (`forge_0206`) поток кадров и лог оборвались на 77-й секунде при
   живом процессе (похоже на залипание в колбэке игры). Свежие 16-Б записи в теле
   (нужен источник хешей) — единственный оставшийся способ «оживить» содержимое.
+
+### 2026-11-17 — fix(hook): трамплин перелокализует все относительные поля, `mov rax` больше не съедает rax (ветка `eac-tramp`)
+
+- **Симптом (живой прогон, подтверждён).** Детуры на `EVP_EncryptInit_ex` /
+  `EVP_CIPHER_CTX_new` (BoringSSL внутри EOSSDK) ставятся «5/5», игра падает
+  примерно через 40 с.
+- **Корень найден (первый).** Пролог BoringSSL —
+  `mov eax,0x28 ; call rel32(__chkstk) ; sub rsp,rax`. Абсолютный прыжок назад в
+  трамплине кодировался как `48 B8 <addr> FF E0` (`mov rax,imm64 ; jmp rax`) и
+  **уничтожал rax**, а пролог именно оттуда берёт размер кадра. Дальше
+  `sub rsp, <адрес кода>` → порча стека → падение не сразу, а через десятки
+  секунд. Воспроизведено на реальной функции под wine: возврат `0x1400014AD`
+  вместо `7`. Все абсолютные прыжки в трамплине (`jcc-abs`, `jmp-abs`, прыжок
+  назад) теперь `FF 25 00000000 <qword>` (`jmp [rip+0]`, 14 байт, ни один
+  регистр не трогается); абсолютный вызов остался `FF 15 02 00000000 ; EB 08 ;
+  dq` (16 байт). Пролог 12→13+ байт: трамплин стал на 2 байта длиннее на каждый
+  абсолютный прыжок, страницы по-прежнему хватает (≤ 0x100).
+- **Второй (собственно перелокация).** В `hromatite-core` (`raw/hook.rs`) сборка
+  копии пролога была вписана в `prepare_span` и не тестировалась. Вынесена в
+  чистую `build_trampoline(head, insns, target, tramp, resume) -> Result<(Vec<u8>,
+  Vec<Reloc>), String>`: `rel8` (jcc/jmp/loop) сдвигается на `-delta` (не
+  влезает — отказ), `rel32` (call/jmp/jcc) сдвигается, а если не влезает —
+  `call`/`jmp` переписываются на `FF 15`/`FF 25 [rip+disp32]` со слотом
+  абсолютного адреса **после** прыжка назад; RIP-relative `disp32` (в т.ч.
+  `FF /2 call [rip+x]`, `FF /4 jmp [rip+x]`) сдвигается, не влезает — `prepare`
+  возвращает `None` и логирует причину. `prepare` пишет по строке на каждую
+  перелокализованную инструкцию (`prepare: 0x…+5 rel32 disp +0x40 -> -0xfc0`) плюс
+  итог `prologue NB (K insn, N relocated) copied to 0x…`.
+- **В `hromatite-eac`** (`src/hook.rs`, движок хуков EOS): все перелокации
+  собираются в `Hook::note` (было — только первая), и строка установки в
+  `eac.hooks` теперь `prologue=13 copied, reloc[call+5->0x…]`. Заодно
+  `F6/F7 /2../7` (`not/neg/mul/div`) больше не «съедают» несуществующий
+  immediate, декодируются `alu al/eax, imm` (04..3D, A8/A9), `prologue_len`
+  документирован как «только целые инструкции».
+- **Коммиты.** `b8bc99e` (core: чистая перелокация + 6 юнит-тестов), `f359fad`
+  (eac: register-free прыжки, полный лог перелокаций, 6 юнит-тестов, wine-тест).
+- **Проверено.**
+  - `cargo test --workspace --target x86_64-unknown-linux-gnu --offline`:
+    abi 3, core 125, dll 5, eac 46, features 15, epochs 1 — ok.
+  - `cargo clippy --workspace --all-targets -- -D warnings` (host **и**
+    windows-gnu) — чисто; `cargo build --workspace --release --target
+    x86_64-pc-windows-gnu` — Finished.
+  - Windows-тесты под wine (nix `wine64-11.0`, отдельный префикс
+    `~/.hermes/cache/scratch/wine-tramp64`; Proton-wine на хосте падает на
+    `/lib/ld-linux.so.2`): `hook_engine` 2/2 ok (в т.ч. новый
+    `a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs`:
+    global_asm `mov eax,0x28 ; call rel32 ; add rax,rcx ; ret`, `prologue_len=13`,
+    нота `call+5->…`, вызовы через детур возвращают 7 и 42),
+    `eos_install` 1/1 ok (stub-SDK собирается из `~/EAC-RE/shim/eossdkstub.c`
+    mingw'ом с `-lmcfgthread` из `/nix/store/*mcfgthread*/lib` в
+    `target/<triple>/debug/stub/`), `epochs` 1/1 ok, lib-тесты eac 46 ok.
+- **Осталось.** Живой прогон в VRChat не делался (по условию задачи игру не
+  запускать): нужно перепроверить, что EVP-детуры держатся >40 с. В `eac`-движке
+  остались дыры: нет слота для RIP-relative операнда, не влезающего в disp32
+  (такой пролог считается неподдерживаемым — хук не ставится, не падает), и не
+  декодируются `loop/jrcxz` (`E0..E3`) — тот же исход. Merge в master — после
+  согласования.
