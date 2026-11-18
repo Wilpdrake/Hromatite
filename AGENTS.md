@@ -3475,3 +3475,35 @@ takeover-режиму дефект надо закрыть: эмиттер об�
 - Для Ghidra теперь нужен образ **из памяти**:
   `~/.hermes/profiles/ds/cache/scratch/eac-b/eac_module.so`
   (6 651 656 Б, sha256 `2e5405f9…`), 12-МБ декод оставлен как стадия-лоадер.
+
+### 2026-11-18 — Ghidra-анализ живого образа EAC (6.65 МБ): каталог, BLAKE3, Zydis, ELF-модули
+
+- В Ghidra (проект `/11.18`) импортирован и проанализирован **правильный** образ —
+  `eac_module_memory.so` (6 651 656 Б, 7064 функции). Ранее открытые
+  `stage1_module.so` (12 МБ) и `elf_load4_nosec_vaddr969000.bin` — другие
+  артефакты, аннотаций в них не было.
+- **Строки:** `Easy Anti-Cheat Hash Catalogue not found`, `Corrupt Easy Anti-Cheat
+  Hash Catalogue`, `Could not locate game executable entry in the catalogue.`,
+  `Forbidden module`, `Corrupted memory`, `Forbidden tool`, `Untrusted system file`,
+  `Cannot run under Virtual Machine.`, `Corrupted packet flow`, `EAC index
+  certificate revoked`, `/proc/self/fd/%d`.
+- **Крипто/декодер:** полноценные BLAKE3 (`blake3_hasher_*`, две копии —
+  generic и AVX2/AVX512) и Zydis (`ZydisDecoderDecodeInstruction`,
+  `ZydisCalcAbsoluteAddress`, …) — то есть контроль целостности кода идёт через
+  дизассемблирование + хеш.
+- **Что хешируется:** `FUN_001601cc` обходит модули через
+  `dl_iterate_phdr(FUN_001605f1)`, для main-образа берёт базу из
+  `getauxval(AT_PHDR/AT_PHNUM)`, затем на каждый модуль вызывает
+  `FUN_0015f92a`/`FUN_0015fbcc`/`FUN_0015ff02`. `FUN_00179996` ищет модуль по
+  `dl_iterate_phdr(FUN_00179910)`. `FUN_001566e6` — потоковый BLAKE3 по чанкам
+  (`FUN_00154d24` → `blake3_hasher_update` → 32-байтный дайджест);
+  `FUN_0015425c` — хеш буфера + проверка через `FUN_00199ea1`.
+- **Вердикты:** `FUN_0012d112` — таблица код→текст (0…0x11: catalogue not
+  found/corrupt, certificate revoked, missing/unknown/untrusted file, forbidden
+  module/tool, corrupted memory/network, VM, system config, service unavailable).
+  `FUN_0012de28` — очередь нарушений (мьютекс +0x18b8), на каждое берёт код,
+  форматирует 512-Б текст и отдаёт в callback.
+- **Главное следствие:** linux-модуль видит только ELF-модули через `link_map`;
+  PE-образы игры (`GameAssembly.dll`, `UnityPlayer.dll`) и наш payload туда не
+  попадают — их маппит Wine. Значит записи отчёта и детект нашего DLL идут с
+  **win64-стороны** (EAC-клиент внутри EOSSDK), а не отсюда.
