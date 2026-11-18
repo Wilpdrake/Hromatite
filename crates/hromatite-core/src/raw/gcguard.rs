@@ -1,10 +1,23 @@
-//! Boehm GC thread-lifetime recovery with ownership-preserving cleanup.
+//! Boehm GC thread-lifetime recovery that never holds a lock across a
+//! collection.
 //!
-//! GC_remove_thread normally does CloseHandle -> unlink -> free. Two precise
-//! detours make it unlink -> CloseHandle -> free instead. The entry collector
-//! also removes already-terminated records through that same original function,
-//! so it never leaks raw records or handles. The original no-argument suspend
-//! pass runs under Boehm's own thread-list lock, which is recursive by design.
+//! `GC_remove_thread` normally does CloseHandle -> unlink -> free; two precise
+//! detours make it unlink -> CloseHandle -> free instead, so a record that the
+//! collector is about to visit still owns a *valid* thread handle (a closed
+//! handle makes `SuspendThread` fail with ERROR_ACCESS_DENIED before the
+//! `GetThreadContext` call-site is ever reached).
+//!
+//! The collector entry detour only marks the collection (`ENTRY_ACTIVE` +
+//! owner tid) and calls the original. It deliberately takes **no** lock: taking
+//! Boehm's thread-list section there and holding it across the stop-the-world
+//! pass inverts locks against `GC_unregister_my_thread` and wedges the world
+//! (measured 2026-11-18: login, world switch and menu freezes, 134/138 threads
+//! idle, main thread at 0% CPU, no dump).
+//!
+//! Records are removed only where the world is already stopped, so the table is
+//! stable without any lock of ours: the `GetThreadContext` call-site guard
+//! (`hook::install_gc_context_guard`) and the last-resort VEH for Boehm's own
+//! `SuspendThread/ResumeThread` aborts.
 
 use crate::gamebuild;
 use crate::raw::hook::{Prep, masked_signature_matches, patch, prepare, register};
@@ -31,7 +44,6 @@ const GC_SUSPEND_ABORT_RVA: usize = 0xc438d5;
 const GC_PROCESS_RECORD_RVA: usize = 0xc43800;
 const GC_ADVANCE_BUCKET_RVA: usize = 0xc439da;
 const GC_THREADS_RVA: usize = 0x0e6b_d8a0;
-const THREAD_LIST_CS_RVA: usize = 0x0e6b_d860;
 const WIN64_CONTEXT_RBX: usize = 0x90;
 const WIN64_CONTEXT_RIP: usize = 0xf8;
 
@@ -61,15 +73,12 @@ static SKIP_PREP: AtomicUsize = AtomicUsize::new(0);
 static AFTER_PREP: AtomicUsize = AtomicUsize::new(0);
 static MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 static THREADS_BASE: AtomicUsize = AtomicUsize::new(0);
-static THREAD_LIST_CS: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 static DETACHING: AtomicBool = AtomicBool::new(false);
 static ENTRY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ENTRY_OWNER_TID: AtomicU32 = AtomicU32::new(0);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-static REMOVED: AtomicU64 = AtomicU64::new(0);
 static RECOVERED: AtomicU64 = AtomicU64::new(0);
-static LAST_REMOVED: AtomicU32 = AtomicU32::new(0);
 static LAST_RECOVERED: AtomicU32 = AtomicU32::new(0);
 
 struct Flight;
@@ -261,7 +270,8 @@ unsafe fn terminate_record_by_tid(id: u32) {
     // lock. GC_remove_thread(tid) owns close+unlink+free for this exact build.
     let f: unsafe extern "system" fn(u32) =
         unsafe { core::mem::transmute(ga + GC_REMOVE_THREAD_RVA) };
-    // SAFETY: id belongs to this exact linked record under the list lock.
+    // SAFETY: id was read from a linked record while the world is stopped (the
+    // collector's own pass or our VEH at its abort site), so the table is stable.
     unsafe { f(id) };
 }
 
@@ -276,56 +286,27 @@ unsafe fn original_wait(handle: usize) -> u32 {
     }
 }
 
-unsafe fn sanitize_locked() {
-    let base = THREADS_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        return;
-    }
-    for bucket in 0..256usize {
-        // SAFETY: base is the build-measured GC_threads table under its own lock.
-        let link = base.wrapping_add(bucket * core::mem::size_of::<usize>());
-        // SAFETY: link is a complete bucket pointer. Cross-bucket removal by tid
-        // is deliberate here: this iteration validates only linked memory.
-        let mut current = unsafe { core::ptr::read_unaligned(link as *const usize) };
-        for _ in 0..8 {
-            if current == 0 {
-                break;
-            }
-            // SAFETY: the list lock prevents concurrent mutation while scalar
-            // fields and the next link are read from this live record.
-            let (next, id, handle, stack, blocked) = unsafe {
-                (
-                    core::ptr::read_unaligned(current as *const usize),
-                    core::ptr::read_unaligned(current.wrapping_add(8) as *const u32),
-                    core::ptr::read_unaligned(current.wrapping_add(0x10) as *const usize),
-                    core::ptr::read_unaligned(current.wrapping_add(0x18) as *const usize),
-                    core::ptr::read_unaligned(current.wrapping_add(0x28) as *const usize),
-                )
-            };
-            if id != 0 && stack != 0 && blocked == 0 && handle != 0 && handle < usize::MAX - 1 {
-                // SAFETY: this exact object is queried only until it returns a
-                // signalled state. Invalid/unknown objects stay linked.
-                let wait = unsafe { original_wait(handle) };
-                if gc_record_action(wait) == GcRecordAction::Unlink {
-                    // SAFETY: GC_remove_thread performs all cleanup itself. Do not
-                    // continue walking this chain after it has freed a record.
-                    unsafe { terminate_record_by_tid(id) };
-                    LAST_REMOVED.store(id, Ordering::Relaxed);
-                    REMOVED.fetch_add(1, Ordering::Release);
-                    break;
-                }
-            }
-            current = next;
-        }
-    }
-}
-
-/// Entry detour for the no-argument GC_suspend_all. Sanitization and the
-/// original pass share the same outmost critical-section ownership.
+/// Entry detour for the no-argument GC_suspend_all: a **marker only**.
+///
+/// It sets `ENTRY_ACTIVE`/`ENTRY_OWNER_TID` (so the removal path knows a
+/// collection is in progress and the last-resort VEH may act) and then runs the
+/// untouched original. It deliberately takes **no** lock and removes nothing.
+///
+/// Why: taking Boehm's thread-list critical section here and holding it across
+/// the original's stop-the-world pass creates a lock inversion — a worker
+/// suspended inside `GC_unregister_my_thread` (which takes the same section and
+/// waits for the collector) blocks the collector for good. Measured
+/// 2026-11-18: three freezes (login, world switch, menu) each left 134+ of 138
+/// threads idle with the main thread at 0% CPU and no dump; the same binary
+/// with this detour disabled loaded worlds normally for 40+ minutes.
+///
+/// Removing a record from here was also unsound: the world is still running at
+/// entry, so a concurrent table walk can observe a freed node. The two places
+/// that may repair the table both run with the world stopped — the
+/// `GetThreadContext` call-site guard and the `SuspendThread loop failed` VEH.
 ///
 /// # Safety
-/// ENTRY_ORIG must be a trampoline for this exact build's GC_suspend_all, and
-/// THREAD_LIST_CS its measured Boehm thread-list critical section.
+/// ENTRY_ORIG must be a trampoline for this exact build's GC_suspend_all.
 unsafe extern "system" fn suspend_entry_detour() {
     let _flight = Flight::new();
     let original = ENTRY_ORIG.load(Ordering::Acquire);
@@ -333,36 +314,23 @@ unsafe extern "system" fn suspend_entry_detour() {
         return;
     }
     // SAFETY: original is a validated no-argument trampoline, with no altered
-    // argument state on the fast path.
+    // argument state.
     let f: unsafe extern "system" fn() = unsafe { core::mem::transmute(original) };
     if !READY.load(Ordering::Acquire) {
         // SAFETY: simply execute the uninstrumented original when not active.
         unsafe { f() };
         return;
     }
-    let cs = THREAD_LIST_CS.load(Ordering::Acquire);
-    if cs == 0 {
-        // SAFETY: optional instrumentation never suppresses Boehm itself.
-        unsafe { f() };
-        return;
-    }
-    // SAFETY: cs is a real CRITICAL_SECTION from GameAssembly; Windows permits
-    // recursive ownership on its collector thread. Lifecycle waits for Flight.
-    unsafe { ffi::EnterCriticalSection(cs as *mut core::ffi::c_void) };
     let was_active = ENTRY_ACTIVE.swap(true, Ordering::AcqRel);
     if !was_active {
         ENTRY_OWNER_TID.store(crate::gcthreads::own_tid(), Ordering::Release);
     }
-    // SAFETY: the recursive outmost lock serializes all record lifetime work.
-    unsafe { sanitize_locked() };
-    // SAFETY: identical no-argument original trampoline, now after sanitization.
+    // SAFETY: identical no-argument original trampoline, called unchanged.
     unsafe { f() };
     ENTRY_ACTIVE.store(was_active, Ordering::Release);
     if !was_active {
         ENTRY_OWNER_TID.store(0, Ordering::Release);
     }
-    // SAFETY: same lock and same owning thread as EnterCriticalSection.
-    unsafe { ffi::LeaveCriticalSection(cs as *mut core::ffi::c_void) };
 }
 
 /// Route skip-CloseHandle. With READY set, skip directly to the original next
@@ -417,7 +385,8 @@ unsafe extern "system" fn defer_close_detour() -> ! {
 ///
 /// # Safety
 /// The route runs only at c41818 in GC_remove_thread with the measured RBX
-/// record layout, while Boehm's thread-list lock excludes other removals.
+/// record layout. Only the removal that owns this record reaches these sites, and
+/// the world is stopped whenever we repair the table, so no second remover races.
 unsafe fn close_after_unlink_route(record: usize) -> usize {
     let _flight = Flight::new();
     // The decision was captured at THIS removal's first detour. Later activation
@@ -464,7 +433,8 @@ unsafe fn linked_by_pointer(base: usize, candidate: usize) -> Option<LinkedRecor
         return None;
     }
     for bucket in 0..256usize {
-        // SAFETY: base is the build-measured GC_threads table under list lock.
+        // SAFETY: base is the build-measured GC_threads table, read while the
+        // caller holds the world stopped.
         let link = base.wrapping_add(bucket * core::mem::size_of::<usize>());
         // SAFETY: link is a complete bucket pointer in that table.
         let mut current = unsafe { core::ptr::read_unaligned(link as *const usize) };
@@ -517,7 +487,8 @@ fn abort_address(ga: usize, code: u32, address: usize) -> bool {
 }
 
 /// Last-resort recovery of an exact Boehm fatal, while the owner thread still
-/// holds the record-list lock. Cleanup is delegated to GC_remove_thread, then
+/// is at its own abort site with the world stopped. Cleanup is delegated to
+/// GC_remove_thread, then
 /// execution resumes using the next pointer saved before that cleanup.
 ///
 /// # Safety
@@ -553,7 +524,8 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
     let candidate =
         unsafe { core::ptr::read_unaligned(context.add(WIN64_CONTEXT_RBX).cast::<usize>()) };
     let base = THREADS_BASE.load(Ordering::Acquire);
-    // SAFETY: the active owner holds Boehm's lock, so pointer validation cannot
+    // SAFETY: the collector is stopped at its own abort site, so pointer
+    // validation cannot race
     // race a record removal/free. A stale RBX is not dereferenced on a miss.
     let Some(record) = (unsafe { linked_by_pointer(base, candidate) }) else {
         return false;
@@ -567,7 +539,7 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
         return false;
     }
     // SAFETY: next is captured while record is still allocated and the active
-    // owner holds Boehm's list lock, not on some later unsynchronized read.
+    // world is stopped at this abort, not on some later unsynchronized read.
     let next = unsafe { core::ptr::read_unaligned(record.record as *const usize) };
     // SAFETY: GC_remove_thread(tid) now uses the corrected unlink/close/free path.
     unsafe { terminate_record_by_tid(record.id) };
@@ -584,13 +556,9 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
 
 pub fn report_lines() -> Vec<String> {
     let mut lines = Vec::new();
-    let removed = REMOVED.swap(0, Ordering::AcqRel);
-    if removed != 0 {
-        lines.push(format!(
-            "entry guard: {removed} terminated record(s) cleaned by GC_remove_thread; last id={:#x}",
-            LAST_REMOVED.load(Ordering::Acquire)
-        ));
-    }
+    // Table repairs are reported by the call-site guard itself
+    // (`inline guard: N stale record(s) reaped`); the entry detour no longer
+    // removes anything, so there is nothing to report here.
     let recovered = RECOVERED.swap(0, Ordering::AcqRel);
     if recovered != 0 {
         lines.push(format!(
@@ -645,22 +613,21 @@ fn install_attached(prep: &Prep, detour: usize, attached: &AtomicBool) -> bool {
 }
 
 /// Idempotent installation: validate destinations for this process, then patch
-/// close handling, close-after-unlink and finally the collector entry. Prepared
-/// pages and origins are never cleared or freed, including on a later failure;
-/// a retry reuses them rather than allocating replacement trampoline pages.
+/// close handling, close-after-unlink and finally the collector entry marker.
+/// Prepared pages and origins are never cleared or freed, including on a later
+/// failure; a retry reuses them rather than allocating replacement pages.
 pub fn install() -> bool {
     if READY.load(Ordering::Acquire) {
         return true;
     }
     reset_install();
-    // `HROMATITE_GCT_ENTRY=0` is an experiment switch: keep Boehm completely
-    // stock. The removal-path patches (`skip_close`, `after_unlink`) are only
-    // sound while the entry detour holds the thread-list lock — their safety
-    // argument states so — therefore disabling the entry disables them too.
-    // Measured use: the world-switch freeze on 2026-11-18 left 134 of 138
-    // threads idle with the main thread at 0% CPU, i.e. a stop-the-world that
-    // never resumed, and the last run that loaded worlds (07:14) had the guard
-    // disabled by its build gate.
+    // `HROMATITE_GCT_ENTRY=0` keeps Boehm completely stock. It exists only as the
+    // emergency switch for this guard: with it off, a worker that exits without
+    // `GC_unregister_my_thread` leaks its record and the next collection aborts
+    // with `SuspendThread loop failed`. The default (unset) is the v2 guard: the
+    // entry detour marks the collection without taking any lock, the removal path
+    // keeps handles valid until after unlink, and the call-site guard repairs the
+    // table with the world stopped.
     if std::env::var("HROMATITE_GCT_ENTRY")
         .map(|value| value == "0")
         .unwrap_or(false)
@@ -719,7 +686,6 @@ pub fn install() -> bool {
     }
     MODULE_BASE.store(ga, Ordering::Release);
     THREADS_BASE.store(ga + GC_THREADS_RVA, Ordering::Release);
-    THREAD_LIST_CS.store(ga + THREAD_LIST_CS_RVA, Ordering::Release);
     SKIP_ORIG.store(skip_prep.trampoline, Ordering::Release);
     AFTER_ORIG.store(after_prep.trampoline, Ordering::Release);
     ENTRY_ORIG.store(entry_prep.trampoline, Ordering::Release);
@@ -744,7 +710,9 @@ pub fn install() -> bool {
     READY.store(true, Ordering::Release);
     log::log_tag(
         "gct",
-        &format!("entry GC guard installed at {entry:#x}; CloseHandle moved after unlink"),
+        &format!(
+            "GC guard installed at {entry:#x} (marker only, no lock held); CloseHandle moved after unlink"
+        ),
     );
     true
 }

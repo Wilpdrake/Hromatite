@@ -78,5 +78,22 @@ class GcDetourAbiTest(unittest.TestCase):
                 self.assertIn("mov    %rbx,%rcx", disassembly)
 
 
+    def test_gc_guard_takes_no_lock_across_a_collection(self) -> None:
+        """The collector entry detour must never take Boehm's thread-list lock.
+
+        Holding that section across the stop-the-world pass inverts locks against
+        `GC_unregister_my_thread` and wedges the world for good. Measured
+        2026-11-18: login, world-switch and menu freezes, 134 of 138 threads idle,
+        main thread at 0% CPU, no dump, no abort. The same binary with the guard
+        off loaded worlds for 40+ minutes.
+        """
+        source = (ROOT / "crates/hromatite-core/src/raw/gcguard.rs").read_text()
+        marker = 'unsafe extern "system" fn suspend_entry_detour'
+        body = source[source.index(marker) :]
+        body = body[: body.index("\n}")]
+        for forbidden in ("EnterCriticalSection", "LeaveCriticalSection", "sanitize_locked"):
+            self.assertNotIn(forbidden, body, f"entry detour must not use {forbidden}")
+
+
 if __name__ == "__main__":
     unittest.main()
