@@ -4626,3 +4626,43 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   `mode on segments>0 players=N`, ни одного нового `[veh] caught 0xe06d7363`, в кадре крест и
   боксы. Фича перезагружаема hot-reload'ом (якоря берутся из `hromatite_abi` внутри образа фичи),
   так что рестарт нужен только потому, что игра уже закрыта.
+
+### 2026-11-18 — Живая приёмка оверлея: он рисует; выход игры = fatal assert Steam, не наш payload
+
+- Прогон 14:46:05–14:49:00 (pid игры 1390333, фича 14:44, sha `616c477946cb…`). Игру закрыло
+  через ~3 минуты после загрузки, но оверлей к этому моменту **работал**.
+- **Оверлей доказан живыми строками** (это первая приёмка после правки GC-хендлов):
+  ```text
+  draw: in-game renderer ready — shader "Hidden/Internal-Colored", mesh 0x7b59a640, 4096 vertices
+  draw: on mode segments=14 players=1 frames=5203
+  draw probe: verts 0x7b59e000 klass 0x31530b08 (created as 0x31530b08) length 4096 (created as 4096)
+  draw probe: mesh klass 0x3034a910 (created as 0x3034a910), GC roots [3859651408, …] via gchandle_new 0x6fffeb70adc0
+  draw probe: mesh.vertexCount = 4096
+  draw probe: SetVertices returned 0x6ffffc27b0a0
+  draw probe: DrawMesh returned 0x6220140d
+  ```
+  То есть хендлы держат объекты, `SetVertices` больше не бросает, `[veh] caught 0xe06d7363`
+  в этом прогоне нет ни одной, а геометрия (14 сегментов, 1 игрок) в меше.
+- **Почему игра закрылась.** Это не наш payload и не GC: последняя запись payload'а — 14:47:06,
+  за ~2 минуты до выхода; новых `crash.dmp` нет (последний 14:31), в gc-логе последняя сборка
+  завершилась нормально, `[veh]`-исключений нет. Последние слова игры в stdout:
+  ```text
+  ../common/processpipe_posix.cpp (519) : Assertion Failed: CCrossProcessPipe::BWrite: 88 (Socket operation on non-socket)
+  ../common/pipes.cpp (882) : CClientPipe::BWriteAndReadResult: BWrite failed
+  ../common/pipes.cpp (882) : Fatal assert; application exiting
+  ```
+  В `output_log` в этот момент — `[Behaviour] Transitioning to room` → `OnLeftRoom` →
+  `Invoking 35 listeners for ExitWorld event`, т.е. выход из мира. `content_log.txt` Steam:
+  `[2026-11-18 14:49:05] AppID 438100 state changed : Fully Installed,` — Steam просто увидел
+  завершение процесса, сам клиент жив. Тот же класс сообщения описан в steam-for-linux
+  #12661 / #13802: обрыв IPC-пайпа Steam, после которого `pipes.cpp` делает `Fatal assert`
+  и приложение выходит. Связь с оверлеем по логам не видна — вызовов в игру в эти 2 минуты не было.
+- **Но и «чисто» назвать нельзя.** Раньше в тот же день были падения 14:19:07 (`AV` по
+  `GameAssembly+0xbcaad7`, в `rbx` — `0x13f099050`, т.е. старый массив вершин + данные) и
+  14:31:20 (`AV` по `GameAssembly+0x19ea0`, `mov 0x18(%rcx),%eax` с мусорным `rcx`). Оба
+  укладываются в картину «старая сборка 48 КБ геометрии писала в уже освобождённый массив»
+  (до правки GC-корней): теперь `intact()` проверяется до записи, и такой записи в чужую память
+  в новом коде нет.
+- **Осталось:** изолировать причину выходов. Нужен один прогон с `HROMATITE_DRAW=0` (контроль) —
+  если выход повторится без оверлея, это Steam/окружение; если нет — копать взаимодействие
+  `DrawMesh` с переходом мира.
