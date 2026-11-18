@@ -8,6 +8,8 @@
 use core::ffi::c_char;
 
 pub mod build;
+pub mod crc;
+pub mod hot;
 
 pub const ABI_VERSION: u32 = 2;
 pub const FEATURE_ENTRY_EXPORT: &[u8] = b"hromatite_feature_v1\0";

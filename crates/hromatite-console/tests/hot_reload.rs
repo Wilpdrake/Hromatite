@@ -43,6 +43,23 @@ fn parses_atomic_runtime_status_and_feature_logs_without_guessing() {
 }
 
 #[test]
+fn parses_stable_requested_and_canary_hot_states_into_exact_variants() {
+    for (name, expected) in [
+        ("stable", HotState::Stable),
+        ("requested", HotState::Requested),
+        ("canary", HotState::Canary),
+    ] {
+        let line = format!(
+            "[15] [hot] state={name} generation=4 previous=3 pending=none sha=0123456789ab flight=0 error=none"
+        );
+        let status = parse_hot_status(&line).expect("status must parse");
+        assert_eq!(status.state, expected, "state={name}");
+        assert_ne!(status.state, HotState::Other, "state={name}");
+        assert_eq!(status.state_name, name);
+    }
+}
+
+#[test]
 fn model_tracks_both_runtime_state_and_loaded_feature_abi() {
     let mut model = ConsoleModel::new(false);
     model.ingest([
