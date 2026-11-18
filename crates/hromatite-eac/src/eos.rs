@@ -74,8 +74,14 @@ const MAX_BINDS: usize = 4;
 const MAX_EVENTS: usize = 4096;
 /// Log lines printed in full before switching to every-Nth sampling.
 const CALLS_FULL: u64 = 200;
-/// `EACSHIM_DROP_AFTER_MS` default when the variable is present but unparsable.
-const DEFAULT_DROP_MS: u64 = 20_000;
+/// `EACSHIM_DROP_AFTER_MS` fallback when the variable is present but unparsable.
+///
+/// Zero means "no cut". A non-numeric value used to fall back to 20 s, which
+/// silently armed the cut whenever a stale `EACSHIM_DROP_AFTER_MS=cmd` entry
+/// from the C shim was left in `~/.hromatite-mode` (observed 2026-11-17: the
+/// payload dropped every outbound frame 20 s into each session and the game
+/// churned BeginSession/EndSession every 24-30 s).
+const DEFAULT_DROP_MS: u64 = 0;
 
 // ---------------------------------------------------------------- state
 
@@ -550,10 +556,12 @@ impl Hooks {
         };
         REPLAY.store(replay_enabled, Ordering::Relaxed);
 
+        // A non-numeric value means "off", not "cut after 20 s": the variable is
+        // shared with the C shim, which used `=cmd` for a file trigger.
         let drop_after = std::env::var("EACSHIM_DROP_AFTER_MS")
             .ok()
-            .map(|value| value.trim().parse::<u64>().unwrap_or(DEFAULT_DROP_MS))
-            .unwrap_or(0);
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DROP_MS);
         DROP_AFTER_MS.store(drop_after, Ordering::Relaxed);
         DROP_IN.store(env_flag("EACSHIM_DROP_IN"), Ordering::Relaxed);
 

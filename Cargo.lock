@@ -14,10 +14,15 @@ name = "hromatite-abi"
 version = "0.1.0"
 
 [[package]]
+name = "hromatite-commands"
+version = "0.1.0"
+
+[[package]]
 name = "hromatite-core"
 version = "0.1.0"
 dependencies = [
  "hromatite-abi",
+ "hromatite-commands",
 ]
 
 [[package]]
@@ -37,6 +42,7 @@ name = "hromatite-features"
 version = "0.1.0"
 dependencies = [
  "hromatite-abi",
+ "hromatite-commands",
  "hromatite-eac",
 ]
 

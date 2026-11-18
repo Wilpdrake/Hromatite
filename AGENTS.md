@@ -42,6 +42,8 @@
 | L2 «двойная память» | ❌ спроектировано (§7.4), не написано |
 | Инцидент: EAC выкинул с «failed to verify installation integrity» (error 16) | ⚠️ причина не изолирована (см. §8.4) |
 | Падения `Fatal error in GC — SuspendThread loop failed` | ✅ причина найдена, лечится в рантайме: протухшая запись `GC_threads[]` у нормально завершившегося потока il2cpp — репер вычеркивает её за <1 с (см. §17, 2026-11-15) |
+| **Живая сборка сейчас `245768f2…`** (шаг образов `0x50`, `Il2CppClass.name +0x10`, steps `class_methods 0x58`, `class_fields 0x88`, `method_*` +8) | ✅ все per-build числа — в `hromatite-abi::build` (`KNOWN`), в коде литералов больше нет; строки TL;DR выше с `0x48`/`0xe66c870`/`0xc2a330` относятся к предыдущей сборке `648f61b1…` |
+| **EAC heartbeat** | ✅ **зеркало** реальных кадров: `eac.tap` читает capture резидента, JSONL пишет `source=wire`, 512 Б, реальные sid/seq, `dt` median 2008 мс, CRC 26/26 (живая приёмка 2026-11-18); ❌ синтез/подмена, который держит сессию (forge 39–75 с против 120.5 с «тишины») |
 
 ---
 
@@ -599,6 +601,10 @@ grep -iE "fallback|unusable" ~/.hromatite-launch.log
 - Любое утверждение о поведении EAC/il2cpp подкреплять логом/файлом; иначе —
   помечать как гипотезу.
 - После обновления VRChat — перегенерировать `symbols.rs` и зафиксировать sha256.
+- **Список команд — только в `crates/hromatite-commands`** (`SPECS`). Оттуда
+  генерируются in-game `help` (resident + образ фич + `eac.*`), палитра TUI,
+  Tab-автодополнение и risk-гейт. Руками списки больше не правим: вторая копия
+  списка — это копия, которая отстаёт.
 
 ---
 
@@ -3063,3 +3069,576 @@ il2cpp одними чтениями памяти (без единого выз�
 - **Что осталось.** Хук на сам ctor `0x180405AF0` (пролог 12 Б без rel32 —
   безопасен) вместо скана; пересчёт `call rel32` в `build_trampoline`, чтобы
   EVP-детуры не роняли игру; проверить CTR/CFB+HMAC и GCM с 8-байтным тегом.
+
+### 2026-11-17 — fix(eac): нечисловой `EACSHIM_DROP_AFTER_MS` = выключено
+
+- **Симптом (пойман живым A/B 2026-11-17).** Прошлый прогон дал исходящие
+  `24×14 / 116×4` вместо ожидаемых 512 Б/2 с и churn `BeginSession`/`EndSession`
+  каждые 24–30 с. Причина: в `~/.hromatite-mode` остался ключ C-шима
+  `EACSHIM_DROP_AFTER_MS=cmd`, а парсер в payload'е на непарсящемся значении
+  брал `DEFAULT_DROP_MS = 20_000` → молча включался drop через 20 с после
+  каждого `BeginSession`.
+- **Исправление.** `DEFAULT_DROP_MS = 0` + `and_then(parse::<u64>().ok())`:
+  нечисловое значение теперь означает «не резать». Заодно это делает переменную
+  общей с C-шимом без сюрпризов.
+- **Контрольный прогон после этого (master, EAC ON).** `hooks 8/8`, вход в мир
+  `Furry Apartment`, `BeginSession`=1/`EndSession`=0, 170 исходящих кадров:
+  **512 Б × 121, median dt 2007 мс**, 24 Б × 18 (событийные), 116 Б нет;
+  входящие 24 Б × 154 (ack). Ни кика, ни `code 104`.
+- **Проверено.** `cargo test -p hromatite-eac` → 32 + 1 ok; `clippy -D warnings`
+  (windows-gnu) чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` → Finished.
+- **Отчёт:** `~/EAC-RE/findings/hooks_control.md`; сырые данные
+  `~/EAC-RE/evidence/control_0009/`.
+
+### 2026-11-17 — Новая игровая сборка: 207 имён il2cpp-экспортов перенесены и применены в Ghidra
+
+- **Факт обновления.** `GameAssembly.dll` теперь 253 015 040 Б, sha256
+  `245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb` (было
+  `648f61b1…`, 253 001 728 Б). Unity-версия не менялась (`6000.0.67f1-DWR`), но
+  `UnityPlayer.dll` тоже новый — имена экспортов и адреса переобфусцированы.
+  Всё, что в §1/§16 привязано к `648f61b1…`, на этой сборке недействительно.
+- **Что сделано.** Открыт Ghidra-проект `/11.17/GameAssembly.dll` (анализ 440 819
+  функций). Имена перенесены со старой карты `tools/data/il2cpp-export-names.json`
+  тремя ступенями: (1) якоря по точному телу с маской по таблице релокаций
+  (мелкие экспорты ≤24 Б), (2) монотонный DP по остальным (балл — доля совпавших
+  немаскированных байт, порядок адресов сохраняется), (3) **приёмка по графу
+  вызовов**: множество внутренних call/jmp-целей старой функции, прогнанное через
+  перенос, обязано совпасть с целями новой — совпало **223 из 224** пар.
+- **Чем подтверждено.**
+  - 223/224 пар с изоморфными графами вызовов; единственное исключение
+    (`il2cpp_gc_set_mode` → `0xc2abf0`) доказано своим телом: переключатель
+    режима, зовущий `gc_enable`(`0xc2ab40`)/`gc_disable`(`0xc2ab90`) и пишущий
+    глобал режима (`hromatite-doc` + дизасм Ghidra).
+  - Три экспорта в новой сборке не обфусцированы (`il2cpp_free` @`0xbdfed0`,
+    `il2cpp_gchandle_get_target` @`0xc2ae10`, `il2cpp_native_stack_trace`
+    @`0xc2a880`) — независимый перенос предсказал ровно их (**3/3**).
+  - `il2cpp_get_corlib` @`0xc29c70` — `mov rax,[global]; ret`, `il2cpp_domain_get`
+    @`0xc2a650` — thunk, `il2cpp_image_get_class` @`0xc2c0a0` — `mov rax,[rcx+0x28];
+    mov r8d,[rax]; add r8d,edx; … imul 0x58` (MetadataCache), т.е. форма совпадает
+    с прежними доказанными личностями.
+- **Результат в базе Ghidra.** Переименовано **207** функций (9 батчей
+  `rename_symbols_batch`, 0 отказов), прочитано обратно через `get_function_info`.
+  Всего названо **222 из 226** различных адресов (251 экспорт). Четыре адреса
+  оставлены **без имени** с plate-комментарием (форма не доказывает личность):
+  `0x0bedb0`, `0x0a9890`, `0x0223a10` (адрес новый, в прошлой сборке его не было),
+  `0x0291f0`. Старая `0x0c4740` (`mov rax,[rcx+0x58]`) экспорта в новой сборке не
+  имеет вовсе.
+- **Побочно — раскладки этой сборки отличаются от прошлой** (снято дизасмом живьём
+  в Ghidra, все ссылки ниже проверены по коду, который эти поля обязан читать):
+  `Il2CppClass.parent` `+0x10` → **`+0xa0`** (три независимых обходчика родителя:
+  `class_get_property_from_name`, `class_get_field_from_name`,
+  `class_get_method_from_name`); `fields` `+0x80`→**`+0x88`**, `FieldInfo` stride
+  `0x28`→**`0x20`** (`name@0`, `offset@8`, `type@0x10` — доказано
+  `il2cpp_field_get_value` @`0xbbe020`); `properties` `+0x90`→**`+0x80`**, stride
+  **0x30**, `name@+0x10`; `methods` `+0x50`→**`+0x58`** (`method_count@+0x120`);
+  `interfaces` **`+0x90`** (`count@+0x12c`); `MethodInfo.name` `+0x18`→**`+0x20`**.
+  Не изменились: `name@0x98`, `namespaze@0x18`, `byval_arg@0x20`,
+  `static_fields@0xb8`, `userdata@0xd0`, `instance_size@0xf8`, `flags@0x118`,
+  `token@0x11c`, `rank@0x132`, `MethodInfo{token@0x48, flags@0x4c, param_count@0x52}`,
+  `Il2CppImage{name@8, filename@0x40}`, `Il2CppArray.max_length@0x18`,
+  `Il2CppString{length@0x10, chars@0x14}`.
+- **Артефакты.** Новая карта `tools/data/il2cpp-export-names-245768f2.json`
+  (226 адресов, 222 названы, 207 `renamed_in_ghidra: true`, в `validation` —
+  методика, результат 223/224, 3/3 по выжившим именам и таблица сдвигов раскладок).
+  Старая карта `tools/data/il2cpp-export-names.json` сохранена как валидная для
+  `648f61b1…`. Документ `docs/IL2CPP-EXPORT-NAMES.md` дополнен разделом про эту
+  сборку (методика + таблица раскладок + 4 неназванных адреса).
+- **Что осталось.** (1) `crates/hromatite-core/src/symbols.rs` и все зашитые в
+  рантайм адреса (`s_TypeInfoDefinitionTable` `0xe66c870`, GC call-site guard
+  `0xc41ad2`, `il2cpp_image_get_class` `0xc2a330`, `il2cpp_get_corlib` `0xc27f00`)
+  относятся к **прошлой** сборке и на новой недействительны — их надо переносить
+  отдельным этапом (по новым именам: `il2cpp_image_get_class` = `0xc2c0a0`,
+  `il2cpp_get_corlib` = `0xc29c70`, `il2cpp_domain_get` = `0xc2a650`);
+  (2) `m3`-константы (`parent`/`fields`/`methods`/`MethodInfo.name`) — по таблице
+  выше; (3) 4 неназванных адреса можно закрыть только по поведению (вызовом в
+  живом процессе), не по форме; (4) Ghidra-проект сохранён пользователем вручную —
+  в открытой сессии переименования есть, на диск они попадают после `Ctrl+S`.
+- **Поправка после повторной проверки (та же сессия).** `0x8ace0` переименован не
+  в `il2cpp_field_get_name`, а в **`il2cpp_field_get_type`**: `il2cpp_field_get_value`
+  (`0xbbe020`) берёт указатель типа из `[field+0x10]` и читает флаги по `[type+0x8]`,
+  т.е. `FieldInfo` = `{name@0, offset@8, type@0x10, token@0x18}` (stride 0x20), и
+  `+0x10` — это тип, а не имя. Имя поля лежит в `FieldInfo+0`. Итог не меняется:
+  207 переименований, 222 из 226 адресов названы, 4 неназванных — те же.
+
+### 2026-11-17 — Зашитые константы вынесены в дескриптор сборки + динамическое разрешение
+
+- Коммит: см. следующий (`feat(build): select per-build anchors from the loaded image`).
+- **Зачем.** После обновления игры (§ записи выше) выяснилось, что все адреса
+  лежали константами в четырёх местах и каждая из них — мина под следующей
+  сборкой: `raw/gcguard.rs` (11 RVAs + 3 байтовых сигнатуры), `raw/hook.rs`
+  (call-site GetThreadContext, threads, unregister/remove, дисплейсмент в
+  `expected`), `features/m3.rs` (3 RVA + 9 смещений структур), `symbols.rs`
+  (251 экспорт, генерируется), плюс литералы sha в гейтах.
+- **Что теперь.** Единственный источник чисел — `crates/hromatite-abi/src/build.rs`:
+  `GcAnchors` (remove/skip/unlinked_next/after_unlink/suspend_entry/context_call/
+  process_record/resume_abort/suspend_abort/advance_bucket/threads/thread_list_cs),
+  `Il2cppAnchors` (get_corlib, image_get_class, class_table) и `Layout`
+  (parent/namespace/methods/fields/name/fields_count + `FieldInfo`
+  name/type/offset/parent + stride + MethodInfo name/return_type/parameters/flags/
+  param_count). Таблица `KNOWN` содержит обе сборки — `648f61b1…` (verified) и
+  `245768f2…` (verified=false, причина в `note`), выбор по sha256 модуля.
+- **Динамика.** `core/buildinfo.rs` выбирает дескриптор по sha из `symbols.rs`;
+  `raw/discover.rs` умеет вывести якоря из самого образа, если сборка неизвестна:
+  сообщение `"SuspendThread loop failed"` в `.rdata` → xref-ы `lea` → вход
+  `GC_suspend_all` (расстояния +0x70/+0xb2/+0xdb/+0x145/+0x24a внутри функции
+  одинаковы в обеих сборках), `49 8B 1C F6` (`mov rbx,[r14+rsi*8]`) → функция
+  удаления записи и `GC_threads[]`, `mov rax,[rip+d]; lea rsi,[rax+rdi*8]` →
+  `s_TypeInfoDefinitionTable`, тело `il2cpp_image_get_class`, а `il2cpp_get_corlib`
+  — единственный геттер, чей глобал указывает на образ с `+0x8 == "mscorlib"`.
+- **Чем подтверждено.** Все пять правил проверены на ДВУХ сборках офлайн:
+  remove_thread (0xc417b0 / 0xc43520), threads (0xe6bb180 / 0xe6bd8a0),
+  class_table (0xe66c870 / 0xe66f0d0), image_get_class (0xc2a330 / 0xc2c0a0) —
+  совпадают с тем, что снято вручную в Ghidra. Пять unit-тестов на синтетических
+  буферах (`raw::discover::tests`), тест консистентности расстояний внутри
+  функций в `hromatite-abi::build::tests`, тест «descriptor существует для
+  скомпилированного sha» в `buildinfo`.
+- **Гейты вместо литералов.** `gcguard::install`, `hook::install_gc_context_guard`
+  и `features/m3` больше не сравнивают sha с зашитой строкой: они спрашивают
+  дескриптор (или discovery) и **отказываются ставить патч**, если якорей нет.
+  Сигнатуры теперь проверяются по форме (`call [rip]`, `lea rax,[rip]`,
+  три `mov [rsp+d8], reg`), а не сравнением с байтами одной сборки.
+  `m3` в фичах берёт RVA/смещения из дескриптора по sha, который резидент
+  отдаёт в `HostApiV1`; при неизвестной сборке отвечает
+  `no metadata layout for GameAssembly <sha>` и `STATUS_NOT_READY`.
+- **Проверено.** host: abi 7, core 127 (+5 discover, +4 build, +3 buildinfo),
+  dll 5, eac 32+1, features 15 — все ok; `cargo clippy --workspace --all-targets
+  --release` чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` — ok (`hromatite.dll` 1 885 923 Б,
+  `hromatite_features.dll` 1 510 055 Б). `symbols.rs` перегенерирован на новую
+  сборку (`tools/symmap.py`), побочный `symbols-245768f25214.json` добавлен.
+- **Что осталось.** (1) `gc.thread_list_cs` новой сборки выведен (table−0xa0),
+  а не доказан — при первом живом прогоне смотреть лог `discover:`/`entry GC
+  guard installed`; (2) `layout.method_return_type` для новой сборки следует из
+  сдвига `name` (+8) — проверить живьём на `LateUpdate`-селекторе; (3)
+  `playerloop.rs` и worker-trace по-прежнему привязаны к `648f61b1…` и на новой
+  сборке честно отказываются — их RVAs надо внести в дескриптор отдельным шагом;
+  (4) в `discover` нет вывода `WORKER_DISPATCH_RVA`/`GC_UNREGISTER_RVA`.
+
+### 2026-11-17 — Промпт для агента-генератора per-build данных
+
+- Коммит: этот (`docs: prompt for the per-build data generator`).
+- Добавлен `docs/PROMPT-BUILD-GENERATOR.md` — готовое задание другой ИИ на
+  `tools/buildgen.py` + рантайм-фоллбэк: перенос имён (`export_transfer.py`),
+  правила вывода 12 GC-якорей, 3 il2cpp-якорей и раскладок структур, требования
+  к качеству (fail closed, ICF, «порядок стабов — не доказательство», никаких
+  `create_function` в Ghidra) и **таблица-оракул** с эталонными значениями обеих
+  сборок (`648f61b1…`, `245768f2…`) для регрессии генератора.
+- Ничего в коде не менялось; это документ-задание для следующего исполнителя.
+
+### 2026-11-17 — buildgen: офлайн-генератор per-build чисел (офлайн-половина готова)
+
+- Коммиты: **`a22b903`** (`feat(buildgen): derive every per-build anchor from
+  GameAssembly.dll`), **`c167f00`** (`chore(build): regenerate the descriptor
+  with buildgen and pin the oracle`).
+- **Что сделано.** `tools/buildgen.py` (stdlib, без внешних зависимостей)
+  собирает из файла `GameAssembly.dll` весь дескриптор сборки:
+  * экспортная карта — через `export_transfer.py` (якоря + монотонный DP +
+    изоморфизм графа вызовов), пишется `tools/data/il2cpp-export-names-<sha12>.json`;
+    если карта для этого sha уже лежит в `tools/data`, перенос не повторяется;
+  * 12 GC-якорей: `GC_threads[]` — цель `lea r14,[rip]` перед
+    `49 8B 1C F6`; `remove_thread` — откат до `0xCC`-паддинга; `skip_close`
+    проверяется по импорту (`call [IAT]`, слот = `CloseHandle`), `unlinked_next`
+    = +6, `after_unlink` = `48 8D 05`; `GC_suspend_all` — от xref'ов на строку
+    `SuspendThread loop failed` (−0x128), внутри проверяются `FF 15` (слот =
+    `GetThreadContext`), два `int3`, `add r15,8`, и кросс-чек: `lea r15` == threads,
+    `lea r12` == threads+0x800;
+  * 3 il2cpp-якоря: слот `s_TypeInfoDefinitionTable` (`mov rax,[rip]; lea
+    rsi,[rax+rdi*8]`), тело `image_get_class` (должно быть экспортом),
+    `get_corlib` — единственный naked-геттер, чей глобал больше 4 ГиБ (остальные
+    два отдают малые константы: `0x10000` — pool chunk, `50000000`);
+  * раскладки: `class_fields`/`class_methods` — нагрузка перед `48 89 07`
+    (публикация итератора), `fields_count` — `cmp word [class+disp],0`,
+    `field_stride` — `add rax,imm8` / `shl rcx,5` / `lea r,[r9+imm8]`
+    (все три формы встречаются: старая сборка 0x28 через lea, новая 0x20 через shl),
+    `field_name` — загрузка перед strcmp в `class_get_field_from_name`,
+    `field_type` — `mov r,[rdx+d]` перед `test dword [type+8],0x20000000` в
+    `field_get_value`, `field_offset` — `movsxd rax,[rcx+0x8]`,
+    `method_name/flags/param_count` — из `class_get_method_from_name`,
+    `method_parameters/param_count` — из `method_get_param`.
+- **Найденная ошибка в существующей карте (ICF).** На `245768f2…` перенесённое имя
+  `il2cpp_class_get_parent` указывает на `0x8ace0` — это тело `mov rax,[rcx+0x10]`,
+  т.е. `field_get_name`, а настоящий `class_get_parent` = `0x12c750` (`[rcx+0xa0]`).
+  Поэтому `class_parent` теперь берётся **из обхода родителя**
+  (`mov rbx,[rbx+disp]; test rbx,rbx` в `class_get_method_from_name`), а имя
+  используется только как сверка; расхождение пишется в `note`. Аналогично
+  `field_parent`: перенесённый `il2cpp_field_get_parent` даёт `0x20`, что не
+  влезает в `FieldInfo` новой сборки (stride 0x20) → `0` + note (в новой сборке
+  родителя поля нет, есть token@0x18).
+- **Чем подтверждено (реальные прогоны).** Обе сборки воспроизведены **точно**
+  по таблице-оракулу из задания:
+  * `648f61b1…`: все 12 GC (0xc417b0…0xe6bb100), 3 il2cpp
+    (0xc27f00 / 0xc2a330 / 0xe66c870), layout 0x10/0x18/0x50/0x80/0x98/0x124/0x28,
+    field 0x10/0x00/0x08/0x20, method 0x18/0x20/0x30/0x4c/0x52;
+  * `245768f2…`: 0xc43520…0xe6bd800, 0xc29c70 / 0xc2c0a0 / 0xe66f0d0,
+    layout 0xa0/0x18/0x58/0x88/0x98/0x124/0x20, field 0x00/0x10/0x08/0x00,
+    method 0x20/0x28/0x30/0x4c/0x52.
+  `tools/test_buildgen.py` — **11/11** (сканеры на синтетике + оба оракула);
+  `cargo test -p hromatite-abi` — **8/8** (новый тест оракула в `build.rs`);
+  host-тесты воркспейса: abi 8, core 127, dll 5, eac 32, features 15 — зелёные;
+  `cargo clippy --workspace --all-targets --release` — чисто;
+  `cargo build --workspace --release --target x86_64-pc-windows-gnu` — OK.
+- **Что осталось (рантайм-половина задания):** резидент пока не пишет кэш
+  `%USERPROFILE%\hromatite-build-<sha12>.json` и не логирует `buildgen: …`;
+  `raw::discover` по-прежнему со своими константами-расстояниями.  Отдельным
+  шагом: при старте считать sha, брать дескриптор из кэша, иначе `discover`,
+  иначе **не ставить патч** (fail closed).  Второй хвост — вывести
+  `GetCurrentPlayerLoop` / worker-dispatch / `GC_unregister` (сейчас последний
+  выводится как единственный вызывающий `remove_thread`: 0xc41920 / 0xc43734,
+  а `class_from_type` берётся из карты имён).
+
+### 2026-11-17 — Рантайм-половина buildgen: определяется загруженная сборка, кэш открытий
+
+- Коммит **`a9f4d37`** (`feat(buildinfo): identify the loaded build, cache
+  discovered anchors`). Файлы: `crates/hromatite-core/src/buildinfo.rs`,
+  `raw/hostapi.rs`, `raw/procs.rs`.
+- **Зачем.** После обновления игры payload старше модуля, в который его
+  замапили, а `buildinfo` верил `symbols.rs` на слово: GC/il2cpp-якоря брались из
+  дескриптора *скомпилированной* сборки, и `hostapi::game_sha_bytes()` отдавал
+  фичам тот же устаревший SHA. Следствие видно в живом логе: на сборке
+  `245768f2…` m3 брал раскладку прошлой сборки → **2662** строки
+  `[m3] class_from_name: fault` + VEH.
+- **Что теперь.** Идентичность модуля определяется в два шага:
+  1. `buildinfo::anchors_match()` — пять байтовых форм, от которых зависит сам
+     GC-guard: пролог коллектора (`48 89 .. 24 d8` ×3), `call [CloseHandle]`
+     (`FF 15`), `lea rax,[sentinel]` (`48 8D 05`), `call [GetThreadContext]`
+     и тело `il2cpp_get_corlib` (`48 8B 05 d C3`). Ни хеширования, ни I/O.
+  2. только если формы не совпали — хеш **файла** модуля
+     (`procs::own_module_path` → `sha256::hex_digest_file`) и поиск в `KNOWN`.
+     Хешировать замапленный образ бессмысленно: он релоцирован (импорты,
+     указатели в `.data`), файловый SHA так не воспроизводится — это
+     зафиксировано комментарием в коде.
+- `hostapi::game_sha_bytes()` теперь отдаёт **загруженную** сборку, поэтому фичи
+  (m3) получают ту раскладку, которая реально в памяти.
+- Если ни таблица, ни скомпилированный дескриптор не подходят —
+  `raw::discover` даёт якоря, а результат один раз на процесс пишется в
+  `%USERPROFILE%\hromatite-build-<sha12>.json` в схеме buildgen (`layout`
+  пустой: раскладки из образа не выводятся) и логируется строкой `buildgen: …`.
+  Этот файл потом съедает `tools/buildgen.py` (`runtime_cache`).
+- **Fail closed сохранён:** нет якорей → патч не ставится; неизвестная сборка →
+  фичи отказываются (`STATUS_NOT_READY`), а не «пробуют».
+- **Чем подтверждено (хост).** host-тесты: `hromatite-core` **133** (в т.ч. 6
+  новых: формы принимаются, сдвинутый якорь отвергается, нечитаемая страница =
+  нет совпадения, декод SHA, имя кэш-файла, JSON кэша); воркспейс целиком
+  **194/194**; `cargo clippy --workspace --all-targets --release -- -D warnings`
+  — чисто; `cargo build --workspace --release --target x86_64-pc-windows-gnu` — OK.
+- **Не проверено живьём.** Хеш-путь срабатывает только после обновления игры
+  (на нормальном пути хеша нет); живой прогон делает пользователь. Критерий:
+  в логе при обновлённой сборке — `buildgen: loaded GameAssembly sha256=…`
+  и (если сборки нет в `KNOWN`) `buildgen: unknown build …: discovery cached at …`
+  плюс файл `hromatite-build-<sha12>.json` в профиле; при неизвестной сборке
+  m3 отвечает `no metadata layout for GameAssembly <sha>`, а не падает VEH-ом.
+
+### 2026-11-17 — TUI: прокрутка колесом мыши и генерируемый каталог команд
+
+- Коммит: `f137405` (`feat(console): mouse-wheel scrolling and a generated
+  command catalogue`). Правки только в host-части (TUI) и в текстах `help`
+  payload'а; игровой протокол, тик, GC-guard и hot-reload не тронуты, игра в
+  этой сессии не запускалась.
+- **Колесо мыши.** Драйвер терминала включает SGR-репорт (`?1000h ?1006h`) в
+  `TerminalGuard::enter` и **снимает его в `Drop` до выхода с альтернативного
+  экрана** — иначе шелл пользователя получал бы клики как escape-последовательности.
+  `KeyDecoder` понимает SGR (`ESC [ < b ; x ; y M`) и legacy X10 (`CSI M cb cx cy`),
+  отбрасывает биты модификаторов/движения, отдаёт `Key::ScrollUp`/`ScrollDown`;
+  неразобранный «хвост» остаётся в буфере, одиночный Esc остаётся Esc.
+  `ConsoleModel` крутит по 3 строки на щелчок: лог (пауза follow, возврат к хвосту
+  возобновляет), field manual и выбор в палитре. Смещение клампится по
+  последнему `render::body_rows` — «щелчки в стену» больше не копят невидимый
+  запас (у прежних `PgUp`/`PgDn` был ровно этот баг; теперь они листают страницу
+  тем же клампленным путём). Field manual переехал из рендерера в модель
+  (`model::field_manual`), потому что прокрутке нужно знать число строк.
+- **Генерируемый каталог.** Новый workspace-крейт `crates/hromatite-commands`
+  (чистые данные, без зависимостей, `forbid(unsafe_code)`): одна таблица
+  `SPECS` — `name`, `aliases`, `usage`, `summary` (EN для палитры),
+  `note` (RU для in-game `help`), `risk` (SAFE/ADV/RISK) и `scope`
+  (Resident / Both / Feature). `help_lines(Scope::*)` рендерит `help`,
+  `names()` кормит автодополнение, `find()` резолвит алиасы. От неё теперь
+  генерируются **четыре** места, которые раньше правились руками:
+  `raw/console.rs` (resident `help`), `features/feature.rs` (help образа фич),
+  `features/eac.rs::help` (`eac.*`) и TUI (`commands.rs` → палитра, Tab,
+  risk-гейт). Побочный эффект: палитра наконец видит feature-only команды
+  (`feature`, `eac.*`), которых в ручном списке не было. Порядок таблицы
+  задаёт порядок help и палитры: сначала `help`, затем `pos`/`who`/`esp`,
+  затем чтения памяти, GC, m3, LateUpdate, `feature`/`eac.*`, hot-reload,
+  затем RISK-команды.
+- **Чем подтверждено (реальные прогоны).**
+  - `crates/hromatite-console`: 46 lib + 6 (`hot_reload`) + 3 (`snapshot`)
+    тестов; clippy `-D warnings`; release `x86_64-unknown-linux-gnu`.
+  - корневой workspace (linux-target): abi 8, commands 4, core 133, dll 5,
+    eac 32 + 1, features 15 — всё `ok`; clippy `-D warnings`; release
+    `x86_64-pc-windows-gnu` (`hromatite.dll` 1 913 812 Б,
+    `hromatite_features.dll` 1 527 485 Б).
+  - **PTY-стенд** `tools/test-console-wheel.py` (release-бинарник в реальном
+    pty 110x24, живой лог из 200 строк): 13/13 — включение/снятие mouse-режима,
+    пауза follow и `back 6` после двух щелчков, кламп ровно на `back 183`
+    (200−17 строк тела), возврат к хвосту и FOLLOW, прокрутка manual на
+    коротком терминале (12 строк), палитра с генерируемым списком и фильтром
+    `eac` → `eac.status`.
+  - Сгенерированный `help` снят печатью `help_lines(Scope::Resident)` /
+    `(Scope::Feature)`: 33 и 26 строк, resident не содержит `eac.*`/`feature`,
+    feature не содержит `reload`/`rollback`/`config`/`gct*`.
+- **Что осталось.** Живой приёмки не было (игру не запускали): пункт «список
+  команд обновлялся не вручную» подтверждён тестами и печатью таблицы, но не
+  живым `help` в логе. Проверить в следующем обычном запуске: `[con] > help`
+  отдаёт те же строки, а `: eac.status` в TUI сразу находит команду.
+  `seal`/`panic`/`av`/`gctresume` по-прежнему перечисляются в help, хотя
+  runtime их отклоняет или использует только в отладке — при желании их можно
+  пометить отдельным `scope`, это одна правка в таблице.
+
+### 2026-11-18 — Живая проверка EAC: хуки 8/8, сессия Mode 1, 512 Б / ~2007 мс; счётчики исходящих в фиче мертвы
+
+- Проверка по просьбе пользователя; игру запускал он сам (pid 785763, 04:01–04:07
+  MSK), режим `HROMATITE_FRAME_HOOK=1`, `PLAYER_LOOP=0`, `LATE_UPDATE=auto`,
+  `LIVE=0`, `EAC_EVENTHOOK=0`, `EACSHIM_DROP_AFTER_MS=0`.
+- **Работает (доказано).** `eac: hooks installed 8/8 on EOSSDK-Win64-Shipping.dll`;
+  патч виден в памяти процесса (`/proc/785763/mem`: `0x6fffeb643560`,
+  `0x6fffeb643588`, `0x6fffeb643790` начинаются с `E9`, релокированные байты
+  следом). Реальная сессия: `[BeginSession-003] Mode: 1` → `Success`; исходящие
+  **512 Б каждые ~2007 мс** (median 2007), по одному входящему ack 24 Б на кадр,
+  0 дропов; capture — 251 кадр по 512 Б. Переход мира 04:05:41 поймали хуки:
+  `eac: EndSession epoch=2 heartbeats=17 (hook)` → `eac: BeginSession epoch=3`,
+  новый sid `0x4d49` (был `0x3545`), ритм восстановился за ~2 с, кика нет.
+- **Тесты.** `cargo test --workspace --target x86_64-unknown-linux-gnu --offline`
+  → abi 8, commands 4, core 133, dll 5, eac 32 (+1 интеграционный), features 15;
+  `EXIT=0`.
+- **Дефект 1 — счётчики.** `eac.hooks` в образе фич печатает `out=0 … seen512=0`
+  при 138+ реально ушедших кадрах: `OUT_MESSAGES`/`SEEN512` — статики
+  `hromatite-eac`, скомпилированные и в резиденте, и в фиче; хуки в этом прогоне
+  ставил резидент (`mode=3 foreign patch`), фича своих детуров не ставит, поэтому
+  её копии остаются нулевыми. `in=184`, `begins=1`, `ends=1` при этом приходят
+  через очередь событий. Истина — `hromatite_eac_hooks.log` + capture-файл.
+- **Дефект 2 — модель ≠ провод.** `eac.status` даёт `interval_ms=5000`
+  (`DEFAULT_INTERVAL_MS`) против живых 2007 мс; модельный `sid` `0x07df…` не равен
+  настоящему `0x4d49`; эпоха 3 открылась с `mode=0`, хотя игра звала `Mode 1`;
+  свой кадр — 144 Б против 512 Б. Эпохи/JSONL считаются по гипотезе, не по трафику.
+- **Дефект 3 — сборка не из master.** Загруженная DLL —
+  `~/EAC-RE/build-eac/.../hromatite.dll` (17.11 23:45, sha256 `a0bc771d…`); в ней
+  есть `seen512`/`[report] armed`, которых в master нет (`git grep seen512 master`
+  пуст, строка живёт в `eac-forge`/`eac-emu`/`eac-emu-forge`). Живая приёмка
+  покрывает исследовательскую ветку; master-овский EAC-код живьём не проверялся.
+- **Побочно.** 195 строк `[veh] passing exception 0xe06d7363 … tid=0x1bc`
+  (C++ EH игры, пробрасываются штатно), паник/fault нет, нового `crash.dmp` нет,
+  в gc-логе текущего прогона нет `SuspendThread loop failed`.
+- Осталось: свести счётчики резидента и фичи через общую таблицу; выставить
+  `DEFAULT_INTERVAL_MS=2000`; брать sid/mode из событий хуков; прогнать master
+  живьём.
+- **Дополнение (тот же прогон, 04:07:44–04:08): игра встала.** После смены мира
+  (`Entering Room: 5ka Пятёрочка Russian` 04:05:41, `AntiCheat Session Begin:
+  Success` 04:05:42) кадры шли до 04:07:41 (sid `0x4d49`, #220), затем весь
+  процесс замолчал: `hromatite.log` последняя запись 04:07:44, `output_log` —
+  04:07:58 (`Waiting for players to network ready`), main thread в
+  `futex_do_wait` (syscall 202), тик не отвечает на `late`/`pos` (20 с без
+  строки). Признаков GC-аборта нет: в `crash.dmp`/`SuspendThread loop failed`
+  ничего, новых дампов нет — это не тот класс, что закрывали guard'ом.
+  Непосредственно перед зависанием — уникальный для всех прогонов всплеск
+  **500** `[veh] passing exception 0xe06d7363` (MSVC C++ EH) на tid `0x1bc`
+  в 04:07:26–04:07:44 (в прошлых прогонах таких строк 0–1). За 2–3 минуты до
+  этого репер проводил завершённые записи `0x53c` и `0x798`, а в stdout игры
+  есть `wine client error:53c/798 … Bad file descriptor` — то есть потоки
+  движка умирали аварийно. Причина зависания не изолирована; EAC-часть к этому
+  моменту была исправна (8/8 хуков, живая сессия).
+
+### 2026-11-18 — TUI: переключение между логами (игра, EAC, хуки, GC, wrapper, launcher)
+
+- Коммит **`4ae5728`** (`feat(console): switch between the game, EAC, GC and
+  wrapper logs`). Изменён только host-крейт `crates/hromatite-console` (+ новый
+  `src/sources.rs`, `tools/test-console-logs.py`); payload, протокол, тик,
+  GC-guard и игровая часть не тронуты, игра агентом не перезапускалась.
+- **Что теперь есть.** Все логи тейлятся одновременно, у каждого **своя**
+  история, свой `scroll_back`, свой `follow` и счётчик непрочитанного; строка 3
+  кадра стала полосой: `logs 2/7: payload [game] eac+28 …`. Переключение —
+  `F9`/`F10` (CSI `20~`/`21~`, декодер дополнен) либо локальные команды
+  `log <name|next|prev|N>` и `logs` (в payload не уходят; `log` нет в
+  `hromatite-commands`, так что конфликта имён нет).
+- **Источники** (`src/sources.rs`, `plan()`): `payload` (hromatite.log),
+  `game` (`AppData/LocalLow/VRChat/VRChat/output_log_*.txt`, самый новый),
+  `eac` (`EasyAntiCheat/*/*/anticheatlauncher.log`), `hooks`
+  (`hromatite_eac_hooks.log`), `gc` (`VRChat.gc.log`, `$HROMATITE_GCLOG`),
+  `stdout` (`$HROMATITE_DBG_DIR` или `~/.hromatite-logs/game-*.log`),
+  `launch` (`~/.hromatite-launch.log`). Свой мини-glob (`*` внутри компонента и
+  компонент-`*`) без внешних зависимостей; wildcard переразрешается раз в 20
+  опросов (~2 с), смена файла (перезапуск игры) даёт `retargeted` и replay
+  хвоста нового файла.
+- **Важные решения.** (1) `LINKED`/`STALE` и гейт авто-телеметрии по-прежнему
+  считаются по `payload` — это единственный лог, который payload пишет по
+  команде; `rx` в шапке показывает свежесть **активного** вида. (2) Эхо
+  `tx | > cmd` всегда пишется в вид `payload`, потому что ответ придёт туда;
+  если на экране другой лог, у `payload` растёт счётчик. (3) Replay при старте и
+  при смене файла идёт через `ingest_replay` и **не** накручивает unread (иначе
+  полоса сразу показывала `game+1529`). (4) `--view NAME|N` задаёт стартовый вид
+  и работает с `--snapshot`; неизвестное имя печатается в notice, а не игнорируется.
+- **Чем подтверждено (реальные прогоны).**
+  - `cargo test --target x86_64-unknown-linux-gnu` в `crates/hromatite-console`:
+    lib **58/58**, `hot_reload` 6/6, `snapshot` 3/3; clippy `-D warnings` чисто;
+    `rustfmt --edition 2024` только по тронутым файлам; release-сборка OK.
+  - Новый PTY-стенд `tools/test-console-logs.py` (настоящий pty 120×24,
+    фейковый префикс с файлами ровно по реальным путям) — **14/14**: полоса
+    находит все 7 источников, `F9` → player log, второй `F9` → EAC, `log gc` по
+    имени, `F10` назад, `logs` печатает нумерованный список, отправленная
+    команда помечает `payload+N`, возврат показывает эхо и обнуляет счётчик,
+    `--view eac` стартует на EAC, неизвестный `--view` сообщается.
+  - Живая установка (игра запущена, pid 903380): `--snapshot` для
+    `payload`/`game`/`eac` показал реальные строки из
+    `output_log_2026-11-18_07-22-27` (`waiting for UI Manager`) и
+    `anticheatlauncher.log` (`Starting Wine module mapping, Wine version: 11.0`),
+    полоса — `logs 1/7 … 3/7` с нулевыми счётчиками после старта.
+- **Осталось.** В интерактивном окне на живой игре (konsole) не проверялось —
+  запуск делает пользователь; критерий: `F9`/`F10` листают семь видов, `logs`
+  печатает список, в игре ничего не меняется. Дефолты не изменились:
+  `tools/hromatite-tui.sh` без аргументов по-прежнему открывает `payload`.
+
+### 2026-11-18 — Heartbeat приведён к проводу: CRC/кадр/каденция по факту, `eac.tap` зеркалит реальные кадры
+
+- Коммиты: **`ba03e35`** (модель+CRC+tap), **`76681ce`** (шаг image-таблицы),
+  **`1004394`** (все resident-аксессоры из дескриптора + `class_from_name`),
+  **`fb4e159`** (`Il2CppClass.name` +0x10 + обход всех образов),
+  **`267e90c`** (CRITICAL_SECTION вместо строки + гейт формы).
+- **Провод изучен и закреплён тестом.** CRC-32C **raw** (`init=0, xorout=0`)
+  по **всему кадру** с обнулённым полем контрольной суммы воспроизводит
+  **170/170** кадров `evidence/control_0009/capture.bin` (121×512 Б + 24-Б ack и
+  все прочие размеры); стандартный вариант `init=xorout=0xFFFFFFFF` — 0/121.
+  Тест включается `HROMATITE_EAC_CAPTURE=<capture.bin>` и **не коммитит байты
+  протокола**. Прежняя реализация ошибалась дважды: не тот вариант и не тот
+  регион (пропускала 4 нулевых байта поля).
+- **Модель больше не выдумывает.** `DEFAULT_INTERVAL_MS = 2007`,
+  `WIRE_HEARTBEAT_LEN = 512` (24+488), `Beat.frame_len/observed`,
+  `EacSession::record_observed` (реальные sid/seq/dt, эпоха открывается сама при
+  смене sid, каденция переучивается и гэп 26 с её не портит). Новый `tap`
+  (инкрементальный ридер capture-файла резидента: offset + неполный хвост +
+  ротация) и команда `eac.tap [off|from <path>|<path>]`. Пока tap подключён,
+  синтетические удары не пишутся; записи несут `source=wire`, а `eac.status`
+  печатает `source= wire_len= tap_crc=ok/total`, `observed=`, измеренный
+  `interval_ms`. `eac.hooks` больше не врёт нулём: строка `out=0 while in=N —
+  outbound counters live in the resident; read the frames with eac.tap`.
+- **Живая приёмка (10:29–10:32 MSK, pid 1116073, мир `wrld_ea474137…`).**
+  `[late] LateUpdate runtime ready … inline GC guard installed`,
+  `LateUpdate … hits=2528 (49.3/s), last tid=0x1c0`. В JSONL 57 записей:
+  **24 heartbeat, все `source=wire`, `frame_len=512`**, `dt` median **2008 мс**
+  (min 2000 / max 2047), `sid=0x5eac` (реальный), `seq` 9→33, `flags=0`;
+  плюс `report` (StartData: `frame_len=356, total_len=32894, action=1`) и 32
+  `ac_in`. `eac.status`: `sid=0x5eac … interval_ms=2010 dt_ms=2010 gaps=0
+  frame_len=512`, `source=wire … tap_crc=26/26`. `eac.tap`: `frames=26
+  crc_ok=26 crc_bad=0`. До правки те же поля были `interval_ms=5000`,
+  `frame_len=144`, выдуманный sid, `dt≈5210`.
+- **Три бага живой сборки `245768f2…`, найденные этим прогоном** (все — «числа
+  прошлой сборки»; из-за них payload вообще не стартовал, а один — вешал игру):
+  1. **шаг таблицы образов** `0x48` → **`0x50`** и имя файла `+0x40` → **`+0x18`**
+     (измерено на живом процессе: 69 записей от `Assembly-CSharp @0x3027c0a0`);
+     `m3::image_of` с литералом не находил `Assembly-CSharp` → `[late] class did
+     not become available` через 30 с;
+  2. **`Il2CppClass.name` `+0x98` → `+0x10`** (на записи `VRC.Udon.UdonManager
+     @0x31e92490`: `+0x10`='UdonManager', `+0x18`='VRC.Udon', `+0x98`=0) →
+     `class_full_name()` давал `"VRC.Udon."` и авто-цель не совпадала. Подтверждено
+     там же: methods `+0x58`, fields `+0x88` (ровно 66 записей по 0x20, счётчик
+     `+0x124`=66), `MethodInfo.name +0x20`, `return_type +0x28` (void у
+     `LateUpdate`), `flags 0x81`, params 0, parent `+0xa0`;
+  3. **`gc.thread_list_cs` = `0xe6bd800`**, а там лежит строка **«CP1252»**.
+     `EnterCriticalSection` по этому адресу крутится вечно: игра вставала через
+     ~20 с после старта (26 % CPU, main thread в futex), тогда как чистый запуск
+     доходит до UI за 24 с. Настоящий адрес — **`0xe6bd860`** (найден офлайном по
+     двум `call [EnterCriticalSection]`, чей `lea rcx` указывает рядом с таблицей
+     потоков; в живой памяти это инициализированная `RTL_CRITICAL_SECTION`:
+     `DebugInfo=-1, LockCount=-1`). Добавлен гейт формы: если по адресу не
+     CRITICAL_SECTION — санитизация отключается с логом, а не вешает игру.
+- **Побочное наблюдение:** wrapper повторно инжектит, пока не увидит строку
+  `LateUpdate runtime ready`; вторая копия образа не может провалидировать уже
+  пропатченные сайты и печатает `signatures do not match` + `startup aborted`.
+  Когда первая установка удаётся, повторов нет; лечится не раньше, чем payload
+  научится распознавать собственные патчи.
+- **Проверено:** `hromatite-core` **134** (включая форму CRITICAL_SECTION и оба
+  CRC-варианта), abi 8, eac 43+1, features 16, commands 4; clippy
+  `--workspace --all-targets --release` (windows-gnu) чисто; release-сборка OK;
+  `HROMATITE_EAC_CAPTURE=…/control_0009/capture.bin` → `verified 170/170`.
+  Новых `crash.dmp` нет, `VRChat.gc.log` в этом прогоне не создавался.
+- **Что НЕ достигнуто (граница честности).** Это **зеркало**, а не синтез:
+  сессию держит реальный клиент, мы лишь читаем его кадры (в игру ничего не
+  отправляется). Собственный heartbeat по-прежнему не держит сессию — forge
+  39–75 с, реплей чужого отчёта 53–65 с, реплей чужих кадров ~200 с против
+  120.5 с полной тишины и 283 с живой сессии; упирается в 16-байтные записи
+  тела (похоже на хеши памяти, ASLR-привязанные) — следующий блокер вне
+  текущего объёма.
+- **Хвост для следующей сессии:** `eac.tick` печатает 144-байтный модельный
+  кадр (честно помечен `model`); `playerloop.rs` и worker-trace всё ещё
+  привязаны к `648f61b1…`; `tools/buildgen.py` не знает новых полей
+  (`image_stride/name/filename`, `class_from_name`) — при следующем обновлении
+  игры их надо добавить в генератор, иначе дескриптор соберётся неполным.
+- **Тот же прогон через 4 минуты** (игра осталась в мире, агент только дописал
+  `eac.status` в командный файл): JSONL 287 записей — **117 heartbeat, все
+  `source=wire`, `frame_len=512`**, `dt` median **2008** (p10 2001, p90 2014),
+  один `sid=0x5eac`, последний `seq=145`; 11 `report`, 158 `ac_in`, ровно один
+  `gap` 6912 мс против ожидаемых 2012. `eac.status`: `interval_ms=2012,
+  observed=117, frame_len=512`, `tap_crc=155/155` (155 кадров, 0 ошибок CRC).
+  Копия лога: `~/.hermes/profiles/ds/cache/scratch/live-heartbeat/eac-final.jsonl`.
+
+### 2026-11-18 — PlayerLoop починен: якоря больше не привязаны к SHA; генератор выводит всё
+
+- Коммит **`a2274f7`** (`feat(build): derive PlayerLoop, worker dispatch and GC unregister
+  per build`) + этот журнал.
+- **Симптом, который чинили.** `playerloop::snapshot` начинался с
+  `if symbols::GAMEASSEMBLY_SHA256 != lateupdate::AUTO_BUILD_SHA256 { return Err(...) }`,
+  поэтому на живой сборке `245768f2…` режим `HROMATITE_PLAYER_LOOP=1` не мог работать вообще:
+  геттер просто переехал (`0x86cda10` → `0x86ea320`). Такие же sha-гейты стояли на
+  worker-trace (`0xbf5ce0`/`0xc41920`), `CLASS_FROM_TYPE_RVA` и таблице `GC_threads[]`
+  в `gcthreads` (`0xe6bb180` вместо `0xe6bd8a0` — из-за этого **репер мёртвых записей на
+  новой сборке читал чужую память** и ничего не вычищал).
+- **Что теперь.** В `hromatite-abi::build` появились `RuntimeAnchors`
+  (`get_current_player_loop`, `worker_dispatch`, `gc_unregister`) и `il2cpp.class_from_type`;
+  `buildinfo::runtime_anchors` отдаёт их из дескриптора, иначе через `raw::discover`,
+  иначе `None` (последнее = не патчить). Гейтов по sha в этих путях больше нет.
+- **Правила вывода (проверены на двух сборках, офлайн и в Ghidra):**
+  * `GetCurrentPlayerLoop` — не экспорт, а скомпилированный managed-геттер: 33-байтный
+    пролог обнуляет 0x28-байтовую `PlayerLoopSystem` (`RCX` — скрытый out-указатель),
+    внутри — `lea` на имя icall `UnityEngine.LowLevel.PlayerLoop::GetCurrentPlayerLoopInternal()`.
+    Правило = сигнатура **плюс** обязательная ссылка на эту строку. Ключевая деталь: геттер
+    лежит в секции **`il2cpp`** (178 МБ, без точки), а не в `.text` — поэтому прежний
+    `.text`-скан «не находил» его и выглядел как «функции нет».
+    Ghidra (проект `/11.17/GameAssembly.dll`): `FUN_1886ea320` — `PUSH RBX; SUB RSP,0x50;
+    XORPS/MOVUPS [RCX], [RCX+0x10]; MOV [RCX+0x20],RAX; … LEA RCX,[0x18b981250];
+    CALL il2cpp_resolve_icall; … MOV [0x18e6a1ba8],RAX; CALL RAX` — ровно геттер.
+  * диспетчер воркеров — уникальное 48-байтное тело (`48 89 5C 24 08 … 83 FA 02`),
+    перекрёстная проверка: на него есть `lea` из создателя потока (`0xbf5e44` / `0xbf7bc4`).
+  * `GC_unregister_my_thread` — единственная функция с `call rel32` на `GC_remove_thread`;
+    вход берётся из **`.pdata`** с разворотом `UNW_FLAG_CHAININFO`. Обратный ход по `0xCC`
+    неверен: у функции несколько EH-фрагментов (`0xc43694`, `0xc436d1`, `0xc4375f`, `0xc43774`
+    → все цепляются к `0xc43690`), а в `rel32`-дисплейсментах полно байта `0xCC` — ход
+    останавливался на `0xc41924`/`0x4375f` вместо входа.
+  * `gc.thread_list_cs` — теперь **CS, которую входит `GC_suspend_all`**: `lea rcx` перед
+    `call [EnterCriticalSection]` внутри первых 0x260 байт функции. Старая эвристика
+    («самый частый lea в 0x200 байтах перед таблицей») вернула строку `"CP1252"` и повесила
+    игру. Значения: старая сборка `0xe6bb100` → **`0xe6bb140`**, новая остаётся
+    **`0xe6bd860`** (это и есть живая, проверенная 2026-11-18). В рантайме значение 0
+    допустимо: `gcguard` проверяет форму `RTL_CRITICAL_SECTION` и без неё просто отключает
+    санитизацию.
+- **Генератор (`tools/buildgen.py`) теперь воспроизводит свой же вывод.** Раньше он:
+  (1) не выводил `image_stride/image_name/image_filename` → `render_build` ронял компиляцию;
+  (2) выкидывал `il2cpp.class_from_name` из `build.rs` (обнулял его при регенерации);
+  (3) выдавал `thread_list_cs` = `0xe6bd800` (строка) для новой сборки. Теперь пишет
+  секцию `runtime`, все ключи `il2cpp`, `image_*` и семантическую CS. Плюс `merge_layout`:
+  если дескриптор этой же сборки уже содержит живое измерение и генератор с ним не
+  согласен, побеждает живое значение, а расхождение пишется в `note` (именно так поймано
+  `class_name`: перенесённый `il2cpp_class_get_name` читает `+0x98`, а в живой записи
+  `VRC.Udon.UdonManager` имя лежит в `+0x10`; теперь в дескрипторе `0x10` и есть строка
+  `class_name: 0x10 (kept from the live-verified descriptor; the generator derived 0x98)`).
+- **Чем подтверждено.** `tools/buildgen.py` на обеих сборках воспроизводит оракул целиком:
+  `648f61b1…` → gc 12 значений (CS `0xe6bb140`), il2cpp `0xc27f00/0xc2a330/0xc28050/0xc28040/
+  0xe66c870`, runtime `0x86cda10/0xbf5ce0/0xc41920`; `245768f2…` → CS `0xe6bd860`,
+  il2cpp `0xc29c70/0xc2c0a0/0xc29dc0/0xc29db0/0xe66f0d0`, runtime `0x86ea320/0xbf7a60/0xc43690`.
+  `tools/test_buildgen.py` — **13/13**, в том числе новый тест, который читает байтовые
+  константы прямо из `raw/discover.rs` и требует, чтобы они находились в обеих бинарниках
+  ровно по ожидаемым RVA (две копии шаблона — две возможности разойтись).
+  `cargo test --workspace` (linux): abi 8, commands 4, core 138, dll 5, eac 43+1,
+  features 16; clippy `--workspace --all-targets --release` (windows-gnu) `-D warnings` чисто;
+  `cargo build --workspace --release` для `x86_64-pc-windows-gnu` — OK.
+- **Что НЕ подтверждено (нужен живой прогон, игру запускает пользователь).**
+  (1) `HROMATITE_PLAYER_LOOP=1` на `245768f2…`: ждём `hooked UnityEngine.PlayerLoop.Update/
+  ScriptRunBehaviourUpdate at 0x…`, затем `loop` → `hits>0` и стабильный tid
+  (ориентир: ~90 вызовов/с, как на старой сборке); (2) в логе репера — `gc_threads @ … (rva
+  0xe6bd8a0)`, а не `0xe6bb180`; (3) `HROMATITE_GCT_TRACE=1` теперь ставит worker-trace и на
+  новой сборке (`worker trace installed: dispatcher=true, unregister=true, remove=true`).
+  Ничего из этого не заявляется проверенным до прогона.
+- **Осталось.** `lateupdate::AUTO_BUILD_SHA256`/`AUTO_TYPE_INDEX` по-прежнему описывают одну
+  сборку (но это лишь подсказка: имя перепроверяется, а на чужой сборке включается
+  `il2cpp_class_from_name`); `tools/buildgen.py` не выводит `image_stride` — это живое
+  измерение, и для новой сборки он честно пишет `0` + note (тогда `m3` откажется работать,
+  пока значение не впишут).
+

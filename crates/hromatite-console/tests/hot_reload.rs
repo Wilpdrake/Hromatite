@@ -79,9 +79,11 @@ fn catalogue_and_double_confirmation_cover_every_hot_mutation() {
         command("config").unwrap().usage,
         "config show|reload|set <key> <value>"
     );
-    assert!(hromatite_console::input::COMMANDS.contains(&"reload"));
-    assert!(hromatite_console::input::COMMANDS.contains(&"rollback"));
-    assert!(hromatite_console::input::COMMANDS.contains(&"config"));
+    let names = hromatite_console::input::command_names();
+    for required in ["reload", "rollback", "config"] {
+        assert!(names.contains(&required), "completion lost {required}");
+        assert!(command(required).is_some(), "palette lost {required}");
+    }
 
     for submitted in [
         "reload",

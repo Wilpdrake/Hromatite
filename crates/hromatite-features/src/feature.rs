@@ -173,16 +173,24 @@ impl Feature {
         if matches!(command.as_str(), "pos" | "who" | "esp") && !self.telemetry {
             return self.disabled(&command);
         }
-        if M3_COMMANDS.contains(&command.as_str()) {
-            let (lines, status) = {
-                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
-                crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+        if M3_COMMANDS.contains(&command.as_str())
+            || matches!(command.as_str(), "pos" | "who" | "esp")
+        {
+            let Some(mut metadata) = Metadata::new(&self.host, &mut self.metadata_cache) else {
+                return self.respond(
+                    [format!(
+                        "{command}: no metadata layout for GameAssembly {}",
+                        self.host.game_sha_hex()
+                    )],
+                    STATUS_NOT_READY,
+                );
             };
-            return self.respond(lines, status);
-        }
-        if matches!(command.as_str(), "pos" | "who" | "esp") {
-            let (lines, status) = {
-                let mut metadata = Metadata::new(&self.host, &mut self.metadata_cache);
+            let (lines, status) = if M3_COMMANDS.contains(&command.as_str()) {
+                if matches!(command.as_str(), "pos" | "who" | "esp") && !self.telemetry {
+                    return self.disabled(&command);
+                }
+                crate::m3::dispatch(&mut metadata, &command, a1, a2, rest)
+            } else {
                 crate::telemetry::dispatch(&mut metadata, &mut self.telemetry_cache, &command)
             };
             return self.respond(lines, status);
@@ -320,28 +328,9 @@ impl Feature {
     }
 }
 
+/// The feature image's `help`, generated from the same shared table the resident
+/// runtime and the host TUI use. Only commands this image implements itself are
+/// listed; resident-only names are refused with an explicit message instead.
 fn help_lines() -> Vec<String> {
-    [
-        "feature                        — feature generation / ABI canary",
-        "pos                            — Camera.main -> transform -> position",
-        "who                            — players through VRCPlayerApi",
-        "esp                            — projected players (overlay contract)",
-        "q <addr> [n]                   — qwords with ascii and module tags",
-        "b <addr> [n]                   — bytes in hex",
-        "s <addr> / ws <addr>           — ASCII / UTF-16 strings",
-        "m3f <ns> [name]                — classes in the verified class table",
-        "m3s <substr>                   — materialised class-name search",
-        "m3l <asm> [substr] [max]       — classes in an IL2CPP image",
-        "m3c <class>                    — class fields and methods",
-        "m3i <assembly>                 — resolve an IL2CPP image",
-        "eac.status / eac.begin / eac.tick / eac.end — anti-cheat epochs",
-        "eac.log <path> / eac.tail <path> — JSONL log, output_log mirror",
-        "call <addr> [a1..a3]           — native call through the host guard",
-        "guard <addr>                   — no-argument host-guarded probe",
-        "wq <addr> <hex> / wb <addr> <hexbytes> — host-mediated writes",
-        "gct/threads/loop/late/seal/quit — resident runtime commands",
-    ]
-    .iter()
-    .map(|line| (*line).to_string())
-    .collect()
+    hromatite_commands::help_lines(hromatite_commands::Scope::Feature)
 }

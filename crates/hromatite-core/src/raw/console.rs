@@ -292,11 +292,7 @@ fn class_or_materialise(ns: &str, name: &str, assembly: &str) -> Option<usize> {
     if let Some((_, c)) = crate::m3::find(ns, name, 120_000).first() {
         return Some(*c);
     }
-    let (ga, gasize) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
-    let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
-    if f + 8 > ga + gasize {
-        return None;
-    }
+    let f = crate::m3::image_get_class_addr()?;
     let first = crate::il2cpp::find_domain()?;
     let image = crate::m3::image_of(first, assembly)?;
     for i in 0..40_000usize {
@@ -715,44 +711,13 @@ fn esp_probe() -> Vec<String> {
     out
 }
 
-const HELP: &[&str] = &[
-    "help                           — этот список",
-    "q <addr> [n]                   — n qword с ascii и меткой модуля",
-    "b <addr> [n]                   — n байт в hex",
-    "s <addr>                       — ascii-строка",
-    "ws <addr>                      — utf-16 строка",
-    "gct [rva]                      — таблица потоков Boehm",
-    "threads                        — потоки процесса и записи GC",
-    "gctfix                         — вычеркнуть мёртвые записи Boehm",
-    "gctresume                      — ResumeThread по записям GC",
-    "call <addr> [a1..a3]           — вызов функции под VEH",
-    "wq <addr> <hex>                — записать qword",
-    "wb <addr> <hexbytes>           — записать байты",
-    "guard <addr>                   — диагностический вызов под VEH",
-    "m3f <ns> [name]                — классы из verified class table",
-    "m3s <substr>                   — поиск материализованных классов",
-    "m3l <asm> [substr] [max]       — классы образа",
-    "m3c <class>                    — поля и методы класса",
-    "m3i <assembly>                 — Il2CppImage сборки",
-    "loopc                          — native PlayerLoop root callbacks",
-    "loop                           — hits/частота/tid PlayerLoop",
-    "latec                          — классы с LateUpdate",
-    "latehook #idx|<class>          — hook конкретного LateUpdate",
-    "late                           — hits/частота/tid LateUpdate",
-    "pos                            — Camera.main -> transform -> position",
-    "who                            — игроки через VRCPlayerApi",
-    "esp                            — игроки в пикселях экрана (overlay contract)",
-    "reload [N|status]               — атомарная смена feature DLL",
-    "rollback                       — вернуть предыдущее поколение",
-    "config show|reload|set         — hot-config без замены DLL",
-    "panic [msg]                    — проверка catch_unwind",
-    "av [addr]                      — проверка VEH",
-    "seal                           — выйти из интерактива",
-    "quit                           — выйти из интерактива",
-];
-
+/// The in-game `help` list, generated from the shared command table.
+///
+/// The same table feeds the host TUI palette, completion and risk gate, so a
+/// command is declared once and can never be listed in one place and missing in
+/// another.
 fn help_lines() -> Vec<String> {
-    HELP.iter().map(|line| (*line).to_string()).collect()
+    hromatite_commands::help_lines(hromatite_commands::Scope::Resident)
 }
 
 /// Execute one command. Returns the answer lines and a control action.
@@ -980,22 +945,18 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let asm = if a1.is_empty() { "Assembly-CSharp" } else { a1 };
             let filt = a2.to_ascii_lowercase();
             let max = parse_addr(rest.trim()).unwrap_or(30_000).min(60_000);
-            let (ga, gasize) = match crate::procs::own_module(crate::GAME_ASSEMBLY) {
-                Some(v) => v,
-                None => {
-                    return (
-                        vec!["m3l: GameAssembly.dll not loaded".into()],
-                        Action::None,
-                    );
-                }
-            };
-            let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
-            if f + 8 > ga + gasize {
+            if crate::procs::own_module(crate::GAME_ASSEMBLY).is_none() {
+                return (
+                    vec!["m3l: GameAssembly.dll not loaded".into()],
+                    Action::None,
+                );
+            }
+            let Some(f) = crate::m3::image_get_class_addr() else {
                 return (
                     vec!["m3l: image_get_class outside the module".into()],
                     Action::None,
                 );
-            }
+            };
             let first = match crate::il2cpp::find_domain() {
                 Some(v) => v,
                 None => {
@@ -1090,7 +1051,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     Some(img) => {
                         out.push(format!(
                             "  {want}: image {img:#x}, il2cpp_image_get_class {:#x}",
-                            crate::m3::IMAGE_GET_CLASS_RVA
+                            crate::m3::image_get_class_addr().unwrap_or(0)
                         ));
                     }
                     None => out.push(format!("  {want}: not found")),
@@ -1198,50 +1159,64 @@ mod command_tests {
     use super::dispatch;
 
     #[test]
-    fn help_lists_only_the_supported_runtime_console() {
+    fn help_is_generated_and_lists_only_routable_resident_commands() {
         let (lines, _) = dispatch("help");
         let listed: Vec<&str> = lines
             .iter()
             .map(|line| line.split_whitespace().next().unwrap_or(""))
             .collect();
-        assert_eq!(
-            listed,
-            [
-                "help",
-                "q",
-                "b",
-                "s",
-                "ws",
-                "gct",
-                "threads",
-                "gctfix",
-                "gctresume",
-                "call",
-                "wq",
-                "wb",
-                "guard",
-                "m3f",
-                "m3s",
-                "m3l",
-                "m3c",
-                "m3i",
-                "loopc",
-                "loop",
-                "latec",
-                "latehook",
-                "late",
-                "pos",
-                "who",
-                "esp",
-                "reload",
-                "rollback",
-                "config",
-                "panic",
-                "av",
-                "seal",
-                "quit",
-            ]
+        for name in [
+            "help",
+            "pos",
+            "who",
+            "esp",
+            "q",
+            "b",
+            "s",
+            "ws",
+            "gct",
+            "threads",
+            "gctfix",
+            "gctresume",
+            "call",
+            "wq",
+            "wb",
+            "guard",
+            "m3f",
+            "m3s",
+            "m3l",
+            "m3c",
+            "m3i",
+            "loopc",
+            "loop",
+            "latec",
+            "latehook",
+            "late",
+            "reload",
+            "rollback",
+            "config",
+            "panic",
+            "av",
+            "seal",
+            "quit",
+        ] {
+            assert!(listed.contains(&name), "resident help lost {name}");
+        }
+        // A feature image owns these; the resident runtime must not claim them.
+        assert!(
+            !listed.iter().any(|name| name.starts_with("eac.")),
+            "{listed:?}"
         );
+        assert!(!listed.contains(&"feature"), "{listed:?}");
+        // Every line is the shared table's line, not a private copy.
+        for line in &lines {
+            assert!(
+                hromatite_commands::SPECS
+                    .iter()
+                    .any(|spec| spec.help_line() == *line),
+                "hand-written help line survived: {line}"
+            );
+        }
     }
 }
 

@@ -5,12 +5,16 @@
 //!
 //! Layers:
 //!
-//! * [`codec`] — the 24-byte wire header; checksum is a pluggable
-//!   **HYPOTHESIS** (default CRC-32C).
-//! * [`payload`] — the 120-byte heartbeat body, layout ported from the verified
-//!   Python reference (`eacheartbeat/heartbeat.py`).
+//! * [`codec`] — the 24-byte wire header. The checksum is **measured**, not
+//!   guessed: raw CRC-32C (`init=0, xorout=0`), reproduced on every captured
+//!   frame.
+//! * [`payload`] — the 120-byte *model* heartbeat body, layout ported from the
+//!   verified Python reference (`eacheartbeat/heartbeat.py`). The real
+//!   steady-state frame is 512 bytes of a report stream (see [`codec`]).
 //! * [`session`] — epoch model: one anti-cheat session per VRChat room, with
-//!   `dt_ms` measured across epochs so a world load shows up as a `gap`.
+//!   `dt_ms` measured across epochs so a world load shows up as a `gap`, and a
+//!   measured 2007 ms cadence that [`session::EacSession::record_observed`]
+//!   re-learns from the wire.
 //! * [`eventlog`] — JSONL records with 32 MiB / 2-file rotation.
 //! * [`tailer`] — polling tail over the VRChat `output_log` for room markers.
 //! * [`hook`] — x64 inline-hook engine (trampoline, ±512 MB allocation,
@@ -22,6 +26,8 @@
 //! * [`keyhunt`] — `EAC_KEYHUNT=1`: scans the live address space for the SDK's
 //!   seed key and its derivations, probes the 512-byte frame buffer and looks
 //!   for other copies of the frame prefix (observation only).
+//! * [`tap`] — incremental reader of that capture, so a feature image can mirror
+//!   the real frames even when the resident owns the hooks.
 //!
 //! Only `hook`/`eos`/`keyhunt` contain `unsafe`; every block carries a
 //! `// SAFETY:` justification and stays inside those `#[allow(unsafe_code)]`
@@ -43,14 +49,16 @@ pub mod keyhunt;
 pub mod payload;
 pub mod session;
 pub mod tailer;
+pub mod tap;
 
 pub use capture::{CaptureFile, Frame as CapturedFrame};
-pub use codec::{ChecksumKind, CodecError, Frame, Header};
+pub use codec::{ChecksumKind, CodecError, Frame, Header, WIRE_BODY_LEN, WIRE_HEARTBEAT_LEN};
 pub use eos::{Counters as HookCounters, HookEvent, Hooks};
 pub use eventlog::{Event, JsonlLog};
 pub use hook::Hook;
 pub use payload::{HeartbeatPayload, PAYLOAD_LEN};
 pub use session::{Beat, EacSession};
+pub use tap::CaptureTap;
 
 /// Encode one complete heartbeat frame (24-byte header + 120-byte payload).
 ///

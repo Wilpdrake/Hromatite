@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 hromatite-abi = { path = "../hromatite-abi" }
+hromatite-commands = { path = "../hromatite-commands" }
 hromatite-eac = { path = "../hromatite-eac" }
 
 [lints]

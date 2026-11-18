@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod buildinfo;
 pub mod crypto;
 pub mod gcthreads;
 pub mod hot;

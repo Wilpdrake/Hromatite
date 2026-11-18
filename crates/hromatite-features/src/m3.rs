@@ -4,22 +4,10 @@
 
 use crate::host::Host;
 use crate::memory::parse_addr;
+use hromatite_abi::build::{Il2cppAnchors, Layout};
 use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 
-pub const CLASS_TABLE_RVA: u32 = 0x0e66_c870;
-pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_a330;
-pub const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_7f00;
 pub const CLASS_MAX: usize = 120_000;
-
-const CLASS_PARENT_OFF: usize = 0x10;
-const CLASS_NS_OFF: usize = 0x18;
-const CLASS_METHODS_OFF: usize = 0x50;
-const CLASS_FIELDS_OFF: usize = 0x80;
-const CLASS_NAME_OFF: usize = 0x98;
-const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
-const FIELD_STRIDE: usize = 0x28;
-const METHOD_NAME_OFF: usize = 0x18;
-const METHOD_RETURN_TYPE_OFF: usize = 0x20;
 
 #[derive(Debug, Default)]
 pub struct Cache {
@@ -29,6 +17,10 @@ pub struct Cache {
 pub struct Metadata<'a> {
     pub host: &'a Host,
     cache: &'a mut Cache,
+    /// Addresses and struct offsets of the build we are attached to, taken from
+    /// `hromatite_abi::build` by the SHA-256 the resident reports.
+    api: Il2cppAnchors,
+    layout: Layout,
 }
 
 pub struct Field {
@@ -47,8 +39,12 @@ pub struct Method {
 }
 
 impl<'a> Metadata<'a> {
-    pub fn new(host: &'a Host, cache: &'a mut Cache) -> Self {
-        Self { host, cache }
+    /// Resolve the per-build numbers; `None` when this build has no descriptor,
+    /// which every caller must treat as "metadata unavailable" rather than
+    /// guessing offsets.
+    pub fn new(host: &'a Host, cache: &'a mut Cache) -> Option<Self> {
+        let build = hromatite_abi::build::select(&host.game_sha_hex())?;
+        Some(Self { host, cache, api: build.il2cpp, layout: build.layout })
     }
 
     fn name_at(&self, pointer: usize) -> Option<String> {
@@ -63,7 +59,7 @@ impl<'a> Metadata<'a> {
             return Some(self.cache.class_table);
         }
         let (base, size) = self.host.game_assembly_range();
-        let slot = base.checked_add(CLASS_TABLE_RVA as usize)?;
+        let slot = base.checked_add(self.api.class_table as usize)?;
         if slot.checked_add(8)? > base.checked_add(size)? {
             return None;
         }
@@ -76,11 +72,11 @@ impl<'a> Metadata<'a> {
     }
 
     pub fn class_name(&self, class: usize) -> Option<String> {
-        self.name_at(self.host.read_usize(class.checked_add(CLASS_NAME_OFF)?)?)
+        self.name_at(self.host.read_usize(class.checked_add(self.layout.class_name as usize)?)?)
     }
 
     pub fn class_namespace(&self, class: usize) -> Option<String> {
-        self.name_at(self.host.read_usize(class.checked_add(CLASS_NS_OFF)?)?)
+        self.name_at(self.host.read_usize(class.checked_add(self.layout.class_namespace as usize)?)?)
     }
 
     pub fn class_full_name(&self, class: usize) -> String {
@@ -139,7 +135,7 @@ impl<'a> Metadata<'a> {
     }
 
     pub fn parent(&self, class: usize) -> Option<usize> {
-        let parent = self.host.read_usize(class.checked_add(CLASS_PARENT_OFF)?)?;
+        let parent = self.host.read_usize(class.checked_add(self.layout.class_parent as usize)?)?;
         (parent >= 0x10000 && self.host.read_u8(parent).is_some()).then_some(parent)
     }
 
@@ -160,26 +156,39 @@ impl<'a> Metadata<'a> {
 
     pub fn fields(&self, class: usize) -> Vec<Field> {
         let mut out = Vec::new();
-        let pointer = match self.host.read_usize(class + CLASS_FIELDS_OFF) {
+        let pointer = match self.host.read_usize(class + self.layout.class_fields as usize) {
             Some(pointer) if pointer >= 0x10000 && self.host.read_u8(pointer).is_some() => pointer,
             _ => return out,
         };
         let count = self
             .host
-            .read_u16(class + CLASS_FIELDS_COUNT_OFF)
+            .read_u16(class + self.layout.class_fields_count as usize)
             .unwrap_or(0) as usize;
         for index in 0..count.min(512) {
-            let record = pointer + index * FIELD_STRIDE;
+            let record = pointer + index * self.layout.field_stride as usize;
             let name = self
                 .host
-                .read_usize(record + 0x10)
+                .read_usize(record + self.layout.field_name as usize)
                 .and_then(|pointer| self.name_at(pointer))
                 .unwrap_or_default();
+            let parent = if self.layout.field_parent == 0 {
+                0
+            } else {
+                self.host
+                    .read_usize(record + self.layout.field_parent as usize)
+                    .unwrap_or(0)
+            };
             out.push(Field {
                 name,
-                ty: self.host.read_usize(record).unwrap_or(0),
-                offset_or_index: self.host.read_u32(record + 0x08).unwrap_or(0),
-                parent: self.host.read_usize(record + 0x20).unwrap_or(0),
+                ty: self
+                    .host
+                    .read_usize(record + self.layout.field_type as usize)
+                    .unwrap_or(0),
+                offset_or_index: self
+                    .host
+                    .read_u32(record + self.layout.field_offset as usize)
+                    .unwrap_or(0),
+                parent,
             });
         }
         out
@@ -187,7 +196,7 @@ impl<'a> Metadata<'a> {
 
     fn method_return_kind(&self, info: usize) -> u32 {
         self.host
-            .read_usize(info + METHOD_RETURN_TYPE_OFF)
+            .read_usize(info + self.layout.method_return_type as usize)
             .and_then(|ty| self.host.read_u32(ty + 0x08))
             .map(|bits| (bits >> 16) & 0xff)
             .unwrap_or(u32::MAX)
@@ -195,7 +204,7 @@ impl<'a> Metadata<'a> {
 
     pub fn methods(&self, class: usize) -> Vec<Method> {
         let mut out = Vec::new();
-        let array = match self.host.read_usize(class + CLASS_METHODS_OFF) {
+        let array = match self.host.read_usize(class + self.layout.class_methods as usize) {
             Some(array) if array >= 0x10000 && self.host.read_u8(array).is_some() => array,
             _ => return out,
         };
@@ -209,7 +218,7 @@ impl<'a> Metadata<'a> {
             }
             let name = self
                 .host
-                .read_usize(info + METHOD_NAME_OFF)
+                .read_usize(info + self.layout.method_name as usize)
                 .and_then(|pointer| self.name_at(pointer))
                 .unwrap_or_default();
             if name.is_empty() {
@@ -244,7 +253,7 @@ impl<'a> Metadata<'a> {
 
     pub fn find_domain(&self) -> Option<usize> {
         let (base, size) = self.host.game_assembly_range();
-        let getter = base.checked_add(CORLIB_IMAGE_GETTER_RVA as usize)?;
+        let getter = base.checked_add(self.api.get_corlib as usize)?;
         if getter.checked_add(8)? > base.checked_add(size)? {
             return None;
         }
@@ -254,14 +263,22 @@ impl<'a> Metadata<'a> {
 
     pub fn image_of(&self, corlib_image: usize, assembly: &str) -> Option<usize> {
         let wanted = assembly.to_ascii_lowercase();
+        // The image records are contiguous but their stride is build specific
+        // (`0x48` on 648f61b1…, `0x50` on 245768f2…), so walking them with a
+        // literal would silently find nothing on the next game update.
+        let stride = i64::from(self.layout.image_stride);
+        if stride <= 0 {
+            return None;
+        }
+        let name_offset = self.layout.image_name as usize;
         let scan = |exact: bool| -> Option<usize> {
             for step in 0i64..768 {
                 for sign in [1i64, -1] {
                     let index = step * sign;
-                    let image = corlib_image.checked_add_signed((index * 0x48) as isize)?;
+                    let image = corlib_image.checked_add_signed((index * stride) as isize)?;
                     let name = match self
                         .host
-                        .read_usize(image + 0x08)
+                        .read_usize(image + name_offset)
                         .and_then(|pointer| self.name_at(pointer))
                     {
                         Some(name) if !name.is_empty() => name,
@@ -278,9 +295,13 @@ impl<'a> Metadata<'a> {
         scan(true).or_else(|| scan(false))
     }
 
+    pub fn image_get_class_rva(&self) -> u32 {
+        self.api.image_get_class
+    }
+
     fn image_get_class(&self) -> Option<usize> {
         let (base, size) = self.host.game_assembly_range();
-        let function = base.checked_add(IMAGE_GET_CLASS_RVA as usize)?;
+        let function = base.checked_add(self.api.image_get_class as usize)?;
         (function.checked_add(8)? <= base.checked_add(size)?).then_some(function)
     }
 
@@ -400,7 +421,7 @@ pub fn dispatch(
                 match metadata.image_of(first, wanted) {
                     Some(image) => out.push(format!(
                         "  {wanted}: image {image:#x}, il2cpp_image_get_class {:#x}",
-                        IMAGE_GET_CLASS_RVA
+                        metadata.image_get_class_rva()
                     )),
                     None => out.push(format!("  {wanted}: not found")),
                 }

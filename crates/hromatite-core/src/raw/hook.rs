@@ -1062,11 +1062,16 @@ fn work() {
 /// `test eax,eax` and `jne`. The trampoline carries all three instructions;
 /// live and synthetic results therefore share Boehm's original success branch
 /// instead of falling into its retry loop.
-const GC_CONTEXT_CALL_RVA: usize = 0xc41ad2;
-const GC_CONTEXT_CALL_SIGNATURE: [u8; 8] = [0xff, 0x15, 0x60, 0x78, 0xac, 0x0a, 0x85, 0xc0];
+/// The site itself is per build (`GcAnchors::context_call`); only the shape is
+/// stable: `call qword [rip+disp32]; test eax,eax`.
+const GC_CONTEXT_CALL_PROLOGUE: usize = 8;
 
 fn valid_gc_context_call_site(bytes: &[u8]) -> bool {
-    bytes.starts_with(&GC_CONTEXT_CALL_SIGNATURE)
+    bytes.len() >= GC_CONTEXT_CALL_PROLOGUE
+        && bytes[0] == 0xff
+        && bytes[1] == 0x15
+        && bytes[6] == 0x85
+        && bytes[7] == 0xc0
 }
 
 static GC_CONTEXT_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -1122,8 +1127,6 @@ unsafe fn write_synthetic_dead_context_raw(context: *mut u8) {
         core::ptr::write_unaligned(context.add(WIN64_CONTEXT_FLAGS).cast::<u32>(), flags);
     }
 }
-
-const GC_THREADS_RVA: usize = 0x0e6b_b180;
 
 /// Find and unlink the record owning `handle` while Boehm holds its stop-world
 /// lock. Every access is a direct unaligned scalar access into static table /
@@ -1256,20 +1259,18 @@ pub unsafe extern "system" fn gc_context_detour() -> ! {
 
 #[allow(dead_code)]
 fn install_legacy_gc_context_guard() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
-        log::log_tag(
-            "gct",
-            "inline guard disabled: RVA/signature belongs to another GameAssembly build",
-        );
-        return false;
-    }
-    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, size)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "inline guard disabled: GameAssembly is not loaded");
         return false;
     };
-    let target = ga.wrapping_add(GC_CONTEXT_CALL_RVA);
+    let Some(anchors) = crate::buildinfo::gc_anchors(ga, size) else {
+        log::log_tag(
+            "gct",
+            "inline guard disabled: this GameAssembly build has no GC anchors",
+        );
+        return false;
+    };
+    let target = ga.wrapping_add(anchors.context_call as usize);
     let Some(head) = crate::safe::read_bytes(target, 14) else {
         log::log_tag(
             "gct",
@@ -1298,7 +1299,7 @@ fn install_legacy_gc_context_guard() -> bool {
         );
         return false;
     }
-    let table_base = ga.wrapping_add(GC_THREADS_RVA);
+    let table_base = ga.wrapping_add(anchors.threads as usize);
     // Resolve the table once. The hot path only performs a zero-timeout wait,
     // direct scalar memory accesses and lock-free counter updates.
     GC_THREADS_BASE.store(table_base, Ordering::Release);
@@ -1340,9 +1341,6 @@ pub fn install_gc_context_guard() -> bool {
 static GC_DISPATCH_ORIG: AtomicUsize = AtomicUsize::new(0);
 static GC_UNREGISTER_ORIG: AtomicUsize = AtomicUsize::new(0);
 
-pub const WORKER_DISPATCH_RVA: u32 = 0xbf5ce0;
-pub const GC_UNREGISTER_RVA: u32 = 0xc41920;
-
 /// Record the real worker body before the shared OS trampoline can free its
 /// argument block. `RCX=inner`, with `{thread,fn,arg}` at offsets 0/8/16.
 ///
@@ -1380,7 +1378,7 @@ pub unsafe extern "system" fn gc_unregister_detour() -> usize {
         return 0;
     }
     // SAFETY: original is the trampoline for the no-argument, EAX-returning
-    // unregister function at GC_UNREGISTER_RVA.
+    // unregister function whose entry the descriptor provides.
     let f: unsafe extern "system" fn() -> usize = unsafe { core::mem::transmute(original) };
     // SAFETY: the no-argument trampoline supplies the original execution context.
     unsafe { f() }
@@ -1389,8 +1387,6 @@ pub unsafe extern "system" fn gc_unregister_detour() -> usize {
 static GC_REMOVE_ORIG: AtomicUsize = AtomicUsize::new(0);
 static EXIT_THREAD_ORIG: AtomicUsize = AtomicUsize::new(0);
 static END_THREAD_EX_ORIG: AtomicUsize = AtomicUsize::new(0);
-
-pub const GC_REMOVE_RVA: u32 = 0xc417b0;
 
 /// The actual deletion of a Boehm record. `FUN_180c417b0(DWORD tid)`: it walks
 /// the bucket without a NULL check, `CloseHandle`s the duplicated handle and
@@ -1407,7 +1403,8 @@ pub unsafe extern "system" fn gc_remove_detour(tid: u32) -> usize {
         return 0;
     }
     // SAFETY: original is the trampoline for the one-argument removal function
-    // at GC_REMOVE_RVA; the argument is forwarded unchanged.
+    // the descriptor named as `gc.remove_thread`; the argument is forwarded
+    // unchanged.
     let f: unsafe extern "system" fn(u32) -> usize = unsafe { core::mem::transmute(original) };
     // SAFETY: as above — tid is the original caller's value.
     unsafe { f(tid) }
@@ -1530,30 +1527,44 @@ fn install_gc_trace_at(
 
 /// Install worker provenance hooks only when explicitly requested. These
 /// diagnostic detours execute from the same plaintext image as LateUpdate.
+///
+/// The three targets are not exports: the dispatcher and the GC removal are
+/// derived per build (descriptor, else `raw::discover`). When any of them is
+/// unknown this refuses; patching a guessed address is worse than losing a
+/// diagnostic.
 pub fn install_gc_worker_trace() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
-        log::log_tag(
-            "gct",
-            "worker trace disabled: RVA map belongs to another GameAssembly build",
-        );
-        return false;
-    }
-    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, size)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "worker trace disabled: GameAssembly is not loaded");
         return false;
     };
+    let Some(runtime) = crate::buildinfo::runtime_anchors(ga, size) else {
+        log::log_tag(
+            "gct",
+            "worker trace disabled: no runtime anchors for this GameAssembly build",
+        );
+        return false;
+    };
+    let Some(gc) = crate::buildinfo::gc_anchors(ga, size) else {
+        log::log_tag("gct", "worker trace disabled: no GC anchors for this build");
+        return false;
+    };
+    if runtime.worker_dispatch == 0 || runtime.gc_unregister == 0 {
+        log::log_tag(
+            "gct",
+            "worker trace disabled: dispatcher/unregister were not derived for this build",
+        );
+        return false;
+    }
     let dispatch = install_gc_trace_at(
         ga,
-        WORKER_DISPATCH_RVA,
+        runtime.worker_dispatch,
         &GC_DISPATCH_ORIG,
         gc_worker_detour as *const () as usize,
         "worker dispatcher",
     );
     let unregister = install_gc_trace_at(
         ga,
-        GC_UNREGISTER_RVA,
+        runtime.gc_unregister,
         &GC_UNREGISTER_ORIG,
         gc_unregister_detour as *const () as usize,
         "GC unregister",
@@ -1563,7 +1574,7 @@ pub fn install_gc_worker_trace() -> bool {
     // "the body skipped the call" from "our hook sat on the wrong wrapper".
     let remove = install_gc_trace_at(
         ga,
-        GC_REMOVE_RVA,
+        gc.remove_thread,
         &GC_REMOVE_ORIG,
         gc_remove_detour as *const () as usize,
         "GC remove thread",
@@ -1716,38 +1727,39 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
     if crate::lateupdate::resolve(selector).is_some() {
         return true;
     }
-    let index = match selector {
-        Selector::Address(_) => return false,
-        Selector::Index(index) => index,
-        Selector::Auto => {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                log::log_tag(
-                    "late",
-                    &format!(
-                        "auto target is exactly {}; no arbitrary fallback",
-                        crate::lateupdate::AUTO_CLASS
-                    ),
-                );
-            }
-            if crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256 {
-                return false;
-            }
-            crate::lateupdate::AUTO_TYPE_INDEX
+    if let Selector::Auto = selector {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log::log_tag(
+                "late",
+                &format!(
+                    "auto target is exactly {}; no arbitrary fallback",
+                    crate::lateupdate::AUTO_CLASS
+                ),
+            );
         }
-    };
-    let Some((ga, gasize)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
-        return false;
-    };
-    let f = ga.wrapping_add(crate::m3::IMAGE_GET_CLASS_RVA as usize);
-    if f < ga || f >= ga.saturating_add(gasize) {
-        return false;
     }
     let Some(corlib) = crate::il2cpp::find_domain() else {
         return false;
     };
+    // A pinned type index describes one metadata build. When the game update
+    // moved it, ask il2cpp by name — one call per image, and the image that owns
+    // the class is the only one that answers.
+    if matches!(selector, Selector::Auto)
+        && crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256
+    {
+        return materialise_by_name(corlib);
+    }
     let Some(image) = crate::m3::image_of(corlib, "Assembly-CSharp") else {
         return false;
+    };
+    let Some(f) = crate::m3::image_get_class_addr() else {
+        return false;
+    };
+    let index = match selector {
+        Selector::Auto => crate::lateupdate::AUTO_TYPE_INDEX,
+        Selector::Index(index) => index,
+        Selector::Address(_) => return false,
     };
     // SAFETY: f is the build-measured il2cpp_image_get_class(image, index) and
     // is called only from the injection stub. The class may initialize lazily,
@@ -1758,6 +1770,50 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
         // In auto mode this re-checks the fully-qualified name. A changed type
         // index must never turn into a hook on an unrelated method.
         && crate::lateupdate::resolve(selector).is_some()
+}
+
+/// `il2cpp_class_from_name(image, namespace, name)` for the auto target.
+///
+/// The class belongs to an assembly the caller does not know (a namespace is not
+/// an image name), so every image is asked until one answers. The two C strings
+/// live in static storage: the runtime keeps the pointers it was given.
+fn materialise_by_name(corlib_image: usize) -> bool {
+    use std::sync::OnceLock;
+    static NAMES: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+    let Some(function) = crate::m3::class_from_name_addr() else {
+        return false;
+    };
+    let (namespace, name) = match crate::lateupdate::AUTO_CLASS.rsplit_once('.') {
+        Some(parts) => parts,
+        None => ("", crate::lateupdate::AUTO_CLASS),
+    };
+    let (namespace, name) = NAMES.get_or_init(|| {
+        let mut ns = namespace.as_bytes().to_vec();
+        ns.push(0);
+        let mut class = name.as_bytes().to_vec();
+        class.push(0);
+        (ns, class)
+    });
+    for image in crate::m3::images(corlib_image, 512) {
+        // SAFETY: f is the build-measured il2cpp_class_from_name; both pointers
+        // are NUL-terminated and outlive the process.
+        let class = unsafe {
+            crate::veh::call3(
+                function,
+                image,
+                namespace.as_ptr() as usize,
+                name.as_ptr() as usize,
+            )
+        }
+        .unwrap_or(0);
+        if class >= 0x10000
+            && crate::safe::readable_at(class)
+            && crate::lateupdate::resolve(crate::lateupdate::Selector::Auto).is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn env_flag(name: &str) -> bool {
@@ -2340,7 +2396,9 @@ mod tests {
 
         assert!(valid_gc_context_call_site(&loaded));
         assert_eq!(prologue_len(&loaded, 14), Some(14));
-        for index in 0..8 {
+        // The displacement belongs to the build; only the opcode and the
+        // test/jne shape must hold.
+        for index in [0usize, 1, 6, 7] {
             let mut changed = loaded;
             changed[index] ^= 1;
             assert!(

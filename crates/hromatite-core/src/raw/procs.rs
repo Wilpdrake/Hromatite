@@ -226,6 +226,25 @@ pub fn regions(max_regions: usize) -> Vec<Region> {
     out
 }
 
+/// Full path of a module loaded in *our own* process (used to hash a build).
+pub fn own_module_path(name: &str) -> Option<std::path::PathBuf> {
+    let w = wide(name);
+    // SAFETY: `w` is NUL-terminated UTF-16 and remains alive throughout the call;
+    // the returned handle is process-owned and never closed here.
+    let module = unsafe { GetModuleHandleW(w.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 4096];
+    // SAFETY: `buffer` is a correctly sized writable UTF-16 destination.
+    let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) }
+        as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(wide_to_string(&buffer[..length])))
+}
+
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
     let w = wide(name);

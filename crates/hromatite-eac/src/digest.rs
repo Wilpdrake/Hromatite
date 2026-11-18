@@ -165,8 +165,9 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// CRC-32C (Castagnoli) — **HYPOTHESIS**: the default candidate for the EAC
-/// header checksum. The real algorithm lives in a bytecode VM and is unknown.
+/// CRC-32C (Castagnoli), the standard variant: register starts at
+/// `0xFFFF_FFFF` and is inverted on the way out. Kept for capture analysis;
+/// the anti-cheat module does **not** use it (see [`crc32c_eac`]).
 pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
@@ -180,6 +181,30 @@ pub fn crc32c(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// CRC-32C (Castagnoli) with a **zero** initial value and **no** final XOR —
+/// the variant the anti-cheat module writes into the 24-byte header.
+///
+/// OBSERVED, not guessed any more: the raw Castagnoli variant reproduces the
+/// header checksum on 451 frames from five sessions (offline analysis,
+/// 2026-11-17) and on the control capture used by the live runs — 121/121
+/// heartbeat frames and 18/18 short frames — while the standard variant
+/// (`crc32c`) reproduces none of them.
+/// Check value: `crc32c_eac(b"123456789") == 0x58e3_FA20`.
+pub fn crc32c_eac(data: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
 }
 
 /// 32-bit FNV-1a, kept only as a third cheap candidate during capture analysis.

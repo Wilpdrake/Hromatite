@@ -1,0 +1,97 @@
+{
+ "schema": "hromatite/build/1",
+ "source": "tools/buildgen.py",
+ "sha256": "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b",
+ "unity": "6000.0.67f1",
+ "gc": {
+  "remove_thread": "0xc417b0",
+  "skip_close": "0xc417f0",
+  "unlinked_next": "0xc417f6",
+  "after_unlink": "0xc41818",
+  "suspend_entry": "0xc41a20",
+  "context_call": "0xc41ad2",
+  "process_record": "0xc41a90",
+  "resume_abort": "0xc41afb",
+  "suspend_abort": "0xc41b65",
+  "advance_bucket": "0xc41c6a",
+  "threads": "0xe6bb180",
+  "thread_list_cs": "0xe6bb140"
+ },
+ "il2cpp": {
+  "get_corlib": "0xc27f00",
+  "image_get_class": "0xc2a330",
+  "class_from_name": "0xc28050",
+  "class_from_type": "0xc28040",
+  "class_table": "0xe66c870"
+ },
+ "runtime": {
+  "get_current_player_loop": "0x86cda10",
+  "worker_dispatch": "0xbf5ce0",
+  "gc_unregister": "0xc41920"
+ },
+ "layout": {
+  "class_parent": "0x10",
+  "class_namespace": "0x18",
+  "class_methods": "0x50",
+  "class_fields": "0x80",
+  "class_name": "0x98",
+  "class_fields_count": "0x124",
+  "field_stride": "0x28",
+  "field_name": "0x10",
+  "field_type": "0x0",
+  "field_offset": "0x8",
+  "field_parent": "0x20",
+  "method_name": "0x18",
+  "method_return_type": "0x20",
+  "method_parameters": "0x30",
+  "method_flags": "0x4c",
+  "method_param_count": "0x52",
+  "image_stride": "0x48",
+  "image_name": "0x8",
+  "image_filename": "0x40"
+ },
+ "extra": {
+  "class_from_type": "0xc28040",
+  "known_names": [
+   "il2cpp_class_from_il2cpp_type",
+   "il2cpp_get_corlib",
+   "il2cpp_image_get_class"
+  ]
+ },
+ "evidence": {
+  "gc": {
+   "context_call": "GetThreadContext",
+   "skip_close": "CloseHandle",
+   "unlinked_next": "0xc417b0+0x46"
+  },
+  "il2cpp": {
+   "getters": [
+    [
+     "0xc28f50",
+     "0xe668c70",
+     "0x2faf080"
+    ],
+    [
+     "0xc27f00",
+     "0xe66b720",
+     "0x1367300013590"
+    ],
+    [
+     "0xc27ef0",
+     "0xe6689d0",
+     "0x10000"
+    ]
+   ]
+  },
+  "runtime": {
+   "player_loop": "0x86cda10 (0x28-byte out struct zeroed, icall referenced at 0x86cda3d)",
+   "worker_dispatch": "0xbf5ce0 (unique body, referenced by its creator)",
+   "gc_unregister": "0xc41920 (only caller of GC_remove_thread 0xc417b0; .pdata entry)"
+  },
+  "layout": [
+   "method_return_type: 0x20 (heuristic: name+8; no function reads it in this build)"
+  ]
+ },
+ "note": "method_return_type: 0x20 (heuristic: name+8; no function reads it in this build); 0x86cda10 (0x28-byte out struct zeroed, icall referenced at 0x86cda3d)",
+ "verified": true
+}

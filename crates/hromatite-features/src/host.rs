@@ -12,6 +12,15 @@ impl Host {
         Self { api }
     }
 
+    /// SHA-256 of the attached `GameAssembly.dll`, lowercase hex.
+    pub fn game_sha_hex(&self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.api.game_assembly_sha256 {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
     pub fn game_assembly_range(&self) -> (usize, usize) {
         (
             self.api.game_assembly_base as usize,

@@ -40,11 +40,28 @@ const OFF_ID: usize = 0x08;
 const OFF_HANDLE: usize = 0x10;
 const OFF_STACK_BASE: usize = 0x18;
 
-/// RVAs of `GC_threads[]` candidates, from static analysis of this build
-/// (GameAssembly sha256 `648f61b1…`). Re-derive them after a game update:
-/// search `.text` for `c1 e8 08` (shr eax,8) followed by `33 c1` and a
-/// `mov (%r14,%rsi,8),%rbx` / `cmp %ecx,0x8(%rbx)` chain.
+/// Last-resort `GC_threads[]` candidates, from static analysis of the build the
+/// `symbols.rs` was generated for. The table address now comes from the build
+/// descriptor (`buildinfo::gc_anchors(..).threads`), so these are only tried
+/// when the loaded module cannot be identified at all.
 pub const CANDIDATE_RVAS: &[u32] = &[0x0e6b_b180, 0x0e66_b180, 0x0e66_c760];
+
+/// `GC_threads[]` candidates for the *loaded* build.
+///
+/// The descriptor is authoritative: on the next build the table moved by
+/// `+0x2720`, and a stale RVA makes the reaper read unrelated memory — it then
+/// finds no stale record and the game dies in `SuspendThread loop failed`
+/// exactly as before the fix.
+fn table_candidates() -> Vec<u32> {
+    #[cfg(target_os = "windows")]
+    if let Some((base, size)) = procs::own_module(GAME_ASSEMBLY)
+        && let Some(anchors) = crate::buildinfo::gc_anchors(base, size)
+        && anchors.threads != 0
+    {
+        return vec![anchors.threads];
+    }
+    CANDIDATE_RVAS.to_vec()
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
@@ -156,8 +173,9 @@ fn find_table(tids: &[u32], forced: Option<u32>) -> Option<(usize, u32)> {
     let ga = procs::own_module(GAME_ASSEMBLY)?.0;
     let cands: Vec<u32> = match forced {
         Some(rva) => vec![rva],
-        None => CANDIDATE_RVAS.to_vec(),
+        None => table_candidates(),
     };
+    let primary_rva = *cands.first()?;
     let mut best: Option<(usize, u32, usize)> = None;
     for rva in cands {
         let base = ga.wrapping_add(rva as usize);
@@ -166,10 +184,10 @@ fn find_table(tids: &[u32], forced: Option<u32>) -> Option<(usize, u32)> {
             continue;
         }
         // A real table has a few records and most of them alive. The first
-        // candidate is the one the static tool derives (`tools/gct_table.py`),
-        // so accept it on plausibility alone — the interesting case is exactly
-        // the one where a record is dead.
-        let primary = rva == CANDIDATE_RVAS[0];
+        // candidate is the one the build descriptor names, so accept it on
+        // plausibility alone — the interesting case is exactly the one where a
+        // record is dead.
+        let primary = rva == primary_rva;
         if (live >= 3 && live * 2 >= plausible) || (primary && plausible >= 3) {
             match best {
                 Some((_, _, bl)) if bl >= live => {}
@@ -391,12 +409,14 @@ pub fn reap() -> Vec<String> {
     let (base, _rva) = match find_table(&[], None) {
         Some(v) => v,
         None => {
-            // `find_table` needs live ids for scoring; fall back to the known rva
+            // `find_table` needs live ids for scoring; fall back to the table
+            // the descriptor names for the loaded build.
             let ga = match procs::own_module(GAME_ASSEMBLY) {
                 Some((b, _)) => b,
                 None => return out,
             };
-            (ga.wrapping_add(CANDIDATE_RVAS[0] as usize), CANDIDATE_RVAS[0])
+            let primary = table_candidates().first().copied().unwrap_or(CANDIDATE_RVAS[0]);
+            (ga.wrapping_add(primary as usize), primary)
         }
     };
     for bucket in 0..BUCKETS {
@@ -807,7 +827,7 @@ pub fn probe(forced_rva: Option<u32>) -> Vec<String> {
     };
     let cands: Vec<u32> = match forced_rva {
         Some(rva) => vec![rva],
-        None => CANDIDATE_RVAS.to_vec(),
+        None => table_candidates(),
     };
     let mut out = vec![format!(
         "gct: {} live thread(s) in this process, our tid {:#x}",
