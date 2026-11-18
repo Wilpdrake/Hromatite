@@ -4868,3 +4868,28 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   а не 39 (39 возвращает 0 и ничего не пишет). Фолбэк-перебор 37..=41 это уже
   покрывает; `probe slot 40 -> hr 0x4, out 0x6aa10080`.
 - **`HROMATITE_UI` снова `0`** — до чистого живого прогона.
+
+### 2026-11-18 — Состояние перед следующим живым прогоном (UI включён снова)
+
+- **`hromatite-mode` пользователем переключён:** `HROMATITE_UI=1` (nuklear через
+  хук Present), `HROMATITE_DRAW=0` (старый ESP на `Graphics.DrawMesh` выключен).
+  Это и есть конфигурация следующего теста: только nuklear-UI, без ESP.
+- **Что должно произойти по логу (порядок):**
+  1. `[d3d11] find: swapchain object 0x…, vtable 0x…`;
+  2. `[kiero] present: swapchain 0x… slot 8 -> 0x…` + `[ui] install: Present hooked …`;
+  3. `[d3d11] GetDevice -> device 0x…`, `probe slot 39 -> …`, `probe slot 40 -> …`,
+     `[d3d11] immediate context 0x… via slot 40`;
+  4. `[d3d11] backend ready: device … context … shader …`;
+  5. `ui status` → `frames > 0`, `backend ready`, в кадре окно `HROMATITE`.
+- **Критерий, что фикс `UpdateSubresource` закрыл проблему:** после `backend ready`
+  **ни одного** `[veh] caught 0x…` и ни одного `another thread holds the guard`,
+  процесс живёт, `ui status` отвечает.
+- **Если шторм AV вернётся** — искать дальше в порядке: (а) какой именно вызов
+  зовёт `Map` (добавить лог перед `Map`); (б) per-thread VEH-гард — сейчас два
+  потока (managed-тик и Present) делят один глобальный guard, и проигравший
+  идёт **без VEH**, поэтому его AV смертелен; (в) проверить, не бьётся ли
+  `device`/`context` с уже существующими объектами.
+- **Ограничение честности:** `HROMATITE_DRAW=0` в этой конфигурации — значит
+  старый ESP не проверяется; `HROMATITE_UI=1` — самый заметный для EAC элемент
+  (патч слота vtable `dxgi.dll`), рядом с ним в префиксе нет файлов, которые можно
+  менять при живом EAC.
