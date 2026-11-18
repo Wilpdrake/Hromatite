@@ -23,11 +23,13 @@
 //!            +0x30              → parameters
 //! ```
 //!
-//! The image array is not the "domain": `il2cpp_get_corlib` (obfuscated
-//! `wYRnnMQuvvH`, RVA 0xc27f00) returns the *corlib `Il2CppImage`*, and the
-//! images of all 216 assemblies are laid out back to back with stride 0x48
-//! (`image + i*0x48`); `image + 0x08` is the short name, `image + 0x30` the
-//! `Il2CppCodeGenModule`.
+//! The image array is not the "domain": `il2cpp_get_corlib` returns the *corlib
+//! `Il2CppImage`*, and the images of every assembly are laid out back to back.
+//! The strides and field offsets differ per build, so they come from the build
+//! descriptor: `0x48` stride with the name at `+0x08` on `648f61b1…`, `0x50`
+//! with the name at `+0x08` on `245768f2…` (the file name moved from `+0x40` to
+//! `+0x18`). A literal here is exactly the bug that stopped the LateUpdate
+//! anchor from finding `Assembly-CSharp` on a newer game build.
 //!
 //! `il2cpp_image_get_class` is `GEsTfKaEfsh` at RVA 0xc2a330 (verified live:
 //! index 167 of UnityEngine.CoreModule returns `Camera`). Reading the class
@@ -309,20 +311,55 @@ pub fn methods(class: usize) -> Vec<Method> {
     out
 }
 
-/// `Il2CppImage*` of an assembly. Images are packed with stride 0x48 and the
-/// `il2cpp_get_corlib` result is *not* the first one (Assembly-CSharp sits four
-/// entries earlier), so the search walks both directions. Exact short names win
-/// over prefixes (`Assembly-CSharp` must not resolve to `Assembly-CSharp-firstpass`).
+/// `Il2CppImage` table layout of the module this process is attached to.
+///
+/// `None` when the build cannot be identified — the caller must then refuse,
+/// never guess an offset.
+#[cfg(target_os = "windows")]
+pub fn image_layout() -> Option<hromatite_abi::build::Layout> {
+    let (base, size) = procs::own_module(crate::GAME_ASSEMBLY)?;
+    crate::buildinfo::layout_for(base, size)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn image_layout() -> Option<hromatite_abi::build::Layout> {
+    None
+}
+
+/// `Il2CppImage*` of an assembly.
+///
+/// The images are packed contiguously and `il2cpp_get_corlib` returns one of
+/// them, not the first: Assembly-CSharp sits several entries earlier on both
+/// known builds. **The stride and the name offset are build specific**
+/// (`0x48`/`+0x08` on `648f61b1…`, `0x50`/`+0x08` on `245768f2…`), so they come
+/// from the build descriptor; a literal here silently finds nothing on the next
+/// game update. Exact short names win over prefixes (`Assembly-CSharp` must not
+/// resolve to `Assembly-CSharp-firstpass`).
 pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
+    let layout = image_layout()?;
+    image_of_with(corlib_image, assembly, &layout)
+}
+
+/// Same search with an explicit layout (testable without a live module).
+pub fn image_of_with(
+    corlib_image: usize,
+    assembly: &str,
+    layout: &hromatite_abi::build::Layout,
+) -> Option<usize> {
+    let stride = i64::from(layout.image_stride);
+    if stride <= 0 {
+        return None;
+    }
+    let name_offset = layout.image_name as usize;
     let want = assembly.to_ascii_lowercase();
     let scan = |exact: bool| -> Option<usize> {
         for step in 0i64..768 {
             for sign in [1i64, -1] {
                 let idx = step * sign;
-                let Some(img) = corlib_image.checked_add_signed((idx * 0x48) as isize) else {
+                let Some(img) = corlib_image.checked_add_signed((idx * stride) as isize) else {
                     continue;
                 };
-                let name = match safe::read_usize(img + 0x08).and_then(name_at) {
+                let name = match safe::read_usize(img + name_offset).and_then(name_at) {
                     Some(n) if !n.is_empty() => n,
                     _ => continue,
                 };

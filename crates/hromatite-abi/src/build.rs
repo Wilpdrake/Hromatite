@@ -80,6 +80,17 @@ pub struct Layout {
     pub method_parameters: u16,
     pub method_flags: u16,
     pub method_param_count: u16,
+    /// `Il2CppImage` record stride in the contiguous image table.
+    ///
+    /// The table itself is contiguous and `il2cpp_get_corlib` returns one
+    /// record inside it, so the stride is the only way to walk to another
+    /// assembly: `0x48` on `648f61b1…`, `0x50` on `245768f2…` (measured live).
+    pub image_stride: u16,
+    /// Offset of the short assembly name (`char*`) inside one image record.
+    pub image_name: u16,
+    /// Offset of the file name (`char*`, `*.dll`) inside one image record;
+    /// `0` when the build carries it elsewhere.
+    pub image_filename: u16,
 }
 
 /// One supported game build.
@@ -140,6 +151,9 @@ pub const BUILD_648F61B1: Build = Build {
         method_parameters: 0x30,
         method_flags: 0x4c,
         method_param_count: 0x52,
+        image_stride: 0x48,
+        image_name: 0x08,
+        image_filename: 0x40,
     },
     verified: true,
     note: "method_return_type: 0x20 (heuristic: name+8; no function reads it in this build); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
@@ -185,9 +199,12 @@ pub const BUILD_245768F2: Build = Build {
         method_parameters: 0x30,
         method_flags: 0x4c,
         method_param_count: 0x52,
+        image_stride: 0x50,
+        image_name: 0x08,
+        image_filename: 0x18,
     },
     verified: true,
-    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (heuristic: name+8; no function reads it in this build); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
+    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (heuristic: name+8; no function reads it in this build); image_stride: 0x50 and image_filename: 0x18 measured live on pid 1071305 (the 0x48/+0x40 layout of the previous build breaks image_of); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
 };
 
 pub static KNOWN: &[Build] = &[
@@ -299,6 +316,9 @@ mod tests {
         assert_eq!(old.layout.field_parent, 0x20);
         assert_eq!(old.layout.method_name, 0x18);
         assert_eq!(old.layout.method_return_type, 0x20);
+        assert_eq!(old.layout.image_stride, 0x48);
+        assert_eq!(old.layout.image_name, 0x08);
+        assert_eq!(old.layout.image_filename, 0x40);
 
         let new = select("245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb")
             .expect("current build");
@@ -327,6 +347,9 @@ mod tests {
         assert_eq!(new.layout.field_parent, 0x00);
         assert_eq!(new.layout.method_name, 0x20);
         assert_eq!(new.layout.method_return_type, 0x28);
+        assert_eq!(new.layout.image_stride, 0x50);
+        assert_eq!(new.layout.image_name, 0x08);
+        assert_eq!(new.layout.image_filename, 0x18);
     }
 
     #[test]

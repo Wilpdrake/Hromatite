@@ -28,10 +28,22 @@ pub const GET_PLAYER_POSITION: u64 = 0x0000_0000_6000_c000;
 pub const GET_PLAYER_OBJECTS: u64 = 0x0000_0000_6000_d000;
 pub const GET_OBJECT_NAME: u64 = 0x0000_0000_6000_e000;
 
+/// Struct/image layout of the build the test host reports (`newest()` is what
+/// `test_support` puts into `HostApiV1::game_assembly_sha256`).
+fn layout() -> &'static hromatite_abi::build::Layout {
+    &hromatite_abi::build::newest().layout
+}
+
+/// Stride of one `Il2CppImage` record: build specific, never a literal.
+fn image_stride() -> u64 {
+    u64::from(layout().image_stride)
+}
+
 fn image(address: u64, name: &str, name_address: u64) {
-    fake::map_zeroed(address, 0x48);
+    let layout = layout();
+    fake::map_zeroed(address, image_stride());
     fake::put_ascii(name_address, name);
-    fake::put_u64(address + 0x08, name_address);
+    fake::put_u64(address + u64::from(layout.image_name), name_address);
 }
 
 fn class(index: usize, address: u64, namespace: &str, name: &str, methods: &[(&str, u64)]) {
@@ -78,11 +90,15 @@ pub fn install() {
         0x0000_0005_1000_0000,
     );
     image(
-        CORLIB_IMAGE - 4 * 0x48,
+        CORLIB_IMAGE - 4 * image_stride(),
         "Assembly-CSharp",
         0x0000_0005_1000_0100,
     );
-    image(CORLIB_IMAGE - 3 * 0x48, "VRCSDKBase", 0x0000_0005_1000_0200);
+    image(
+        CORLIB_IMAGE - 3 * image_stride(),
+        "VRCSDKBase",
+        0x0000_0005_1000_0200,
+    );
 
     class(
         167,

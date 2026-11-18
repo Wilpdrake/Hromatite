@@ -263,14 +263,22 @@ impl<'a> Metadata<'a> {
 
     pub fn image_of(&self, corlib_image: usize, assembly: &str) -> Option<usize> {
         let wanted = assembly.to_ascii_lowercase();
+        // The image records are contiguous but their stride is build specific
+        // (`0x48` on 648f61b1…, `0x50` on 245768f2…), so walking them with a
+        // literal would silently find nothing on the next game update.
+        let stride = i64::from(self.layout.image_stride);
+        if stride <= 0 {
+            return None;
+        }
+        let name_offset = self.layout.image_name as usize;
         let scan = |exact: bool| -> Option<usize> {
             for step in 0i64..768 {
                 for sign in [1i64, -1] {
                     let index = step * sign;
-                    let image = corlib_image.checked_add_signed((index * 0x48) as isize)?;
+                    let image = corlib_image.checked_add_signed((index * stride) as isize)?;
                     let name = match self
                         .host
-                        .read_usize(image + 0x08)
+                        .read_usize(image + name_offset)
                         .and_then(|pointer| self.name_at(pointer))
                     {
                         Some(name) if !name.is_empty() => name,
