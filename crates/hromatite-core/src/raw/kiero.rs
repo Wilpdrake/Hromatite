@@ -553,6 +553,26 @@ where
     }
 }
 
+/// Register a per-frame callback that stays armed.
+///
+/// Unlike [`render`], which fires once and disarms, this closure is called on
+/// every `Present` until replaced or cleared. It must be `Send` because it lives
+/// in a process-wide slot, but it runs on whatever thread calls `Present`; keep
+/// any non-`Send` state (the nuklear context, a D3D11 immediate context) in a
+/// thread-local the closure reaches into.
+pub fn render_each<F>(f: F)
+where
+    F: FnMut() + Send + 'static,
+{
+    let callback: RenderFn = Box::new(f);
+    match RENDER.lock() {
+        Ok(mut guard) => *guard = Some(callback),
+        Err(poisoned) => {
+            poisoned.into_inner().replace(callback);
+        }
+    }
+}
+
 /// Address the detour forwards to, or `0` when nothing is bound.
 pub fn original_present() -> usize {
     PRESENT_ORIG.load(Ordering::Acquire)

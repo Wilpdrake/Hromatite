@@ -25,6 +25,7 @@ pub mod symbols;
 // hierarchy as an additional compatibility contract.
 pub use raw::console;
 pub use raw::context as veh;
+pub use raw::d3d11;
 pub use raw::ffi;
 pub use raw::hook;
 pub use raw::hookset;
@@ -38,6 +39,7 @@ pub use raw::photon;
 pub use raw::playerloop;
 pub use raw::procs;
 pub use raw::remote;
+pub use raw::ui;
 pub use raw::vmt;
 
 pub const GAME_EXE: &str = "VRChat.exe";

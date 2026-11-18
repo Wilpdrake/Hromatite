@@ -886,6 +886,14 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let table = crate::gcthreads::snapshot(None);
             (crate::gcthreads::thread_rows(table.as_ref()), Action::None)
         }
+        // In-game nuklear UI: report the hook, the frame count and the panel
+        // state. The overlay itself is drawn from the render thread's Present
+        // hook, so there is nothing to toggle here — `HROMATITE_UI=1` is the
+        // switch and it is read at startup.
+        "ui" => match a1 {
+            "" | "status" => (crate::ui::status(), Action::None),
+            _ => (vec!["usage: ui [status]".into()], Action::None),
+        },
         // Raw diagnostic calls stay behind the same VEH boundary as M3 getters.
         // `guard <addr>` calls a raw GameAssembly RVA-relative function through
         // the vectored handler: the answer is either a return value or a fault

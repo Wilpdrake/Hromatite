@@ -39,6 +39,7 @@ version = "0.1.0"
 dependencies = [
  "hromatite-abi",
  "hromatite-commands",
+ "hromatite-nuklear",
 ]
 
 [[package]]

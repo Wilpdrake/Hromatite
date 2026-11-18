@@ -10,7 +10,9 @@
 //! `Result` remain the only contract for rejected addresses and OS failures.
 
 pub mod console;
+pub mod d3d11;
 pub mod discover;
+pub(crate) mod d3d11_shaders;
 pub mod context;
 pub mod ffi;
 pub mod gcguard;
@@ -36,4 +38,5 @@ pub mod playerloop;
 pub mod procs;
 pub mod remote;
 pub mod sys;
+pub mod ui;
 pub mod vmt;

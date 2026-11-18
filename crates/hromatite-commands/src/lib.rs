@@ -167,6 +167,15 @@ pub const SPECS: &[Spec] = &[
         scope: Scope::Resident,
     },
     Spec {
+        name: "ui",
+        aliases: &[],
+        usage: "ui [status]",
+        summary: "in-game nuklear UI drawn through Present",
+        note: "HROMATITE_UI=1 включает оверлей nuklear (хук Present)",
+        risk: Risk::ReadOnly,
+        scope: Scope::Resident,
+    },
+    Spec {
         name: "gctfix",
         aliases: &[],
         usage: "gctfix",

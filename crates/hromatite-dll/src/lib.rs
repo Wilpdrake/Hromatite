@@ -233,6 +233,14 @@ fn attach(hinst: *mut core::ffi::c_void) {
     log::guard("install_ac_hooks", install_ac_hooks);
     log::guard("install_photon_hook", install_photon_hook);
 
+    // In-game nuklear UI: find the game's swapchain and hook Present. Off unless
+    // `HROMATITE_UI=1` — a Present hook is the most visible thing this payload
+    // can install, so it stays opt-in like the other live hooks.
+    if hromatite_core::ui::enabled() {
+        let installed = log::guard("install_ui", hromatite_core::ui::install).unwrap_or(false);
+        log::log_tag("ui", &format!("install: hooked={installed}"));
+    }
+
     if let Err(error) = validate_modes(
         &env_or("HROMATITE_FRAME_HOOK", "1"),
         &env_or("HROMATITE_LIVE", "0"),
