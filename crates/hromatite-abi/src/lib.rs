@@ -16,12 +16,13 @@ pub const STATUS_BAD_ABI: i32 = -1;
 pub const STATUS_BAD_ARGUMENT: i32 = -2;
 pub const STATUS_NOT_READY: i32 = -3;
 pub const STATUS_ERROR: i32 = -4;
-/// Largest number of register arguments a single delegated call may carry.
+/// Largest number of arguments a single delegated call may carry.
 ///
-/// Win64 passes the first four integer/pointer arguments in RCX, RDX, R8, R9,
-/// and the callers here never need a fifth: `Graphics.DrawMesh(mesh, matrix,
-/// material, layer)` is the widest shape the overlay issues.
-pub const MAX_CALL_ARGS: usize = 4;
+/// Win64 passes the first four integer/pointer arguments in RCX, RDX, R8, R9 and
+/// the rest on the stack; a typed `extern "system"` call lets the compiler build
+/// that frame for us. Ten is what `Graphics.DrawMesh` needs in Unity 6, where
+/// the four-argument C# shape no longer exists as a separate method.
+pub const MAX_CALL_ARGS: usize = 10;
 
 /// Resident logging service. Both slices are borrowed UTF-8 data.
 pub type LogFn = extern "system" fn(

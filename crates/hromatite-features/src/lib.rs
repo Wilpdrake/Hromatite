@@ -358,6 +358,57 @@ mod tests {
         assert_eq!(&fake::bytes(0x2008, 3)[..], &[1, 0, 0xff]);
     }
 
+    /// Overload selection reads the signature, because `Mesh.SetVertices` and
+    /// `SetTriangles` exist for both `T[]` and `List<T>` with the same arity:
+    /// an array passed where a list is expected makes the callee read fields the
+    /// object does not have.
+    #[test]
+    fn parameter_types_come_from_the_signature_not_from_the_name() {
+        let _serial = fake::serial();
+        start(41);
+        let host = crate::host::Host::new(fake::api());
+        let mut cache = crate::m3::Cache::default();
+        let Some(metadata) = crate::m3::Metadata::new(&host, &mut cache) else {
+            panic!("the fixture build must resolve a descriptor");
+        };
+
+        // MethodInfo: parameters pointer at the layout's own offset.
+        let layout = hromatite_abi::build::newest().layout;
+        let info = 0x0000_0010_0000_0000u64;
+        let params = info + 0x100;
+        let vector3_array = info + 0x200;
+        let element = info + 0x300;
+        let vector3 = 0x0000_0010_0000_4000u64;
+        let int32 = 0x0000_0010_0000_5000u64;
+        fake::map_zeroed(info, 0x800);
+        fake::put_u64(info + u64::from(layout.method_parameters), params);
+        fake::put_u64(params, vector3_array);
+        fake::put_u64(params + 8, int32);
+        // SZARRAY whose data points at the element type (a value type).
+        fake::put_u64(vector3_array, element);
+        fake::put_u32(vector3_array + 8, 0x1d << 16);
+        fake::put_u64(element, vector3);
+        fake::put_u32(element + 8, 0x11 << 16);
+        // System.Int32 is a plain IVT (0x08), not a class.
+        fake::put_u32(int32 + 8, 0x08 << 16);
+
+        assert!(
+            metadata.parameter_is_array(info as usize, 0),
+            "Vector3[] must be seen as an array"
+        );
+        assert_eq!(
+            metadata.parameter_array_element_class(info as usize, 0),
+            Some(vector3 as usize)
+        );
+        assert_eq!(metadata.parameter_kind(info as usize, 1), Some(0x08));
+        assert_eq!(
+            metadata.parameter_class(info as usize, 1),
+            None,
+            "Int32 is not an object"
+        );
+        assert_eq!(metadata.parameter_kind(info as usize, 2), None, "no third parameter");
+    }
+
     #[test]
     fn unknown_commands_and_usage_errors_have_explicit_responses() {
         let _serial = fake::serial();

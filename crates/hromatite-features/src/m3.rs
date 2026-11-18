@@ -9,6 +9,11 @@ use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 
 pub const CLASS_MAX: usize = 120_000;
 
+/// `Il2CppTypeEnum` values this crate discriminates overloads by.
+const TYPE_VALUETYPE: u32 = 0x11;
+const TYPE_CLASS: u32 = 0x12;
+const TYPE_SZARRAY: u32 = 0x1d;
+
 #[derive(Debug, Default)]
 pub struct Cache {
     class_table: usize,
@@ -254,20 +259,64 @@ impl<'a> Metadata<'a> {
     /// `Material.SetInt` shapes, `string` versus `int`) are indistinguishable by
     /// name and arity, so the type kind is the only honest discriminator.
     pub fn first_parameter_kind(&self, info: usize) -> Option<u32> {
+        self.parameter_kind(info, 0)
+    }
+
+    /// `Il2CppTypeEnum` of parameter `index` (zero based), from the signature.
+    pub fn parameter_kind(&self, info: usize, index: u8) -> Option<u32> {
+        let ty = self.parameter_type(info, index)?;
+        self.type_kind(ty)
+    }
+
+    /// Address of the `Il2CppType` of parameter `index` (zero based).
+    pub fn parameter_type(&self, info: usize, index: u8) -> Option<usize> {
         let parameters = self
             .host
             .read_usize(info.checked_add(self.layout.method_parameters as usize)?)?;
         if parameters < 0x10000 {
             return None;
         }
-        let kind = self.host.read_usize(parameters)?;
-        if kind < 0x10000 {
+        self.host
+            .read_usize(parameters.checked_add(index as usize * 8)?)
+            .filter(|ty| *ty >= 0x10000)
+    }
+
+    /// `Il2CppTypeEnum` of a type record: the enum sits in bits 16..24 of the
+    /// second dword (`attrs:16, type:8, num_mods:6, byref:1, pinned:1`).
+    pub fn type_kind(&self, ty: usize) -> Option<u32> {
+        self.host
+            .read_u32(ty.checked_add(0x08)?)
+            .map(|bits| (bits >> 16) & 0xff)
+    }
+
+    /// `Il2CppClass*` a class/value-type record refers to (the type's `data`
+    /// union holds it for both kinds).
+    pub fn type_class(&self, ty: usize) -> Option<usize> {
+        if !matches!(self.type_kind(ty)?, TYPE_CLASS | TYPE_VALUETYPE) {
             return None;
         }
-        // Same bitfield `method_return_kind` uses: the enum sits in bits 16..24.
-        self.host
-            .read_u32(kind.checked_add(0x08)?)
-            .map(|bits| (bits >> 16) & 0xff)
+        self.host.read_usize(ty).filter(|class| *class >= 0x10000)
+    }
+
+    /// `Il2CppClass*` of parameter `index` when it is a class or a value type.
+    pub fn parameter_class(&self, info: usize, index: u8) -> Option<usize> {
+        self.type_class(self.parameter_type(info, index)?)
+    }
+
+    /// True when parameter `index` is a managed one-dimensional array (`T[]`).
+    pub fn parameter_is_array(&self, info: usize, index: u8) -> bool {
+        self.parameter_kind(info, index) == Some(TYPE_SZARRAY)
+    }
+
+    /// Element class of parameter `index` when it is `T[]`.
+    pub fn parameter_array_element_class(&self, info: usize, index: u8) -> Option<usize> {
+        let ty = self.parameter_type(info, index)?;
+        if self.type_kind(ty)? != TYPE_SZARRAY {
+            return None;
+        }
+        // For SZARRAY the `data` union points at the element's `Il2CppType`.
+        let element = self.host.read_usize(ty).filter(|ty| *ty >= 0x10000)?;
+        self.type_class(element)
     }
 
     pub fn method_in_chain(&self, class: usize, name: &str) -> Option<(usize, usize)> {

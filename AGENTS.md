@@ -4459,3 +4459,48 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   `restore_mode` возвращает исходное содержимое на выходе обёртки, но прогон,
   убитый `SIGKILL`'ом, оставит `git diff` в этом файле. Это ожидаемо: правится
   `git checkout -- hromatite-mode`.
+
+### 2026-11-18 — Живой прогон оверлея: `DrawMesh` в Unity 6 не имеет 4-аргументной формы
+
+- Коммит: этот (`fix(render): pick DrawMesh and mesh setters by signature`).
+- **Что показал живой прогон** (игра запущена 12:19, payload — сборка 13:09):
+  `[con] draw: renderer unavailable — UnityEngine.Graphics.DrawMesh(mesh, matrix,
+  material, layer) not found`. Остальное до этого места дошло: канал команд жив,
+  `draw on` отвечает, `m3f/m3c` работают.
+- **Причина (измерена в живой игре, не из документации).** `m3f UnityEngine Graphics`
+  → класс `#21080 0xe3e2c360`, 88 методов; `m3c` показывает **три** `DrawMesh`:
+  `params=10` `0x6ffff303c940`, `params=11` `0x6ffff303cb50`, `params=12`
+  `0x6ffff303cc70`. Четырёхпараметрической перегрузки нет: в Unity 6 опциональные
+  параметры C# схлопнуты в один широкий метод. `Mesh` (344 метода) при этом имеет
+  `.ctor` `params=0` — как и ожидалось.
+- **Что исправлено.**
+  1. ABI вызова расширен с 4 до **10** аргументов (`MAX_CALL_ARGS`), в
+     `raw/context.rs` появились `call5..call10` (macro, `extern "system"` — стековые
+     слоты и home space генерирует компилятор, VEH по-прежнему владеет кадром),
+     `raw/hostapi.rs` диспетчеризует по `arg_count`.
+  2. `Graphics.DrawMesh` выбирается по сигнатуре: 10 параметров, чьи последние три —
+     `BOOLEAN` (`castShadows, receiveShadows, useLightProbes`); 11/12-параметрические
+     заканчиваются `ShadowCastingMode`/`LightProbeUsage`/`LightProbeProxyVolume`.
+     Вызов: `(mesh, &matrix, material, layer=0, camera=null, submesh=0, props=null,
+     cast=0, receive=0, probes=0)`.
+  3. **Найдена и закрыта опасность того же класса:** `Mesh.SetVertices` и
+     `SetTriangles` существуют и для `T[]`, и для `List<T>` с одинаковым числом
+     параметров. Выбор «первый с нужным числом» мог передать массив в слот `List<T>`
+     и дать калви чтение полей, которых у массива нет. Теперь перегрузки выбираются
+     по типу параметра: `CheckOn` `SZARRAY` (`0x1d`) + элемент (`parameter_array_element_class
+     == int32_class` для `SetTriangles`), а `Material..ctor` — по `parameter_class ==
+     shader_class`.
+  4. В `m3` добавлены `parameter_type/type_kind/type_class/parameter_class/
+     parameter_is_array/parameter_array_element_class` (все чтения — через host,
+     никаких прямых дерефов).
+- **Чем подтверждено.** Новый host-тест
+  `parameter_types_come_from_the_signature_not_from_the_name` строит синтетический
+  `MethodInfo` (`Vector3[]` + `Int32`) и проверяет, что `SZARRAY`-элемент читается как
+  класс, а `I4` — нет; features **23/23**, abi 8, clippy `-D warnings` (windows-gnu)
+  чисто; release-сборка OK (`hromatite.dll` 2 489 533 Б 14:07,
+  `hromatite_features.dll` 2 718 062 Б 14:10).
+- **Осталось.** Живой приёмки после правки не было: нужен **рестарт игры** (resident
+  тоже изменился — расширен ABI вызова, hot-reload фичи недостаточно). Критерий:
+  `draw: managed API resolved — shader …` затем `draw: in-game renderer ready …`,
+  `draw status` → `segments>0`, в кадре крест и боксы. Если снова отказ — в тексте
+  ошибки теперь печатаются найденные `parameters_count`.

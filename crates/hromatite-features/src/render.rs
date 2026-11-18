@@ -198,10 +198,23 @@ impl Renderer {
         // SAFETY: the matrix is only read for the duration of the call, and it
         // is a local `[f32;16]`, i.e. a valid address in this process.
         let matrix = api.matrix.as_ptr() as usize;
-        match metadata
-            .host
-            .call(api.draw_mesh, &[api.mesh, matrix, api.material, 0])
-        {
+        // Ten arguments: mesh, matrix, material, layer, camera, submesh index,
+        // property block, cast shadows, receive shadows, light probes. The
+        // camera and the property block are null (every camera, no overrides),
+        // shadows are off and light probes are not used.
+        let arguments = [
+            api.mesh,
+            matrix,
+            api.material,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        match metadata.host.call(api.draw_mesh, &arguments) {
             Ok(_) => self.faults = 0,
             Err(status) => {
                 self.faults = self.faults.saturating_add(1);
@@ -336,26 +349,76 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     classes.push(format!("Vector3 {vector3_class:#x}"));
     classes.push(format!("Int32 {int32_class:#x}"));
 
-    // `Shader.Find` is static: its single argument is the managed string.
-    let find = method(metadata, shader_class, "Find", 1)
+    // Overload selection is by signature, never by name and arity alone:
+    // `Mesh.SetVertices`/`SetTriangles` take either `T[]` or `List<T>` with the
+    // same parameter count, and passing an array where a `List` is expected
+    // makes the callee read fields that do not exist in that object.
+    let shader_methods = metadata.methods(shader_class);
+    let find = shader_methods
+        .iter()
+        .find(|m| {
+            m.name == "Find"
+                && m.parameters_count == 1
+                && metadata.first_parameter_kind(m.info) == Some(TYPE_STRING)
+        })
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Shader.Find(string) not found".to_string())?;
-    let material_ctor = method(metadata, material_class, ".ctor", 1)
+
+    let material_methods = metadata.methods(material_class);
+    let material_ctor = material_methods
+        .iter()
+        .find(|m| {
+            m.name == ".ctor"
+                && m.parameters_count == 1
+                && metadata.parameter_class(m.info, 0) == Some(shader_class)
+        })
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Material..ctor(Shader) not found".to_string())?;
-    let mesh_ctor = method(metadata, mesh_class, ".ctor", 0)
+
+    let mesh_methods = metadata.methods(mesh_class);
+    let mesh_ctor = mesh_methods
+        .iter()
+        .find(|m| m.name == ".ctor" && m.parameters_count == 0)
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Mesh..ctor() not found".to_string())?;
-    let set_vertices = method(metadata, mesh_class, "SetVertices", 1)
+    let set_vertices = mesh_methods
+        .iter()
+        .find(|m| {
+            m.name == "SetVertices"
+                && m.parameters_count == 1
+                && metadata.parameter_is_array(m.info, 0)
+        })
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Mesh.SetVertices(Vector3[]) not found".to_string())?;
-    let set_triangles = method(metadata, mesh_class, "SetTriangles", 2)
+    let set_triangles = mesh_methods
+        .iter()
+        .find(|m| {
+            m.name == "SetTriangles"
+                && m.parameters_count == 2
+                && metadata.parameter_array_element_class(m.info, 0) == Some(int32_class)
+        })
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Mesh.SetTriangles(int[], int) not found".to_string())?;
-    let set_bounds = method(metadata, mesh_class, "set_bounds", 1);
-    let set_color = method(metadata, material_class, "set_color", 1);
+    let set_bounds = mesh_methods
+        .iter()
+        .find(|m| m.name == "set_bounds" && m.parameters_count == 1)
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0);
+    let set_color = material_methods
+        .iter()
+        .find(|m| m.name == "set_color" && m.parameters_count == 1)
+        .map(|m| m.entry)
+        .filter(|entry| *entry != 0);
     // `SetInt` has two overloads (`string,int` and `int,int`); the string one is
     // told apart by its first parameter being a managed string.
     let set_int = method_named_with_string_first(metadata, material_class, "SetInt")
         .or_else(|| method_named_with_string_first(metadata, material_class, "SetInteger"));
-    let draw_mesh = method(metadata, graphics_class, "DrawMesh", 4)
-        .ok_or_else(|| "UnityEngine.Graphics.DrawMesh(mesh, matrix, material, layer) not found"
-            .to_string())?;
+    let draw_mesh = draw_mesh_entry(metadata, graphics_class)?;
 
     // Lazy type initializers must run before instances/arrays exist.
     for class in [
@@ -541,19 +604,47 @@ fn class_in(
         .map(|(_, class)| *class)
 }
 
-/// First method with that exact name and parameter count.
-fn method(metadata: &Metadata<'_>, class: usize, name: &str, parameters: u8) -> Option<usize> {
-    metadata
-        .methods(class)
-        .into_iter()
-        .find(|candidate| candidate.name == name && candidate.parameters_count == parameters)
-        .map(|candidate| candidate.entry)
-        .filter(|entry| *entry != 0)
-}
-
 /// `Il2CppTypeEnum::STRING` — the kind that tells `SetInt(string,int)` apart
 /// from `SetInt(int,int)` when both have the same name and arity.
 const TYPE_STRING: u32 = 0x0e;
+/// `Il2CppTypeEnum::BOOLEAN`.
+const TYPE_BOOLEAN: u32 = 0x02;
+
+/// The `DrawMesh` overload to call.
+///
+/// Unity 6 collapsed the C# optional parameters into one wide method: the
+/// measured build has `DrawMesh` with 10, 11 and 12 parameters and **no**
+/// four-argument shape at all. The ten-argument one is the classic
+/// `(mesh, matrix, material, layer, camera, submeshIndex, properties,
+/// castShadows, receiveShadows, useLightProbes)` — its last three parameters are
+/// booleans, while the wider shapes end in `ShadowCastingMode`/`LightProbeUsage`
+/// enums or a `LightProbeProxyVolume`.
+fn draw_mesh_entry(metadata: &Metadata<'_>, class: usize) -> Result<usize, String> {
+    let mut counts = Vec::new();
+    let mut ten = None;
+    for candidate in metadata.methods(class) {
+        if candidate.name != "DrawMesh" {
+            continue;
+        }
+        let count = candidate.parameters_count;
+        counts.push(count);
+        if count != 10 {
+            continue;
+        }
+        let boolean_tail = (7..10u8).all(|index| {
+            metadata.parameter_kind(candidate.info, index) == Some(TYPE_BOOLEAN)
+        });
+        if boolean_tail {
+            return Ok(candidate.entry);
+        }
+        ten.get_or_insert(candidate.entry);
+    }
+    ten.ok_or_else(|| {
+        format!(
+            "no ten-argument Graphics.DrawMesh in this build (parameter counts found: {counts:?})"
+        )
+    })
+}
 
 /// The overload of `name` whose first parameter is a managed `string`.
 fn method_named_with_string_first(
