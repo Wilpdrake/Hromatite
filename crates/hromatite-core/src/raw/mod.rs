@@ -27,6 +27,7 @@ pub mod localmap;
 pub mod m3dump;
 pub mod memory;
 pub mod memscan;
+pub mod midhook;
 pub mod photon;
 pub mod playerloop;
 pub mod procs;
