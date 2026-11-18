@@ -541,17 +541,27 @@ mod imp {
                 return Err(format!("IDXGISwapChain::GetDevice failed: {hr:#x}"));
             }
             log::log_tag("d3d11", &format!("GetDevice -> device {device:#x} (hr {hr:#x})"));
+            // Slots 37..=41 are `GetCreationFlags`, `GetDeviceRemovedReason`,
+            // `GetImmediateContext`, `SetExceptionMode`, `GetExceptionMode`.
+            // Only `GetImmediateContext` writes an out pointer, so probing the
+            // whole window cannot mistake another getter's return value for a
+            // context — it either yields a non-null pointer or nothing.
             let mut context = 0usize;
-            let hr = method(
-                device,
-                DEVICE_GET_IMMEDIATE_CONTEXT,
-                &[(&mut context as *mut usize as u64)],
-            );
-            log::log_tag(
-                "d3d11",
-                &format!("GetImmediateContext slot {DEVICE_GET_IMMEDIATE_CONTEXT} -> hr {hr:#x}, context {context:#x}"),
-            );
-            if !succeeded(hr) || context == 0 {
+            let mut used = DEVICE_GET_IMMEDIATE_CONTEXT;
+            for index in [DEVICE_GET_IMMEDIATE_CONTEXT, 40, 38, 41, 37] {
+                let mut candidate = 0usize;
+                let hr = method(device, index, &[(&mut candidate as *mut usize as u64)]);
+                log::log_tag(
+                    "d3d11",
+                    &format!("probe slot {index} -> hr {hr:#x}, out {candidate:#x}"),
+                );
+                if succeeded(hr) && candidate != 0 {
+                    context = candidate;
+                    used = index;
+                    break;
+                }
+            }
+            if context == 0 {
                 // Dump the surrounding vtable entries with their first bytes: the
                 // next live run then settles the index without another rebuild.
                 for index in 34..=44u32 {
@@ -565,8 +575,11 @@ mod imp {
                         &format!("  slot {index} @ {function:#x}: {}", hex.join(" ")),
                     );
                 }
-                return Err(format!("ID3D11Device::GetImmediateContext failed: {hr:#x}"));
+                return Err(format!(
+                    "ID3D11Device::GetImmediateContext (slot {used}) failed: no context"
+                ));
             }
+            log::log_tag("d3d11", &format!("immediate context {context:#x} via slot {used}"));
 
             let vertex_shader = {
                 let mut value = 0usize;
