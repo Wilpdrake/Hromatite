@@ -4759,3 +4759,50 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   `IID_ID3D11Device` = `db6f6ddb-ac77-4e88-8253-819df9bbf140`;
   `IID_IDXGISwapChain` = `310d36a0-d2e7-4c0a-aa04-6a9d23b8886a`.
   В префиксе есть `d3dcompiler_47.dll` (не маппингован) — шейдеры лучше прекомпилировать.
+
+### 2026-11-18 — Обвязка nuklear: поиск swapchain → хук Present → D3D11-отрисовка
+
+- Коммит **`8a96099`** (`feat(ui): draw the nuklear panel through the game's Present hook`).
+- **Сделано.**
+  * `crates/hromatite-core/src/raw/d3d11_shaders.rs` — прекомпилированные DXBC-шейдеры
+    nuklear-D3D11 из апстримного демо (1352 Б vertex / 636 Б pixel, магия `DXBC`),
+    вкомпилированы в образ → `d3dcompiler` в рантайме не нужен.
+  * `crates/hromatite-core/src/raw/d3d11.rs` (~1300 строк): поиск swapchain игры
+    (скан writable-памяти за указателем внутрь `dxgi.dll` + проверка формы таблицы
+    18 слотов + **реальный вызов `GetDesc`** как доказательство), получение
+    `ID3D11Device`/`ImmediateContext`, создание шейдеров/input layout/блендинга/
+    растеризации/сэмплера/буферов, загрузка атласа шрифта, отрисовка `Frame`
+    (`DrawIndexed` по командам, scissor по `clip`, текстура 0 = белый пиксель,
+    1 = атлас) и **сохранение/восстановление состояния D3D11** (render target,
+    blend, rasterizer, viewport, scissor, input layout, vertex/index buffers,
+    topology) вокруг кадра.
+  * `crates/hromatite-core/src/raw/ui.rs` — `HROMATITE_UI=1` (по умолчанию выкл),
+    ввод из Win32 (`GetForegroundWindow`/`GetClientRect`/`GetCursorPos`/
+    `ScreenToClient`/`GetAsyncKeyState`), `Nk`+`Backend` в thread-local (поток
+    рендера), команда `ui [status]`.
+  * `kiero::render_each` — постоянный per-frame колбэк (существующий `render()`
+    одноразовый). Замечание: `Present`-хук и бэкенд — **в резиденте**, не в фиче,
+    потому что immediate context принадлежит потоку рендера.
+  * `hromatite-mode`: `HROMATITE_UI=1` с явным предупреждением про патч vtable.
+- **Индексы vtable и константы сверены с заголовками** (mingw-w64 `dxgi.h`/`d3d11.h`
+  и wine `d3d11.idl`, оба источника совпали): `GetDevice`=7, `Present`=8,
+  `GetDesc`=12, `ResizeBuffers`=13; `GetImmediateContext`=39, `DrawIndexed`=12,
+  `Map`=14, `IASetIndexBuffer`=19, `OMSetBlendState`=35, `RSSetScissorRects`=45,
+  `OMGetRenderTargets`=89, `UpdateSubresource`=48. `IID_ID3D11Device`
+  = `db6f6ddb-ac77-4e88-8253-819df9bbf140`.
+- **Проверено офлайн.** `cargo test --workspace --target x86_64-unknown-linux-gnu
+  --offline` — всё зелёное (core **220**, +5 новых тестов `d3d11`: проекция,
+  вырожденный размер, scissor, индексы vtable, IID); `cargo build --workspace
+  --release --target x86_64-pc-windows-gnu` — 0 warnings; `cargo clippy
+  --workspace --all-targets --release … -- -D warnings` — чисто;
+  `tools/test_buildgen.py` — 13/13.
+- **Что НЕ проверено (нужен живой прогон, игру запускает пользователь).** Впервые
+  всё это попадёт в игру только после перезапуска: не проверены ни поиск
+  swapchain, ни `GetDevice`, ни создание ресурсов, ни сама отрисовка, ни ввод.
+  Критерий приёмки: в логе `ui: install: Present hooked at swapchain 0x…` и
+  `d3d11: backend ready: …`; затем `ui status` → `frames > 0`, `backend ready`;
+  в кадре — окно `HROMATITE`. Если `ui: install: no IDXGISwapChain found` —
+  скан не нашёл объект (тогда нужен другой способ получения swapchain).
+- **Риски (явно).** Хук патчит слот vtable в `dxgi.dll` (COW-страница модуля) —
+  самый заметный для EAC элемент проекта; `HROMATITE_UI=0` убирает и хук, и
+  бэкенд. Скан пишет в лог только факт находки/отказа, не каждый кандидат.
