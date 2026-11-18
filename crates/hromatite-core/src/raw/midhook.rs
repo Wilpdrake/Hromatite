@@ -59,7 +59,6 @@ pub(crate) enum PlanError {
 /// the patch, computed from the target bytes and the trampoline address.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Plan {
-    pub target: usize,
     /// Length of the overwritten instruction window.
     pub prologue: usize,
     /// Relocated window followed by `jmp [rip+0] <target+prologue>`.
@@ -131,7 +130,6 @@ pub(crate) fn plan(target: usize, head: &[u8], trampoline: usize) -> Result<Plan
         return Err(PlanError::WindowTooLong);
     }
     Ok(Plan {
-        target,
         prologue,
         code,
         orig: head[..prologue].to_vec(),
