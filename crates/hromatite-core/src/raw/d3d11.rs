@@ -299,7 +299,14 @@ mod imp {
             .map(|region| (region.base, region.base + region.size))
             .collect();
         if exec.is_empty() {
-            log::log_tag("d3d11", "find: dxgi.dll has no executable region");
+            log::log_tag(
+                "d3d11",
+                &format!(
+                    "find: dxgi.dll {base:#x}+{size:#x} has no executable region \
+                     ({} regions walked)",
+                    regions.len()
+                ),
+            );
             return None;
         }
         let in_exec = |value: usize| exec.iter().any(|&(lo, hi)| value >= lo && value < hi);

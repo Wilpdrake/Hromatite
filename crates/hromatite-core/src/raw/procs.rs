@@ -187,8 +187,14 @@ impl Region {
         p != PAGE_NOACCESS && p != 0 && (self.protect & PAGE_GUARD) == 0
     }
     pub fn executable(&self) -> bool {
-        let p = self.protect & 0xFF;
-        (p & 0x10) != 0 || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY
+        // All four executable page protections, not just `PAGE_EXECUTE`: a
+        // module's `.text` is normally `PAGE_EXECUTE_READ` (0x20), which the old
+        // `p & 0x10` test missed — that made `d3d11::find_swapchain` see no
+        // executable region in `dxgi.dll` at all.
+        matches!(
+            self.protect & 0xFF,
+            PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        )
     }
 }
 
@@ -298,4 +304,38 @@ pub fn own_module(name: &str) -> Option<(usize, usize)> {
     let opt = base.checked_add(e_lfanew)?.checked_add(4 + 20)?;
     let size = crate::safe::read_u32(opt + 56)? as usize;
     Some((base, size))
+}
+
+
+#[cfg(test)]
+mod region_tests {
+    use super::Region;
+
+    fn region(protect: u32) -> Region {
+        Region {
+            base: 0x1000,
+            size: 0x1000,
+            protect,
+            ty: 0x1000,
+        }
+    }
+
+    #[test]
+    fn every_executable_page_protection_is_recognised() {
+        // `.text` is normally PAGE_EXECUTE_READ; missing it made the swapchain
+        // scan report "no executable region" for dxgi.dll.
+        for protect in [0x10, 0x20, 0x40, 0x80] {
+            assert!(region(protect).executable(), "{protect:#x} must be executable");
+        }
+        for protect in [0x01, 0x02, 0x04, 0x08, 0x00] {
+            assert!(!region(protect).executable(), "{protect:#x} must not be executable");
+        }
+    }
+
+    #[test]
+    fn guard_pages_are_not_readable() {
+        assert!(!region(0x104).readable(), "PAGE_GUARD|PAGE_READWRITE");
+        assert!(region(0x04).readable());
+        assert!(!region(0x01).readable());
+    }
 }
