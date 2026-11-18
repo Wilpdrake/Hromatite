@@ -4920,3 +4920,36 @@ takeover-режиму дефект надо закрыть: эмиттер об�
 - **Осталось:** код в `context.rs`/`d3d11.rs` всё ещё не закоммичен (см. предыдущую
   запись); перед живым прогоном — пересобрать `cargo build --workspace --release
   --target x86_64-pc-windows-gnu`.
+
+### 2026-11-18 — Исправление краша UI (`HROMATITE_UI=1`): косвенность указателей D3D11, упаковка VB/IB, сохранение состояния и per-thread VEH
+
+- **Точная причина шторма AV и краша в прогоне 21:17 (`1× 0x6ffffa0fef46`, `1× 0x6ffffa0f78d9`, `20× 0x6ffffa16b2f4`, `2× 0x0`):**
+  1. Шесть методов `ID3D11DeviceContext`, принимающих одиночный COM-указатель **по значению** (`IASetInputLayout`, `IASetIndexBuffer`, `VSSetShader`, `PSSetShader`, `OMSetBlendState`, `RSSetState`), в `draw()` и `restore()` вызывались с адресом поля структуры (`&self.<field>` / `&state.<field>`) вместо самого значения указателя (`self.<field>` / `state.<field>`).
+     * В `draw()` первый `map_data(self.constant_buffer)` проходил без ошибок, затем вызовы `IASetInputLayout(&self.input_layout)`, `IASetIndexBuffer(&self.index_buffer)`, `VSSetShader(&self.vertex_shader)` и др. передавали в DXVK адреса внутрь структуры `Backend`; DXVK трактовал их как COM-объекты, ловил AV (`0x6ffffa0fef46`, `0x6ffffa0f78d9`) и портил соседние поля `self.vertex_buffer` и `self.index_buffer`. Затем цикл из 10 draw-команд 20 раз вызывал `Map` (`0x6ffffa16b2f4`) на испорченных `vertex_buffer`/`index_buffer`.
+     * В `restore()` при `state.blend_state == 0` и `state.rasterizer_state == 0` передача `&state.blend_state` и `&state.rasterizer_state` давала ненулевой стек-адрес, указывающий на `0`, поэтому DXVK читал `vtable = 0` и прыгал на `0x0` (`2× по 0x0`), а после выхода из `present_detour` оставался с висячими указателями на стек в `m_state` и падал вне VEH.
+  2. `RSGetViewports` и `RSGetScissorRects` вызывались с входным `count = 0` (`[in, out]` размер буфера), из-за чего D3D11 не записывал текущий viewport/scissor игры, а `restore()` восстанавливал нулевой viewport `0×0`.
+  3. В `draw()` на каждой команде вызывался `Map(MAP_WRITE_DISCARD)` на `vertex_buffer` и `index_buffer`, стирая вершины/индексы предыдущих команд, но в `DrawIndexed` передавался растущий `StartIndexLocation = base` (смещённый на число вершин).
+  4. `save()`/`restore()` не сохраняли `VS`/`PS` шейдеры, constant buffer, SRV, sampler, depth-stencil, blend factor/mask и offsets буферов, а также не вызывали `Release()` на 12 COM-интерфейсах, полученных через `*Get*` (утечка ссылок каждый кадр). Кроме того, `void`-методы `ID3D11DeviceContext` проверялись через `succeeded(hr)` (`eax >= 0`), хотя `void`-функции Win64 не обязаны обнулять `eax`.
+  5. `veh::call_with_mode` в `context.rs` имел один глобальный `LOCK_TID`: при одновременной работе потока `Present` и потока `PlayerLoop`/`LateUpdate` второй поток шёл без защиты VEH.
+- **Что сделано:**
+  * `crates/hromatite-core/src/raw/context.rs`:
+    - Глобальный `LOCK_TID` заменён на пул из `MAX_THREADS = 8` независимых per-thread стеков (`LANES`, `CTX`, `SLOTS` по `MAX_DEPTH = 8`), привязанных к `tid` потока.
+    - Вызов `f()` внутри `call_with_mode` изолирован в отдельный `#[inline(never)]` дочерний кадр стека ниже захваченного `RtlCaptureContext` `RSP`, чтение/запись `SLOTS[..].resumed` переведены на `read_volatile`/`write_volatile`, а в `pop()` восстановление `saved`/`catch_panic` выполняется до `Release`-записи `depth - 1`.
+    - Добавлен host-тест `per_thread_lanes_isolate_concurrent_threads_and_reuse_for_nested_guards`.
+  * `crates/hromatite-core/src/raw/d3d11.rs`:
+    - Добавлен `method_void` для `void`-методов COM (`ID3D11DeviceContext` getters/setters, `Unmap`, `Release`, `GetImmediateContext`).
+    - Исправлена передача одиночных указателей по значению в `IASetInputLayout`, `IASetIndexBuffer`, `VSSetShader`, `PSSetShader`, `OMSetBlendState`, `RSSetState` и `pDepthStencilView` в `OMSetRenderTargets`.
+    - `render_target_view` для backbuffer 0 (`IDXGISwapChain::GetBuffer(0, IID_ID3D11Texture2D)` → `CreateRenderTargetView`) создаётся на время `draw()` и отвязывается + освобождается через `Release()` до выхода из кадра (чтобы не удерживать ссылку на backbuffer между кадрами и не блокировать `IDXGISwapChain::ResizeBuffers`).
+    - В `Backend::new` частичная инициализация сразу складывается в `Backend`, чтобы при ошибке на любом шаге `Drop` освобождал уже созданные COM-объекты без утечек; в `map_data` проверяется точная ёмкость целевого буфера (`capacity`).
+    - Атлас шрифта в `upload_font` создаётся сразу с `D3D11_SUBRESOURCE_DATA` в `CreateTexture2D`, промежуточный `ID3D11Texture2D` освобождается через `Release()` после создания SRV.
+    - Добавлена функция `pack_frame`: все команды кадра упаковываются в единый VB и единый IB за один `Map(WRITE_DISCARD)` за кадр с перебазированием локальных индексов каждой команды на `vertex_base`; добавлен host-тест `pack_frame_rebases_indices_across_commands`.
+    - В `save()`/`restore()` сохраняются и восстанавливаются все `MAX_VIEWPORTS = 16` (`D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE`) viewports и scissor rects (запрашиваются до `*Get*`-вызовов, увеличивающих refcount), шейдеры `VS`/`PS`, `VS` constant buffer, `PS` SRV, `PS` sampler, `depth_stencil`, `blend_factor`, `sample_mask`, `vertex_offset`, `index_offset`, и вызывается `release()` для всех 12 захваченных COM-указателей.
+    - Добавлена `swapchain_desc()` (`IDXGISwapChain::GetDesc` → `BufferDesc.Width`, `BufferDesc.Height`, `OutputWindow`).
+  * `crates/hromatite-core/src/raw/ui.rs`:
+    - Телеметрия `ui::status()` переведена с `thread_local! LOCAL` (невидимого из потока `PlayerLoop`/`LateUpdate`, где выполняется консоль) на межпоточные атомики (`FRAMES`, `WIDTH_BITS`, `HEIGHT_BITS`, `BACKEND_READY`, `PANEL_OPEN`, `FAILED`); добавлен тест `status_reads_published_telemetry_across_threads`.
+    - Размер viewport и `HWND` окна берутся из `swapchain_desc(swapchain)` (`OutputWindow`, `BufferDesc.Width/Height`), чтобы потеря фокуса окном игры при переключении в терминал не сбрасывала viewport UI в `1×1`.
+- **Чем подтверждено:**
+  * `cargo test --workspace --target x86_64-unknown-linux-gnu --offline` — все тесты зелёные (`hromatite-core`: **225 passed**, включая новые тесты в `context`, `d3d11` и `ui`).
+  * `cargo clippy --workspace --all-targets --release --target x86_64-pc-windows-gnu --offline -- -D warnings` — 0 ошибок и 0 предупреждений.
+  * `cargo build --workspace --release --target x86_64-pc-windows-gnu --offline` — релизные `hromatite.dll` и `hromatite_features.dll` пересобраны.
+- **Осталось:** живой прогон в VRChat (запускает пользователь) с `HROMATITE_UI=1`.

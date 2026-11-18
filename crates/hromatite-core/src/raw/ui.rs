@@ -9,12 +9,38 @@
 //! Off unless `HROMATITE_UI=1`: installing a Present hook is the most visible
 //! thing this project can do, so it is opt-in like the other live hooks.
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use crate::log;
-use hromatite_nuklear::{Input, Keys, Nk};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 static SWAPCHAIN: AtomicUsize = AtomicUsize::new(0);
 static HOOKED: AtomicBool = AtomicBool::new(false);
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static WIDTH_BITS: AtomicU32 = AtomicU32::new(0);
+static HEIGHT_BITS: AtomicU32 = AtomicU32::new(0);
+static BACKEND_READY: AtomicBool = AtomicBool::new(false);
+static PANEL_OPEN: AtomicBool = AtomicBool::new(true);
+static STARTED: AtomicBool = AtomicBool::new(false);
+static FAILED: Mutex<Option<String>> = Mutex::new(None);
+
+fn publish_status(frames: u64, width: f32, height: f32, backend_ready: bool, panel_open: bool) {
+    FRAMES.store(frames, Ordering::Release);
+    WIDTH_BITS.store(width.to_bits(), Ordering::Release);
+    HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
+    BACKEND_READY.store(backend_ready, Ordering::Release);
+    PANEL_OPEN.store(panel_open, Ordering::Release);
+    STARTED.store(true, Ordering::Release);
+}
+
+fn publish_failure(note: String) {
+    STARTED.store(true, Ordering::Release);
+    match FAILED.lock() {
+        Ok(mut guard) => *guard = Some(note),
+        Err(poisoned) => *poisoned.into_inner() = Some(note),
+    }
+}
 
 /// `HROMATITE_UI=1` — install the Present hook and draw the UI.
 pub fn enabled() -> bool {
@@ -25,7 +51,9 @@ pub fn hooked() -> bool {
     HOOKED.load(Ordering::Acquire)
 }
 
-/// One line per fact; safe to call from the console at any time.
+/// One line per fact; safe to call from the console at any time (including from
+/// the `PlayerLoop`/`LateUpdate` game thread while `Present` runs on Unity's
+/// render thread).
 pub fn status() -> Vec<String> {
     let mut out = vec![format!(
         "ui: {} (HROMATITE_UI=1 to enable), hook {}",
@@ -33,8 +61,27 @@ pub fn status() -> Vec<String> {
         if hooked() { "installed" } else { "not installed" },
     )];
     out.push(format!("ui: swapchain {:#x}", SWAPCHAIN.load(Ordering::Acquire)));
-    #[cfg(windows)]
-    imp::status_into(&mut out);
+    if !STARTED.load(Ordering::Acquire) {
+        out.push("ui: no frame rendered yet".into());
+        return out;
+    }
+    let frames = FRAMES.load(Ordering::Acquire);
+    let width = f32::from_bits(WIDTH_BITS.load(Ordering::Acquire));
+    let height = f32::from_bits(HEIGHT_BITS.load(Ordering::Acquire));
+    let ready = BACKEND_READY.load(Ordering::Acquire);
+    let open = PANEL_OPEN.load(Ordering::Acquire);
+    out.push(format!(
+        "ui: frames {frames} viewport {width:.0}x{height:.0} backend {} panel {}",
+        if ready { "ready" } else { "unavailable" },
+        if open { "open" } else { "closed" },
+    ));
+    let failed = match FAILED.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(note) = failed {
+        out.push(format!("ui: stopped — {note}"));
+    }
     out
 }
 
@@ -54,8 +101,9 @@ pub fn install() -> bool {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use crate::raw::d3d11::Backend;
+    use crate::raw::d3d11::{swapchain_desc, Backend};
     use core::cell::RefCell;
+    use hromatite_nuklear::{Input, Keys, Nk};
 
     // User32: the panel is driven by the window's own mouse and keyboard state,
     // so no Unity call is needed and the UI works before il2cpp is up.
@@ -84,6 +132,7 @@ mod imp {
     struct Local {
         nk: Nk,
         backend: Option<Backend>,
+        window: isize,
         width: f32,
         height: f32,
         frames: u64,
@@ -93,27 +142,6 @@ mod imp {
 
     thread_local! {
         static LOCAL: RefCell<Option<Local>> = const { RefCell::new(None) };
-    }
-
-    pub fn status_into(out: &mut Vec<String>) {
-        LOCAL.with(|cell| {
-            let cell = cell.borrow();
-            let Some(local) = cell.as_ref() else {
-                out.push("ui: no frame rendered yet".into());
-                return;
-            };
-            out.push(format!(
-                "ui: frames {} viewport {:.0}x{:.0} backend {} panel {}",
-                local.frames,
-                local.width,
-                local.height,
-                if local.backend.is_some() { "ready" } else { "unavailable" },
-                if local.nk.ui().open { "open" } else { "closed" },
-            ));
-            if let Some(note) = &local.failed {
-                out.push(format!("ui: stopped — {note}"));
-            }
-        });
     }
 
     pub fn install() -> bool {
@@ -143,14 +171,17 @@ mod imp {
             let mut cell = cell.borrow_mut();
             if cell.is_none() {
                 let Some(nk) = Nk::new() else {
-                    log::log_tag("ui", "first frame: nuklear context could not be created");
+                    let note = "first frame: nuklear context could not be created".to_string();
+                    publish_failure(note.clone());
+                    log::log_tag("ui", &note);
                     return;
                 };
                 *cell = Some(Local {
                     nk,
                     backend: None,
-                    width: 1.0,
-                    height: 1.0,
+                    window: 0,
+                    width: 1280.0,
+                    height: 720.0,
                     frames: 0,
                     last_left: false,
                     failed: None,
@@ -163,14 +194,16 @@ mod imp {
                 return;
             }
 
-            let (width, height) = window_size();
+            let swapchain = SWAPCHAIN.load(Ordering::Acquire);
+            let (width, height, window) =
+                target_window_and_size(swapchain, local.window, local.width, local.height);
+            local.window = window;
             local.width = width;
             local.height = height;
 
             // The backend is built on the render thread: the immediate context
             // is not thread-safe and every call below must come from here.
             if local.backend.is_none() {
-                let swapchain = SWAPCHAIN.load(Ordering::Acquire);
                 match Backend::new(swapchain) {
                     Ok(mut backend) => {
                         if let Some(atlas) = local.nk.font_texture() {
@@ -179,7 +212,16 @@ mod imp {
                                 Ok(()) => {}
                                 Err(error) => {
                                     local.failed = Some(error.clone());
+                                    publish_status(
+                                        local.frames,
+                                        local.width,
+                                        local.height,
+                                        false,
+                                        local.nk.ui().open,
+                                    );
+                                    publish_failure(error.clone());
                                     log::log_tag("ui", &format!("font atlas: {error}"));
+                                    return;
                                 }
                             }
                         }
@@ -188,13 +230,21 @@ mod imp {
                     }
                     Err(error) => {
                         local.failed = Some(error.clone());
+                        publish_status(
+                            local.frames,
+                            local.width,
+                            local.height,
+                            false,
+                            local.nk.ui().open,
+                        );
+                        publish_failure(error.clone());
                         log::log_tag("ui", &format!("backend: {error}"));
                         return;
                     }
                 }
             }
 
-            let input = read_input(width, height, local.last_left);
+            let input = read_input(window, width, height, local.last_left);
             local.last_left = input.left_down;
             let frame = local.nk.frame(&input);
             let Some(backend) = local.backend.as_mut() else {
@@ -202,31 +252,70 @@ mod imp {
             };
             backend.set_size(width, height);
             let Some(state) = backend.save() else {
-                local.failed = Some("could not read the game's D3D11 state".into());
+                let note = "could not read the game's D3D11 state".to_string();
+                local.failed = Some(note.clone());
+                publish_status(
+                    local.frames,
+                    local.width,
+                    local.height,
+                    true,
+                    local.nk.ui().open,
+                );
+                publish_failure(note);
                 log::log_tag("ui", "save: the game's D3D11 state could not be captured");
                 return;
             };
             backend.draw(&frame, &state);
             backend.restore(&state);
             local.frames = local.frames.saturating_add(1);
+            publish_status(
+                local.frames,
+                local.width,
+                local.height,
+                true,
+                local.nk.ui().open,
+            );
         });
     }
 
-    fn window_size() -> (f32, f32) {
-        // SAFETY: user32 reads the foreground window and writes a 16-byte RECT.
-        unsafe {
-            let window = GetForegroundWindow();
-            if window == 0 {
-                return (1.0, 1.0);
+    /// Resolve the swapchain's own `OutputWindow` and dimensions so Alt-Tabbing
+    /// to another window (e.g. the terminal console) never collapses the
+    /// viewport to `1x1`.
+    fn target_window_and_size(
+        swapchain: usize,
+        prev_window: isize,
+        prev_width: f32,
+        prev_height: f32,
+    ) -> (f32, f32, isize) {
+        let mut window = prev_window;
+        let mut desc_w = 0u32;
+        let mut desc_h = 0u32;
+        if let Some((w, h, hwnd)) = swapchain_desc(swapchain) {
+            desc_w = w;
+            desc_h = h;
+            if hwnd != 0 {
+                window = hwnd;
             }
-            let mut rect = [0i32; 4];
-            if GetClientRect(window, rect.as_mut_ptr()) == 0 {
-                return (1.0, 1.0);
-            }
-            let width = (rect[2] - rect[0]).max(1) as f32;
-            let height = (rect[3] - rect[1]).max(1) as f32;
-            (width, height)
         }
+        if window == 0 {
+            // SAFETY: user32 reads the foreground window handle.
+            window = unsafe { GetForegroundWindow() };
+        }
+        if desc_w > 0 && desc_h > 0 {
+            return (desc_w as f32, desc_h as f32, window);
+        }
+        if window != 0 {
+            let mut rect = [0i32; 4];
+            // SAFETY: `rect` is a valid 4-i32 stack buffer (`RECT`).
+            if unsafe { GetClientRect(window, rect.as_mut_ptr()) } != 0 {
+                let w = rect[2] - rect[0];
+                let h = rect[3] - rect[1];
+                if w > 0 && h > 0 {
+                    return (w as f32, h as f32, window);
+                }
+            }
+        }
+        (prev_width.max(1.0), prev_height.max(1.0), window)
     }
 
     fn key_down(key: i32) -> bool {
@@ -234,7 +323,7 @@ mod imp {
         unsafe { GetAsyncKeyState(key) < 0 }
     }
 
-    fn read_input(width: f32, height: f32, last_left: bool) -> Input {
+    fn read_input(target_window: isize, width: f32, height: f32, last_left: bool) -> Input {
         let mut input = Input {
             mouse_x: 0.0,
             mouse_y: 0.0,
@@ -243,10 +332,15 @@ mod imp {
             scroll: 0.0,
             keys: Keys::default(),
         };
-        // SAFETY: user32 writes a `POINT` and translates it; both buffers are
-        // 16-byte aligned stack arrays.
+        // SAFETY: user32 reads the foreground window, writes a `POINT` and
+        // translates it; `point` is a valid 2-i32 stack array.
         unsafe {
-            let window = GetForegroundWindow();
+            let fg = GetForegroundWindow();
+            let window = if target_window != 0 {
+                target_window
+            } else {
+                fg
+            };
             let mut point = [0i32; 2];
             if window != 0
                 && GetCursorPos(point.as_mut_ptr()) != 0
@@ -271,9 +365,26 @@ mod imp {
             left: key_down(VK_LEFT),
             right: key_down(VK_RIGHT),
         };
-        // nuklear clips to the window; a cursor outside it must not draw a
-        // hover state at a stale position.
         let _ = (width, height);
         input
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_reads_published_telemetry_across_threads() {
+        publish_status(42, 1920.0, 1080.0, true, true);
+        let lines = std::thread::spawn(status)
+            .join()
+            .expect("status thread joins");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("frames 42 viewport 1920x1080 backend ready panel open")),
+            "unexpected status lines: {lines:?}"
+        );
     }
 }

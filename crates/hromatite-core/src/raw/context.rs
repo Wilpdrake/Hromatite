@@ -37,33 +37,22 @@
 //!     alive across the guarded call — on the fault path it leaks (a leaked lock
 //!     is a hang, not just memory).
 //!
-//! The payload is single-threaded by design; if two threads guard at once the
-//! second one runs unguarded (logged once per process) rather than corrupting
-//! the first one's context.
+//! The payload uses a small fixed pool of per-thread guard stacks (`MAX_THREADS`
+//! × `MAX_DEPTH`), so the render thread (`Present`) and the game thread
+//! (`PlayerLoop` / `LateUpdate`) can run under VEH protection at the same time
+//! without contending on a single global lock.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::ffi;
 use crate::log;
 
-/// How deep guards may nest before the innermost ones run unguarded.
+/// How deep guards may nest on one thread before the innermost ones run unguarded.
 const MAX_DEPTH: usize = 8;
+/// How many concurrent threads may hold an armed guard stack at once.
+const MAX_THREADS: usize = 8;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
-/// Thread that currently owns the guard stack (0 = free). Re-entrant: the same
-/// thread may nest `call_with` (a command guard that calls into a guarded game
-/// function), another thread has to run unguarded.
-static LOCK_TID: AtomicU32 = AtomicU32::new(0);
-/// Number of armed guards on the stack (single payload thread → global is fine).
-static DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// Context pointer of the **innermost** armed guard; the handler jumps here.
-static SAVED: AtomicUsize = AtomicUsize::new(0);
-static GUARD_TID: AtomicU32 = AtomicU32::new(0);
-/// While set, a Rust panic (SEH code `0x20474343`) is caught and longjmp'ed
-/// instead of being unwound. Sticky for nested guards.
-static CATCH_PANIC: AtomicBool = AtomicBool::new(false);
-static LAST_CODE: AtomicU32 = AtomicU32::new(0);
-static LAST_ADDR: AtomicU64 = AtomicU64::new(0);
 static LOGGED_CONTENTION: AtomicBool = AtomicBool::new(false);
 
 /// SEH code `x86_64-pc-windows-gnu` uses for Rust panics ("CGC " in ASCII).
@@ -72,6 +61,7 @@ const RUST_PANIC_CODE: u32 = 0x2047_4343;
 /// x64 `CONTEXT` is 1232 bytes and must be 16-byte aligned: `RtlCaptureContext`
 /// stores XMM registers with aligned moves.
 #[repr(align(16))]
+#[derive(Clone, Copy)]
 pub struct CtxBuf([u64; ffi::CONTEXT_QWORDS]);
 
 impl CtxBuf {
@@ -80,11 +70,11 @@ impl CtxBuf {
 
 /// One nesting level: what to restore when this level finishes, and whether the
 /// handler already jumped back into it.
+#[derive(Clone, Copy)]
 struct Slot {
     saved: usize,
     resumed: bool,
     prev_saved: usize,
-    prev_tid: u32,
     prev_catch: bool,
 }
 
@@ -93,13 +83,66 @@ impl Slot {
         saved: 0,
         resumed: false,
         prev_saved: 0,
-        prev_tid: 0,
         prev_catch: false,
     };
 }
 
-static mut CTX: [CtxBuf; MAX_DEPTH] = [CtxBuf::ZERO; MAX_DEPTH];
-static mut SLOTS: [Slot; MAX_DEPTH] = [Slot::EMPTY; MAX_DEPTH];
+/// Per-thread guard stack. `tid == 0` means the lane is free; once claimed by a
+/// thread it stays owned while `depth > 0` and is released when the outermost
+/// guard pops.
+struct ThreadLane {
+    tid: AtomicU32,
+    depth: AtomicUsize,
+    saved: AtomicUsize,
+    catch_panic: AtomicBool,
+    last_code: AtomicU32,
+    last_addr: AtomicU64,
+}
+
+impl ThreadLane {
+    const fn new() -> ThreadLane {
+        ThreadLane {
+            tid: AtomicU32::new(0),
+            depth: AtomicUsize::new(0),
+            saved: AtomicUsize::new(0),
+            catch_panic: AtomicBool::new(false),
+            last_code: AtomicU32::new(0),
+            last_addr: AtomicU64::new(0),
+        }
+    }
+}
+
+static LANES: [ThreadLane; MAX_THREADS] = [const { ThreadLane::new() }; MAX_THREADS];
+static mut CTX: [[CtxBuf; MAX_DEPTH]; MAX_THREADS] = [[CtxBuf::ZERO; MAX_DEPTH]; MAX_THREADS];
+static mut SLOTS: [[Slot; MAX_DEPTH]; MAX_THREADS] = [[Slot::EMPTY; MAX_DEPTH]; MAX_THREADS];
+
+fn find_owned_lane(tid: u32) -> Option<usize> {
+    if tid == 0 {
+        return None;
+    }
+    for (idx, lane) in LANES.iter().enumerate() {
+        if lane.tid.load(Ordering::Acquire) == tid {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn acquire_lane(tid: u32) -> Option<(usize, bool)> {
+    if let Some(idx) = find_owned_lane(tid) {
+        return Some((idx, false));
+    }
+    for (idx, lane) in LANES.iter().enumerate() {
+        if lane
+            .tid
+            .compare_exchange(0, tid, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some((idx, true));
+        }
+    }
+    None
+}
 
 /// What went wrong inside a guarded call.
 #[derive(Clone, Copy, Debug)]
@@ -244,26 +287,29 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
         return ffi::EXCEPTION_CONTINUE_EXECUTION;
     }
     // Cheap gates first: on the game's own exceptions this must cost nothing.
-    let depth = DEPTH.load(Ordering::Acquire);
-    if depth == 0 {
+    let tid = crate::raw::sys::current_thread_id();
+    let Some(lane_idx) = find_owned_lane(tid) else {
         log_passing(info);
         return ffi::EXCEPTION_CONTINUE_SEARCH;
-    }
-    if GUARD_TID.load(Ordering::Relaxed) != crate::raw::sys::current_thread_id() {
+    };
+    let lane = &LANES[lane_idx];
+    let depth = lane.depth.load(Ordering::Acquire);
+    if depth == 0 {
+        log_passing(info);
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
 
     let (code, addr) = exception_parts(info);
     // A Rust panic only counts as "ours" when a guard asked for it; otherwise it
     // must reach whatever `catch_unwind` the caller set up.
-    if code == RUST_PANIC_CODE && !CATCH_PANIC.load(Ordering::Relaxed) {
+    if code == RUST_PANIC_CODE && !lane.catch_panic.load(Ordering::Relaxed) {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
 
-    LAST_CODE.store(code, Ordering::Relaxed);
-    LAST_ADDR.store(addr as u64, Ordering::Relaxed);
+    lane.last_code.store(code, Ordering::Relaxed);
+    lane.last_addr.store(addr as u64, Ordering::Relaxed);
 
-    let saved = SAVED.load(Ordering::Relaxed);
+    let saved = lane.saved.load(Ordering::Relaxed);
     log::log_tag(
         "veh",
         &format!("caught {code:#010x} at {addr:#x} — restoring captured context ({saved:#x})"),
@@ -272,10 +318,10 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
         // No context to go back to (should not happen): let the game see it.
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
-    // SAFETY: depth is the active 1..=MAX_DEPTH value published by call_with,
-    // so depth-1 indexes an initialized slot owned by the current thread.
+    // SAFETY: depth is the active 1..=MAX_DEPTH value published by call_with_mode
+    // on this thread's lane, so (lane_idx, depth-1) is exclusively owned here.
     unsafe {
-        SLOTS[depth - 1].resumed = true;
+        core::ptr::write_volatile(&raw mut SLOTS[lane_idx][depth - 1].resumed, true);
     }
     // Does not return when the restored context differs from the current one.
     // SAFETY: saved points to the 16-byte-aligned, fully sized CONTEXT captured
@@ -286,96 +332,96 @@ unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
 }
 
 /// Undo one nesting level: pop the slot and re-arm the parent (if any).
-fn pop(depth: usize) {
-    // SAFETY: callers pass the active depth in 1..=MAX_DEPTH and hold LOCK_TID,
+fn pop(lane_idx: usize, depth: usize) {
+    let lane = &LANES[lane_idx];
+    // SAFETY: callers pass the active depth in 1..=MAX_DEPTH on their owned lane,
     // so no other thread can mutate this slot or its previous-link fields.
     unsafe {
-        let slot = &mut SLOTS[depth - 1];
+        let slot = &mut SLOTS[lane_idx][depth - 1];
         let prev_saved = slot.prev_saved;
-        let prev_tid = slot.prev_tid;
         let prev_catch = slot.prev_catch;
-        slot.resumed = false;
+        core::ptr::write_volatile(&raw mut slot.resumed, false);
         slot.saved = 0;
 
-        DEPTH.store(depth - 1, Ordering::Release);
-        SAVED.store(prev_saved, Ordering::Relaxed);
-        GUARD_TID.store(prev_tid, Ordering::Relaxed);
-        CATCH_PANIC.store(prev_catch, Ordering::Relaxed);
+        lane.saved.store(prev_saved, Ordering::Relaxed);
+        lane.catch_panic.store(prev_catch, Ordering::Relaxed);
+        lane.depth.store(depth - 1, Ordering::Release);
     }
+}
+
+/// Execute `f` in its own child stack frame below `call_with_mode`'s captured
+/// `RSP`, so locals inside `f` never share stack-coloring slots with the
+/// frame that `RtlRestoreContext` jumps back into.
+#[inline(never)]
+fn run_body<R>(f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 /// Run `f` under the vectored handler; a hardware exception inside it becomes
 /// `Err(Fault)` in this frame instead of a dead process.
+#[inline(never)]
 fn call_with_mode<R>(f: impl FnOnce() -> R, catch_panic: bool) -> Result<R, Fault> {
     install();
 
     let tid = crate::raw::sys::current_thread_id();
-    // Re-entrant per thread: the slots are global, so another *thread* has to
-    // run unguarded rather than clobber the owner's context.
-    let mut acquired = false;
-    match LOCK_TID.compare_exchange(0, tid, Ordering::Acquire, Ordering::Relaxed) {
-        Ok(_) => acquired = true,
-        Err(owner) if owner == tid => {}
-        Err(_) => {
-            if !LOGGED_CONTENTION.swap(true, Ordering::Relaxed) {
-                log::log_tag("veh", "another thread holds the guard — running unguarded");
-            }
-            return Ok(f());
+    let Some((lane_idx, acquired)) = acquire_lane(tid) else {
+        if !LOGGED_CONTENTION.swap(true, Ordering::Relaxed) {
+            log::log_tag("veh", "all guard lanes busy — running unguarded");
         }
-    }
-    let depth = DEPTH.load(Ordering::Acquire);
+        return Ok(f());
+    };
+    let lane = &LANES[lane_idx];
+    let depth = lane.depth.load(Ordering::Acquire);
     if depth >= MAX_DEPTH {
         if acquired {
-            LOCK_TID.store(0, Ordering::Release);
+            lane.tid.store(0, Ordering::Release);
         }
         log::log_tag("veh", "guard stack full — running unguarded");
         return Ok(f());
     }
 
     let previous_catch = if catch_panic {
-        CATCH_PANIC.swap(true, Ordering::AcqRel)
+        lane.catch_panic.swap(true, Ordering::AcqRel)
     } else {
-        CATCH_PANIC.load(Ordering::Relaxed)
+        lane.catch_panic.load(Ordering::Relaxed)
     };
 
-    // SAFETY: depth < MAX_DEPTH and LOCK_TID is held; the context storage is
-    // statically allocated, aligned and large enough for RtlCaptureContext.
-    let ctx_ptr = unsafe { CTX[depth].0.as_mut_ptr() as usize };
-    // SAFETY: depth < MAX_DEPTH and this thread owns the global guard stack, so
-    // the mutable slot cannot alias another active access.
+    // SAFETY: depth < MAX_DEPTH and lane_idx is owned by `tid`; the context
+    // storage is statically allocated, aligned and large enough for RtlCaptureContext.
+    let ctx_ptr = unsafe { CTX[lane_idx][depth].0.as_mut_ptr() as usize };
+    // SAFETY: depth < MAX_DEPTH and this thread owns `lane_idx`, so the mutable
+    // slot cannot alias another active access.
     unsafe {
-        let slot = &mut SLOTS[depth];
+        let slot = &mut SLOTS[lane_idx][depth];
         slot.saved = ctx_ptr;
-        slot.resumed = false;
-        slot.prev_saved = SAVED.load(Ordering::Relaxed);
-        slot.prev_tid = GUARD_TID.load(Ordering::Relaxed);
+        core::ptr::write_volatile(&raw mut slot.resumed, false);
+        slot.prev_saved = lane.saved.load(Ordering::Relaxed);
         slot.prev_catch = previous_catch;
     }
-    SAVED.store(ctx_ptr, Ordering::Relaxed);
-    GUARD_TID.store(tid, Ordering::Relaxed);
-    DEPTH.store(depth + 1, Ordering::Release);
+    lane.saved.store(ctx_ptr, Ordering::Relaxed);
+    lane.depth.store(depth + 1, Ordering::Release);
 
-    // SAFETY: ctx_ptr targets CTX[depth], an aligned CONTEXT_QWORDS buffer.
+    // SAFETY: ctx_ptr targets CTX[lane_idx][depth], an aligned CONTEXT_QWORDS buffer.
     unsafe { ffi::RtlCaptureContext(ctx_ptr as *mut u64) };
 
     // Second return: the handler longjmp'ed here.
     // SAFETY: depth is still the active slot; only the current thread and its
     // vectored handler access `resumed` at this point.
-    if unsafe { SLOTS[depth].resumed } {
-        pop(depth + 1);
+    if unsafe { core::ptr::read_volatile(&raw const SLOTS[lane_idx][depth].resumed) } {
+        pop(lane_idx, depth + 1);
         if acquired {
-            LOCK_TID.store(0, Ordering::Release);
+            lane.tid.store(0, Ordering::Release);
         }
         return Err(Fault {
-            code: LAST_CODE.load(Ordering::Relaxed),
-            addr: LAST_ADDR.load(Ordering::Relaxed) as usize,
+            code: lane.last_code.load(Ordering::Relaxed),
+            addr: lane.last_addr.load(Ordering::Relaxed) as usize,
         });
     }
 
-    let value = f();
-    pop(depth + 1);
+    let value = run_body(f);
+    pop(lane_idx, depth + 1);
     if acquired {
-        LOCK_TID.store(0, Ordering::Release);
+        lane.tid.store(0, Ordering::Release);
     }
     Ok(value)
 }
@@ -459,3 +505,30 @@ guarded_calls!(
     call9(a, b, c, d, e, f, g, h, i),
     call10(a, b, c, d, e, f, g, h, i, j),
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_thread_lanes_isolate_concurrent_threads_and_reuse_for_nested_guards() {
+        let (lane_a, first_a) = acquire_lane(0x1111).expect("first thread gets a lane");
+        assert!(first_a, "first claim on 0x1111 owns the lane");
+        let (lane_a_nested, nested_a) =
+            acquire_lane(0x1111).expect("nested guard on same tid reuses its lane");
+        assert_eq!(lane_a, lane_a_nested);
+        assert!(!nested_a, "nested claim must not mark itself as the outer owner");
+
+        let (lane_b, first_b) = acquire_lane(0x2222).expect("second thread gets its own lane");
+        assert!(first_b);
+        assert_ne!(lane_a, lane_b, "render and game threads must not share a lane");
+
+        assert_eq!(find_owned_lane(0x1111), Some(lane_a));
+        assert_eq!(find_owned_lane(0x2222), Some(lane_b));
+
+        LANES[lane_a].tid.store(0, Ordering::Release);
+        LANES[lane_b].tid.store(0, Ordering::Release);
+        assert_eq!(find_owned_lane(0x1111), None);
+        assert_eq!(find_owned_lane(0x2222), None);
+    }
+}
