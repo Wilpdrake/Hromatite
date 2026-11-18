@@ -312,10 +312,15 @@ mod imp {
         let in_exec = |value: usize| exec.iter().any(|&(lo, hi)| value >= lo && value < hi);
 
         let mut scanned = 0usize;
-        const BUDGET: usize = 1_536_000_000; // ~1.5 GiB of writable memory
+        // Unity's heap is large; the swapchain object can sit anywhere in it, so
+        // the budget has to cover the whole writable heap rather than a corner.
+        const BUDGET: usize = 4_000_000_000;
+        let mut candidates = 0usize;
         for region in regions {
             if scanned >= BUDGET {
-                log::log_tag("d3d11", &format!("find: budget exhausted after {scanned} bytes"));
+                log::log_tag("d3d11", &format!(
+                    "find: budget exhausted after {scanned} bytes, {candidates} candidate(s)"
+                ));
                 break;
             }
             if !writable(region.protect) {
@@ -339,6 +344,7 @@ mod imp {
                     if object == table {
                         continue;
                     }
+                    candidates += 1;
                     if let Some(found) = validate_table(object, table, in_exec) {
                         log::log_tag(
                             "d3d11",
@@ -351,7 +357,14 @@ mod imp {
                 scanned += want;
             }
         }
-        log::log_tag("d3d11", &format!("find: no swapchain after {scanned} bytes"));
+        log::log_tag(
+            "d3d11",
+            &format!(
+                "find: no swapchain after {scanned} bytes, {candidates} candidate(s), \
+                 dxgi exec region(s) {}",
+                exec.len()
+            ),
+        );
         None
     }
 
