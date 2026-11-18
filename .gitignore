@@ -3,3 +3,4 @@ crates/hromatite-overlay/target/
 .idea/
 *.iml
 __pycache__/
+target-*/
