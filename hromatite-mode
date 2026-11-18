@@ -1,0 +1,43 @@
+# Hromatite runtime mode.
+#
+# Один KEY=VALUE на строку, '#' — комментарий. Этот файл читает
+# tools/hromatite-launch.sh (он исполняется внутри контейнера игры), поэтому
+# режим едет вместе с деревом, которое собрало payload'ы.
+#
+# Приоритет источников:
+#   HROMATITE_MODE_FILE=<путь>  →  <repo>/hromatite-mode  →  ~/.hromatite-mode
+# Посмотреть, что реально применится, ничего не запуская:
+#   HROMATITE_MODE_SHOW=1 tools/hromatite-launch.sh
+#
+# Пути к DLL здесь намеренно НЕ указаны: обёртка берёт их из этого же чекаута
+# ($ROOT/target/x86_64-pc-windows-gnu/release), и файл остаётся переносимым.
+# Нужны чужие бинарники (другой worktree) — задать HROMATITE_DLL и
+# HROMATITE_FEATURE_DLL явно, в Z:\-форме.
+
+# --- режим доставки: всё, что не совпадает, отклоняется на старте ------------
+# Свой поток, полный seal и L2b удалены из runtime: тик идёт в потоке игры.
+HROMATITE_FRAME_HOOK=1
+HROMATITE_LIVE=0
+HROMATITE_SEAL=0
+HROMATITE_L2B=0
+
+# --- источник тика -----------------------------------------------------------
+# PlayerLoop: hook UnityEngine.PlayerLoop.Update/ScriptRunBehaviourUpdate (~90/с).
+# LateUpdate остаётся запасным путём; auto = выбрать самому, если PlayerLoop=0.
+HROMATITE_LATE_UPDATE=auto
+HROMATITE_PLAYER_LOOP=1
+HROMATITE_PLAYER_LOOP_TARGET=Update
+
+# --- GC и диагностика --------------------------------------------------------
+# GCT_FIX=1 — репер мёртвых записей Boehm (обязателен, иначе SuspendThread loop failed).
+# LOG_AV=0 — не печатать каждое чужое исключение (шумно на C++ EH игры).
+HROMATITE_GCT_FIX=1
+HROMATITE_LOG_AV=0
+EAC_EVENTHOOK=0
+EACSHIM_DROP_AFTER_MS=0
+
+# --- in-game оверлей (рисует сама игра, без хука графики) --------------------
+# 1 = поднять ESP сразу при загрузке: боксы вокруг игроков + крест в центре.
+# 0 или отсутствие строки = выключен (ни одного вызова в игру).
+# В консоли то же самое: draw on | draw off | draw status.
+HROMATITE_DRAW=1

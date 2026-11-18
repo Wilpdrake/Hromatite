@@ -149,6 +149,7 @@ Hromatite/
 ├─ crates/hromatite-dll/      # cdylib "hromatite.dll": DllMain + inline recon + PEB unlink
 ├─ crates/test-target/        # подставной VRChat.exe (tick-цикл) для тестов маппера
 ├─ tools/symmap.py            # генератор символов (uv run --no-project python)
+├─ hromatite-mode             # режим запуска (KEY=VALUE), читает launch-wrapper
 ├─ tools/hromatite-launch.sh  # Steam launch-options wrapper + инжект (attach/proton)
 ├─ tools/test-loadlib.sh      # стенд для loadlib-пути в отдельном префиксе
 ├─ symbols-<sha12>.json       # побочный выход symmap
@@ -483,11 +484,14 @@ DllMain отработал), через несколько минут — кик
 Частично проверено: последний запуск (attach-инжект, L1) прошёл без немедленного
 кика; длительного наблюдения не было.
 
-### 8.4.1 A/B-прогоны (2026-11-14, режим задаётся файлом `~/.hromatite-mode`)
+### 8.4.1 A/B-прогоны (2026-11-14, режим задаётся файлом; с 2026-11-18 — `<repo>/hromatite-mode`)
 
 Переменные окружения через Steam-клиент не проходят: клиент запускает игру со своим
-env. Wrapper читает `KEY=VALUE` из `~/.hromatite-mode` (одна строка на переменную),
-поэтому режим переключается файлом, без правки launch options.
+env. Wrapper читает `KEY=VALUE` из файла режима (одна строка на переменную),
+поэтому режим переключается файлом, без правки launch options. Порядок поиска:
+`HROMATITE_MODE_FILE` → `<repo>/hromatite-mode` (отслеживается git'ом) →
+`~/.hromatite-mode` (старое место, поддержано для чужих чекаутов). Посмотреть
+действующий файл, ничего не запуская: `HROMATITE_MODE_SHOW=1 tools/hromatite-launch.sh`.
 
 | Режим | Конфигурация | Длительность | Итог |
 |---|---|---|---|
@@ -4421,3 +4425,37 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   (48 КБ → 1–3 КБ на rebuild при 5–10 игроках), хвост обнуляется только при уменьшении
   числа боксов, а пустая сцена (нет SDK/загрузка) больше не пишет пустой буфер и не
   спамит лог. Проверено: features 22/22, clippy `-D warnings`, release-сборка.
+
+### 2026-11-18 — Режим запуска переехал в репозиторий: `<repo>/hromatite-mode`
+
+- Коммит: этот (`chore(mode): keep the run mode in the checkout, enable the overlay`).
+- **Что сделано.** Файл режима больше не живёт в `$HOME`: `hromatite-mode` лежит в
+  корне дерева и **отслеживается git'ом**, поэтому режим едет вместе с чекаутом,
+  который собрал payload'ы. Из него убраны абсолютные пути к DLL — обёртка и так
+  берёт их из `$ROOT/target/x86_64-pc-windows-gnu/release`, и файл остаётся
+  переносимым (в комментарии — как указать чужие бинарники: `HROMATITE_DLL`,
+  `HROMATITE_FEATURE_DLL`).
+- **Порядок поиска в `tools/hromatite-launch.sh`:** `HROMATITE_MODE_FILE` →
+  `<repo>/hromatite-mode` → `~/.hromatite-mode` (последнее оставлено для чужих
+  worktree/чекаутов). `HERE`/`ROOT` теперь вычисляются до чтения файла — раньше
+  блок режима шёл первым и абсолютный путь к репо был недоступен.
+- **Новая диагностика:** `HROMATITE_MODE_SHOW=1 tools/hromatite-launch.sh` печатает
+  фактический файл и его действующие строки и выходит, ничего не запуская; в
+  `~/.hromatite-launch.log` появилась строка `mode file: <путь>` (раньше было
+  непонятно, какой файл применился).
+- **Что записано в файл (актуальный рабочий режим):** `FRAME_HOOK=1`, `LIVE=0`,
+  `SEAL=0`, `L2B=0`, `LATE_UPDATE=auto`, `PLAYER_LOOP=1`,
+  `PLAYER_LOOP_TARGET=Update`, `GCT_FIX=1`, `LOG_AV=0`, `EAC_EVENTHOOK=0`,
+  `EACSHIM_DROP_AFTER_MS=0` и **`HROMATITE_DRAW=1`** — оверлей поднимается вместе с
+  игрой (без консоли); `draw off` в консоли выключает его на ходу.
+- **Чем подтверждено.** `sh -n tools/hromatite-launch.sh` — OK;
+  `HROMATITE_MODE_SHOW=1 tools/hromatite-launch.sh` → `mode file:
+  /home/wilpdrake/RustroverProjects/Hromatite/hromatite-mode` и 12 строк ключей;
+  после временного переименования файла обёртка честно откатилась на
+  `~/.hromatite-mode` и напечатала `(absent: normal injected run)`. Старый
+  `~/.hromatite-mode` (и его `.launch-bak`) перемещены в
+  `var/mode/.hromatite-mode.moved-20261118-132818` (в `var/` — git-игнор).
+- **Оговорка.** Файл теперь отслеживается, а живой прогон его переписывает;
+  `restore_mode` возвращает исходное содержимое на выходе обёртки, но прогон,
+  убитый `SIGKILL`'ом, оставит `git diff` в этом файле. Это ожидаемо: правится
+  `git checkout -- hromatite-mode`.

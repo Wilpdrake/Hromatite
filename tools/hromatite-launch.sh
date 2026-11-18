@@ -24,7 +24,8 @@
 #   HROMATITE_FIND_MS=n    how long to look for the game process (default 120000)
 #   HROMATITE_VERIFY_MS=n  how long to wait for a *single* inject to show up
 #                          in hromatite.log (default 3000)
-#   HROMATITE_MODE_RESTORE=0  do not put ~/.hromatite-mode back on exit
+#   HROMATITE_MODE_RESTORE=0  do not put the mode file back on exit
+#   HROMATITE_MODE_SHOW=1     print the resolved mode file and exit
 #
 # Exactly one injector runs at a time, and a game pid that already reported
 # `target pid` is never injected twice: a second copy of the payload means a
@@ -45,11 +46,22 @@ T0_MS=$(now_ms)
 rel_ms() { echo $(( $(now_ms) - T0_MS )); }
 
 # Steam launches the game from the client's environment, so an A/B run cannot be
-# selected by exporting variables in a shell. Read them from a file instead:
-#   echo HROMATITE_DISABLE=1 > ~/.hromatite-mode
-#   echo HROMATITE_LIVE=0 > ~/.hromatite-mode   (one KEY=VALUE per line)
-# Absent/empty file = normal injected run.
-MODE_FILE="${HROMATITE_MODE_FILE:-$HOME/.hromatite-mode}"
+# selected by exporting variables in a shell. Read them from a file instead.
+#
+# The file lives in the checkout (`<repo>/hromatite-mode`) so the mode travels
+# with the tree that built the payloads and there is exactly one file to edit;
+# a personal `~/.hromatite-mode` is still honoured when the in-tree one is
+# absent, and `HROMATITE_MODE_FILE` overrides both. `HROMATITE_MODE_SHOW=1`
+# prints the resolved file and exits without launching anything.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
+if [ -n "${HROMATITE_MODE_FILE:-}" ]; then
+    MODE_FILE="$HROMATITE_MODE_FILE"
+elif [ -r "$ROOT/hromatite-mode" ]; then
+    MODE_FILE="$ROOT/hromatite-mode"
+else
+    MODE_FILE="$HOME/.hromatite-mode"
+fi
 if [ -r "$MODE_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         # shellcheck disable=SC2163  # KEY=VALUE from the mode file is exported as-is
@@ -59,9 +71,13 @@ if [ -r "$MODE_FILE" ]; then
         esac
     done <"$MODE_FILE"
 fi
+if [ "${HROMATITE_MODE_SHOW:-0}" = "1" ]; then
+    echo "mode file: $MODE_FILE"
+    [ -r "$MODE_FILE" ] || { echo "  (absent: normal injected run)"; exit 0; }
+    grep -v '^[[:space:]]*$' "$MODE_FILE" | grep -v '^[[:space:]]*#' | sed 's/^/  /'
+    exit 0
+fi
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
 PROTON="${HROMATITE_PROTON:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton}"
 DIST=$(dirname "$PROTON")/files
 BIN="$ROOT/target/x86_64-pc-windows-gnu/release"
@@ -100,7 +116,7 @@ LOG="$HOME/.hromatite-launch.log"
 PFX="${WINEPREFIX:-$HOME/.local/share/Steam/steamapps/compatdata/438100/pfx}"
 GAME_LOG="$PFX/drive_c/users/steamuser/hromatite.log"
 
-# --- ~/.hromatite-mode is shared state --------------------------------------
+# --- the mode file is shared state ------------------------------------------
 # A live run (tools/live_run.sh) rewrites this file before launching; put back
 # what we found so a killed run cannot leave the next boot in test mode.
 MODE_BAK=""
@@ -148,6 +164,7 @@ export GC_PRINT_STATS="${GC_PRINT_STATS:-1}"
 export GC_PRINT_VERBOSE_STATS="${GC_PRINT_VERBOSE_STATS:-0}"
 
 echo "[hromatite] wrapper: $* (t0=$T0_MS)" >>"$LOG"
+echo "[hromatite] mode file: $MODE_FILE" >>"$LOG"
 echo "[hromatite] game output -> $GAME_OUT, gc log backup -> $DBG_DIR/gc-$TS-before.log" >>"$LOG"
 "$@" >>"$GAME_OUT" 2>&1 &
 GAME_PID=$!
