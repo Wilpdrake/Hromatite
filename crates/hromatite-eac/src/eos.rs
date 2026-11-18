@@ -200,6 +200,11 @@ static CAPTURE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Keeping the last `SELF_RING_MAX` frames in memory costs ~250 KiB and is the
 /// same data the stream needs.
 static SELF_RING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Last time the "waiting for a complete message" line was printed.
+///
+/// [`forge_begin`] retries every 50 ms, so an unthrottled line would bury the
+/// log while the module is still producing its first report.
+static SELF_WAIT_MS: AtomicU64 = AtomicU64::new(0);
 /// How many live frames the ring keeps (≈ 17 minutes at 2007 ms).
 const SELF_RING_MAX: usize = 512;
 /// `EAC_REPLAY_FLAGS=live`: `Flags` come from the live template, not the file.
@@ -698,9 +703,21 @@ impl Hooks {
         // replace the forge ones, because a report run must still learn the
         // live `SessionId` before it can retarget anything.
         let report_config = report::Config::parse(|name| std::env::var(name).ok());
+        let self_replay = env_flag("EAC_REPLAY_SELF");
         if let Some(config) = report_config.as_ref() {
             forge_config.after_ms = config.after_ms;
             forge_config.min_frames = config.min_frames;
+        } else if self_replay {
+            // `EAC_REPLAY_SELF=1` alone arms the takeover: the stream is built
+            // from this session's own frames, so there is no file to name. The
+            // deadline has to be long enough for one complete message (the
+            // module reports are 35..209 frames, i.e. 70 s..7 min).
+            if forge_config.after_ms == 0 {
+                forge_config.after_ms = 90_000;
+            }
+            if forge_config.min_frames == 0 {
+                forge_config.min_frames = 20;
+            }
         }
         FORGE_AFTER_MS.store(forge_config.after_ms, Ordering::Relaxed);
         FORGE_MIN_FRAMES.store(forge_config.min_frames, Ordering::Relaxed);
@@ -722,9 +739,9 @@ impl Hooks {
         // The report itself is read here, once: a handler must never touch the
         // filesystem, and `install` already reads the replay capture for the
         // same reason. A failed load degrades to the template forge.
-        REPORT_ENABLED.store(report_config.is_some(), Ordering::Relaxed);
+        REPORT_ENABLED.store(report_config.is_some() || self_replay, Ordering::Relaxed);
         REPORT_FROM_WRAPPER.store(env_flag("EAC_REPLAY_FROM_WRAPPER"), Ordering::Relaxed);
-        REPORT_SELF.store(env_flag("EAC_REPLAY_SELF"), Ordering::Relaxed);
+        REPORT_SELF.store(self_replay, Ordering::Relaxed);
         REPORT_STOPPED.store(false, Ordering::Relaxed);
         REPORT_FLAGS_LIVE.store(
             report_config
@@ -1555,8 +1572,10 @@ fn forge_begin(now: u64) -> bool {
         return false;
     };
     let template = &learned.template;
-    if REPORT_SELF.load(Ordering::Relaxed) {
-        self_stream(template.session_id);
+    if REPORT_SELF.load(Ordering::Relaxed) && self_stream(template.session_id).is_none() {
+        // No complete message of this session yet: stay with the live stream
+        // and retry on the next tick instead of taking over with a fragment.
+        return false;
     }
     let seq = template.next_seq();
     FORGE_NEXT_SEQ.store(seq, Ordering::Relaxed);
@@ -1596,59 +1615,87 @@ fn forge_begin(now: u64) -> bool {
     true
 }
 
+/// Print a self-replay wait line at most once every five seconds.
+fn self_wait_log(message: String) {
+    let now = now_ms();
+    if now.saturating_sub(SELF_WAIT_MS.load(Ordering::Relaxed)) < 5_000 {
+        return;
+    }
+    SELF_WAIT_MS.store(now, Ordering::Relaxed);
+    hook_log(message);
+}
+
 /// Rebuild the replay stream out of this session's **own** captured frames.
 ///
 /// The 16-byte records are the one part of the body the server can compare
 /// against something it knows, and if they hash memory (addresses included),
-/// frames of another process can never validate. This keeps the whole message
-/// the live module produced in *this* epoch, from its last `StartData` to the
-/// takeover point, and replays it with a fresh `Sequence`.
-fn self_stream(sid: u64) {
-    let Ok(ring) = SELF_RING.lock() else {
-        return;
+/// frames of another process can never validate. This keeps one **complete**
+/// message the live module produced in *this* epoch — from a `StartData` up to
+/// the next one — and replays it with a fresh `Sequence`.
+///
+/// A partial message is useless for the experiment: it would contradict the
+/// framing (a message that never ends) and hide the only thing this run is
+/// meant to measure. Until the ring holds two message starts of this session
+/// the takeover therefore waits, and [`forge_begin`] retries on the next tick.
+fn self_stream(sid: u64) -> Option<usize> {
+    let ring = SELF_RING.lock().ok()?.clone();
+    let frames: Vec<&Vec<u8>> = ring
+        .iter()
+        .filter(|data| {
+            data.len() == forge::FRAME_LEN
+                && u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8])) == sid
+        })
+        .collect();
+    let starts: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, data)| u16::from_le_bytes([data[2], data[3]]) & forge::FLAG_START != 0)
+        .map(|(index, _)| index)
+        .collect();
+    let Some((from, to)) = starts
+        .len()
+        .checked_sub(2)
+        .map(|second_last| (starts[second_last], starts[starts.len() - 1]))
+    else {
+        self_wait_log(format!(
+            "[report] self: {} frame(s), {} message start(s) for sid=0x{sid:x} — \
+             waiting for one complete message",
+            frames.len(),
+            starts.len()
+        ));
+        return None;
     };
-    let source = ring.clone();
-    drop(ring);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut started = false;
-    for data in source.iter() {
-        if data.len() != forge::FRAME_LEN {
-            continue;
-        }
-        let live = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
-        if live != sid {
-            continue;
-        }
-        let flags = u16::from_le_bytes([data[2], data[3]]);
-        if flags & forge::FLAG_START != 0 {
-            buf.clear();
-            started = true;
-        }
-        if !started {
-            continue;
-        }
+    let length = to - from;
+    if length < 4 {
+        self_wait_log(format!(
+            "[report] self: the last complete message is {length} frame(s); waiting for a longer one"
+        ));
+        return None;
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(length * (forge::FRAME_LEN + 8));
+    for data in &frames[from..to] {
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(data);
     }
     let report = report::Report::from_bytes(&buf);
-    if report.len() < 4 {
+    if report.len() != length {
         hook_log(format!(
-            "[report] self: only {} frames captured for sid=0x{sid:x} (ring={})",
-            report.len(),
-            source.len()
+            "[report] self: parsed {} of {length} frame(s); not taking over",
+            report.len()
         ));
-        return;
+        return None;
     }
-    let total = report.len();
     let bytes = buf.len();
     if let Ok(mut slot) = REPORT_STREAM.lock() {
         *slot = Some(report::Stream::new(report, 0, true));
     }
     hook_log_blocking(&format!(
-        "[report] self stream sid=0x{sid:x} frames={total} bytes={bytes} ring={}",
-        source.len()
+        "[report] self stream sid=0x{sid:x} frames={length} bytes={bytes} \
+         ring={} (one complete message, replayed and looped)",
+        ring.len()
     ));
+    Some(length)
 }
 
 /// Forget the template when a new `BeginSession` opens the next epoch.
