@@ -77,6 +77,15 @@ pub struct Il2cppAnchors {
     /// `il2cpp_runtime_class_init(Il2CppClass*)` — finishes the lazy type
     /// initializer before an instance or an array of it is created.
     pub class_init: u32,
+    /// `il2cpp_gchandle_new(Il2CppObject*, bool pinned)` — a strong GC handle.
+    ///
+    /// Required by anything that keeps a managed object between calls: a
+    /// pointer living only in our own `.data` is not a GC root, so Unity's
+    /// collector may free the object and hand the memory to somebody else.
+    /// That is exactly what happened to the overlay's `Vector3[]`: its address
+    /// still looked valid, but `klass` and `max_length` had been recycled into
+    /// another object, and `Mesh.SetVertices` threw every frame.
+    pub gchandle_new: u32,
 }
 
 /// Entry points of the tick sources and of the opt-in GC diagnostics.
@@ -190,6 +199,7 @@ pub const BUILD_648F61B1: Build = Build {
         array_new: 0x00c2_7f40,
         string_new: 0x00c2_98e0,
         class_init: 0x00c2_98b0,
+        gchandle_new: 0x00c2_9050,
     },
     runtime: RuntimeAnchors {
         get_current_player_loop: 0x086c_da10,
@@ -249,6 +259,7 @@ pub const BUILD_245768F2: Build = Build {
         array_new: 0x00c2_9cb0,
         string_new: 0x00c2_b650,
         class_init: 0x00c2_b620,
+        gchandle_new: 0x00c2_adc0,
     },
     runtime: RuntimeAnchors {
         get_current_player_loop: 0x086e_a320,
@@ -388,6 +399,10 @@ mod tests {
         assert_eq!(old.il2cpp.array_new, 0x00c2_7f40);
         assert_eq!(old.il2cpp.string_new, 0x00c2_98e0);
         assert_eq!(old.il2cpp.class_init, 0x00c2_98b0);
+        assert_eq!(
+            old.il2cpp.gchandle_new, 0x00c2_9050,
+            "the strong-handle factory the renderer roots its managed buffers with"
+        );
         assert_eq!(old.runtime.get_current_player_loop, 0x086c_da10);
         assert_eq!(old.runtime.worker_dispatch, 0x00bf_5ce0);
         assert_eq!(old.runtime.gc_unregister, 0x00c4_1920);
@@ -433,6 +448,10 @@ mod tests {
         assert_eq!(new.il2cpp.array_new, 0x00c2_9cb0);
         assert_eq!(new.il2cpp.string_new, 0x00c2_b650);
         assert_eq!(new.il2cpp.class_init, 0x00c2_b620);
+        assert_eq!(
+            new.il2cpp.gchandle_new, 0x00c2_adc0,
+            "transfer:proven in tools/data/il2cpp-export-names-245768f2.json"
+        );
         assert_eq!(
             new.runtime.get_current_player_loop, 0x086e_a320,
             "verified in Ghidra: zeroes the 0x28-byte PlayerLoopSystem and resolves the icall"

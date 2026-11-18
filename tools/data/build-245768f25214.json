@@ -26,6 +26,7 @@
   "array_new": "0xc29cb0",
   "string_new": "0xc2b650",
   "class_init": "0xc2b620",
+  "gchandle_new": "0xc2adc0",
   "class_table": "0xe66f0d0"
  },
  "runtime": {

@@ -78,8 +78,6 @@ pub struct Renderer {
     /// Consecutive faults; a run of them switches the renderer off instead of
     /// faulting the game once per frame.
     faults: u32,
-    /// Consecutive vertex-upload faults (the mesh never received geometry).
-    upload_faults: u32,
 }
 
 impl Default for Renderer {
@@ -92,7 +90,6 @@ impl Default for Renderer {
             segments: 0,
             players: 0,
             faults: 0,
-            upload_faults: 0,
         }
     }
 }
@@ -115,6 +112,19 @@ struct Api {
     /// Element class and factory kept for the probe's own diagnostics.
     vector3_class: usize,
     array_new: usize,
+    /// `il2cpp_gchandle_new`, so the probe can report how the objects are held.
+    gchandle_new: usize,
+    /// Strong GC handles, one per managed object kept between calls.
+    ///
+    /// A pointer stored in this image is **not** a GC root: Unity's collector
+    /// cannot see it, frees the wrapper, and the address is reused by an
+    /// unrelated object. That is what happened to the `Vector3[]` — its
+    /// `klass` had become some other class and its `max_length` had become
+    /// UTF-16 text, so `Mesh.SetVertices` threw on every rebuild.
+    roots: Vec<u32>,
+    /// `klass` of the vertex array right after creation; compared on every
+    /// rebuild so a recycled object never reaches Unity.
+    verts_klass: usize,
     /// Floats currently holding geometry in the managed vertex array.
     written: usize,
     shader: String,
@@ -181,13 +191,25 @@ impl Renderer {
             metadata.host.read_usize(api.material).unwrap_or(0)
         ));
         out.push(format!(
-            "draw probe: verts {:#x} klass {:#x} length {}",
-            api.verts, verts_class, verts_len
+            "draw probe: verts {:#x} klass {:#x} (created as {:#x}) length {} (created as {})",
+            api.verts, verts_class, api.verts_klass, verts_len, MAX_VERTS
+        ));
+        out.push(format!(
+            "draw probe: mesh klass {:#x} (created as {:#x}), GC roots {:?} via gchandle_new {:#x}",
+            mesh_class, api.mesh_class, api.roots, api.gchandle_new
         ));
         out.push(format!(
             "draw probe: SetVertices {:#x}, DrawMesh {:#x}, shader {:?}",
             api.set_vertices, api.draw_mesh, api.shader
         ));
+        if !intact(metadata.host, api) {
+            out.push(
+                "draw probe: the managed objects are NOT intact — skipping the calls that would \
+                 throw inside Unity (run `draw on` to rebuild)"
+                    .into(),
+            );
+            return out;
+        }
         // Is the mesh object itself healthy? A zero vertex count on a freshly
         // constructed Mesh means the ctor did not run, not that the array is bad.
         let mesh_methods = metadata.methods(api.mesh_class);
@@ -199,7 +221,9 @@ impl Renderer {
         {
             match metadata.host.call(get_count, &[api.mesh]) {
                 Ok(value) => out.push(format!("draw probe: mesh.vertexCount = {value}")),
-                Err(status) => out.push(format!("draw probe: get_vertexCount faulted, status {status}")),
+                Err(status) => out.push(format!(
+                    "draw probe: get_vertexCount faulted, status {status}"
+                )),
             }
         }
         // Same call with a one-element array: distinguishes "the array is wrong"
@@ -208,25 +232,39 @@ impl Renderer {
             && small >= 0x10000
         {
             match metadata.host.call(api.set_vertices, &[api.mesh, small]) {
-                Ok(value) => out.push(format!("draw probe: SetVertices(len 1) returned {value:#x}")),
+                Ok(value) => out.push(format!(
+                    "draw probe: SetVertices(len 1) returned {value:#x}"
+                )),
                 Err(status) => out.push(format!(
                     "draw probe: SetVertices(len 1) faulted, host status {status}"
                 )),
             }
         }
-        match metadata
-            .host
-            .call(api.set_vertices, &[api.mesh, api.verts])
-        {
+        match metadata.host.call(api.set_vertices, &[api.mesh, api.verts]) {
             Ok(value) => out.push(format!("draw probe: SetVertices returned {value:#x}")),
-            Err(status) => out.push(format!("draw probe: SetVertices faulted, host status {status}")),
+            Err(status) => out.push(format!(
+                "draw probe: SetVertices faulted, host status {status}"
+            )),
         }
-        match metadata
-            .host
-            .call(api.draw_mesh, &[api.mesh, api.matrix.as_ptr() as usize, api.material, 0, 0, 0, 0, 0, 0, 0])
-        {
+        match metadata.host.call(
+            api.draw_mesh,
+            &[
+                api.mesh,
+                api.matrix.as_ptr() as usize,
+                api.material,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ) {
             Ok(value) => out.push(format!("draw probe: DrawMesh returned {value:#x}")),
-            Err(status) => out.push(format!("draw probe: DrawMesh faulted, host status {status}")),
+            Err(status) => out.push(format!(
+                "draw probe: DrawMesh faulted, host status {status}"
+            )),
         }
         out
     }
@@ -263,39 +301,59 @@ impl Renderer {
                 }
             }
         }
-        let Some(api) = self.api.as_mut() else {
+        let Some(api) = self.api.as_ref() else {
             return;
         };
         self.frames = self.frames.saturating_add(1);
+        let rebuild_due = self.frames % REBUILD_EVERY == 1;
 
-        if self.frames % REBUILD_EVERY == 1 {
+        // Before the objects are handed to Unity again, prove they are still the
+        // objects we made. A recycled array would make `SetVertices` throw, and
+        // an exception unwound through the VEH is exactly what must not happen
+        // once per rebuild.
+        if rebuild_due && !intact(metadata.host, api) {
+            let line = "draw: the managed objects are no longer ours (a GC handle did not \
+                        hold them) — rebuilding";
+            metadata.host.log(line);
+            self.reported = Some(line.to_string());
+            self.api = None;
+            self.segments = 0;
+            self.players = 0;
+            return;
+        }
+
+        let mut fatal = None;
+        if rebuild_due && let Some(api) = self.api.as_mut() {
             let (segments, players, upload_fault) = rebuild(metadata, scene_cache, api);
             self.players = players;
             match upload_fault {
-                None => {
-                    self.segments = segments;
-                    self.upload_faults = 0;
-                }
+                None => self.segments = segments,
                 Some(status) => {
-                    // Retry twice (the other upload path may work), then stop:
-                    // a fault per rebuild is an exception per rebuild inside Unity.
+                    // Both upload paths were tried inside `rebuild`. A managed
+                    // exception thrown out of a call we made has already
+                    // unwound through the VEH without running Unity's own
+                    // cleanup, so the object graph is suspect: stop, and let a
+                    // later `draw on` build a fresh set instead of faulting the
+                    // game every few frames.
                     self.segments = 0;
-                    self.upload_faults = self.upload_faults.saturating_add(1);
-                    if self.upload_faults == 1 {
-                        metadata.host.log(&format!(
-                            "draw: Mesh.SetVertices faulted (host status {status}); trying the legacy \
-                             vertices setter"
-                        ));
-                    }
-                    if self.upload_faults >= 3 {
-                        metadata
-                            .host
-                            .log("draw: vertex upload keeps faulting — renderer switched off");
-                        self.mode = Mode::Off;
-                    }
+                    fatal = Some(status);
                 }
             }
         }
+        if let Some(status) = fatal {
+            let line = format!(
+                "draw: Mesh.SetVertices rejected the buffer (host status {status}); renderer \
+                 stopped, run `draw on` to rebuild the managed objects"
+            );
+            metadata.host.log(&line);
+            self.reported = Some(line);
+            self.mode = Mode::Off;
+            self.api = None;
+            return;
+        }
+        let Some(api) = self.api.as_mut() else {
+            return;
+        };
 
         // SAFETY: the matrix is only read for the duration of the call, and it
         // is a local `[f32;16]`, i.e. a valid address in this process.
@@ -304,36 +362,40 @@ impl Renderer {
         // property block, cast shadows, receive shadows, light probes. The
         // camera and the property block are null (every camera, no overrides),
         // shadows are off and light probes are not used.
-        let arguments = [
-            api.mesh,
-            matrix,
-            api.material,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let arguments = [api.mesh, matrix, api.material, 0, 0, 0, 0, 0, 0, 0];
         match metadata.host.call(api.draw_mesh, &arguments) {
             Ok(_) => self.faults = 0,
             Err(status) => {
                 self.faults = self.faults.saturating_add(1);
                 if self.faults == 1 {
-                    metadata
-                        .host
-                        .log(&format!("draw: Graphics.DrawMesh faulted (host status {status})"));
+                    metadata.host.log(&format!(
+                        "draw: Graphics.DrawMesh faulted (host status {status})"
+                    ));
                 }
-                if self.faults >= 16 {
+                if self.faults >= 4 {
                     metadata
                         .host
-                        .log("draw: 16 consecutive draw faults — renderer switched off");
+                        .log("draw: 4 consecutive draw faults — renderer switched off");
                     self.mode = Mode::Off;
                 }
             }
         }
     }
+}
+
+/// Are the managed objects still the ones we created?
+///
+/// Cheap enough for the rebuild cadence (three cross-process reads): the mesh
+/// still carries its class, the vertex array still carries *its* array class,
+/// and its `max_length` still says `MAX_VERTS`. A collector that ignored our
+/// handles shows up here before Unity ever sees the object.
+fn intact(host: &Host, api: &Api) -> bool {
+    if api.verts_klass == 0 {
+        return false;
+    }
+    host.read_usize(api.mesh) == Some(api.mesh_class)
+        && host.read_usize(api.verts) == Some(api.verts_klass)
+        && host.read_usize(api.verts.wrapping_add(0x18)) == Some(MAX_VERTS)
 }
 
 /// Replace the vertex buffer with the current scene.
@@ -351,8 +413,7 @@ fn rebuild(
         for (_, position) in &scene.players {
             let eye = eye.unwrap_or(*position);
             let distance = length(sub(*position, eye));
-            let half = (distance * HALF_WIDTH_PER_METRE)
-                .clamp(HALF_WIDTH_MIN, HALF_WIDTH_MAX);
+            let half = (distance * HALF_WIDTH_PER_METRE).clamp(HALF_WIDTH_MIN, HALF_WIDTH_MAX);
             let min = (
                 position.0 - BODY_HALF_WIDTH,
                 position.1,
@@ -444,14 +505,23 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     let array_new = rva(host, api.array_new)?;
     let string_new = rva(host, api.string_new)?;
     let class_init = rva(host, api.class_init)?;
+    let gchandle_new = rva(host, api.gchandle_new)?;
 
     let mut classes = Vec::new();
     let mesh_class = resolve_class(metadata, "UnityEngine", "Mesh", "UnityEngine.CoreModule")?;
-    let material_class =
-        resolve_class(metadata, "UnityEngine", "Material", "UnityEngine.CoreModule")?;
+    let material_class = resolve_class(
+        metadata,
+        "UnityEngine",
+        "Material",
+        "UnityEngine.CoreModule",
+    )?;
     let shader_class = resolve_class(metadata, "UnityEngine", "Shader", "UnityEngine.CoreModule")?;
-    let graphics_class =
-        resolve_class(metadata, "UnityEngine", "Graphics", "UnityEngine.CoreModule")?;
+    let graphics_class = resolve_class(
+        metadata,
+        "UnityEngine",
+        "Graphics",
+        "UnityEngine.CoreModule",
+    )?;
     let vector3_class =
         resolve_class(metadata, "UnityEngine", "Vector3", "UnityEngine.CoreModule")?;
     let int32_class = resolve_class(metadata, "System", "Int32", "mscorlib")?;
@@ -595,7 +665,9 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
             }
             Ok(_) => continue,
             Err(status) => {
-                host.log(&format!("draw: Shader.Find({candidate:?}) faulted: {status}"));
+                host.log(&format!(
+                    "draw: Shader.Find({candidate:?}) faulted: {status}"
+                ));
                 continue;
             }
         }
@@ -612,6 +684,7 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     }
     host.call(material_ctor, &[material, shader])
         .map_err(|status| format!("Material..ctor faulted: {status}"))?;
+    let material_root = root(host, gchandle_new, material)?;
 
     // A visible colour and no depth test: an ESP that walls occlude is useless.
     if let Some(set_color) = set_color {
@@ -637,6 +710,7 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     }
     host.call(mesh_ctor, &[mesh])
         .map_err(|status| format!("Mesh..ctor faulted: {status}"))?;
+    let mesh_root = root(host, gchandle_new, mesh)?;
 
     // `HideFlags.HideAndDontSave` (61): the objects are ours for the session and
     // must not take part in scene saving or the object browser.
@@ -655,6 +729,20 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     if verts < 0x10000 {
         return Err("il2cpp_array_new(Vector3[]) returned null".into());
     }
+    let verts_root = root(host, gchandle_new, verts)?;
+    let verts_klass = host
+        .read_usize(verts)
+        .filter(|klass| *klass >= 0x10000)
+        .ok_or_else(|| {
+            "il2cpp_array_new(Vector3[]) returned an object without a class".to_string()
+        })?;
+    let verts_length = host.read_usize(verts.wrapping_add(0x18));
+    if verts_length != Some(MAX_VERTS) {
+        return Err(format!(
+            "il2cpp_array_new(Vector3[]) produced a malformed array: max_length {verts_length:?} \
+             (expected {MAX_VERTS})"
+        ));
+    }
 
     let triangles = host
         .call(array_new, &[int32_class, MAX_INDICES])
@@ -662,8 +750,15 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     if triangles < 0x10000 {
         return Err("il2cpp_array_new(int[]) returned null".into());
     }
+    let triangles_root = root(host, gchandle_new, triangles)?;
+    if host.read_usize(triangles.wrapping_add(0x18)) != Some(MAX_INDICES) {
+        return Err("il2cpp_array_new(int[]) produced a malformed array".into());
+    }
     let indices = triangle_indices();
-    let bytes: Vec<u8> = indices.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let bytes: Vec<u8> = indices
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
     if !host.write_bytes(triangles.wrapping_add(ARRAY_DATA), &bytes) {
         return Err("could not fill the index array".into());
     }
@@ -709,10 +804,30 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
         staging: Vec::with_capacity(MAX_VERTS * 3),
         vector3_class,
         array_new,
+        gchandle_new,
+        roots: vec![material_root, mesh_root, verts_root, triangles_root],
+        verts_klass,
         written: 0,
         shader: shader_name,
         classes,
     })
+}
+
+/// Keep a managed object alive for the rest of the process.
+///
+/// This is the whole point of `il2cpp_gchandle_new`: a pointer that only lives
+/// in this image's `.data` is invisible to Unity's collector, so the object is
+/// freed and its memory reused while we still think we own it.
+fn root(host: &Host, gchandle_new: usize, object: usize) -> Result<u32, String> {
+    let handle = host
+        .call(gchandle_new, &[object, 0])
+        .map_err(|status| format!("il2cpp_gchandle_new faulted: {status}"))?;
+    if handle == 0 || handle > u32::MAX as usize {
+        return Err(format!(
+            "il2cpp_gchandle_new returned a bogus handle {handle:#x}"
+        ));
+    }
+    Ok(handle as u32)
 }
 
 fn rva(host: &Host, value: u32) -> Result<usize, String> {
@@ -785,9 +900,8 @@ fn draw_mesh_entry(metadata: &Metadata<'_>, class: usize) -> Result<usize, Strin
         if count != 10 {
             continue;
         }
-        let boolean_tail = (7..10u8).all(|index| {
-            metadata.parameter_kind(candidate.info, index) == Some(TYPE_BOOLEAN)
-        });
+        let boolean_tail = (7..10u8)
+            .all(|index| metadata.parameter_kind(candidate.info, index) == Some(TYPE_BOOLEAN));
         if boolean_tail {
             return Ok(candidate.entry);
         }
@@ -977,6 +1091,68 @@ fn push_cross(out: &mut Vec<f32>, centre: P3, forward: P3, size: f32, eye: P3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support as fake;
+
+    fn api(mesh: u64, verts: u64) -> Api {
+        Api {
+            mesh: mesh as usize,
+            material: 0x5000_1000,
+            verts: verts as usize,
+            verts_data: verts as usize + ARRAY_DATA,
+            mesh_class: 0x3000_0001,
+            set_vertices: 0,
+            set_vertices_legacy: 0,
+            draw_mesh: 0,
+            matrix: [0.0; 16],
+            staging: Vec::new(),
+            vector3_class: 0x3000_0003,
+            array_new: 0,
+            gchandle_new: 0,
+            roots: vec![1, 2, 3, 4],
+            verts_klass: 0x3000_0002,
+            written: 0,
+            shader: String::new(),
+            classes: Vec::new(),
+        }
+    }
+
+    /// The live failure of 2026-11-18: the `Vector3[]` was still at the same
+    /// address but Unity's collector had reused it, so `klass` belonged to
+    /// another class and `max_length` read as UTF-16 text. That object must
+    /// never reach `Mesh.SetVertices` again.
+    #[test]
+    fn a_recycled_vertex_array_is_caught_before_unity_sees_it() {
+        let _serial = fake::serial();
+        fake::reset();
+        let host = Host::new(fake::api());
+        let mesh = 0x5000_0000u64;
+        let verts = 0x6000_0000u64;
+        fake::put_u64(mesh, 0x3000_0001);
+        fake::put_u64(verts, 0x3000_0002);
+        fake::put_u64(verts + 0x18, MAX_VERTS as u64);
+        let api = api(mesh, verts);
+        assert!(
+            intact(&host, &api),
+            "a freshly built object set must be intact"
+        );
+
+        fake::put_u64(verts, 0x3025_f890);
+        assert!(!intact(&host, &api), "a foreign class must be rejected");
+
+        fake::put_u64(verts, 0x3000_0002);
+        fake::put_u64(verts + 0x18, 0x3a00_7300_7000_7400);
+        assert!(
+            !intact(&host, &api),
+            "a recycled max_length must be rejected"
+        );
+
+        fake::put_u64(verts + 0x18, MAX_VERTS as u64);
+        fake::put_u64(mesh, 0x3000_0009);
+        assert!(
+            !intact(&host, &api),
+            "a foreign mesh class must be rejected"
+        );
+    }
 
     #[test]
     fn indices_cover_both_windings_for_every_segment() {
@@ -984,8 +1160,13 @@ mod tests {
         assert_eq!(indices.len(), MAX_INDICES);
         for segment in 0..MAX_SEGMENTS {
             let base = (segment * VERTS_PER_SEGMENT) as i32;
-            let slice = &indices[segment * INDICES_PER_SEGMENT..(segment + 1) * INDICES_PER_SEGMENT];
-            assert!(slice.iter().all(|index| *index >= base && *index < base + 4));
+            let slice =
+                &indices[segment * INDICES_PER_SEGMENT..(segment + 1) * INDICES_PER_SEGMENT];
+            assert!(
+                slice
+                    .iter()
+                    .all(|index| *index >= base && *index < base + 4)
+            );
             // A CW triangle and its CCW twin must both be present.
             assert_eq!(slice[0], base);
             assert_eq!(slice[9], base + 3);
@@ -996,7 +1177,13 @@ mod tests {
     fn a_box_becomes_twelve_camera_facing_quads() {
         let mut out = Vec::new();
         let eye = (0.0, 1.0, 0.0);
-        assert!(push_box(&mut out, (-0.4, 0.0, -0.4), (0.4, 1.8, 0.4), eye, 0.01));
+        assert!(push_box(
+            &mut out,
+            (-0.4, 0.0, -0.4),
+            (0.4, 1.8, 0.4),
+            eye,
+            0.01
+        ));
         assert_eq!(out.len(), 12 * VERTS_PER_SEGMENT * 3);
         assert!(out.iter().all(|value| value.is_finite()));
         // Every quad keeps its width: opposite corners of a quad differ by 2*half
@@ -1013,7 +1200,13 @@ mod tests {
     fn a_camera_inside_the_box_still_produces_visible_quads() {
         let mut out = Vec::new();
         let eye = (0.0, 0.9, 0.0);
-        assert!(push_box(&mut out, (-0.4, 0.0, -0.4), (0.4, 1.8, 0.4), eye, 0.01));
+        assert!(push_box(
+            &mut out,
+            (-0.4, 0.0, -0.4),
+            (0.4, 1.8, 0.4),
+            eye,
+            0.01
+        ));
         assert_eq!(out.len(), 12 * VERTS_PER_SEGMENT * 3);
         // No quad may collapse: each one must have non-zero area.
         for quad in out.chunks(VERTS_PER_SEGMENT * 3) {

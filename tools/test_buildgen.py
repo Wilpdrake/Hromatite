@@ -61,6 +61,7 @@ ORACLE = {
             "array_new": 0xC27F40,
             "string_new": 0xC298E0,
             "class_init": 0xC298B0,
+            "gchandle_new": 0xC29050,
         },
         "runtime": {
             "get_current_player_loop": 0x86CDA10,
@@ -114,6 +115,7 @@ ORACLE = {
             "array_new": 0xC29CB0,
             "string_new": 0xC2B650,
             "class_init": 0xC2B620,
+            "gchandle_new": 0xC2ADC0,
         },
         "runtime": {
             "get_current_player_loop": 0x86EA320,

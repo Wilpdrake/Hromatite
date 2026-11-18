@@ -645,6 +645,10 @@ def il2cpp_anchors(pe: PE, names: dict[str, int], runtime_cache: dict | None):
             "array_new": names.get("il2cpp_array_new", 0),
             "string_new": names.get("il2cpp_string_new", 0),
             "class_init": names.get("il2cpp_runtime_class_init", 0),
+            # A strong GC handle: the only way to keep a managed object alive
+            # between calls, because a pointer stored in our own image is not a
+            # GC root and the collector frees the object under us.
+            "gchandle_new": names.get("il2cpp_gchandle_new", 0),
             "class_table": class_table,
         },
         {"getters": [(hex(rva), hex(global_rva), hex(value)) for rva, global_rva, value in getters]},
@@ -1384,6 +1388,7 @@ def render_build(descriptor: dict) -> str:
         "array_new",
         "string_new",
         "class_init",
+        "gchandle_new",
     ):
         value = il2cpp.get(key)
         lines.append(f"        {key}: {word(value) if value else '0x0000_0000'},")

@@ -503,6 +503,7 @@ pub fn il2cpp_anchors(base: usize, size: usize) -> Option<Il2cppAnchors> {
         array_new: 0,
         string_new: 0,
         class_init: 0,
+        gchandle_new: 0,
     })
 }
 
