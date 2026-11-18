@@ -4666,3 +4666,26 @@ takeover-режиму дефект надо закрыть: эмиттер об�
 - **Осталось:** изолировать причину выходов. Нужен один прогон с `HROMATITE_DRAW=0` (контроль) —
   если выход повторится без оверлея, это Steam/окружение; если нет — копать взаимодействие
   `DrawMesh` с переходом мира.
+
+### 2026-11-18 — Kiero + SafetyHook + переписывание UI на nuklear (старт, промежуточно)
+
+- Коммит этого шага: документо-запись (код в агентских worktree, ещё не влит).
+- **Что заказано пользователем:** (1) живой хук в духе Kiero (`Rebzzel/kiero`), (2) переписать
+  in-game UI на nuklear, (3) удалить прежний UI-код, (4) работа по агентам (до 3 штук).
+- **Удалено:** незакоммиченный черновик векторной «панели» в `render.rs` (шрифт-глифы, `Menu`,
+  `push_panel`/`push_readout`, `poll_input`, правки `feature.rs`/`commands`). Бэкап —
+  `var/ui-draft-backup/` (`uncommitted-ui.patch`, копии файлов; каталог в git-игноре).
+- **Живой хук:** `feat/kiero` (worktree `Hromatite-kiero`) — `raw/vmt.rs` + `raw/kiero.rs`
+  (VMT-подмена `IDXGISwapChain::Present`, адаптер, `render()`), тесты.
+  `feat/safetyhook` (worktree `Hromatite-midhook`) — `raw/midhook.rs` (mid-function хук
+  с переносом инструкций из середины) + `raw/hookset.rs` (менеджер хуков), переиспользуют
+  движок `raw/hook.rs`.
+- **Факты, важные для UI (проверены на живой игре, pid 1402017):** игра на **D3D11** — в процессе
+  `d3d11.dll` + `dxgi.dll` (базы `0x6ffff9fa0000` / `0x6ffffc840000`), d3d12 не загружен;
+  `d3dcompiler_47.dll` есть в префиксе, но **не маппингован** в процесс. `ptrace_scope=0` —
+  `/proc/<pid>/mem` читается, vtable-указатели на код d3d11 в куче находятся (21 указатель).
+- **nuklear:** вендор `nuklear.h` v4.13.4 (MIT/public domain) скачан в
+  `crates/hromatite-nuklear/third_party/nuklear/` (sha256 `d6e4c896…`, 31 471 строка,
+  IMPLEMENTATION ~25 360 строк) в worktree `feat/nuklear`. Бэкенд/биндинг — следующим шагом.
+- **Осталось:** дождаться агентских веток, влить последовательно (тесты + release + buildgen),
+  затем бэкенд nuklear под D3D11 и живая приёмка (игру запускает пользователь).
