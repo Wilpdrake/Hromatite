@@ -105,6 +105,8 @@ struct Api {
     draw_mesh: usize,
     matrix: [f32; 16],
     staging: Vec<f32>,
+    /// Floats currently holding geometry in the managed vertex array.
+    written: usize,
     shader: String,
     /// Which classes ended up resolved, for the one-line report.
     classes: Vec<String>,
@@ -258,14 +260,35 @@ fn rebuild(
         }
     }
 
+    // Nothing to draw (no SDK yet, empty scene): clear previously drawn geometry
+    // once instead of writing an empty buffer every rebuild.
+    if api.staging.is_empty() {
+        if api.written > 0 {
+            let zeros = vec![0u8; api.written * 4];
+            metadata.host.write_bytes(api.verts_data, &zeros);
+            api.written = 0;
+            let _ = metadata.host.call(api.set_vertices, &[api.mesh, api.verts]);
+        }
+        return (0, players);
+    }
+
     // Unused vertices collapse onto the origin, which rasterises to nothing.
+    // Only the prefix that carries geometry is written: the mesh keeps its
+    // vertices between frames, and the tail was last cleared below.
+    let filled = api.staging.len().min(MAX_VERTS * 3);
     api.staging.resize(MAX_VERTS * 3, 0.0);
-    let bytes = f32_bytes(&api.staging);
-    let written = metadata.host.write_bytes(api.verts_data, bytes);
-    if !written {
+    let bytes = f32_bytes(&api.staging[..filled]);
+    if !metadata.host.write_bytes(api.verts_data, bytes) {
         metadata.host.log("draw: could not write the vertex array");
         return (0, 0);
     }
+    // When the box count drops, the vertices written last time are still in the
+    // mesh; clear exactly that tail.
+    if filled < api.written {
+        let tail = f32_bytes(&api.staging[filled..api.written]);
+        metadata.host.write_bytes(api.verts_data + filled * 4, tail);
+    }
+    api.written = filled;
     match metadata.host.call(api.set_vertices, &[api.mesh, api.verts]) {
         Ok(_) => {}
         Err(status) => {
@@ -275,7 +298,7 @@ fn rebuild(
             return (0, 0);
         }
     }
-    (api.staging.len() / 12, players)
+    (filled / 12, players)
 }
 
 /// Reinterpret an `f32` slice as bytes without copying: the staging buffer is
@@ -469,6 +492,7 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
             0.0, 0.0, 0.0, 1.0,
         ],
         staging: Vec::with_capacity(MAX_VERTS * 3),
+        written: 0,
         shader: shader_name,
         classes,
     })
