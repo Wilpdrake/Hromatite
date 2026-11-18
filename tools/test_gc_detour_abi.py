@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -10,7 +11,13 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DLL = ROOT / "target/x86_64-pc-windows-gnu/release/hromatite.dll"
+# HROMATITE_DLL_PATH lets the same checks run against a CARGO_TARGET_DIR build
+# (this workspace is usually built with an out-of-tree target directory).
+DLL = Path(
+    os.environ.get(
+        "HROMATITE_DLL_PATH", ROOT / "target/x86_64-pc-windows-gnu/release/hromatite.dll"
+    )
+)
 
 
 def llvm_tool(name: str) -> str:
@@ -76,6 +83,53 @@ class GcDetourAbiTest(unittest.TestCase):
             self.assertIn("add    $0x30,%rsp", disassembly)
             if symbol == "close_after_unlink_detour":
                 self.assertIn("mov    %rbx,%rcx", disassembly)
+
+
+    def test_gc_guard_takes_no_lock_across_a_collection(self) -> None:
+        """The collector entry detour must never take Boehm's thread-list lock.
+
+        Holding that section across the stop-the-world pass inverts locks against
+        `GC_unregister_my_thread` and wedges the world for good. Measured
+        2026-11-18: login, world-switch and menu freezes, 134 of 138 threads idle,
+        main thread at 0% CPU, no dump, no abort. The same binary with the guard
+        off loaded worlds for 40+ minutes.
+        """
+        source = (ROOT / "crates/hromatite-core/src/raw/gcguard.rs").read_text()
+        marker = 'unsafe extern "system" fn suspend_entry_detour'
+        body = source[source.index(marker) :]
+        body = body[: body.index("\n}")]
+        for forbidden in ("EnterCriticalSection", "LeaveCriticalSection", "sanitize_locked"):
+            self.assertNotIn(forbidden, body, f"entry detour must not use {forbidden}")
+
+
+    def test_suspend_call_site_stub_keeps_the_router_abi(self) -> None:
+        """The SuspendThread stub must save RCX, then branch on the repair flag.
+
+        The patched site is `mov rcx,[rbx+0x10]; call [SuspendThread]`, so RCX is
+        the handle and RBX the record. On repair the stub jumps to
+        process_record/advance_bucket with RBX = saved next; otherwise it runs the
+        copied call from the trampoline.
+        """
+        nm = run([llvm_tool("nm"), str(DLL)])
+        match = re.search(r"^([0-9a-f]+) [Tt] .*gc_suspend_detour$", nm, re.MULTILINE)
+        if match is None:
+            self.fail("gc_suspend_detour symbol missing from release DLL")
+        address = int(match.group(1), 16)
+        disassembly = run(
+            [
+                llvm_tool("objdump"),
+                "-d",
+                f"--start-address=0x{address:x}",
+                f"--stop-address=0x{address + 0x40:x}",
+                str(DLL),
+            ]
+        )
+        self.assertIn("sub    $0x30,%rsp", disassembly)
+        self.assertIn("mov    %rcx,0x20(%rsp)", disassembly)
+        self.assertIn("test   $0x1,%al", disassembly)
+        self.assertIn("mov    %rax,%rbx", disassembly)
+        self.assertIn("jmp    *%r11", disassembly)
+        self.assertIn("add    $0x30,%rsp", disassembly)
 
 
 if __name__ == "__main__":

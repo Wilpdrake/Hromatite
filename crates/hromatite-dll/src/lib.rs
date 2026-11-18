@@ -49,6 +49,17 @@ fn player_loop_requested(value: Option<&str>) -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// `EAC_IAT=1` (off by default): also patch the callers' EOSSDK import slots.
+///
+/// Off by default because the IAT walk touches other modules' pages; when it is
+/// on, the resident thread runs it as soon as EOSSDK is loaded, before any
+/// managed tick exists.
+fn iat_requested(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result<(), String> {
     if frame_hook != "1" {
         return Err(
@@ -69,10 +80,23 @@ fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result
 
 fn require_gc_guard(installed: bool) -> Result<(), &'static str> {
     if installed {
-        Ok(())
-    } else {
-        Err("refusing to install managed LateUpdate without the inline GC GetThreadContext guard")
+        return Ok(());
     }
+    // `HROMATITE_GCT_ENTRY=0` is the deliberate A/B: Boehm runs stock and the
+    // startup is allowed to continue, loudly. Without it the guard stays
+    // mandatory, because an unguarded inline hook next to a leaked Boehm record
+    // is what turns a normal worker exit into `SuspendThread loop failed`.
+    if std::env::var("HROMATITE_GCT_ENTRY")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+    {
+        log::log_tag(
+            "gct",
+            "startup continues WITHOUT the GC guard: HROMATITE_GCT_ENTRY=0 is an experiment switch",
+        );
+        return Ok(());
+    }
+    Err("refusing to install managed LateUpdate without the inline GC GetThreadContext guard")
 }
 
 fn install_late_update_with_retry(
@@ -140,11 +164,51 @@ fn install_ac_hooks() {
         );
         return;
     }
+    // `EAC_IAT=1`: rewrite the callers' import slots *first*. The game caches the
+    // export pointer it resolved ~20 s in, so an inline patch of the export entry
+    // may already be too late; the caller's IAT slot is re-read on every call.
+    if iat_requested(std::env::var("EAC_IAT").ok().as_deref()) {
+        let slots = hromatite_eac::eos::install_iat();
+        log::log_tag("iat", &format!("patched {slots} slots"));
+    }
     let mut hooks = hromatite_eac::Hooks::new();
     let line = hooks.install_now();
     log::log_tag("eac", &line);
     if let Some(status) = hooks.status_lines().first() {
         log::log_tag("eac", status);
+    }
+}
+
+/// `EAC_EVENTHOOK=1`: first (early, likely too early) attempt at the managed
+/// Photon hook. Photon types are materialised later, so failure here is normal —
+/// `hook::tick` retries through `photon::poll` once the managed runtime is up.
+fn install_photon_hook() {
+    use hromatite_core::photon;
+    if !photon::enabled_outgoing() && !photon::enabled_incoming() {
+        return;
+    }
+    if photon::enabled_outgoing() {
+        match photon::install_outgoing() {
+            Ok(target) => log::log_tag(
+                "photon",
+                &format!(
+                    "early send hook: entry={:#x} MethodInfo={:#x} params={}",
+                    target.entry, target.info, target.parameters
+                ),
+            ),
+            Err(reason) => log::log_tag("photon", &format!("early send hook deferred: {reason}")),
+        }
+    }
+    if photon::enabled_incoming() {
+        match photon::install_incoming() {
+            Ok(target) => log::log_tag(
+                "photon",
+                &format!("early incoming hook: entry={:#x}", target.entry),
+            ),
+            Err(reason) => {
+                log::log_tag("photon", &format!("early incoming hook deferred: {reason}"))
+            }
+        }
     }
 }
 
@@ -167,6 +231,7 @@ fn attach(hinst: *mut core::ffi::c_void) {
     // Anti-cheat hooks before any managed tick exists: VRChat registers its
     // message-to-server callback early and only once.
     log::guard("install_ac_hooks", install_ac_hooks);
+    log::guard("install_photon_hook", install_photon_hook);
 
     if let Err(error) = validate_modes(
         &env_or("HROMATITE_FRAME_HOOK", "1"),
@@ -260,6 +325,15 @@ pub extern "system" fn DllMain(
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
         log::install_panic_hook();
+        // A launcher that retries the injection maps a fresh copy each time;
+        // only the first one may install hooks, guards and a VEH handler.
+        if !procs::claim_single_instance("Local\\hromatite_payload_v1") {
+            log::log_tag(
+                "dll",
+                "another payload instance is already resident; this copy stays dormant",
+            );
+            return 1;
+        }
         hromatite_core::veh::install();
         if log::guard("dllmain", || attach(hinst)).is_none() {
             log::log_tag(
@@ -273,7 +347,9 @@ pub extern "system" fn DllMain(
 
 #[cfg(test)]
 mod tests {
-    use super::{player_loop_requested, require_gc_guard, select_late_update, validate_modes};
+    use super::{
+        iat_requested, player_loop_requested, require_gc_guard, select_late_update, validate_modes,
+    };
     use hromatite_core::lateupdate::Selector;
 
     #[test]
@@ -283,6 +359,16 @@ mod tests {
         assert!(!player_loop_requested(Some("0")));
         assert!(player_loop_requested(Some("1")));
         assert!(player_loop_requested(Some("true")));
+    }
+
+    #[test]
+    fn the_iat_walk_is_opt_in_only() {
+        assert!(!iat_requested(None));
+        assert!(!iat_requested(Some("")));
+        assert!(!iat_requested(Some("  ")));
+        assert!(!iat_requested(Some("0")));
+        assert!(iat_requested(Some("1")));
+        assert!(iat_requested(Some(" 1 ")));
     }
 
     #[test]

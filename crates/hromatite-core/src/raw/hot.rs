@@ -8,13 +8,17 @@ static TICK_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_os = "windows", test))]
 fn canonical_generation(value: &str) -> Option<u64> {
-    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     value.parse::<u64>().ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 enum ReloadSelection {
     Latest,
     Generation(u64),

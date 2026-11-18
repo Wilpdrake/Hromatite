@@ -542,6 +542,9 @@ impl EacFeature {
             "eac.end" => self.end_command(arg),
             "eac.hooks" => self.hooks_command(arg),
             "eac.tap" => self.tap_command(arg),
+            // Read-only: locate the in-process ELF image of the anti-cheat
+            // client module (it is not a PE, so no module list can show it).
+            "eac.module" => (hromatite_eac::eos::module_report(arg), STATUS_OK),
             "eac.log" => self.log_command(arg),
             "eac.tail" => self.tail_command(arg),
             other => (

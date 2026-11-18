@@ -3,7 +3,6 @@
 
 use crate::raw::ffi;
 
-
 pub fn current_process_id() -> u32 {
     // SAFETY: parameterless Win32 query with no pointer preconditions.
     unsafe { ffi::GetCurrentProcessId() }
@@ -115,5 +114,8 @@ pub fn resume_thread(handle: u64) -> Option<i32> {
 
 /// UTF-16LE path/argument bytes owned safely by the caller.
 pub fn wide_bytes(s: &str) -> Vec<u8> {
-    ffi::wide(s).into_iter().flat_map(u16::to_le_bytes).collect()
+    ffi::wide(s)
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }

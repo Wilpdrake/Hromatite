@@ -285,4 +285,13 @@ mod tests {
         assert_eq!(crc32c(b"123456789"), 0xe306_9283);
         assert_eq!(fnv1a32(b""), 0x811c_9dc5);
     }
+
+    #[test]
+    fn the_eac_variant_differs_from_the_standard_one_only_in_the_inversions() {
+        // Cross-checked against `tools/frame_analyze.py::eac_crc32c` (init=0,
+        // xorout=0), the reference that reproduces 451/451 captured frames.
+        assert_eq!(crc32c_eac(b"123456789"), 0x58e3_fa20);
+        assert_ne!(crc32c_eac(b"123456789"), crc32c(b"123456789"));
+        assert_eq!(crc32c_eac(b""), 0);
+    }
 }

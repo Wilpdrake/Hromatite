@@ -28,6 +28,9 @@
 //!   for other copies of the frame prefix (observation only).
 //! * [`tap`] — incremental reader of that capture, so a feature image can mirror
 //!   the real frames even when the resident owns the hooks.
+//! * [`forge`] — `EAC_FORGE`: 512-byte heartbeats rebuilt from a live template.
+//! * [`report`] — `EAC_REPLAY_REPORT`: replay a whole recorded report instead,
+//!   retargeted to the live `SessionId`/`Sequence` with a fresh CRC.
 //!
 //! Only `hook`/`eos`/`keyhunt` contain `unsafe`; every block carries a
 //! `// SAFETY:` justification and stays inside those `#[allow(unsafe_code)]`
@@ -40,13 +43,22 @@ pub mod clock;
 pub mod codec;
 pub mod digest;
 #[allow(unsafe_code)]
+pub mod eacimage;
+#[allow(unsafe_code)]
 pub mod eos;
+pub mod epoch;
 pub mod eventlog;
+#[allow(unsafe_code)]
+pub mod evp;
+pub mod forge;
+#[allow(unsafe_code)]
+pub mod m3probe;
 #[allow(unsafe_code)]
 pub mod hook;
 #[allow(unsafe_code)]
 pub mod keyhunt;
 pub mod payload;
+pub mod report;
 pub mod session;
 pub mod tailer;
 pub mod tap;

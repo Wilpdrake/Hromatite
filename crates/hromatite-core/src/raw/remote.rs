@@ -25,7 +25,9 @@ impl Remote {
             // SAFETY: GetLastError has no pointer preconditions and reads the
             // calling thread's error slot immediately after the failed call.
             let error = unsafe { GetLastError() };
-            Err(format!("OpenProcess(pid={pid}) failed, GetLastError={error}"))
+            Err(format!(
+                "OpenProcess(pid={pid}) failed, GetLastError={error}"
+            ))
         } else {
             Ok(Self { pid, h })
         }
@@ -35,7 +37,13 @@ impl Remote {
         // SAFETY: self.h was opened with PROCESS_VM_READ and remains valid;
         // buf supplies a valid writable region of buf.len() bytes.
         unsafe {
-            ReadProcessMemory(self.h, addr as *const u8, buf.as_mut_ptr(), buf.len(), core::ptr::null_mut()) != 0
+            ReadProcessMemory(
+                self.h,
+                addr as *const u8,
+                buf.as_mut_ptr(),
+                buf.len(),
+                core::ptr::null_mut(),
+            ) != 0
         }
     }
 
@@ -72,7 +80,13 @@ impl Remote {
         // SAFETY: self.h was opened with PROCESS_VM_WRITE|OPERATION and buf is
         // a valid immutable region of buf.len() bytes for the synchronous call.
         unsafe {
-            WriteProcessMemory(self.h, addr as *mut u8, buf.as_ptr(), buf.len(), core::ptr::null_mut()) != 0
+            WriteProcessMemory(
+                self.h,
+                addr as *mut u8,
+                buf.as_ptr(),
+                buf.len(),
+                core::ptr::null_mut(),
+            ) != 0
         }
     }
 
@@ -85,9 +99,7 @@ impl Remote {
     pub fn alloc_at(&self, addr: usize, size: usize, protect: u32) -> Option<usize> {
         // SAFETY: self.h is live and has allocation rights. No buffer pointer
         // is passed; the returned address belongs to the target process.
-        let p = unsafe {
-            VirtualAllocEx(self.h, addr, size, MEM_COMMIT | MEM_RESERVE, protect)
-        };
+        let p = unsafe { VirtualAllocEx(self.h, addr, size, MEM_COMMIT | MEM_RESERVE, protect) };
         (!p.is_null()).then_some(p as usize)
     }
 

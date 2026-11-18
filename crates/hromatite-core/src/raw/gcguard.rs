@@ -685,6 +685,22 @@ pub fn install() -> bool {
         return true;
     }
     reset_install();
+    // `HROMATITE_GCT_ENTRY=0` keeps Boehm completely stock and is only the
+    // emergency switch for this guard: with it off, a worker that exits without
+    // `GC_unregister_my_thread` leaks its record and the next collection aborts
+    // with `SuspendThread loop failed`. Unset (the default) is the guard as
+    // described above; nothing else about the default path depends on the env.
+    if std::env::var("HROMATITE_GCT_ENTRY")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+    {
+        log::log_tag(
+            "gct",
+            "GC guard disabled by HROMATITE_GCT_ENTRY=0: Boehm runs stock and the \
+             removal-path protection is off with it",
+        );
+        return false;
+    }
     let Some((ga, gasize)) = procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "entry guard disabled: GameAssembly is not loaded");
         return false;

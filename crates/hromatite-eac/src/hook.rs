@@ -9,13 +9,19 @@
 //! `disp32` and `rel32` encodings stay reachable) and relocated instruction by
 //! instruction:
 //!
-//! * rip-relative `disp32` — retargeted to the copy;
-//! * `jcc rel8` — inverse `jcc +12 ; mov rax,target ; jmp rax` (14 bytes), the
-//!   exact form the working shim emits (`reloc=jcc-abs+7` in
-//!   `evidence/runA_final_2301/eacshim.log`);
-//! * `jcc rel32` — a compact `jcc rel32` when it still reaches, else the same
-//!   absolute form;
-//! * `jmp rel8/rel32` and `call rel32` — rel32 if it reaches, else absolute;
+//! * rip-relative `disp32` — retargeted to the same absolute address;
+//! * `jcc rel8` — the **inverted** condition hopping over a register-free
+//!   `jmp qword [rip+0] <target>` (16 bytes): a taken branch runs the absolute
+//!   jump, a not-taken one lands on the fall-through;
+//! * `loop`/`loope`/`loopne`/`jrcxz` (`E0..E3`) — the same, spelled
+//!   `loop +2 ; jmp short over ; jmp [rip+0] <target>` because those have no
+//!   inverse opcode;
+//! * `jcc rel32`/`jmp rel32`/`call rel32` — the original encoding while the new
+//!   displacement still fits, else `jmp [rip+0] <target>` or
+//!   `call [rip+2] ; jmp +8 ; dq target` (all register-free: the copied
+//!   prologue may still be using `rax`);
+//! * a branch whose target is one of the copied bytes follows the **copy**,
+//!   since those bytes are now the patch;
 //! * anything else — copied verbatim.
 //!
 //! The trampoline ends with an absolute jump to `entry + total`, never to
@@ -24,6 +30,9 @@
 //! A named shared section (`Local\hromatite_rust_hooktable_v1`) records
 //! `{target -> trampoline, handler}` so a second injection into the same process
 //! reuses the existing trampoline instead of re-hooking already patched bytes.
+// Every target of this module is a Win32 code patch; on the host the
+// bookkeeping statics are simply unused.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// Bytes overwritten at the target entry.
 pub const PATCH_LEN: usize = 12;
@@ -51,6 +60,12 @@ pub struct Insn {
     pub rel_off: usize,
     /// Relative field width in bytes: 1 or 4.
     pub rel_size: u8,
+    /// Offset of the primary opcode byte (after legacy prefixes and REX), so a
+    /// relative branch is classified from the opcode and not from `code[0]`.
+    pub op_off: usize,
+    /// The branch is conditional (`jcc`, `loop`, `jrcxz`). Only those can be
+    /// rewritten as `cond-short over an absolute jump`.
+    pub cond: bool,
 }
 
 fn is_rex(byte: u8) -> bool {
@@ -120,10 +135,14 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
         rex = head;
         i += 1;
     }
+    let op_off = i;
     let op = *code.get(i)?;
     i += 1;
 
-    let mut out = Insn::default();
+    let mut out = Insn {
+        op_off,
+        ..Insn::default()
+    };
     let mut has_modrm = false;
     let mut imm = 0usize;
 
@@ -140,6 +159,7 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
             }
             0x80..=0x8F => {
                 out.rel = true;
+                out.cond = true;
                 out.rel_off = i;
                 out.rel_size = 4;
                 i += 4;
@@ -147,6 +167,11 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
                 return Some(out);
             }
             0x05 | 0x0B | 0x31 | 0x77 | 0xA2 | 0x34 | 0x35 | 0x0D => {}
+            // `pshufd` and friends: ModRM *and* an imm8 the generic path would miss
+            0x70 => {
+                has_modrm = true;
+                imm = 1;
+            }
             0x71 | 0x72 | 0x73 | 0xBA | 0xC2 | 0xC4 | 0xC5 | 0xC6 => {
                 has_modrm = true;
                 imm = 1;
@@ -160,8 +185,29 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
             0x50..=0x5F => {}
             0x68 => imm = if opsz16 { 2 } else { 4 },
             0x6A => imm = 1,
-            0x70..=0x7F | 0xEB => {
+            0x70..=0x7F => {
                 out.rel = true;
+                out.cond = true;
+                out.rel_off = i;
+                out.rel_size = 1;
+                i += 1;
+                out.len = i;
+                return Some(out);
+            }
+            0xEB => {
+                out.rel = true;
+                out.rel_off = i;
+                out.rel_size = 1;
+                i += 1;
+                out.len = i;
+                return Some(out);
+            }
+            // `loopne`/`loope`/`loop`/`jrcxz` — short conditional branches with
+            // the same rewrite as a `jcc` (the condition itself is not inverted,
+            // only the *target* moves over the absolute jump).
+            0xE0..=0xE3 => {
+                out.rel = true;
+                out.cond = true;
                 out.rel_off = i;
                 out.rel_size = 1;
                 i += 1;
@@ -187,6 +233,15 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
                     4
                 };
             }
+            // alu `al, imm8` / `eax, imm32` forms carry no ModRM
+            0xA8 => imm = 1,
+            0xA9 => {
+                imm = if opsz16 { 2 } else { 4 };
+            }
+            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C => imm = 1,
+            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D => {
+                imm = if opsz16 { 2 } else { 4 };
+            }
             _ => {
                 if !one_byte_has_modrm(op) {
                     return None;
@@ -204,6 +259,22 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
     if has_modrm {
         let modrm = *code.get(i)?;
         i += 1;
+        // group 3: only `/0 test` and `/1 test` take an immediate — `/2.. /7`
+        // (not/neg/mul/imul/div/idiv) are one byte shorter than the table says.
+        if matches!(op, 0xF6 | 0xF7) {
+            let reg = (modrm >> 3) & 7;
+            imm = if reg <= 1 {
+                if op == 0xF6 {
+                    1
+                } else if opsz16 {
+                    2
+                } else {
+                    4
+                }
+            } else {
+                0
+            };
+        }
         let mode = modrm >> 6;
         let rm = modrm & 7;
         let mut disp = 0usize;
@@ -242,23 +313,70 @@ pub fn decode(code: &[u8]) -> Option<Insn> {
     (1..=15).contains(&i).then_some(out)
 }
 
+/// Length of a prologue covering at least [`PATCH_LEN`] whole instructions, and
+/// how many they are. `Err` names the first byte that cannot be decoded, so a
+/// refused hook can say *why* instead of silently skipping.
+pub fn prologue_span(code: &[u8]) -> Result<(usize, usize), String> {
+    let mut n = 0usize;
+    let mut insns = 0usize;
+    while n < PATCH_LEN {
+        if insns > 8 {
+            return Err(format!("more than 8 instructions within {PATCH_LEN} bytes"));
+        }
+        let insn = decode(code.get(n..).unwrap_or(&[])).ok_or_else(|| {
+            format!(
+                "undecodable opcode {:#04x} at +{n}",
+                code.get(n).copied().unwrap_or(0)
+            )
+        })?;
+        if insn.len == 0 {
+            return Err(format!("zero-length instruction at +{n}"));
+        }
+        n += insn.len;
+        insns += 1;
+    }
+    if n > 24 {
+        return Err(format!("prologue {n} bytes exceeds the 24-byte bound"));
+    }
+    Ok((n, insns))
+}
+
 /// Length of a prologue covering at least [`PATCH_LEN`] bytes. `None` when an
 /// unknown opcode is hit or the span exceeds 24 bytes (the shim's bound).
 pub fn prologue_len(code: &[u8]) -> Option<usize> {
-    let mut n = 0usize;
-    let mut guard = 0usize;
-    while n < PATCH_LEN {
-        if guard > 8 {
-            return None;
-        }
-        guard += 1;
-        let insn = decode(code.get(n..)?)?;
-        if insn.len == 0 {
-            return None;
-        }
-        n += insn.len;
-    }
-    (n <= 24).then_some(n)
+    prologue_span(code).ok().map(|(len, _)| len)
+}
+
+/// Length of `jmp qword ptr [rip+0] ; dq addr` — the register-free absolute
+/// jump. `mov rax,imm64 ; jmp rax` is two bytes shorter but destroys `rax`,
+/// which a relocated prologue may still be using (`mov eax,0x28 ; call
+/// __chkstk ; sub rsp,rax` hands the stack size over in `rax`).
+pub const ABS_JUMP: usize = 14;
+
+/// Length of `call qword ptr [rip+2] ; jmp +8 ; dq addr` — the register-free
+/// absolute call. The extra `jmp` hops over the address so the fall-through
+/// continues right after the call.
+pub const ABS_CALL: usize = 16;
+
+/// Write `jmp qword ptr [rip+0] ; dq addr` into a 14-byte slot.
+fn push_abs_jump_slice(slot: &mut [u8], addr: usize) -> Result<(), String> {
+    let slot = slot
+        .get_mut(..ABS_JUMP)
+        .ok_or_else(|| "absolute jump does not fit in the trampoline page".to_string())?;
+    slot[..6].copy_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+    slot[6..].copy_from_slice(&(addr as u64).to_le_bytes());
+    Ok(())
+}
+
+/// Write `call qword ptr [rip+2] ; jmp +8 ; dq addr` into a 16-byte slot.
+fn push_abs_call_slice(slot: &mut [u8], addr: usize) -> Result<(), String> {
+    let slot = slot
+        .get_mut(..ABS_CALL)
+        .ok_or_else(|| "absolute call does not fit in the trampoline page".to_string())?;
+    slot[..6].copy_from_slice(&[0xFF, 0x15, 0x02, 0, 0, 0]);
+    slot[6..8].copy_from_slice(&[0xEB, (ABS_CALL - 8) as u8]);
+    slot[8..].copy_from_slice(&(addr as u64).to_le_bytes());
+    Ok(())
 }
 
 /// Encode `mov rax, imm64 ; jmp rax`.
@@ -288,19 +406,225 @@ pub fn looks_patched(code: &[u8]) -> Option<usize> {
     }
 }
 
-/// The relocated trampoline plus the relocation label used in the log
-/// (`jcc-abs+7`, `jcc-rel32+4`, `call`, `rip-rel`, ...).
+/// One field of the copied prologue that had to be re-encoded, kept as data so
+/// the install log can name every rewrite and its distance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reloc {
+    /// `call-rel32`, `call-abs`, `jmp-rel32`, `jmp-abs`, `jcc-rel32`, `jcc-abs`
+    /// or `rip-rel`.
+    pub kind: &'static str,
+    /// Offset of the instruction inside the original prologue.
+    pub at: usize,
+    /// Absolute address the field now points at (the copy itself for a branch
+    /// that stayed inside the prologue).
+    pub target: i64,
+    /// `target - (address of the rewritten instruction)`, signed.
+    pub distance: i64,
+}
+
+impl Reloc {
+    /// `call-rel32+5->0x6fffe2c98890(-0x18ffe6)` — kind, prologue offset,
+    /// absolute target and the signed distance from the copy to it.
+    pub fn label(&self) -> String {
+        format!(
+            "{}+{}->{:#x}({:+})",
+            self.kind, self.at, self.target, self.distance
+        )
+    }
+}
+
+/// The relocated trampoline plus everything the install log reports about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Built {
     /// Bytes written into the trampoline page.
     pub len: usize,
-    /// Human-readable relocation note for the hook log.
+    /// Human-readable relocation note (`jcc-abs+7->0x…(+0x…)`, comma joined;
+    /// `verbatim` when nothing moved).
     pub note: String,
+    /// How many instructions the copied prologue holds.
+    pub insns: usize,
+    /// Every rewritten field, in prologue order.
+    pub relocs: Vec<Reloc>,
 }
 
 fn read_i32(code: &[u8], at: usize) -> Option<i32> {
     let bytes = code.get(at..at + 4)?;
     Some(i32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn fits_i32(value: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&value)
+}
+
+/// How one copied instruction is re-encoded at its new address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// Copied byte for byte.
+    Verbatim,
+    /// Kept, with its `disp32` retargeted.
+    Rip32,
+    /// Kept verbatim, with the relative field rewritten in place (any form that
+    /// still reaches from the copy).
+    Rel,
+    /// `inverse-jcc +ABS_JUMP ; jmp [rip+0] <target>`: the *inverted* condition
+    /// skips the absolute jump into the fall-through, so a taken branch still
+    /// reaches the original target.
+    CondAbs,
+    /// `loop/jrcxz +2 ; jmp-short over ; jmp [rip+0] <target>` for `E0..E3`,
+    /// which have no inverse opcode (17-18 bytes).
+    LoopAbs,
+    /// `0F 8x ; jmp [rip+0] <target>` with the inverted condition (a rel32 `jcc`
+    /// out of reach).
+    CondAbsLong,
+    JmpRel32,
+    JmpAbs,
+    CallRel32,
+    /// `call [rip+2] ; jmp +8 ; dq <target>`.
+    CallAbs,
+}
+
+impl Form {
+    fn size(self, insn: &Insn) -> usize {
+        match self {
+            // The absolute conditional forms keep whatever prefixes the original
+            // carried, so their size depends on where the relative field sits.
+            Form::Verbatim | Form::Rip32 | Form::Rel => insn.len,
+            Form::CondAbs => insn.rel_off + 1 + ABS_JUMP,
+            Form::LoopAbs => insn.rel_off + 1 + 2 + ABS_JUMP,
+            Form::CondAbsLong => insn.rel_off + 4 + ABS_JUMP,
+            Form::JmpRel32 | Form::CallRel32 => 5,
+            Form::JmpAbs => ABS_JUMP,
+            Form::CallAbs => ABS_CALL,
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Form::Verbatim => "verbatim",
+            Form::Rip32 => "rip-rel",
+            Form::Rel => "rel32",
+            Form::CondAbs | Form::LoopAbs | Form::CondAbsLong => "jcc-abs",
+            Form::JmpRel32 => "jmp-rel32",
+            Form::JmpAbs => "jmp-abs",
+            Form::CallRel32 => "call-rel32",
+            Form::CallAbs => "call-abs",
+        }
+    }
+}
+
+/// One instruction of the planned copy: where it starts, how it is encoded and
+/// where its relative field points before the move.
+#[derive(Clone, Copy, Debug)]
+struct Step {
+    /// Offset inside the original prologue.
+    old: usize,
+    insn: Insn,
+    /// Offset inside the trampoline copy.
+    new: usize,
+    form: Form,
+    /// Absolute branch target, or the absolute address a rip-relative operand
+    /// resolves to.
+    target: i64,
+}
+
+fn rel_disp(insn: &Insn, code: &[u8], old: usize) -> Option<i64> {
+    if insn.rel_size == 1 {
+        Some(i64::from(*code.get(old + insn.rel_off)? as i8))
+    } else {
+        Some(i64::from(read_i32(code, old + insn.rel_off)?))
+    }
+}
+
+/// Choose the encoding of one instruction. Needs only the original prologue and
+/// the layout so far, so the same decision is available before and after the
+/// offsets of the copy are known.
+fn plan(
+    insn: &Insn,
+    code: &[u8],
+    old: usize,
+    base: usize,
+    copied: usize,
+    tramp_addr: usize,
+    new_off: usize,
+) -> Result<(Form, i64), String> {
+    if !insn.rel && !insn.rip_rel {
+        return Ok((Form::Verbatim, 0));
+    }
+    // A rip-relative operand keeps its `disp32` position (`disp_off`), a branch
+    // its relative field (`rel_off`); both are resolved to an absolute address
+    // here and re-encoded at the new offset later.
+    let disp = if insn.rip_rel {
+        i64::from(
+            read_i32(code, old + insn.disp_off)
+                .ok_or_else(|| format!("rip disp32 at +{old} is truncated"))?,
+        )
+    } else {
+        rel_disp(insn, code, old).ok_or_else(|| format!("relative field at +{old} is truncated"))?
+    };
+    let next = (base + old + insn.len) as i64;
+    let target = next + disp;
+    if insn.rip_rel {
+        return Ok((Form::Rip32, target));
+    }
+    // A branch that lands inside the prologue follows the *copy*, because the
+    // first PATCH_LEN bytes of the original are the `mov rax,imm64 ; jmp rax`
+    // patch — jumping there would re-enter the detour (or a stale handler).
+    let inside = target >= base as i64 && target < (base + copied) as i64;
+    if insn.cond {
+        if insn.rel_size == 1 {
+            // A rel8 condition reaches 127 bytes; the copy lives in another
+            // page, so the short form never survives relocation. `jcc` has an
+            // inverse opcode, the `loop`/`jrcxz` family does not.
+            let opcode = *code
+                .get(old + insn.rel_off - 1)
+                .ok_or_else(|| format!("branch opcode at +{old} is truncated"))?;
+            let form = if (0x70..=0x7F).contains(&opcode) {
+                Form::CondAbs
+            } else {
+                Form::LoopAbs
+            };
+            return Ok((form, target));
+        }
+        let fits = inside || fits_i32(target - (tramp_addr + new_off + 6) as i64);
+        return Ok((if fits { Form::Rel } else { Form::CondAbsLong }, target));
+    }
+    let op = *code
+        .get(old + insn.op_off)
+        .ok_or_else(|| format!("opcode at +{old} is past the snapshot"))?;
+    let is_call = op == 0xE8;
+    let fits = inside || fits_i32(target - (tramp_addr + new_off + 5) as i64);
+    Ok(match (is_call, fits) {
+        (true, true) => (Form::CallRel32, target),
+        (true, false) => (Form::CallAbs, target),
+        (false, true) => (Form::JmpRel32, target),
+        (false, false) => (Form::JmpAbs, target),
+    })
+}
+
+/// Follow a branch of the copy back into the copy when its target is one of the
+/// overwritten prologue bytes; anything else keeps its original address.
+fn map_target(
+    target: i64,
+    base: usize,
+    copied: usize,
+    steps: &[Step],
+    tramp_addr: usize,
+) -> Result<i64, String> {
+    if target >= base as i64 && target < (base + copied) as i64 {
+        let old = (target - base as i64) as usize;
+        return steps
+            .iter()
+            .find(|step| step.old == old)
+            .map(|step| (tramp_addr + step.new) as i64)
+            .ok_or_else(|| {
+                format!("branch target +{old:#x} lands in the middle of an instruction")
+            });
+    }
+    Ok(target)
+}
+
+fn page_full(at: usize) -> String {
+    format!("trampoline page is too small at +{at}")
 }
 
 /// Copy and relocate the prologue into `tramp`.
@@ -311,151 +635,170 @@ fn read_i32(code: &[u8], at: usize) -> Option<i32> {
 ///
 /// The final absolute jump goes to `base + total` — resuming at `base` would
 /// re-enter the patch. `None` means the prologue cannot be relocated safely.
-pub fn build_trampoline(tramp: &mut [u8], base: usize, code: &[u8], total: usize) -> Option<Built> {
+pub fn build_trampoline(
+    tramp: &mut [u8],
+    base: usize,
+    code: &[u8],
+    total: usize,
+) -> Result<Built, String> {
     let tramp_addr = tramp.as_ptr() as usize;
+
+    // ---- pass 1: decode the prologue and lay the copy out ------------------
+    let mut steps: Vec<Step> = Vec::with_capacity(8);
     let mut old = 0usize;
     let mut nw = 0usize;
-    let mut note = String::new();
-
-    let mut label = |text: &str| {
-        if note.is_empty() {
-            note = text.to_string();
-        }
-    };
-
     while old < total {
-        let insn = decode(code.get(old..)?)?;
+        let insn = decode(code.get(old..).unwrap_or(&[])).ok_or_else(|| {
+            format!(
+                "undecodable opcode {:#04x} at +{old}",
+                code.get(old).copied().unwrap_or(0)
+            )
+        })?;
         if insn.len == 0 {
-            return None;
+            return Err(format!("zero-length instruction at +{old}"));
         }
-
-        // rip-relative: keep the instruction, retarget the disp32.
-        if insn.rip_rel {
-            let disp = read_i32(code, old + insn.disp_off)? as i64;
-            let target = (base + old + insn.len) as i64 + disp;
-            let next = (tramp_addr + nw + insn.len) as i64;
-            let new_disp = i32::try_from(target - next).ok()?;
-            tramp
-                .get_mut(nw..nw + insn.len)?
-                .copy_from_slice(code.get(old..old + insn.len)?);
-            tramp
-                .get_mut(nw + insn.disp_off..nw + insn.disp_off + 4)?
-                .copy_from_slice(&new_disp.to_le_bytes());
-            label(&format!("rip-rel+{old}"));
-            old += insn.len;
-            nw += insn.len;
-            continue;
-        }
-
-        if insn.rel {
-            let op = code[old];
-            let is_jcc = (0x70..=0x7F).contains(&op)
-                || (op == 0x0F && code.get(old + 1).is_some_and(|b| b & 0xF0 == 0x80));
-            let is_call = op == 0xE8;
-            let is_jmp = op == 0xE9 || op == 0xEB;
-
-            let target = if insn.rel_size == 1 {
-                (base + old + insn.len) as i64 + i64::from(code[old + insn.rel_off] as i8)
-            } else {
-                (base + old + insn.len) as i64 + i64::from(read_i32(code, old + insn.rel_off)?)
-            };
-
-            if is_jcc {
-                let cond = if op == 0x0F {
-                    code[old + 1] & 0x0F
-                } else {
-                    op & 0x0F
-                };
-                // The C shim only uses the compact rel32 form for an original
-                // rel32 jcc; a rel8 jcc is exactly the case the absolute form
-                // exists for (`reloc=jcc-abs+7` in the live evidence).
-                let compact = if insn.rel_size == 4 {
-                    let delta = target - (tramp_addr + nw + 6) as i64;
-                    i32::try_from(delta).ok()
-                } else {
-                    None
-                };
-                if let Some(delta) = compact {
-                    tramp
-                        .get_mut(nw..nw + 2)?
-                        .copy_from_slice(&[0x0F, 0x80 | cond]);
-                    tramp
-                        .get_mut(nw + 2..nw + 6)?
-                        .copy_from_slice(&delta.to_le_bytes());
-                    label(&format!("jcc-rel32+{old}"));
-                    nw += 6;
-                } else {
-                    tramp
-                        .get_mut(nw..nw + 2)?
-                        .copy_from_slice(&[0x70 | (cond ^ 1), 0x0C]);
-                    tramp
-                        .get_mut(nw + 2..nw + 2 + PATCH_LEN)?
-                        .copy_from_slice(&abs_jmp(target as usize));
-                    label(&format!("jcc-abs+{old}"));
-                    nw += 2 + PATCH_LEN;
-                }
-            } else if is_jmp {
-                let delta = target - (tramp_addr + nw + 5) as i64;
-                if let Ok(delta) = i32::try_from(delta) {
-                    *tramp.get_mut(nw)? = 0xE9;
-                    tramp
-                        .get_mut(nw + 1..nw + 5)?
-                        .copy_from_slice(&delta.to_le_bytes());
-                    label(&format!("jmp-rel32+{old}"));
-                    nw += 5;
-                } else {
-                    tramp
-                        .get_mut(nw..nw + PATCH_LEN)?
-                        .copy_from_slice(&abs_jmp(target as usize));
-                    label(&format!("jmp-abs+{old}"));
-                    nw += PATCH_LEN;
-                }
-            } else if is_call {
-                let delta = target - (tramp_addr + nw + 5) as i64;
-                if let Ok(delta) = i32::try_from(delta) {
-                    *tramp.get_mut(nw)? = 0xE8;
-                    tramp
-                        .get_mut(nw + 1..nw + 5)?
-                        .copy_from_slice(&delta.to_le_bytes());
-                    nw += 5;
-                } else {
-                    // call qword ptr [rip+2] ; jmp +8 ; dq target
-                    tramp
-                        .get_mut(nw..nw + 6)?
-                        .copy_from_slice(&[0xFF, 0x15, 0x02, 0x00, 0x00, 0x00]);
-                    tramp
-                        .get_mut(nw + 6..nw + 8)?
-                        .copy_from_slice(&[0xEB, 0x08]);
-                    tramp
-                        .get_mut(nw + 8..nw + 8 + 8)?
-                        .copy_from_slice(&(target as u64).to_le_bytes());
-                    nw += 16;
-                }
-                label(&format!("call+{old}"));
-            } else {
-                return None;
-            }
-            old += insn.len;
-            continue;
-        }
-
-        tramp
-            .get_mut(nw..nw + insn.len)?
-            .copy_from_slice(code.get(old..old + insn.len)?);
+        let (form, target) = plan(&insn, code, old, base, total, tramp_addr, nw)?;
+        steps.push(Step {
+            old,
+            insn,
+            new: nw,
+            form,
+            target,
+        });
+        nw += form.size(&insn);
         old += insn.len;
-        nw += insn.len;
+    }
+    if old != total {
+        return Err(format!("decoded {old} of {total} prologue bytes"));
     }
 
-    tramp
-        .get_mut(nw..nw + PATCH_LEN)?
-        .copy_from_slice(&abs_jmp(base + total));
-    nw += PATCH_LEN;
-    Some(Built { len: nw, note })
+    // ---- pass 2: emit, now that every target offset is known ---------------
+    let mut relocs: Vec<Reloc> = Vec::new();
+    for step in &steps {
+        let insn = &step.insn;
+        let at = step.new;
+        let size = step.form.size(insn);
+        let chunk = code
+            .get(step.old..step.old + insn.len)
+            .ok_or_else(|| format!("instruction at +{} is truncated", step.old))?;
+        let out = tramp.get_mut(at..at + size).ok_or_else(|| page_full(at))?;
+        match step.form {
+            Form::Verbatim => out.copy_from_slice(chunk),
+            Form::Rip32 => {
+                let next = (tramp_addr + at + insn.len) as i64;
+                let disp = i32::try_from(step.target - next).map_err(|_| {
+                    format!(
+                        "rip-relative operand at +{} ({:#x}) is out of disp32 reach",
+                        step.old, step.target
+                    )
+                })?;
+                out.copy_from_slice(chunk);
+                out[insn.disp_off..insn.disp_off + 4].copy_from_slice(&disp.to_le_bytes());
+                relocs.push(Reloc {
+                    kind: Form::Rip32.kind(),
+                    at: step.old,
+                    target: step.target,
+                    distance: step.target - (tramp_addr + at) as i64,
+                });
+            }
+            form => {
+                let target = map_target(step.target, base, total, &steps, tramp_addr)?;
+                match form {
+                    Form::Rel => {
+                        let ro = insn.rel_off;
+                        let bits = insn.rel_size;
+                        let disp = target - (tramp_addr + at + insn.len) as i64;
+                        out.copy_from_slice(chunk);
+                        if bits == 32 {
+                            let v = i32::try_from(disp)
+                                .map_err(|_| format!("rel32 at +{} lost its reach", step.old))?;
+                            out[ro..ro + 4].copy_from_slice(&v.to_le_bytes());
+                        } else {
+                            let v = i8::try_from(disp)
+                                .map_err(|_| format!("rel8 at +{} lost its reach", step.old))?;
+                            out[ro] = v as u8;
+                        }
+                    }
+                    Form::CondAbs => {
+                        // `jcc <disp8>`: keep the prefixes, invert the condition
+                        // so that *taking* the branch runs the absolute jump to
+                        // the original target while *not* taking it lands on the
+                        // fall-through right after the 14-byte jump.
+                        let keep = insn.rel_off;
+                        out[..keep].copy_from_slice(&chunk[..keep]);
+                        out[keep - 1] ^= 1;
+                        out[keep] = ABS_JUMP as u8;
+                        push_abs_jump_slice(&mut out[keep + 1..], target as usize)?;
+                    }
+                    Form::LoopAbs => {
+                        // `loop`/`loope`/`loopne`/`jrcxz` have no inverse
+                        // opcode: keep it as it is, and let the *taken* branch
+                        // skip a `jmp short` that would have skipped the
+                        // absolute jump.
+                        let keep = insn.rel_off;
+                        out[..keep].copy_from_slice(&chunk[..keep]);
+                        out[keep] = 2;
+                        out[keep + 1] = 0xEB;
+                        out[keep + 2] = ABS_JUMP as u8;
+                        push_abs_jump_slice(&mut out[keep + 3..], target as usize)?;
+                    }
+                    Form::CondAbsLong => {
+                        // `0F 8x <disp32>` out of reach: same shape, one byte
+                        // wider prefix/opcode part, still inverted.
+                        let keep = insn.rel_off;
+                        out[..keep].copy_from_slice(&chunk[..keep]);
+                        out[keep - 1] ^= 1;
+                        out[keep..keep + 4].copy_from_slice(&(ABS_JUMP as i32).to_le_bytes());
+                        push_abs_jump_slice(&mut out[keep + 4..], target as usize)?;
+                    }
+                    Form::JmpRel32 | Form::CallRel32 => {
+                        out[0] = if form == Form::CallRel32 { 0xE8 } else { 0xE9 };
+                        let disp = i32::try_from(target - (tramp_addr + at + 5) as i64)
+                            .map_err(|_| format!("branch at +{} lost its reach", step.old))?;
+                        out[1..5].copy_from_slice(&disp.to_le_bytes());
+                    }
+                    Form::JmpAbs => push_abs_jump_slice(out, target as usize)?,
+                    Form::CallAbs => push_abs_call_slice(out, target as usize)?,
+                    Form::Verbatim | Form::Rip32 => unreachable!("handled above"),
+                }
+                relocs.push(Reloc {
+                    kind: form.kind(),
+                    at: step.old,
+                    target,
+                    distance: target - (tramp_addr + at) as i64,
+                });
+            }
+        }
+    }
+
+    // jump back to `base + total` without touching any register: the copied
+    // prologue may have just computed a value in rax that the rest of the
+    // function needs (e.g. the `__chkstk` result used by `sub rsp,rax`).
+    push_abs_jump_slice(
+        tramp.get_mut(nw..).ok_or_else(|| page_full(nw))?,
+        base + total,
+    )?;
+    let len = nw + ABS_JUMP;
+    let note = if relocs.is_empty() {
+        "verbatim".to_string()
+    } else {
+        relocs
+            .iter()
+            .map(Reloc::label)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Ok(Built {
+        len,
+        note,
+        insns: steps.len(),
+        relocs,
+    })
 }
 
 /// A freshly installed hook. The trampoline page is owned by the caller (kept
 /// alive for the process lifetime) and is what the detour must tail-call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hook {
     /// Original entry (now holding the 12-byte patch).
     pub target: usize,
@@ -463,9 +806,47 @@ pub struct Hook {
     pub tramp: usize,
     /// Bytes of prologue relocated.
     pub copied: usize,
+    /// Every relocation applied to the copy, as `kind+offset->addr` entries.
+    /// Empty when the entry was reused (`copied == 0`).
+    pub note: String,
+    /// How many instructions the copied prologue holds (0 when reused).
+    pub insns: usize,
+    /// How many of those were re-encoded (0 when reused).
+    pub relocs: usize,
     /// 1 = fresh patch, 2 = reused a trampoline from the shared table,
     /// 3 = the entry was patched by a foreign image (forwarded).
     pub mode: u8,
+}
+
+impl Hook {
+    /// One log line naming what the trampoline contains: prologue length and
+    /// instruction count, how many fields moved and in which form, the
+    /// trampoline address and its distance from the target.
+    pub fn describe(&self) -> String {
+        let delta = self.tramp as i64 - self.target as i64;
+        if self.copied == 0 {
+            return format!(
+                "mode={} target={:#x} tramp={:#x} ({delta:+#x}, reused) {}",
+                self.mode, self.target, self.tramp, self.note
+            );
+        }
+        format!(
+            "prologue={}B/{} insn, reloc={}/{} [{}], target={:#x} -> tramp={:#x} ({delta:+#x}, {:.1} MB), mode={}",
+            self.copied,
+            self.insns,
+            self.relocs,
+            self.insns,
+            if self.note.is_empty() {
+                "verbatim"
+            } else {
+                &self.note
+            },
+            self.target,
+            self.tramp,
+            delta as f64 / (1024.0 * 1024.0),
+            self.mode
+        )
+    }
 }
 
 /// One row of the named shared table.
@@ -481,7 +862,7 @@ pub struct TableEntry {
 }
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     //! Minimal Win32 surface. No external crates: these are the declarations the
     //! shim used, and everything here is `extern "system"` (win64 ABI).
 
@@ -883,6 +1264,9 @@ pub unsafe fn install(target: usize, handler: usize, name: &str) -> Result<Hook,
                 target,
                 tramp,
                 copied: 0,
+                note: String::new(),
+                insns: 0,
+                relocs: 0,
                 mode,
             });
         }
@@ -892,11 +1276,15 @@ pub unsafe fn install(target: usize, handler: usize, name: &str) -> Result<Hook,
             target,
             tramp: imm,
             copied: 0,
+            note: String::new(),
+            insns: 0,
+            relocs: 0,
             mode: 3,
         });
     }
 
-    let total = prologue_len(&original).ok_or_else(|| "prologue undecodable".to_string())?;
+    let (total, insns) =
+        prologue_span(&original).map_err(|reason| format!("prologue at {target:#x}: {reason}"))?;
     if total < PATCH_LEN {
         return Err(format!("prologue {total} < {PATCH_LEN}"));
     }
@@ -907,7 +1295,7 @@ pub unsafe fn install(target: usize, handler: usize, name: &str) -> Result<Hook,
     // SAFETY: the page is a fresh, writable TRAMP_PAGE-byte allocation.
     let tramp = unsafe { core::slice::from_raw_parts_mut(page as *mut u8, TRAMP_PAGE) };
     let built = build_trampoline(tramp, target, &original, total)
-        .ok_or_else(|| "trampoline relocation failed".to_string())?;
+        .map_err(|reason| format!("trampoline relocation at {target:#x}: {reason}"))?;
 
     // Publish the trampoline before patching the target, so a thread that
     // enters the hook immediately always finds a complete trampoline.
@@ -933,12 +1321,21 @@ pub unsafe fn install(target: usize, handler: usize, name: &str) -> Result<Hook,
     }
 
     table_store(target, page, handler, name);
-    Ok(Hook {
+    let hook = Hook {
         target,
         tramp: page,
         copied: total,
+        note: built.note,
+        insns,
+        relocs: built.relocs.len(),
         mode: 1,
-    })
+    };
+    // One line per installed detour: prologue length, instruction count, how
+    // many fields were re-encoded and in which form, the trampoline address and
+    // its distance from the target. This is the record that makes a live "hook
+    // installed but the game died 40 s later" diagnosable.
+    crate::eos::hook_log(format!("[hook] {name}: {}", hook.describe()));
+    Ok(hook)
 }
 
 #[cfg(test)]
@@ -978,40 +1375,71 @@ mod tests {
         assert_eq!(prologue_len(&[0x06]), None, "unknown opcode");
     }
 
+    /// Absolute address a `jmp [rip+0] ; dq` at `at` jumps to.
+    fn abs_jump_target(page: &[u8], at: usize) -> usize {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&page[at + 6..at + 14]);
+        u64::from_le_bytes(raw) as usize
+    }
+
     #[test]
-    fn rel8_jcc_is_rewritten_as_inverse_jcc_plus_absolute_jump() {
-        // Trampoline placed at +0x100000 from the target: a rel8 target cannot
-        // reach, so the absolute form (inverse jcc +0x0C ; mov rax ; jmp rax)
-        // must be emitted, exactly like `jcc-abs+7` in the live log.
-        let base = 0x6fff_e24e_6990usize;
-        let tramp_addr = 0x6fff_e1e7_0000usize;
+    fn rel8_jcc_becomes_a_cond_short_over_an_absolute_jump() {
+        // A rel8 condition reaches 127 bytes, the copy lives in another page:
+        // `jz +0x1C` must become `jz +14 ; jmp [rip+0] <base+0x1C>`. The
+        // condition stays as it was — only the short jump now hops *over* the
+        // absolute jump, so the taken branch reaches the fall-through code.
         let mut page = vec![0u8; 4096];
-        // Simulate the trampoline living at `tramp_addr` by only checking the
-        // emitted bytes, which do not depend on the page address for rel8.
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
         let built = build_trampoline(&mut page, base, &LIVE_PROLOGUE, 12).expect("relocate");
-        assert_eq!(built.note, "jcc-abs+7");
-        assert_eq!(built.len, 36);
+        assert!(built.note.starts_with("jcc-abs+7->"), "{}", built.note);
+        // 4 + 3 + (2 + 14) + 3 + 14
+        assert_eq!(built.len, 40);
+        assert_eq!(built.insns, 4);
+        assert_eq!(built.relocs.len(), 1);
 
         assert_eq!(&page[0..4], &[0x48, 0x83, 0xEC, 0x28]);
         assert_eq!(&page[4..7], &[0x48, 0x85, 0xC9]);
-        // `74 13` -> inverse `75 0C`, then mov rax,target ; jmp rax.
-        assert_eq!(&page[7..9], &[0x75, 0x0C]);
-        assert_eq!(&page[9..11], &[0x48, 0xB8]);
-        let mut target_bytes = [0u8; 8];
-        target_bytes.copy_from_slice(&page[11..19]);
+        // `jz` -> `jnz` over the absolute jump: taking the original branch must
+        // fall through to the jump, not skip it.
+        assert_eq!(
+            &page[7..9],
+            &[0x75, ABS_JUMP as u8],
+            "jnz over the abs jump"
+        );
+        assert_eq!(&page[9..11], &[0xFF, 0x25]);
         // jz target = base + 9 + 0x13 = base + 0x1C.
-        assert_eq!(u64::from_le_bytes(target_bytes), (base + 0x1C) as u64);
-        assert_eq!(&page[19..21], &[0xFF, 0xE0]);
-        // Verbatim `test rdx,rdx`.
-        assert_eq!(&page[21..24], &[0x48, 0x85, 0xD2]);
-        // Final absolute jump back to entry + 12.
-        assert_eq!(&page[24..26], &[0x48, 0xB8]);
-        let mut back = [0u8; 8];
-        back.copy_from_slice(&page[26..34]);
-        assert_eq!(u64::from_le_bytes(back), (base + 12) as u64);
-        assert_eq!(&page[34..36], &[0xFF, 0xE0]);
+        assert_eq!(abs_jump_target(&page, 9), base + 0x1C);
+        // Verbatim `test rdx,rdx` right after the 14-byte absolute jump.
+        assert_eq!(&page[23..26], &[0x48, 0x85, 0xD2]);
+        assert_eq!(&page[26..28], &[0xFF, 0x25]);
+        assert_eq!(abs_jump_target(&page, 26), base + 12);
+    }
 
-        let _ = tramp_addr;
+    #[test]
+    fn jrcxz_and_loop_rel8_branches_are_relocated_too() {
+        // `sub rsp,0x28 ; jrcxz +6 ; test rcx,rcx ; nop ; nop` — E3 is not a
+        // jcc, but the same rewrite applies: keep the opcode and the condition,
+        // hop over the absolute jump, land the absolute jump on the target.
+        let code = [
+            0x48, 0x83, 0xEC, 0x28, // sub rsp,0x28
+            0xE3, 0x06, // jrcxz +6 -> base + 12
+            0x48, 0x85, 0xC9, // test rcx,rcx
+            0x90, 0x90, 0x90, // padding to 12 bytes
+        ];
+        assert_eq!(prologue_len(&code), Some(12));
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let built = build_trampoline(&mut page, base, &code, 12).expect("relocate");
+        assert_eq!(built.relocs[0].kind, "jcc-abs");
+        assert_eq!(built.relocs[0].at, 4);
+        // `jrcxz +2 ; jmp short over ; jmp [rip+0] <target>`: the taken branch
+        // skips the `EB` hop and runs the absolute jump.
+        assert_eq!(&page[4..8], &[0xE3, 0x02, 0xEB, ABS_JUMP as u8]);
+        assert_eq!(abs_jump_target(&page, 8), base + 12);
+        // The copied `test rcx,rcx` follows the 18-byte form.
+        assert_eq!(&page[22..25], &[0x48, 0x85, 0xC9]);
     }
 
     #[test]
@@ -1037,6 +1465,322 @@ mod tests {
             (base + 0x107) as i64,
             "disp must still resolve the original target"
         );
+    }
+
+    #[test]
+    fn call_rel32_in_prologue_targets_the_original_callee() {
+        // The BoringSSL `__chkstk` entry shape measured live on
+        // `EVP_EncryptInit_ex`: `mov eax,0x28 ; call rel32 ; sub rsp,0x28`.
+        // The relocated copy must call the *original* callee.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let callee = base + 5 + 5 + 0x40;
+
+        let mut code = [0x90u8; 14];
+        code[0..5].copy_from_slice(&[0xB8, 0x28, 0x00, 0x00, 0x00]);
+        code[5] = 0xE8;
+        code[6..10].copy_from_slice(&(callee as i64 - (base + 10) as i64).to_le_bytes()[..4]);
+        code[10..14].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+        let built = build_trampoline(&mut page, base, &code, 14).expect("relocate");
+        assert!(built.note.starts_with("call-rel32+5->"), "{}", built.note);
+        assert_eq!(&page[5], &0xE8);
+        let disp = i32::from_le_bytes(page[6..10].try_into().unwrap());
+        assert_eq!(
+            (page_addr + 5 + 5) as i64 + i64::from(disp),
+            callee as i64,
+            "the relocated call must still reach the original callee"
+        );
+    }
+
+    #[test]
+    fn call_rel32_beyond_reach_goes_through_an_absolute_slot() {
+        // A trampoline 8 GiB away from the callee: the rel32 form cannot be
+        // re-encoded, so the copy must use `call [rip+2] ; jmp +8 ; dq callee`,
+        // which is register-free as well.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x2_0000_0000;
+        let callee = base + 0x100;
+        let mut code = [0x90u8; 14];
+        code[0..5].copy_from_slice(&[0xB8, 0x28, 0, 0, 0]);
+        code[5] = 0xE8;
+        code[6..10].copy_from_slice(&((callee as i64 - (base + 10) as i64) as i32).to_le_bytes());
+        code[10..14].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+        let built = build_trampoline(&mut page, base, &code, 14).expect("relocate");
+        assert_eq!(built.relocs[0].kind, "call-abs");
+        assert_eq!(&page[5..11], &[0xFF, 0x15, 0x02, 0, 0, 0]);
+        assert_eq!(&page[11..13], &[0xEB, (ABS_CALL - 8) as u8]);
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&page[13..21]);
+        assert_eq!(u64::from_le_bytes(slot) as usize, callee);
+        // The instruction after the call still runs, then the jump back.
+        assert_eq!(&page[21..25], &[0x48, 0x83, 0xEC, 0x28]);
+    }
+
+    #[test]
+    fn jcc_rel32_out_of_reach_becomes_cond_short_plus_absolute() {
+        // `sub rsp,0x28 ; jne rel32 ; nop ; nop` copied 8 GiB away: the rel32
+        // condition no longer reaches, so it keeps its opcode, hops over the
+        // absolute jump and the absolute jump holds the original target.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x2_0000_0000;
+        let mut code = [0x90u8; 12];
+        code[0..4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+        code[4..6].copy_from_slice(&[0x0F, 0x85]);
+        code[6..10]
+            .copy_from_slice(&(((base + 12) as i64 - (base + 10) as i64) as i32).to_le_bytes());
+
+        let built = build_trampoline(&mut page, base, &code, 12).expect("relocate");
+        assert_eq!(built.relocs[0].kind, "jcc-abs");
+        // `jne` -> `je` over the absolute jump, so a taken `jne` still reaches
+        // the original target.
+        assert_eq!(&page[4..6], &[0x0F, 0x84]);
+        assert_eq!(
+            i32::from_le_bytes(page[6..10].try_into().unwrap()),
+            ABS_JUMP as i32
+        );
+        assert_eq!(abs_jump_target(&page, 10), base + 12);
+    }
+
+    #[test]
+    fn a_branch_into_the_prologue_follows_the_copy() {
+        // `test rcx,rcx ; call rel32(-5)` calls *itself*: after the move the
+        // original bytes are the 12-byte `mov rax,imm64 ; jmp rax` patch, so
+        // the target has to become the copy of that instruction.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let mut code = [0x90u8; 12];
+        code[0..3].copy_from_slice(&[0x48, 0x85, 0xC9]);
+        code[3..8].copy_from_slice(&[0xE8, 0xFB, 0xFF, 0xFF, 0xFF]); // call +3
+
+        let built = build_trampoline(&mut page, base, &code, 12).expect("relocate");
+        assert_eq!(built.relocs[0].kind, "call-rel32");
+        assert_eq!(
+            built.relocs[0].target as usize,
+            page_addr + 3,
+            "the self-call must land in the copy, not on the patched original"
+        );
+        assert_eq!(i32::from_le_bytes(page[4..8].try_into().unwrap()), -5);
+    }
+
+    #[test]
+    fn a_branch_into_the_middle_of_an_instruction_is_refused() {
+        // `test rcx,rcx ; jmp rel32 -> base+1` (inside the `test`): there is no
+        // copy of that byte, so the hook must be refused rather than guess.
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let mut code = [0x90u8; 12];
+        code[0..3].copy_from_slice(&[0x48, 0x85, 0xC9]);
+        code[3..8].copy_from_slice(&[0xE9, 0xF9, 0xFF, 0xFF, 0xFF]); // jmp +1
+        let err = build_trampoline(&mut page, base, &code, 12).expect_err("mid-instruction target");
+        assert!(err.contains("middle of an instruction"), "{err}");
+    }
+
+    #[test]
+    fn prologue_span_names_the_offending_byte() {
+        assert_eq!(prologue_span(&LIVE_PROLOGUE), Ok((12, 4)));
+        let err = prologue_span(&[0x48, 0x83, 0xEC, 0x28, 0x06]).expect_err("0x06 is not decoded");
+        assert!(err.contains("undecodable opcode 0x06 at +4"), "{err}");
+        // A truncated instruction at the end of the snapshot is not accepted.
+        assert!(prologue_span(&[0x48, 0x81, 0xEC, 0x28]).is_err());
+    }
+
+    #[test]
+    fn the_real_boring_ssl_evp_prologues_relocate_their_chkstk_call() {
+        // Byte-exact prologues of the five BoringSSL entry points the EOSSDK
+        // protector calls, read from `EOSSDK-Win64-Shipping.dll`
+        // (`findings/eossdk.md` §6.1). All five start with the `__chkstk`
+        // shape `mov eax,0xNN ; call rel32(__chkstk)`, and all five of those
+        // calls land on RVA 0xE6B030 — the case that used to crash the game.
+        const RVAS: [(usize, [u8; 16]); 5] = [
+            (
+                0xcd_b040,
+                [
+                    0xB8, 0x28, 0x00, 0x00, 0x00, 0xE8, 0xE6, 0xFF, 0x18, 0x00, 0x48, 0x2B, 0xE0,
+                    0x44, 0x8D, 0x40,
+                ],
+            ),
+            (
+                0xcd_bcb0,
+                [
+                    0xB8, 0x38, 0x00, 0x00, 0x00, 0xE8, 0x76, 0xF3, 0x18, 0x00, 0x48, 0x2B, 0xE0,
+                    0x48, 0x8B, 0x44,
+                ],
+            ),
+            (
+                0xcd_bce0,
+                [
+                    0xB8, 0x38, 0x00, 0x00, 0x00, 0xE8, 0x46, 0xF3, 0x18, 0x00, 0x48, 0x2B, 0xE0,
+                    0x83, 0x79, 0x10,
+                ],
+            ),
+            (
+                0xcd_af90,
+                [
+                    0xB8, 0x38, 0x00, 0x00, 0x00, 0xE8, 0x96, 0x00, 0x19, 0x00, 0x48, 0x2B, 0xE0,
+                    0x48, 0x8B, 0x01,
+                ],
+            ),
+            // No call in its 12-byte prologue: two stores and `push r14`.
+            (
+                0xcd_bb60,
+                [
+                    0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x41, 0x56, 0xB8,
+                    0x30, 0x00, 0x00,
+                ],
+            ),
+        ];
+        const CHKSTK_RVA: i64 = 0xE6_B030;
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        for (rva, bytes) in RVAS {
+            let base = page_addr + 0x800;
+            let added = base as i64 - rva as i64;
+            assert_eq!(
+                prologue_len(&bytes),
+                Some(if rva == 0xcd_bb60 { 12 } else { 13 }),
+                "{rva:#x}"
+            );
+            let built = build_trampoline(
+                &mut page,
+                base,
+                &bytes,
+                if rva == 0xcd_bb60 { 12 } else { 13 },
+            )
+            .expect("relocate");
+            if rva == 0xcd_bb60 {
+                assert!(built.relocs.is_empty(), "{rva:#x}: {}", built.note);
+                assert_eq!(built.note, "verbatim");
+            } else {
+                assert_eq!(built.relocs.len(), 1, "{rva:#x}: {}", built.note);
+                assert_eq!(built.relocs[0].kind, "call-rel32");
+                assert_eq!(built.relocs[0].at, 5);
+                assert_eq!(
+                    built.relocs[0].target - added,
+                    CHKSTK_RVA,
+                    "{rva:#x} must call __chkstk"
+                );
+            }
+            // ...and the copy always ends with the absolute jump back.
+            assert_eq!(
+                &page[built.len - ABS_JUMP..built.len - ABS_JUMP + 2],
+                &[0xFF, 0x25]
+            );
+        }
+    }
+
+    #[test]
+    fn describe_reports_the_relocations_of_a_installed_hook() {
+        let hook = Hook {
+            target: 0x6ffe_0000,
+            tramp: 0x6ff0_0000,
+            copied: 13,
+            note: "call-rel32+5->0x6ffe3b020(+0x3b020)".to_string(),
+            insns: 3,
+            relocs: 1,
+            mode: 1,
+        };
+        let line = hook.describe();
+        assert!(line.contains("prologue=13B/3 insn"), "{line}");
+        assert!(line.contains("reloc=1/3"), "{line}");
+        assert!(line.contains("call-rel32+5->"), "{line}");
+        assert!(line.contains("tramp=0x6ff00000"), "{line}");
+
+        let reused = Hook {
+            copied: 0,
+            insns: 0,
+            relocs: 0,
+            mode: 2,
+            note: String::new(),
+            target: 0x1000,
+            tramp: 0x2000,
+        };
+        assert!(
+            reused.describe().contains("reused"),
+            "{}",
+            reused.describe()
+        );
+    }
+
+    #[test]
+    fn lea_rip_relative_in_prologue_is_retargeted() {
+        // `lea rcx,[rip+0x400] ; mov eax,[rip+0x100] ; ret`
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let mut code = [0xCCu8; 17];
+        code[0..3].copy_from_slice(&[0x48, 0x8D, 0x0D]);
+        code[3..7].copy_from_slice(&0x400i32.to_le_bytes());
+        code[7..9].copy_from_slice(&[0x8B, 0x05]);
+        code[9..13].copy_from_slice(&0x100i32.to_le_bytes());
+        code[13] = 0xC3;
+
+        let built = build_trampoline(&mut page, base, &code, 14).expect("relocate");
+        assert!(built.note.starts_with("rip-rel+0"), "{}", built.note);
+        assert!(built.note.contains("rip-rel+7"), "{}", built.note);
+        let lea = i32::from_le_bytes(page[3..7].try_into().unwrap());
+        assert_eq!(
+            (page_addr + 7) as i64 + i64::from(lea),
+            (base + 7 + 0x400) as i64
+        );
+        let mov = i32::from_le_bytes(page[9..13].try_into().unwrap());
+        assert_eq!(
+            (page_addr + 13) as i64 + i64::from(mov),
+            (base + 13 + 0x100) as i64
+        );
+    }
+
+    #[test]
+    fn every_relocation_is_reported_not_just_the_first() {
+        // `mov eax,0x28 ; call rel32 ; lea rdx,[rip+x] ; ret`
+        let mut page = [0u8; 4096];
+        let page_addr = page.as_ptr() as usize;
+        let base = page_addr + 0x800;
+        let callee = base + 0x100;
+        let mut code = [0xCCu8; 19];
+        code[0..5].copy_from_slice(&[0xB8, 0x28, 0x00, 0x00, 0x00]);
+        code[5] = 0xE8;
+        code[6..10].copy_from_slice(&((callee as i64 - (base + 10) as i64) as i32).to_le_bytes());
+        code[10..13].copy_from_slice(&[0x48, 0x8D, 0x15]);
+        code[13..17].copy_from_slice(&0x200i32.to_le_bytes());
+        code[17] = 0xC3;
+
+        let built = build_trampoline(&mut page, base, &code, 18).expect("relocate");
+        assert!(built.note.contains("call-rel32+5"), "{}", built.note);
+        assert!(built.note.contains("rip-rel+10"), "{}", built.note);
+        assert_eq!(built.insns, 4);
+        assert_eq!(built.relocs.len(), 2);
+    }
+
+    #[test]
+    fn prologue_len_never_splits_an_instruction() {
+        // 12 bytes fall inside `sub rsp,0x28` (bytes 10..14) — the span must
+        // round up to the whole instruction, never to 12.
+        let chkstk = [
+            0xB8, 0x28, 0x00, 0x00, 0x00, // mov eax,0x28
+            0xE8, 0x10, 0x00, 0x00, 0x00, // call rel32
+            0x48, 0x83, 0xEC, 0x28, // sub rsp,0x28
+        ];
+        assert_eq!(prologue_len(&chkstk), Some(14));
+        // A truncated instruction at the end of the snapshot is not accepted.
+        assert_eq!(prologue_len(&chkstk[..12]), None);
+    }
+
+    #[test]
+    fn group3_registers_without_an_immediate_decode_short() {
+        assert_eq!(decode(&[0x48, 0xF7, 0xD8]).map(|i| i.len), Some(3)); // neg rax
+        assert_eq!(
+            decode(&[0x48, 0xF7, 0xC1, 1, 0, 0, 0]).map(|i| i.len),
+            Some(7),
+            "test rcx, 1 keeps its imm32"
+        );
+        assert_eq!(decode(&[0xF6, 0xD3]).map(|i| i.len), Some(2)); // not bl
     }
 
     #[test]

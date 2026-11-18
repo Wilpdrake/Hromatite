@@ -17,13 +17,12 @@ pub enum Selector {
     Address(usize),
 }
 
-/// Chosen from the live candidate list for GameAssembly
-/// `648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b`.
+/// Chosen from the live candidate list for the supported GameAssembly build
+/// (see [`crate::gamebuild::SUPPORTED_SHA256`]).
 /// Its index is only a materialisation hint; resolution always re-checks the name.
 pub const AUTO_CLASS: &str = "VRC.Udon.UdonManager";
 pub const AUTO_TYPE_INDEX: usize = 34_575;
-pub const AUTO_BUILD_SHA256: &str =
-    "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b";
+pub const AUTO_BUILD_SHA256: &str = crate::gamebuild::SUPPORTED_SHA256;
 const AUTO_SCAN_LIMIT: usize = 120_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +58,11 @@ pub fn parse_selector(text: &str) -> Option<Selector> {
     })
 }
 
-pub fn candidate_from_methods(index: usize, class: usize, methods: &[m3::Method]) -> Option<Candidate> {
+pub fn candidate_from_methods(
+    index: usize,
+    class: usize,
+    methods: &[m3::Method],
+) -> Option<Candidate> {
     methods
         .iter()
         .find(|m| {
@@ -118,11 +121,10 @@ pub fn resolve(selector: Selector) -> Option<Candidate> {
             m3::methods,
             m3::class_full_name,
         ),
-        Selector::Index(index) => resolve_with(selector, m3::class_at, m3::methods)
-            .or_else(|| {
-                log::log_tag("late", &format!("class index {index} is not materialised"));
-                None
-            }),
+        Selector::Index(index) => resolve_with(selector, m3::class_at, m3::methods).or_else(|| {
+            log::log_tag("late", &format!("class index {index} is not materialised"));
+            None
+        }),
         Selector::Address(_) => resolve_with(selector, Some, m3::methods),
     }
 }
@@ -191,7 +193,10 @@ mod tests {
         assert_eq!(parse_selector("auto"), Some(Selector::Auto));
         assert_eq!(parse_selector(" AUTO "), Some(Selector::Auto));
         assert_eq!(parse_selector("#21033"), Some(Selector::Index(21033)));
-        assert_eq!(parse_selector("0x30344d10"), Some(Selector::Address(0x30344d10)));
+        assert_eq!(
+            parse_selector("0x30344d10"),
+            Some(Selector::Address(0x30344d10))
+        );
         assert_eq!(parse_selector("21033"), Some(Selector::Address(21033)));
         assert_eq!(parse_selector(""), None);
         assert_eq!(parse_selector("#"), None);
@@ -217,24 +222,30 @@ mod tests {
     #[test]
     fn auto_resolver_rejects_duplicates_and_never_picks_an_arbitrary_candidate() {
         let duplicate_classes = vec![(1, 0x1000), (2, 0x2000)];
-        assert!(auto_candidate_from(
-            duplicate_classes,
-            |class| vec![method("LateUpdate", class + 0x100)],
-            |_| AUTO_CLASS.to_string(),
-        )
-        .is_none());
-        assert!(auto_candidate_from(
-            vec![(3, 0x3000)],
-            |class| vec![method("LateUpdate", class + 0x100)],
-            |_| "Other.Class".to_string(),
-        )
-        .is_none());
-        assert!(auto_candidate_from(
-            vec![(1, 0x1000)],
-            |_| vec![method("Update", 0x1100)],
-            |_| AUTO_CLASS.to_string(),
-        )
-        .is_none());
+        assert!(
+            auto_candidate_from(
+                duplicate_classes,
+                |class| vec![method("LateUpdate", class + 0x100)],
+                |_| AUTO_CLASS.to_string(),
+            )
+            .is_none()
+        );
+        assert!(
+            auto_candidate_from(
+                vec![(3, 0x3000)],
+                |class| vec![method("LateUpdate", class + 0x100)],
+                |_| "Other.Class".to_string(),
+            )
+            .is_none()
+        );
+        assert!(
+            auto_candidate_from(
+                vec![(1, 0x1000)],
+                |_| vec![method("Update", 0x1100)],
+                |_| AUTO_CLASS.to_string(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -260,7 +271,9 @@ mod tests {
                 parameters_count,
                 flags,
             };
-            assert!(candidate_from_methods(4, 0x4444, std::slice::from_ref(&unsupported)).is_none());
+            assert!(
+                candidate_from_methods(4, 0x4444, std::slice::from_ref(&unsupported)).is_none()
+            );
         }
     }
 
@@ -322,14 +335,10 @@ mod tests {
         assert_eq!(calls, 3);
 
         let mut failed_calls = 0;
-        let expired = retry_for(
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            |_| {
-                failed_calls += 1;
-                None::<()>
-            },
-        );
+        let expired = retry_for(std::time::Duration::ZERO, std::time::Duration::ZERO, |_| {
+            failed_calls += 1;
+            None::<()>
+        });
         assert_eq!(expired, None);
         assert_eq!(failed_calls, 1);
     }

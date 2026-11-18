@@ -365,6 +365,15 @@ pub const SPECS: &[Spec] = &[
         scope: Scope::Feature,
     },
     Spec {
+        name: "eac.module",
+        aliases: &[],
+        usage: "eac.module [pages] [read=<bytes>]",
+        summary: "locate the in-process ELF image of the anti-cheat client",
+        note: "найти ELF-образ античита в процессе",
+        risk: Risk::ReadOnly,
+        scope: Scope::Feature,
+    },
+    Spec {
         name: "eac.log",
         aliases: &[],
         usage: "eac.log <path>",

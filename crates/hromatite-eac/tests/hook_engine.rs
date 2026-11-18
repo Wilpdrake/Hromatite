@@ -98,3 +98,163 @@ fn inline_hook_redirects_calls_and_the_trampoline_preserves_the_result() {
     assert_eq!(again.mode, 2, "reused through the shared table");
     assert_eq!(again.tramp, installed.tramp);
 }
+
+// ---------------------------------------------------------------------------
+// A prologue with a `call rel32` in it (the EVP/BoringSSL `__chkstk` shape)
+// ---------------------------------------------------------------------------
+
+// `mov eax,0x28 ; call callee ; add rax,rcx ; ret` — the same 14-byte shape
+// measured live on `EVP_EncryptInit_ex`. The 12-byte patch cuts into `add`, so
+// `prologue_len` must round the copied span up to 14 and the trampoline must
+// relocate the `call` back to `callee`.
+core::arch::global_asm!(
+    r#"
+    .text
+    .globl tramp_probe
+tramp_probe:
+    mov eax, 0x28
+    call tramp_probe_callee
+    add rax, rcx
+    ret
+
+    .globl tramp_probe_callee
+tramp_probe_callee:
+    mov eax, 7
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn tramp_probe(a: u64) -> u64;
+}
+
+static PROBE_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn probe_detour(a: u64) -> u64 {
+    PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+    let trampoline = PROBE_TRAMPOLINE.load(Ordering::Acquire);
+    assert_ne!(
+        trampoline, 0,
+        "detour ran before the trampoline was published"
+    );
+    // SAFETY: the trampoline is the relocated prologue of `tramp_probe` and ends
+    // in an absolute jump back into its body, so it has the same ABI.
+    let original: unsafe extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(trampoline) };
+    // SAFETY: same ABI and same single integer argument as the interrupted call.
+    unsafe { original(a) }
+}
+
+// `test rcx,rcx ; je .zero ; mov eax,42 ; ret ; .zero: mov eax,7 ; ret` — a
+// rel8 `jcc` whose target sits *inside* the 12-byte patch window. The copy must
+// turn it into `je +14 ; jmp [rip+0] <copy+11>` and still take the branch.
+core::arch::global_asm!(
+    r#"
+    .text
+    .globl branch_probe
+branch_probe:
+    test rcx, rcx
+    je 2f
+    mov eax, 42
+    ret
+2:
+    mov eax, 7
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn branch_probe(a: u64) -> u64;
+}
+
+static BRANCH_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn branch_detour(a: u64) -> u64 {
+    let trampoline = BRANCH_TRAMPOLINE.load(Ordering::Acquire);
+    assert_ne!(
+        trampoline, 0,
+        "detour ran before the trampoline was published"
+    );
+    // SAFETY: the trampoline is the relocated prologue of `branch_probe` and
+    // ends in an absolute jump back into its body.
+    let original: unsafe extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(trampoline) };
+    // SAFETY: same ABI and same single integer argument as the interrupted call.
+    unsafe { original(a) }
+}
+
+#[test]
+fn a_rel8_jcc_pointing_into_the_patch_window_is_relocated_and_still_branches() {
+    let entry = branch_probe as *const () as usize;
+    // SAFETY: the entry is a readable 16-byte prologue of our own assembly.
+    let head = unsafe { std::slice::from_raw_parts(entry as *const u8, 16) };
+    assert_eq!(head[0..3], [0x48, 0x85, 0xC9], "test rcx,rcx");
+    assert_eq!(head[3], 0x74, "the prologue really contains a rel8 jcc");
+    // 3 + 2 + 5 + 1 + 5 = 16 bytes: the copied span reaches past the jump back.
+    assert_eq!(hook::prologue_len(head), Some(16));
+
+    // SAFETY: see above; both addresses live for the whole process.
+    let installed =
+        unsafe { hook::install(entry, branch_detour as *const () as usize, "branch_probe") }
+            .expect("install");
+    assert_eq!(installed.copied, 16);
+    assert_eq!(installed.insns, 5, "five whole instructions copied");
+    assert_eq!(installed.relocs, 1, "only the jcc moved");
+    assert!(
+        installed.note.starts_with("jcc-abs+3->"),
+        "the rel8 jcc must become an absolute one, got '{}'",
+        installed.note
+    );
+    BRANCH_TRAMPOLINE.store(installed.tramp, Ordering::Release);
+
+    // SAFETY: `branch_probe` is our own global_asm function with the declared
+    // signature; its entry now jumps to `branch_detour`, which forwards on.
+    unsafe {
+        assert_eq!(branch_probe(1), 42, "non-zero rcx falls through the jcc");
+        assert_eq!(branch_probe(0), 7, "rcx == 0 takes the relocated branch");
+    }
+}
+
+#[test]
+fn a_prologue_with_a_rel32_call_is_relocated_and_the_callee_still_runs() {
+    // SAFETY: `tramp_probe` is a real function entry in this image (global_asm
+    // above) and `probe_detour` is an `extern "C"` function of matching shape.
+    let entry = tramp_probe as *const () as usize;
+    // SAFETY: the entry is a readable 16-byte prologue of our own assembly.
+    let head = unsafe { std::slice::from_raw_parts(entry as *const u8, 16) };
+
+    // `mov eax,0x28` (5) + `call rel32` (5) + `add rax,rcx` (3) — the 12-byte
+    // patch ends inside `add rax,rcx` (bytes 10..13), so the span must round up
+    // to the whole instruction: 13, never 12.
+    assert_eq!(head[0], 0xB8, "prologue starts with mov eax, imm32");
+    assert_eq!(head[5], 0xE8, "the prologue really contains a rel32 call");
+    assert_eq!(hook::prologue_len(head), Some(13));
+
+    // SAFETY: see above; both addresses live for the whole process.
+    let installed =
+        unsafe { hook::install(entry, probe_detour as *const () as usize, "tramp_probe") }
+            .expect("install");
+    assert_eq!(installed.mode, 1);
+    assert_eq!(installed.copied, 13);
+    assert!(
+        installed.note.starts_with("call-rel32+5->"),
+        "the rel32 call must be relocated, got '{}'",
+        installed.note
+    );
+    assert_eq!(installed.insns, 3, "three copied instructions");
+    assert_eq!(installed.relocs, 1, "exactly one rewrite");
+    PROBE_TRAMPOLINE.store(installed.tramp, Ordering::Release);
+
+    // The callee returns 7; a mis-relocated `call` would land at `tramp+10+disp`
+    // inside the trampoline page and return garbage (or fault).
+    // SAFETY: `tramp_probe` is our own global_asm function with the declared
+    // signature; the entry now jumps to `probe_detour`, which forwards on.
+    unsafe {
+        assert_eq!(tramp_probe(0), 7, "original body through the trampoline");
+        assert_eq!(tramp_probe(35), 42, "the callee's value plus the argument");
+    }
+    assert_eq!(
+        PROBE_CALLS.load(Ordering::SeqCst),
+        2,
+        "both calls hit the detour"
+    );
+}

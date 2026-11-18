@@ -14,9 +14,9 @@
 //! Containers here are deliberately allocation-light: the hot paths (heap scan)
 //! call only `read_u64`/`read_bytes`.
 
-use crate::ffi::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
 #[cfg(target_os = "windows")]
 use crate::ffi::{GetCurrentProcess, ReadProcessMemory, VirtualQuery, WriteProcessMemory};
+use crate::ffi::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS};
 
 // Linux unit tests link pure-Rust modules without Win32. They exercise only
 // owned snapshots, so unsupported calls deterministically fail closed.
@@ -163,10 +163,7 @@ impl Span {
     }
 
     pub fn contains(&self, addr: usize, len: usize) -> bool {
-        addr >= self.base
-            && addr
-                .checked_add(len)
-                .is_some_and(|end| end <= self.end())
+        addr >= self.base && addr.checked_add(len).is_some_and(|end| end <= self.end())
     }
 
     fn writable(&self) -> bool {
@@ -290,7 +287,9 @@ impl ScanChunks {
         let body = remaining.min(self.window);
         let tail = self.overlap.min(remaining - body);
         self.next = self.next.saturating_add(body);
-        let ok = self.span.refresh(self.next - body, body + tail, self.protect);
+        let ok = self
+            .span
+            .refresh(self.next - body, body + tail, self.protect);
         self.failed = !ok;
         ok
     }
@@ -357,7 +356,11 @@ pub fn span_at(addr: usize) -> Option<Span> {
         if p == PAGE_NOACCESS || p == 0 || (mbi.Protect & PAGE_GUARD) != 0 {
             return None;
         }
-        Some(Span::from_parts(mbi.BaseAddress, mbi.RegionSize, mbi.Protect))
+        Some(Span::from_parts(
+            mbi.BaseAddress,
+            mbi.RegionSize,
+            mbi.Protect,
+        ))
     }
 }
 
@@ -597,7 +600,11 @@ pub fn ascii_lossy(p: usize, max: usize) -> String {
         if b == 0 {
             break;
         }
-        s.push(if (32..127).contains(&b) { b as char } else { '.' });
+        s.push(if (32..127).contains(&b) {
+            b as char
+        } else {
+            '.'
+        });
     }
     s
 }
@@ -643,7 +650,9 @@ mod tests {
     use super::*;
 
     fn fixture() -> [u8; 24] {
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]
     }
 
     fn fixture_span(bytes: &[u8]) -> Span {
@@ -669,19 +678,31 @@ mod tests {
     #[test]
     fn candidate_limit_does_not_duplicate_the_next_chunk_start() {
         let base = 0x10000usize;
-        let mut chunks = ScanChunks::new(base, 64 * 1024 + 32, crate::ffi::PAGE_READONLY, 64 * 1024, 4);
+        let mut chunks = ScanChunks::new(
+            base,
+            64 * 1024 + 32,
+            crate::ffi::PAGE_READONLY,
+            64 * 1024,
+            4,
+        );
         // Position the cursor exactly after the first logical body, as
         // next_chunk() leaves it. The extra four bytes are lookahead only.
         chunks.next = base + 64 * 1024;
         let last = chunks.candidate_end().saturating_sub(4);
-        assert!(base + 64 * 1024 > last, "a match at the next chunk base would duplicate");
+        assert!(
+            base + 64 * 1024 > last,
+            "a match at the next chunk base would duplicate"
+        );
         assert_eq!(last, base + 64 * 1024 - 4);
     }
 
     #[test]
     fn refresh_failure_is_reported_not_confused_with_end_of_scan() {
         let mut chunks = ScanChunks::new(1, 4096, crate::ffi::PAGE_READONLY, 64, 0);
-        assert!(!chunks.next_chunk(), "address 1 must not be treated as a valid region");
+        assert!(
+            !chunks.next_chunk(),
+            "address 1 must not be treated as a valid region"
+        );
         assert!(chunks.failed());
     }
 

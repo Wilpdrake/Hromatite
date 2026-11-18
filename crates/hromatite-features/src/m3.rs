@@ -208,6 +208,8 @@ impl<'a> Metadata<'a> {
             Some(array) if array >= 0x10000 && self.host.read_u8(array).is_some() => array,
             _ => return out,
         };
+        // The `MethodInfo**` array is not NULL-terminated, so the walk is bounded
+        // structurally: a zero/unmapped slot or an empty name ends it.
         for index in 0..4096 {
             let info = match self.host.read_usize(array + index * 8) {
                 Some(info) => info,

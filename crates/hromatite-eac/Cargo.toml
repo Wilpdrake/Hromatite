@@ -8,5 +8,10 @@ description = "EAC/EOS anti-cheat session, heartbeat codec and JSONL event log (
 name = "hromatite_eac"
 path = "src/lib.rs"
 
+[dependencies]
+# In-repo only (no external crates): the m3 probe reads il2cpp structures
+# through the same safe readers the rest of the payload uses.
+hromatite-core = { path = "../hromatite-core" }
+
 [lints]
 workspace = true
