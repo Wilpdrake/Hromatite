@@ -1732,17 +1732,17 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
     let Some(corlib) = crate::il2cpp::find_domain() else {
         return false;
     };
-    let Some(image) = crate::m3::image_of(corlib, "Assembly-CSharp") else {
-        return false;
-    };
     // A pinned type index describes one metadata build. When the game update
-    // moved it, ask il2cpp by name — one call instead of walking up to 120k
-    // classes through image_get_class.
+    // moved it, ask il2cpp by name — one call per image, and the image that owns
+    // the class is the only one that answers.
     if matches!(selector, Selector::Auto)
         && crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256
     {
-        return materialise_by_name(image);
+        return materialise_by_name(corlib);
     }
+    let Some(image) = crate::m3::image_of(corlib, "Assembly-CSharp") else {
+        return false;
+    };
     let Some(f) = crate::m3::image_get_class_addr() else {
         return false;
     };
@@ -1764,9 +1764,10 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
 
 /// `il2cpp_class_from_name(image, namespace, name)` for the auto target.
 ///
-/// The two C strings live in static storage: the runtime keeps the pointers it
-/// was given, so stack buffers would dangle.
-fn materialise_by_name(image: usize) -> bool {
+/// The class belongs to an assembly the caller does not know (a namespace is not
+/// an image name), so every image is asked until one answers. The two C strings
+/// live in static storage: the runtime keeps the pointers it was given.
+fn materialise_by_name(corlib_image: usize) -> bool {
     use std::sync::OnceLock;
     static NAMES: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     let Some(function) = crate::m3::class_from_name_addr() else {
@@ -1783,20 +1784,26 @@ fn materialise_by_name(image: usize) -> bool {
         class.push(0);
         (ns, class)
     });
-    // SAFETY: f is the build-measured il2cpp_class_from_name; the two pointers
-    // are NUL-terminated and outlive the process.
-    let class = unsafe {
-        crate::veh::call3(
-            function,
-            image,
-            namespace.as_ptr() as usize,
-            name.as_ptr() as usize,
-        )
+    for image in crate::m3::images(corlib_image, 512) {
+        // SAFETY: f is the build-measured il2cpp_class_from_name; both pointers
+        // are NUL-terminated and outlive the process.
+        let class = unsafe {
+            crate::veh::call3(
+                function,
+                image,
+                namespace.as_ptr() as usize,
+                name.as_ptr() as usize,
+            )
+        }
+        .unwrap_or(0);
+        if class >= 0x10000
+            && crate::safe::readable_at(class)
+            && crate::lateupdate::resolve(crate::lateupdate::Selector::Auto).is_some()
+        {
+            return true;
+        }
     }
-    .unwrap_or(0);
-    class >= 0x10000
-        && crate::safe::readable_at(class)
-        && crate::lateupdate::resolve(crate::lateupdate::Selector::Auto).is_some()
+    false
 }
 
 fn env_flag(name: &str) -> bool {

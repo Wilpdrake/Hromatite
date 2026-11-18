@@ -416,6 +416,42 @@ pub fn image_of_with(corlib_image: usize, assembly: &str, layout: &Layout) -> Op
     scan(true).or_else(|| scan(false))
 }
 
+/// Every image record around `corlib_image`, nearest first, in both directions.
+///
+/// `il2cpp_class_from_name` answers only for the image that owns the class, so a
+/// caller that knows the namespace but not the assembly walks this list.
+pub fn images(corlib_image: usize, max: usize) -> Vec<usize> {
+    let Some(layout) = layout() else {
+        return Vec::new();
+    };
+    let stride = i64::from(layout.image_stride);
+    if stride <= 0 {
+        return Vec::new();
+    }
+    let name_offset = layout.image_name as usize;
+    let mut out = Vec::new();
+    for step in 0i64..max as i64 {
+        for sign in [1i64, -1] {
+            if step == 0 && sign < 0 {
+                continue;
+            }
+            let Some(img) = corlib_image.checked_add_signed((step * sign * stride) as isize) else {
+                continue;
+            };
+            if safe::read_usize(img + name_offset)
+                .and_then(name_at)
+                .is_some_and(|name| !name.is_empty())
+            {
+                out.push(img);
+            }
+        }
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{field_offset, method_return_kind_with};

@@ -193,7 +193,7 @@ pub const BUILD_245768F2: Build = Build {
         class_namespace: 0x18,
         class_methods: 0x58,
         class_fields: 0x88,
-        class_name: 0x98,
+        class_name: 0x10,
         class_fields_count: 0x124,
         field_stride: 0x20,
         field_name: 0x00,
@@ -210,7 +210,7 @@ pub const BUILD_245768F2: Build = Build {
         image_filename: 0x18,
     },
     verified: true,
-    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (heuristic: name+8; no function reads it in this build); image_stride: 0x50 and image_filename: 0x18 measured live on pid 1071305 (the 0x48/+0x40 layout of the previous build breaks image_of); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
+    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (measured: LateUpdate return descriptor is void); image_stride: 0x50 and image_filename: 0x18 measured live on pid 1071305; class_name: 0x10 measured on the live Il2CppClass record of VRC.Udon.UdonManager (0x98 reads 0 there, so the previous build's slot does not carry over); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
 };
 
 pub static KNOWN: &[Build] = &[
@@ -314,6 +314,8 @@ mod tests {
         assert_eq!(old.il2cpp.class_from_name, 0xc2_8050);
         assert_eq!(old.il2cpp.class_table, 0xe66_c870);
         assert_eq!(old.layout.class_parent, 0x10);
+        assert_eq!(old.layout.class_name, 0x98);
+        assert_eq!(old.layout.class_namespace, 0x18);
         assert_eq!(old.layout.class_methods, 0x50);
         assert_eq!(old.layout.class_fields, 0x80);
         assert_eq!(old.layout.field_stride, 0x28);
@@ -346,6 +348,11 @@ mod tests {
         assert_eq!(new.il2cpp.class_from_name, 0xc2_9dc0);
         assert_eq!(new.il2cpp.class_table, 0xe66_f0d0);
         assert_eq!(new.layout.class_parent, 0xa0);
+        assert_eq!(
+            new.layout.class_name, 0x10,
+            "measured live on the VRC.Udon.UdonManager class record"
+        );
+        assert_eq!(new.layout.class_namespace, 0x18);
         assert_eq!(new.layout.class_methods, 0x58);
         assert_eq!(new.layout.class_fields, 0x88);
         assert_eq!(new.layout.field_stride, 0x20);
@@ -364,14 +371,22 @@ mod tests {
     fn struct_offsets_are_word_aligned_and_ordered() {
         for build in KNOWN {
             let l = &build.layout;
-            assert_eq!(l.class_namespace % 8, 0);
-            assert!(l.class_fields < l.class_name);
+            // Slot order is *not* a property of a build: 245768f2 keeps the name
+            // at +0x10, before the fields pointer at +0x88. Only alignment and
+            // the internal record layout are invariants.
+            assert_eq!(l.class_namespace % 8, 0, "namespace must be word aligned");
+            assert_eq!(l.class_name % 8, 0, "name must be word aligned");
+            assert_eq!(l.class_parent % 8, 0, "parent must be word aligned");
+            assert_ne!(l.class_name, l.class_namespace);
             assert_ne!(l.class_name, l.class_parent);
+            assert_ne!(l.class_fields, l.class_methods);
             assert!(l.field_stride >= 0x20);
             assert!(l.field_name < l.field_stride && l.field_type < l.field_stride);
             assert!(l.field_offset < l.field_stride);
             assert!(l.method_name < l.method_return_type);
             assert!(l.method_return_type < l.method_parameters);
+            assert!(l.image_stride >= 0x40, "image records are not tiny");
+            assert!(l.image_name < l.image_stride);
         }
     }
 }
