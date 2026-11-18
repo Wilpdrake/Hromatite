@@ -692,6 +692,108 @@ fn parse_size(value: &str) -> Option<usize> {
         .and_then(|number| number.checked_mul(factor))
 }
 
+// ---------------------------------------------------------------- unix view
+//
+// The anti-cheat client image is mapped into this process by *native* code
+// (`dlopen` of a `/memfd:` file by the launcher), not by Wine: `VirtualQuery`
+// reports the whole span as unmapped and `ReadProcessMemory` cannot touch it.
+// The Linux view of our own address space is the only way to name it, and Wine
+// exposes that view at `\\?\unix\...` — verified live 2026-11-18: the payload
+// read `\\?\unix\proc\self\maps` while a nonexistent path returned
+// "File not found".
+
+/// One line of `/proc/self/maps`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    /// First address of the mapping.
+    pub start: u64,
+    /// One past the last address.
+    pub end: u64,
+    /// `rwxp`-style permission string.
+    pub perms: String,
+    /// File offset the mapping starts at.
+    pub offset: u64,
+    /// Everything after the inode column (`/memfd:… (deleted)`, a path, empty).
+    pub path: String,
+}
+
+impl MapEntry {
+    /// Mapping length in bytes.
+    pub fn size(&self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// A readable, file-backed memfd mapping that starts a file.
+    ///
+    /// This is how the anti-cheat client image looks: `/memfd:<uuid> (deleted)`,
+    /// first segment `r--p` at offset 0. Anonymous regions and the `(deleted)`
+    /// tail of a PE are excluded by the `offset == 0` rule.
+    pub fn is_memfd_image(&self) -> bool {
+        self.path.contains("memfd") && self.perms.starts_with('r') && self.offset == 0
+    }
+}
+
+/// Parse the text of `/proc/self/maps`; a malformed line is skipped, never fatal.
+pub fn parse_maps(text: &str) -> Vec<MapEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(range) = fields.next() else { continue };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            u64::from_str_radix(start, 16),
+            u64::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        let Some(perms) = fields.next() else { continue };
+        let Some(offset) = fields.next().and_then(|o| u64::from_str_radix(o, 16).ok()) else {
+            continue;
+        };
+        // device and inode columns, then the (possibly absent) path
+        let _device = fields.next();
+        let _inode = fields.next();
+        let path = fields.collect::<Vec<_>>().join(" ");
+        out.push(MapEntry {
+            start,
+            end,
+            perms: perms.to_string(),
+            offset,
+            path,
+        });
+    }
+    out
+}
+
+/// Bases of memfd-backed images, ascending and deduplicated.
+pub fn memfd_bases(maps: &[MapEntry]) -> Vec<u64> {
+    let mut bases: Vec<u64> = maps
+        .iter()
+        .filter(|m| m.is_memfd_image())
+        .map(|m| m.start)
+        .collect();
+    bases.sort_unstable();
+    bases.dedup();
+    bases
+}
+
+/// `(first, last)` addresses of every mapping that shares the memfd path of the
+/// mapping starting at `base` — the image's real span, not one segment.
+pub fn image_span(maps: &[MapEntry], base: u64) -> (u64, u64) {
+    let Some(first) = maps.iter().find(|m| m.start == base) else {
+        return (base, base);
+    };
+    let mut lo = first.start;
+    let mut hi = first.end;
+    for map in maps.iter().filter(|m| m.path == first.path) {
+        lo = lo.min(map.start);
+        hi = hi.max(map.end);
+    }
+    (lo, hi)
+}
+
 #[cfg(windows)]
 mod live {
     use super::*;
@@ -922,13 +1024,359 @@ mod live {
     }
 }
 
+
+    // ----------------------------------------------------- the unix view
+
+    /// `/proc/self/maps` of *this* process, through the Wine unix namespace.
+    const UNIX_MAPS: &str = r"\\?\unix\proc\self\maps";
+    /// The same process's memory as a seekable file.
+    const UNIX_MEM: &str = r"\\?\unix\proc\self\mem";
+
+    /// [`ReadAt`] over `/proc/self/mem`, with a byte budget.
+    ///
+    /// `/proc/self/mem` answers at *virtual* offsets, so `base + offset` names
+    /// the same byte the payload would read with `safe::*` — if the mapping were
+    /// visible to `VirtualQuery`, which the memfd image is not.
+    pub struct UnixMemRead {
+        file: std::fs::File,
+        base: u64,
+        budget: usize,
+        spent: usize,
+    }
+
+    impl UnixMemRead {
+        /// Open `/proc/self/mem` and anchor it at `base`.
+        pub fn open(base: u64, budget: usize) -> Option<Self> {
+            let file = std::fs::File::open(UNIX_MEM).ok()?;
+            Some(Self {
+                file,
+                base,
+                budget,
+                spent: 0,
+            })
+        }
+
+        /// Bytes copied out of the image by this reader.
+        pub fn spent(&self) -> usize {
+            self.spent
+        }
+    }
+
+    impl ReadAt for UnixMemRead {
+        fn read_at(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            if self.spent.checked_add(len)? > self.budget {
+                return None;
+            }
+            let at = self.base.checked_add(offset)?;
+            self.file.seek(SeekFrom::Start(at)).ok()?;
+            let mut buffer = vec![0u8; len];
+            self.file.read_exact(&mut buffer).ok()?;
+            self.spent += len;
+            Some(buffer)
+        }
+    }
+
+    /// Locate memfd images through the Linux view and describe them.
+    ///
+    /// Costs one small file read plus a 64-byte probe per candidate; nothing is
+    /// walked page by page, and no budget can be exceeded.
+    pub fn locate_unix(probe: &Probe) -> Vec<String> {
+        let text = match std::fs::read_to_string(UNIX_MAPS) {
+            Ok(text) => text,
+            Err(error) => {
+                return vec![format!("eac.module: cannot read {UNIX_MAPS}: {error}")];
+            }
+        };
+        let maps = parse_maps(&text);
+        let mut lines = vec![format!(
+            "eac.module: unix view: {} mapping(s) in /proc/self/maps, {} bytes",
+            maps.len(),
+            text.len()
+        )];
+        if let Some(first) = maps.first() {
+            lines.push(format!(
+                "eac.module: unix view: first=0x{:x} {} perms={} path={}",
+                first.start,
+                first.size(),
+                first.perms,
+                if first.path.is_empty() {
+                    "<anon>"
+                } else {
+                    &first.path
+                }
+            ));
+        }
+        let mut found = 0usize;
+        for base in memfd_bases(&maps) {
+            let Some(mut reader) = UnixMemRead::open(base, probe.read_bytes) else {
+                lines.push("eac.module: cannot open /proc/self/mem".to_string());
+                break;
+            };
+            let Some(head) = reader.read_at(0, MAGIC.len()) else {
+                continue;
+            };
+            if head != MAGIC {
+                continue;
+            }
+            found += 1;
+            let (lo, hi) = image_span(&maps, base);
+            let segments: Vec<String> = maps
+                .iter()
+                .filter(|m| m.start >= lo && m.end <= hi)
+                .map(|m| format!("{}+0x{:x}({})", m.perms, m.size(), m.offset))
+                .collect();
+            lines.push(format!(
+                "eac.module: unix ELF image at 0x{base:x} span=0x{:x} (0x{lo:x}..0x{hi:x}) \
+                 segments={}",
+                hi.saturating_sub(lo),
+                segments.join(" ")
+            ));
+            let result = describe(&mut reader, probe.import_limit);
+            lines.push(format!(
+                "eac.module: snapshot budget {} B, copied {} B",
+                probe.read_bytes,
+                reader.spent()
+            ));
+            match result {
+                Ok(summary) => lines.extend(summary.lines()),
+                Err(error) => lines.push(format!("eac.module: parse failed: {error}")),
+            }
+            if found >= 2 {
+                break;
+            }
+        }
+        if found == 0 {
+            lines.push("eac.module: unix view: no memfd ELF image".to_string());
+        }
+        lines
+    }
+
+
+// ----------------------------------------------------- the native view
+//
+// Measured live 2026-11-18: in Wine a `\\?\unix\proc\self\...` path is opened by
+// the *wineserver*, so `self` names wineserver (111 mappings, first one
+// `.../bin/wineserver`), not the game. The game's own Linux pid has to be found
+// by name; its `maps` is world-readable, and the memfd image it names is
+// readable by a plain load even though `VirtualQuery` reports it unmapped —
+// Wine simply does not track mappings that native code created.
+
+/// `/proc` of the host namespace, as seen through Wine.
+const UNIX_PROC: &str = r"\\?\unix\proc";
+
+/// The Linux pid of `VRChat.exe`, found by reading `cmdline` of `/proc/<pid>`.
+pub fn find_process_pid() -> Option<u32> {
+    let entries = std::fs::read_dir(UNIX_PROC).ok()?;
+    for (index, entry) in entries.flatten().enumerate() {
+        if index > 4096 {
+            break;
+        }
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("{UNIX_PROC}/{pid}/cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|arg| arg.ends_with(b"VRChat.exe"))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// `maps` text of one pid.
+pub fn maps_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("{UNIX_PROC}/{pid}/maps")).ok()
+}
+
+/// One mapped file segment of the image: `offset` in the file, `size` bytes,
+/// at `address` in our address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// File offset the segment starts at.
+    pub offset: u64,
+    /// Segment length in bytes.
+    pub size: u64,
+    /// Address the segment is mapped at.
+    pub address: u64,
+}
+
+/// Translation table from `maps` entries that belong to one image.
+///
+/// ELF offsets handed to [`ReadAt`] are *file* offsets (the header and program
+/// headers are addressed that way), and the loader maps the last segment at a
+/// different `p_vaddr` than its `p_offset` — for the live EAC image the program
+/// headers live at file offset `0x655258` but at address `base + 0x65e258`.
+/// Only `maps` knows the difference.
+pub fn segments_of(maps: &[MapEntry], base: u64) -> Vec<Segment> {
+    let Some(first) = maps.iter().find(|m| m.start == base) else {
+        return Vec::new();
+    };
+    let mut segments: Vec<Segment> = maps
+        .iter()
+        .filter(|m| m.path == first.path)
+        .map(|m| Segment {
+            offset: m.offset,
+            size: m.size(),
+            address: m.start,
+        })
+        .collect();
+    segments.sort_by_key(|segment| segment.offset);
+    segments
+}
+
+/// [`ReadAt`] over raw addresses of our own process, bounded by the segments.
+///
+/// The segments come from `/proc/<pid>/maps`, so every read is inside a mapping
+/// the kernel reports; the VEH guard turns a stale mapping into `None` instead
+/// of a dead game.
+pub struct NativeMemRead {
+    segments: Vec<Segment>,
+    budget: usize,
+    spent: usize,
+}
+
+impl NativeMemRead {
+    /// Reader over the image whose segments are `segments`.
+    pub fn new(segments: Vec<Segment>, budget: usize) -> Self {
+        Self {
+            segments,
+            budget,
+            spent: 0,
+        }
+    }
+
+    /// Bytes copied out of the image by this reader.
+    pub fn spent(&self) -> usize {
+        self.spent
+    }
+
+    /// Address of a file offset, when a mapped segment contains all of `[offset, offset+len)`.
+    fn address_of(&self, offset: u64, len: u64) -> Option<u64> {
+        let end = offset.checked_add(len)?;
+        self.segments.iter().find_map(|segment| {
+            let segment_end = segment.offset.checked_add(segment.size)?;
+            (segment.offset <= offset && end <= segment_end)
+                .then(|| segment.address.checked_add(offset - segment.offset))
+                .flatten()
+        })
+    }
+}
+
+impl ReadAt for NativeMemRead {
+    fn read_at(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        let at = self.address_of(offset, u64::try_from(len).ok()?)?;
+        if self.spent.checked_add(len)? > self.budget {
+            return None;
+        }
+        let mut buffer = vec![0u8; len];
+        let result = hromatite_core::veh::call_with(|| {
+            // SAFETY: `at` comes from a `maps` entry of this process and `len`
+            // stays inside that mapping; the vectored handler converts a fault
+            // into `Err` instead of killing the game.
+            unsafe {
+                core::ptr::copy_nonoverlapping(at as *const u8, buffer.as_mut_ptr(), len);
+            }
+        });
+        if result.is_err() {
+            return None;
+        }
+        self.spent += len;
+        Some(buffer)
+    }
+}
+
+/// Locate the memfd image through `maps` + direct reads, and describe it.
+pub fn locate_native(probe: &Probe) -> Vec<String> {
+    let Some(pid) = find_process_pid() else {
+        return vec!["eac.module: VRChat.exe not found in /proc (wine unix view)".to_string()];
+    };
+    let Some(text) = maps_of(pid) else {
+        return vec![format!("eac.module: cannot read /proc/{pid}/maps")];
+    };
+    let maps = parse_maps(&text);
+    let bases = memfd_bases(&maps);
+    let mut lines = vec![format!(
+        "eac.module: pid {pid}, {} mapping(s), {} memfd candidate(s)",
+        maps.len(),
+        bases.len()
+    )];
+    let mut found = 0usize;
+    for base in bases {
+        let (lo, hi) = image_span(&maps, base);
+        let segments_of_image = segments_of(&maps, base);
+        let mut reader = NativeMemRead::new(segments_of_image.clone(), probe.read_bytes);
+        let Some(head) = reader.read_at(0, MAGIC.len()) else {
+            lines.push(format!("eac.module: 0x{base:x}: not readable"));
+            continue;
+        };
+        if head != MAGIC {
+            continue;
+        }
+        found += 1;
+        let segments: Vec<String> = maps
+            .iter()
+            .filter(|m| m.start >= lo && m.end <= hi)
+            .map(|m| format!("{}+0x{:x}({})", m.perms, m.size(), m.offset))
+            .collect();
+        let file_map: Vec<String> = segments_of_image
+            .iter()
+            .map(|segment| format!("file 0x{:x} -> 0x{:x}", segment.offset, segment.address))
+            .collect();
+        lines.push(format!(
+            "eac.module: native ELF image at 0x{base:x} span=0x{:x} (0x{lo:x}..0x{hi:x}) segments={}",
+            hi.saturating_sub(lo),
+            segments.join(" ")
+        ));
+        lines.push(format!(
+            "eac.module: file mapping: {}",
+            file_map.join(", ")
+        ));
+        let result = describe(&mut reader, probe.import_limit);
+        lines.push(format!(
+            "eac.module: snapshot budget {} B, copied {} B",
+            probe.read_bytes,
+            reader.spent()
+        ));
+        match result {
+            Ok(summary) => lines.extend(summary.lines()),
+            Err(error) => lines.push(format!("eac.module: parse failed: {error}")),
+        }
+        if found >= 2 {
+            break;
+        }
+    }
+    if found == 0 {
+        lines.push("eac.module: no readable memfd ELF image in our own maps".to_string());
+    }
+    lines
+}
+
 /// `eac.module [pages] [read=<bytes>] [imports=<n>]`: locate the in-process
 /// ELF image(s) and describe them. Read-only; never writes a byte.
 pub fn command(arg: &str) -> Vec<String> {
     let probe = Probe::parse(arg);
     #[cfg(windows)]
     {
-        live::probe_command(&probe)
+        // `win` = the Windows view (VirtualQuery, blind to native mappings);
+        // `self` = the `proc/self` view (which names the wineserver, see above);
+        // default = pid + `maps` + direct reads, the only view that finds it.
+        if arg.split_whitespace().any(|token| token == "win") {
+            return live::probe_command(&probe);
+        }
+        if arg.split_whitespace().any(|token| token == "self") {
+            return locate_unix(&probe);
+        }
+        let mut lines = locate_native(&probe);
+        if !lines.iter().any(|line| line.contains("native ELF image")) {
+            lines.push("eac.module: falling back to the Windows view (VirtualQuery)".to_string());
+            lines.extend(live::probe_command(&probe));
+        }
+        lines
     }
     #[cfg(not(windows))]
     {
@@ -1151,5 +1599,60 @@ mod tests {
             "---",
             "PAGE_NOACCESS is no access at all"
         );
+    }
+
+    #[test]
+    fn proc_maps_parser_names_the_memfd_image() {
+        // Two lines taken verbatim from the live game process (2026-11-18).
+        let text = "7c4eb05a0000-7c4eb05a1000 rw-p 0011f000 00:01 281203 /wine/x86_64-unix/ntdll.so\n\
+                    7c4eb05a1000-7c4eb05c1000 r--p 00000000 00:01 281203 /memfd:b2e3ac3c-c96e-1f40-9a39 (deleted)\n\
+                    7c4eb05c1000-7c4eb0704000 r-xp 00020000 00:01 281203 /memfd:b2e3ac3c-c96e-1f40-9a39 (deleted)\n\
+                    7c4eb07b9000-7c4eb07bb000 rw-p 00217000 00:01 281203 /memfd:b2e3ac3c-c96e-1f40-9a39 (deleted)\n\
+                    100000000-104000000 rw-p 00000000 00:00 0";
+        let maps = parse_maps(text);
+        assert_eq!(maps.len(), 5);
+        assert_eq!(memfd_bases(&maps), vec![0x7c4eb05a1000], "only offset 0 starts a file");
+        let (lo, hi) = image_span(&maps, 0x7c4eb05a1000);
+        assert_eq!(lo, 0x7c4eb05a1000);
+        assert_eq!(hi, 0x7c4eb07bb000, "the rw-p tail belongs to the same image");
+        assert_eq!(hi - lo, 0x21a000);
+        assert!(!maps[0].is_memfd_image(), "an ELF .so of Wine is not a memfd image");
+        assert!(!maps[4].is_memfd_image(), "an anonymous region has no path");
+    }
+
+    #[test]
+    fn malformed_maps_lines_are_skipped_not_fatal() {
+        let maps = parse_maps("garbage\n7c4e-zzzz r-xp 0 0:0 0 x\n7c4e0000-7c4e1000 r--p 00000000 00:01 1 /memfd:abc (deleted)\n");
+        assert_eq!(maps.len(), 1, "only the well-formed line survives");
+        assert_eq!(maps[0].size(), 0x1000);
+        assert_eq!(memfd_bases(&maps), vec![0x7c4e0000]);
+        assert_eq!(image_span(&maps, 0xdead), (0xdead, 0xdead), "unknown base is empty");
+    }
+
+    #[test]
+    fn segment_table_translates_file_offsets_the_way_the_loader_mapped_them() {
+        // Live lines (2026-11-18): the last LOAD has p_offset 0x219000 but
+        // p_vaddr 0x222000, and the program headers live at file offset 0x655258.
+        let text = "7c4eb05a1000-7c4eb05c1000 r--p 00000000 00:01 1 /memfd:x (deleted)\n\
+                    7c4eb05c1000-7c4eb0704000 r-xp 00020000 00:01 1 /memfd:x (deleted)\n\
+                    7c4eb07c3000-7c4ec0000000 r-xp 00219000 00:01 1 /memfd:x (deleted)";
+        let maps = parse_maps(text);
+        let base = 0x7c4eb05a1000u64;
+        let segments = segments_of(&maps, base);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2].offset, 0x219000);
+        assert_eq!(segments[2].address, 0x7c4eb07c3000, "p_vaddr, not p_offset");
+        let reader = NativeMemRead::new(segments, 4096);
+        assert_eq!(
+            reader.address_of(0x655258, 56),
+            Some(0x7c4eb07c3000 + (0x655258 - 0x219000)),
+            "the program headers are addressed by file offset, mapped at p_vaddr"
+        );
+        assert_eq!(
+            reader.address_of(0x2186c0, 64),
+            None,
+            "section headers fall in an unmapped gap between two LOAD segments"
+        );
+        assert_eq!(reader.address_of(0x1000, 0x100), Some(base + 0x1000));
     }
 }
