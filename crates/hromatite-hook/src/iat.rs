@@ -1,25 +1,4 @@
 //! Import-address-table (IAT) hooks of the *calling* modules.
-//!
-//! An inline hook on an exported entry only wins if it is installed before the
-//! game resolves that symbol: VRChat registers its `AddNotifyMessageToServer`
-//! callback ~20 s into the session and then keeps calling through the pointer it
-//! cached, so an export patch that lands later is never invoked (0 outbound
-//! frames, a 0-byte capture). Rewriting the **caller's** IAT slot is immune to
-//! that caching — the loader-resolved address lives in the caller's image and
-//! every call re-reads it.
-//!
-//! The module has two layers on purpose:
-//!
-//! * a pure PE reader over a [`Reader`] abstraction — descriptors, thunk arrays
-//!   and export ordinals are parsed from a `(base, size)` pair plus byte reads,
-//!   so the whole walk is unit-tested on the host against a synthetic image;
-//! * the live layer, which locates a loaded module, flips the slot's page to
-//!   `PAGE_READWRITE` (Wine maps IAT pages read-only) and writes the detour.
-//!
-//! Headers of other modules are *not* erased (they are the loader's own
-//! mapping), so the in-memory descriptors are the authoritative source; every
-//! access still goes through `safe::read_*`, because a stale or partially
-//! mapped image must never raise an access violation inside `DllMain`.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -41,10 +20,6 @@ const MAX_NAME: usize = 128;
 // --------------------------------------------------------------- reader layer
 
 /// Byte access to a foreign (or synthetic) image.
-///
-/// Reads are exact: `read(addr, len)` returns `Some` only when all `len` bytes
-/// are readable. Callers keep the requests small so a name never straddles an
-/// unmapped page.
 pub trait Reader {
     /// Read `len` bytes at `addr`, or `None` when the range is unreadable.
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>>;
@@ -71,8 +46,6 @@ fn usize_at<R: Reader + ?Sized>(reader: &R, addr: usize) -> Option<usize> {
     u64_at(reader, addr).map(|value| value as usize)
 }
 
-/// NUL-terminated printable ASCII at `addr`. Chunked so a name that ends near a
-/// page boundary still reads: a rejected candidate is `None`, never a panic.
 fn cstr_at<R: Reader + ?Sized>(reader: &R, addr: usize, max: usize) -> Option<String> {
     let max = max.min(MAX_NAME);
     let mut text = Vec::with_capacity(max.min(48));
@@ -93,8 +66,7 @@ fn cstr_at<R: Reader + ?Sized>(reader: &R, addr: usize, max: usize) -> Option<St
 }
 
 /// Import/export names are compared case-insensitively and without the `.dll`
-/// suffix or a directory prefix: the same module is spelled differently by
-/// different linkers (`EOSSDK-Win64-Shipping` vs `...\EOSSDK-Win64-Shipping.dll`).
+/// suffix or a directory prefix.
 pub fn same_dll(imported: &str, wanted: &str) -> bool {
     fn base_name(name: &str) -> &str {
         name.rsplit(['\\', '/']).next().unwrap_or(name).trim()
@@ -114,13 +86,9 @@ pub fn same_dll(imported: &str, wanted: &str) -> bool {
 
 // ------------------------------------------------------------ descriptors
 
-/// One `IMAGE_IMPORT_DESCRIPTOR`, reduced to the three fields we walk.
 struct Descriptor {
-    /// RVA of the NUL-terminated DLL name.
     name: u32,
-    /// RVA of the hint/name array; `0` once the loader overwrote it in place.
     original_first_thunk: u32,
-    /// RVA of the slot array the calls actually go through.
     first_thunk: u32,
 }
 
@@ -130,11 +98,7 @@ fn image_nt<R: Reader + ?Sized>(reader: &R, base: usize) -> Option<usize> {
     if u32_at(reader, nt)? != 0x0000_4550 {
         return None;
     }
-    // PE32+ has the wider optional header; both put the data directories at a
-    // fixed offset from the optional header (which starts 24 bytes into `nt`).
     let magic = u16_at(reader, nt.checked_add(24)?)?;
-    // PE32+ (`0x20B`) and PE32 (`0x10B`) differ only in the data-directory
-    // offset, handled by `data_directory`.
     (magic == 0x20B || magic == 0x10B).then_some(nt)
 }
 
@@ -173,8 +137,6 @@ fn descriptors<R: Reader + ?Sized>(reader: &R, base: usize) -> Vec<Descriptor> {
         ) else {
             break;
         };
-        // The chain ends with an all-zero descriptor; `FirstThunk == 0` alone is
-        // the loader's own "unused entry" marker.
         if name == 0 && first_thunk == 0 {
             break;
         }
@@ -196,8 +158,6 @@ pub struct OrdinalNames {
 }
 
 impl OrdinalNames {
-    /// Name of `ordinal` (a *biased* ordinal, as stored in a thunk), if the
-    /// exporter's name table mentions it.
     pub fn name(&self, ordinal: u16) -> Option<&str> {
         let index = (u32::from(ordinal)).checked_sub(self.base)? as usize;
         self.names.get(index)?.as_deref()
@@ -205,10 +165,6 @@ impl OrdinalNames {
 }
 
 /// Parse the export directory of the module at `base` into an ordinal→name map.
-///
-/// Only used to recognise an import that names no symbol (a thunk with
-/// `IMAGE_ORDINAL_FLAG64`): the exporter is loaded in the same process, so its
-/// names are available even though the caller's thunk array has none.
 pub fn exporter_ordinals<R: Reader + ?Sized>(reader: &R, base: usize) -> Option<OrdinalNames> {
     let nt = image_nt(reader, base)?;
     let export_rva = data_directory(reader, nt, 0)? as usize;
@@ -260,16 +216,12 @@ pub fn exporter_ordinals<R: Reader + ?Sized>(reader: &R, base: usize) -> Option<
 /// One IAT entry that imports the wanted symbol from the wanted DLL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slot {
-    /// Address of the 8-byte IAT entry inside the calling module.
     pub slot: usize,
-    /// Imported name, when the image still names it.
     pub name: Option<String>,
-    /// Ordinal of an ordinal import.
     pub ordinal: Option<u16>,
 }
 
 impl Slot {
-    /// Human-readable identity for logs and [`status`].
     pub fn label(&self) -> String {
         match (&self.name, self.ordinal) {
             (Some(name), _) => name.clone(),
@@ -281,19 +233,12 @@ impl Slot {
 
 /// What to look for inside one image.
 pub struct Want<'a> {
-    /// Importing DLL name (`EOSSDK-Win64-Shipping.dll`, any spelling).
     pub dll: &'a str,
-    /// Symbol name, or `#<ordinal>` for an ordinal-only match.
     pub func: &'a str,
-    /// Resolved address of the symbol, used when the thunk array holds no names
-    /// (an already bound IAT whose `OriginalFirstThunk` is zero).
     pub address: Option<usize>,
 }
 
-/// Every IAT slot of the image at `base` that imports `want.func` from
-/// `want.dll`.
-///
-/// `size` (the image size from the module list) bounds the walk when non-zero.
+/// Every IAT slot of the image at `base` that imports `want.func` from `want.dll`.
 pub fn slots<R: Reader + ?Sized>(
     reader: &R,
     base: usize,
@@ -316,8 +261,6 @@ pub fn slots<R: Reader + ?Sized>(
         if !same_dll(&dll_name, want.dll) {
             continue;
         }
-        // A zero `OriginalFirstThunk` means the loader bound in place: the array
-        // now holds addresses, so names are gone and only a value match works.
         let named = descriptor.original_first_thunk != 0;
         let lookup_rva = if named {
             descriptor.original_first_thunk
@@ -406,22 +349,15 @@ pub fn imports_dll<R: Reader + ?Sized>(reader: &R, base: usize, dll: &str) -> bo
 /// Result of one intended write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
-    /// Symbol name as requested.
     pub func: String,
-    /// Address of the patched IAT entry (0 when none was found).
     pub slot: usize,
-    /// Value the slot held before the write (the original function).
     pub old: usize,
-    /// Detour that was written.
     pub new: usize,
-    /// True once the slot reads back as `new`.
     pub ok: bool,
-    /// Failure reason or a short success note.
     pub detail: String,
 }
 
 impl Outcome {
-    /// One log line, identical for the console and [`status`].
     pub fn line(&self, module: &str, dll: &str) -> String {
         format!(
             "{module} {dll}!{} slot={:#x} old={:#x} new={:#x} ok={} {}",
@@ -430,9 +366,7 @@ impl Outcome {
     }
 }
 
-/// Lines about every slot the live layer touched, most recent last.
 static PATCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-/// Slots that currently hold a detour.
 static PATCHED: AtomicUsize = AtomicUsize::new(0);
 
 fn note(line: String) {
@@ -460,36 +394,28 @@ pub fn status() -> String {
     )
 }
 
-/// Base and size of a module of *our own* process.
 #[cfg(windows)]
 fn locate(module: &str) -> Option<(usize, usize)> {
-    if let Some(found) = crate::procs::own_module(module) {
+    if let Some(found) = hromatite_win::procs::own_module(module) {
         return Some(found);
     }
-    // The main image is normally reachable by name; Toolhelp covers the rest
-    // (and the case where the loader's name table hides an exe).
-    let pid = crate::raw::sys::current_process_id();
-    crate::procs::module(pid, module)
+    let pid = hromatite_win::sys::current_process_id();
+    hromatite_win::procs::module(pid, module)
 }
 
-/// Byte reads of the live process.
 #[cfg(windows)]
 struct Live;
 
 #[cfg(windows)]
 impl Reader for Live {
     fn read(&self, addr: usize, len: usize) -> Option<Vec<u8>> {
-        crate::safe::read_bytes(addr, len)
+        hromatite_win::memory::read_bytes(addr, len)
     }
 }
 
-/// Flip an 8-byte IAT entry to `value`, restoring the previous protection after.
-///
-/// Wine maps many IAT pages `PAGE_READONLY`, so the write is always bracketed by
-/// `VirtualProtectEx`; a failed restore is reported but does not undo the patch.
 #[cfg(windows)]
 fn write_slot(slot: usize, value: usize) -> Result<String, String> {
-    use crate::ffi;
+    use hromatite_win::{ffi, memory as safe};
     let size = core::mem::size_of::<usize>();
     let mut previous = 0u32;
     // SAFETY: `slot` is a live 8-byte IAT entry inside a mapped image and
@@ -508,10 +434,8 @@ fn write_slot(slot: usize, value: usize) -> Result<String, String> {
         let error = unsafe { ffi::GetLastError() };
         return Err(format!("VirtualProtectEx(rw) failed, err={error}"));
     }
-    let wrote = crate::safe::write_bytes(slot, &value.to_le_bytes())
-        && crate::safe::read_usize(slot) == Some(value);
-    // Restore what the loader had; `0` means the query failed and read-only is
-    // the safe default for an IAT page.
+    let wrote =
+        safe::write_bytes(slot, &value.to_le_bytes()) && safe::read_usize(slot) == Some(value);
     let restore = if previous & 0xFF == 0 {
         ffi::PAGE_READONLY
     } else {
@@ -533,17 +457,12 @@ fn write_slot(slot: usize, value: usize) -> Result<String, String> {
         return Err("WriteProcessMemory failed".to_string());
     }
     if !restored {
-        // The slot holds the detour; only its page is left writable.
         return Ok(format!("patched, protection {restore:#x} not restored"));
     }
     Ok(String::new())
 }
 
 /// Patch every IAT slot of `module` that imports `wanted` from `dll`.
-///
-/// Returns one [`Outcome`] per intended symbol×slot; a symbol with no slot in
-/// this module is reported as `ok=false` with an explanatory detail so the
-/// caller can log why a module contributed nothing.
 pub fn patch_module(
     module: &str,
     dll: &str,
@@ -569,7 +488,7 @@ pub fn patch_module(
             let want = Want {
                 dll,
                 func,
-                address: crate::raw::sys::export_address(dll, func),
+                address: hromatite_win::sys::export_address(dll, func),
             };
             let found = slots(&reader, base, size, &want, ordinals.as_ref());
             if found.is_empty() {
@@ -630,9 +549,6 @@ pub fn patch_module(
 }
 
 /// Rewrite the first IAT slot of `module` that imports `dll!func`.
-///
-/// Returns the address that used to sit in the slot (the original function) so
-/// the caller can forward to it; the host target is a no-op that returns `0`.
 pub fn replace(module: &str, dll: &str, func: &str, replacement: usize) -> Result<usize, String> {
     let outcomes = patch_module(module, dll, &[(func, replacement)])?;
     match outcomes.into_iter().next() {
@@ -657,7 +573,7 @@ pub fn find_slot(module: &str, dll: &str, func: &str) -> Option<usize> {
         let want = Want {
             dll,
             func,
-            address: crate::raw::sys::export_address(dll, func),
+            address: hromatite_win::sys::export_address(dll, func),
         };
         first_slot(&reader, base, size, &want, ordinals.as_ref()).map(|slot| slot.slot)
     }
@@ -683,7 +599,6 @@ pub fn module_imports(module: &str, dll: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Synthetic image: a byte buffer addressed as if it were mapped at `base`.
     struct Image {
         base: usize,
         bytes: Vec<u8>,
@@ -719,7 +634,6 @@ mod tests {
             self.bytes[rva..rva + value.len()].copy_from_slice(value.as_bytes());
         }
 
-        /// DOS + NT headers with a PE32+ optional header and a size of image.
         fn headers(&mut self) {
             self.u16(0, 0x5A4D); // "MZ"
             self.u32(0x3C, 0x40); // e_lfanew
@@ -744,20 +658,16 @@ mod tests {
         }
     }
 
-    /// Imports: `EOSSDK-Win64-Shipping.dll` (two named + one ordinal) and
-    /// `kernel32.dll`, then the terminating descriptor.
     fn caller_image() -> Image {
         let mut image = Image::new(0x1000);
         image.headers();
         image.data_dir(1, 0x200, 20 * 4);
 
-        // Descriptor 0: EOSSDK, thunk names at 0x300, IAT slots at 0x500.
         image.u32(0x200, 0x300);
         image.u32(0x20C, 0x400);
         image.u32(0x210, 0x500);
         image.str(0x400, "EOSSDK-Win64-Shipping.dll");
 
-        // Two imports by name, one by ordinal (biased 26), then the terminator.
         image.u64(0x300, 0x600);
         image.u64(0x308, 0x640);
         image.u64(0x310, IMAGE_ORDINAL_FLAG64 | 26);
@@ -765,13 +675,10 @@ mod tests {
         image.str(0x600, "EOS_AntiCheatClient_BeginSession");
         image.str(0x640, "EOS_AntiCheatClient_AddNotifyMessageToServer");
 
-        // The IAT mirrors the hints until the loader binds it; the test writes
-        // the "bound" values itself.
         image.u64(0x500, 0x7FF0_0000_1000);
         image.u64(0x508, 0x7FF0_0000_2000);
         image.u64(0x510, 0x7FF0_0000_3000);
 
-        // Descriptor 1: an unrelated DLL that imports the same symbol name.
         image.u32(0x214, 0x280);
         image.u32(0x220, 0x420);
         image.u32(0x224, 0x520);
@@ -783,7 +690,6 @@ mod tests {
         image
     }
 
-    /// Exports of a stand-in EOSSDK: ordinal base 25, two named exports.
     fn exporter_image() -> Image {
         let mut image = Image::new(0x1000);
         image.headers();
@@ -794,9 +700,7 @@ mod tests {
         image.u32(0x200 + 28, 0x300); // AddressOfFunctions
         image.u32(0x200 + 32, 0x320); // AddressOfNames
         image.u32(0x200 + 36, 0x340); // AddressOfNameOrdinals
-        // names[0] = BeginSession (ordinal index 0 → biased 25)
         image.u32(0x320, 0x400);
-        // names[1] = ProtectMessage (ordinal index 1 → biased 26)
         image.u32(0x324, 0x440);
         image.u16(0x340, 0);
         image.u16(0x342, 1);
@@ -826,8 +730,6 @@ mod tests {
             ),
             None,
         );
-        // Only the EOSSDK descriptor may match: kernel32 imports the same name
-        // in the fixture, but from another DLL.
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].slot, image.at(0x500));
         assert_eq!(
@@ -905,7 +807,6 @@ mod tests {
             Some("EOS_AntiCheatClient_ProtectMessage")
         );
 
-        // Without the exporter the caller can still ask for the raw ordinal.
         let by_number = slots(
             &image,
             image.base,
@@ -920,8 +821,6 @@ mod tests {
 
     #[test]
     fn an_already_bound_image_is_matched_by_value() {
-        // A module whose loader zeroed `OriginalFirstThunk`: only the IAT is
-        // left, so the walk has to compare the resolved address instead.
         let mut image = Image::new(0x1000);
         image.headers();
         image.data_dir(1, 0x200, 40);
@@ -987,7 +886,7 @@ mod tests {
             .is_empty()
         );
 
-        let stub = Image::new(0x40); // no NT headers at all
+        let stub = Image::new(0x40);
         assert!(
             slots(
                 &stub,
@@ -1008,8 +907,6 @@ mod tests {
     #[test]
     fn the_image_size_bounds_the_walk() {
         let image = caller_image();
-        // A size that ends before the IAT: the descriptor is still parsed, the
-        // slots are out of the reported image.
         let found = slots(
             &image,
             image.base,

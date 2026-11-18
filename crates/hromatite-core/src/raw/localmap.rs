@@ -621,11 +621,6 @@ mod imp {
     use crate::raw::{ffi, memory};
     use hromatite_abi::{FeatureApiV1, FeatureEntryFn};
 
-    unsafe extern "system" {
-        #[link_name = "FreeLibrary"]
-        fn free_library(module: ffi::HMODULE) -> ffi::BOOL;
-    }
-
     #[derive(Clone)]
     struct LiveModule {
         base: usize,
@@ -929,7 +924,7 @@ mod imp {
         let mut errors = Vec::new();
         for module in libraries.iter().rev() {
             // SAFETY: each handle represents one LoadLibraryW reference owned here.
-            if unsafe { free_library(*module as ffi::HMODULE) } == 0 {
+            if unsafe { ffi::FreeLibrary(*module as ffi::HMODULE) } == 0 {
                 // SAFETY: read immediately after the failing call on this thread.
                 let error = unsafe { ffi::GetLastError() };
                 errors.push(format!(

@@ -5,43 +5,33 @@
 
 #![deny(unsafe_code)]
 
-pub mod crc;
 pub mod buildinfo;
+pub mod crc;
 pub mod crypto;
 pub mod gamebuild;
 pub mod gcthreads;
 pub mod hot;
 pub mod lateupdate;
-pub mod log;
 pub mod m3;
 pub mod manualmap;
-pub mod pe;
 #[allow(unsafe_code)]
 mod raw;
-pub mod sha256;
 pub mod symbols;
+
+pub use hromatite_hook::{hookset, iat, midhook, vmt};
+pub use hromatite_win::{
+    GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER, ffi, log, memory as safe, pe, procs, remote, sha256,
+    veh,
+};
 
 // Keep the established public API without exposing the raw implementation
 // hierarchy as an additional compatibility contract.
 pub use raw::console;
-pub use raw::context as veh;
 pub use raw::d3d11;
-pub use raw::ffi;
 pub use raw::hook;
-pub use raw::hookset;
 pub use raw::hot as hot_runtime;
-pub use raw::iat;
 pub use raw::il2cpp;
 pub use raw::kiero;
-pub use raw::memory as safe;
-pub use raw::midhook;
 pub use raw::photon;
 pub use raw::playerloop;
-pub use raw::procs;
-pub use raw::remote;
 pub use raw::ui;
-pub use raw::vmt;
-
-pub const GAME_EXE: &str = "VRChat.exe";
-pub const GAME_ASSEMBLY: &str = "GameAssembly.dll";
-pub const UNITY_PLAYER: &str = "UnityPlayer.dll";

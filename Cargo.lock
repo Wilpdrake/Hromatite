@@ -39,7 +39,9 @@ version = "0.1.0"
 dependencies = [
  "hromatite-abi",
  "hromatite-commands",
+ "hromatite-hook",
  "hromatite-nuklear",
+ "hromatite-win",
 ]
 
 [[package]]
@@ -55,6 +57,8 @@ name = "hromatite-eac"
 version = "0.1.0"
 dependencies = [
  "hromatite-core",
+ "hromatite-hook",
+ "hromatite-win",
 ]
 
 [[package]]
@@ -67,11 +71,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hromatite-hook"
+version = "0.1.0"
+dependencies = [
+ "hromatite-win",
+]
+
+[[package]]
 name = "hromatite-nuklear"
 version = "0.1.0"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "hromatite-win"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"

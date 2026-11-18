@@ -54,9 +54,25 @@ const MAX_THREADS: usize = 8;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static LOGGED_CONTENTION: AtomicBool = AtomicBool::new(false);
+static PRE_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
 /// SEH code `x86_64-pc-windows-gnu` uses for Rust panics ("CGC " in ASCII).
 const RUST_PANIC_CODE: u32 = 0x2047_4343;
+
+/// Early exception interceptor invoked before per-thread guard slots are checked.
+/// Returns `true` when the exception was handled and execution should resume
+/// (`EXCEPTION_CONTINUE_EXECUTION`).
+pub type PreHandler = unsafe fn(*mut ffi::EXCEPTION_POINTERS) -> bool;
+
+/// Register an early exception interceptor (such as the Boehm GC abort recovery
+/// gate) that runs before ordinary payload guard frames.
+///
+/// # Safety
+/// `f` must be a valid function pointer for the process lifetime and must obey
+/// the OS vectored-exception-handler contract for `EXCEPTION_POINTERS`.
+pub unsafe fn register_pre_handler(f: PreHandler) {
+    PRE_HANDLER.store(f as usize, Ordering::Release);
+}
 
 /// x64 `CONTEXT` is 1232 bytes and must be 16-byte aligned: `RtlCaptureContext`
 /// stores XMM registers with aligned moves.
@@ -237,7 +253,6 @@ fn exception_info0(info: *mut ffi::EXCEPTION_POINTERS) -> Option<usize> {
 /// guard is armed. A payload thread that dies silently (no panic, no log line)
 /// leaves no other trace — this names the faulting address instead.
 fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
-    use std::sync::atomic::AtomicBool;
     static ON: AtomicBool = AtomicBool::new(false);
     static INIT: AtomicBool = AtomicBool::new(false);
     static SEEN: AtomicUsize = AtomicUsize::new(0);
@@ -270,7 +285,7 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
     // The thread id is the whole point: a thread that dies without unregistering
     // from Boehm shows up here first if its exit was an uncaught exception.
     if SEEN.fetch_add(1, Ordering::Relaxed) < cap {
-        let tid = crate::raw::sys::current_thread_id();
+        let tid = crate::sys::current_thread_id();
         let extra = exception_info0(info).map_or_else(String::new, |a| format!(" info0={a:#x}"));
         log::log_tag(
             "veh",
@@ -280,14 +295,21 @@ fn log_passing(info: *mut ffi::EXCEPTION_POINTERS) {
 }
 
 unsafe extern "system" fn handler(info: *mut ffi::EXCEPTION_POINTERS) -> i32 {
-    // Before ordinary payload guards: the GC recovery gate itself remains closed
-    // unless a fully installed entry detour owns Boehm's record-list lock.
-    // SAFETY: info is the OS-owned callback record described by recover_boehm_abort.
-    if unsafe { crate::raw::gcguard::recover_boehm_abort(info) } {
-        return ffi::EXCEPTION_CONTINUE_EXECUTION;
+    // Before ordinary payload guards: allow an installed pre-handler (such as
+    // the Boehm GC abort recovery gate) to intercept the exception.
+    let pre = PRE_HANDLER.load(Ordering::Acquire);
+    if pre != 0 {
+        // SAFETY: `PRE_HANDLER` is only ever populated via `register_pre_handler`
+        // with a valid `PreHandler` function pointer, and `info` is the OS-owned
+        // callback record.
+        let pre_fn: PreHandler = unsafe { core::mem::transmute(pre) };
+        // SAFETY: `info` is valid for the duration of this vectored callback.
+        if unsafe { pre_fn(info) } {
+            return ffi::EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
     // Cheap gates first: on the game's own exceptions this must cost nothing.
-    let tid = crate::raw::sys::current_thread_id();
+    let tid = crate::sys::current_thread_id();
     let Some(lane_idx) = find_owned_lane(tid) else {
         log_passing(info);
         return ffi::EXCEPTION_CONTINUE_SEARCH;
@@ -363,7 +385,7 @@ fn run_body<R>(f: impl FnOnce() -> R) -> R {
 fn call_with_mode<R>(f: impl FnOnce() -> R, catch_panic: bool) -> Result<R, Fault> {
     install();
 
-    let tid = crate::raw::sys::current_thread_id();
+    let tid = crate::sys::current_thread_id();
     let Some((lane_idx, acquired)) = acquire_lane(tid) else {
         if !LOGGED_CONTENTION.swap(true, Ordering::Relaxed) {
             log::log_tag("veh", "all guard lanes busy — running unguarded");

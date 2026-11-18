@@ -12,6 +12,8 @@ path = "src/lib.rs"
 # In-repo only (no external crates): the m3 probe reads il2cpp structures
 # through the same safe readers the rest of the payload uses.
 hromatite-core = { path = "../hromatite-core" }
+hromatite-hook = { path = "../hromatite-hook" }
+hromatite-win = { path = "../hromatite-win" }
 
 [lints]
 workspace = true

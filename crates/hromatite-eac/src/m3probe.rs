@@ -14,7 +14,8 @@
 //!
 //! It only reads memory that `safe::readable_at` vouches for.
 
-use hromatite_core::{m3, procs, safe, GAME_ASSEMBLY};
+use hromatite_core::m3;
+use hromatite_win::{GAME_ASSEMBLY, memory as safe, procs};
 
 /// The table RVA measured on the 2026-11-17 build; the search is centred on it.
 const LEGACY_TABLE_RVA: usize = 0x0e66_f0d0;

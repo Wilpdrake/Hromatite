@@ -698,6 +698,10 @@ pub fn install() -> bool {
         return true;
     }
     reset_install();
+    // SAFETY: `recover_boehm_abort` is a static function matching `PreHandler`.
+    unsafe {
+        crate::veh::register_pre_handler(recover_boehm_abort);
+    }
     // `HROMATITE_GCT_ENTRY=0` keeps Boehm completely stock and is only the
     // emergency switch for this guard: with it off, a worker that exits without
     // `GC_unregister_my_thread` leaks its record and the next collection aborts

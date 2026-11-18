@@ -24,6 +24,7 @@ pub const SYNCHRONIZE: u32 = 0x0010_0000;
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_RELEASE: u32 = 0x8000;
+pub const MEM_FREE: u32 = 0x1_0000;
 
 pub const PAGE_NOACCESS: u32 = 0x01;
 pub const PAGE_READONLY: u32 = 0x02;
@@ -38,6 +39,8 @@ pub const PAGE_NOCACHE: u32 = 0x200;
 
 pub const MEM_IMAGE: u32 = 0x0100_0000;
 pub const MEM_MAPPED: u32 = 0x0040_0000;
+
+pub const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
 
 /// x64 layout (48 bytes): every field is 8-byte aligned, the two DWORD pairs
 /// are padded. Must match both Windows and wine's implementation.
@@ -234,32 +237,40 @@ unsafe extern "system" {
         flags: u32,
         tid: *mut u32,
     ) -> HANDLE;
-    pub fn CreateThread(
-        sa: *mut core::ffi::c_void,
-        stack: usize,
-        start: usize,
-        param: *mut core::ffi::c_void,
-        flags: u32,
-        tid: *mut u32,
-    ) -> HANDLE;
     pub fn WaitForSingleObject(h: HANDLE, ms: u32) -> u32;
     pub fn GetExitCodeThread(h: HANDLE, code: *mut u32) -> BOOL;
 
     pub fn GetModuleHandleW(name: *const u16) -> HMODULE;
+    pub fn GetModuleHandleA(name: *const core::ffi::c_char) -> HMODULE;
     pub fn GetProcAddress(m: HMODULE, name: *const u8) -> *mut core::ffi::c_void;
     pub fn LoadLibraryW(path: *const u16) -> HMODULE;
+    pub fn FreeLibrary(m: HMODULE) -> BOOL;
     pub fn GetModuleFileNameW(m: HMODULE, buf: *mut u16, size: u32) -> u32;
     pub fn GetLastError() -> u32;
     pub fn EnterCriticalSection(cs: *mut core::ffi::c_void);
     pub fn LeaveCriticalSection(cs: *mut core::ffi::c_void);
+
+    pub fn CreateFileMappingA(
+        file: HANDLE,
+        attrs: *const core::ffi::c_void,
+        protect: u32,
+        high: u32,
+        low: u32,
+        name: *const core::ffi::c_char,
+    ) -> HANDLE;
+    pub fn MapViewOfFile(
+        mapping: HANDLE,
+        access: u32,
+        high: u32,
+        low: u32,
+        size: usize,
+    ) -> *mut core::ffi::c_void;
 
     // present in ntdll and forwarders both under Windows and wine
     pub fn AddVectoredExceptionHandler(
         first: u32,
         handler: *const core::ffi::c_void,
     ) -> *mut core::ffi::c_void;
-    pub fn RemoveVectoredExceptionHandler(handle: *mut core::ffi::c_void) -> u32;
-    pub fn SetUnhandledExceptionFilter(filter: *const core::ffi::c_void) -> *mut core::ffi::c_void;
 
     /// `VirtualFree` via mingw import libs reaches kernelbase even though the
     /// historical declaration is commonly shown under kernel32.
@@ -279,6 +290,13 @@ unsafe extern "system" {
     pub fn RtlCaptureContext(ctx: *mut u64);
     /// Non-returning when the restored context differs from the current one.
     pub fn RtlRestoreContext(ctx: *const u64, exception_record: *const core::ffi::c_void);
+
+    // User32 window/input queries used by the in-process Nuklear panel.
+    pub fn GetForegroundWindow() -> isize;
+    pub fn GetClientRect(window: isize, rect: *mut i32) -> i32;
+    pub fn GetCursorPos(point: *mut i32) -> i32;
+    pub fn ScreenToClient(window: isize, point: *mut i32) -> i32;
+    pub fn GetAsyncKeyState(key: i32) -> i16;
 }
 
 /// Size of an x64 `CONTEXT` in qwords (1232 bytes), 16-byte aligned by host code.

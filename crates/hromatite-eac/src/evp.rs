@@ -263,69 +263,25 @@ mod imp {
     use crate::eos::hook_log;
     use crate::hook;
     use core::sync::atomic::Ordering;
+    use hromatite_win::memory as safe;
 
     /// Six integer argument registers, as the interrupted call had them.
     type Fn6 = unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64;
 
-    /// True when `[addr, addr+len)` is mapped with read access.
-    ///
-    /// # Safety
-    ///
-    /// Pure query: `VirtualQuery` is called on the current process and the
-    /// result is only used to decide whether reading is safe.
-    unsafe fn readable(addr: usize, len: usize) -> bool {
-        if addr < 0x1_0000 || addr.checked_add(len).is_none() {
-            return false;
-        }
-        // SAFETY: `MemBasic` is a plain POD structure of raw integers and
-        // pointers; an all-zero value is a valid initialiser for it.
-        let mut info: hook::win::MemBasic = unsafe { core::mem::zeroed() };
-        // SAFETY: `info` is a valid writable structure of the declared size.
-        let got = unsafe {
-            hook::win::VirtualQuery(
-                addr as *const _,
-                &mut info,
-                core::mem::size_of::<hook::win::MemBasic>(),
-            )
-        };
-        if got == 0 {
-            return false;
-        }
-        // PROTECT bits: 0x04 = PAGE_READWRITE, 0x02 = PAGE_READONLY,
-        // 0x20 = EXECUTE_READ, 0x40 = EXECUTE_READWRITE, 0x80 = WRITECOPY.
-        let protect = info.protect & 0xff;
-        matches!(protect, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
-            && (info.state == 0x1000 || info.state == 0x2000)
-    }
-
     /// Read `len` bytes at `addr` when they are mapped.
-    ///
-    /// # Safety
-    ///
-    /// The range must be readable in this process; guarded by [`readable`].
-    unsafe fn slice(addr: u64, len: usize) -> Option<&'static [u8]> {
-        // SAFETY: pure query; `readable` only asks the loader about the range.
-        if addr == 0 || !unsafe { readable(addr as usize, len) } {
+    fn slice(addr: u64, len: usize) -> Option<Vec<u8>> {
+        if addr < 0x1_0000 {
             return None;
         }
-        // SAFETY: `readable` just proved the range is mapped for `len` bytes.
-        Some(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
+        safe::read_bytes(addr as usize, len)
     }
 
     /// Read the 32-bit length an EVP call wrote through its `int *outl`.
-    ///
-    /// # Safety
-    ///
-    /// `addr` is an output pointer supplied by the intercepted call; it is only
-    /// dereferenced after `readable` proved the four bytes are mapped.
-    unsafe fn read_u32(addr: u64) -> Option<u32> {
-        // SAFETY: pure query; `readable` only asks the loader about the range.
-        if addr < 0x1_0000 || !unsafe { readable(addr as usize, 4) } {
+    fn read_u32(addr: u64) -> Option<u32> {
+        if addr < 0x1_0000 {
             return None;
         }
-        // SAFETY: the range was just proved readable; the call wrote an `int`
-        // there (Win32 `int *outl`), which needs no stronger alignment.
-        Some(unsafe { core::ptr::read_unaligned(addr as *const u32) })
+        safe::read_u32(addr as usize)
     }
 
     fn hex_or_unknown(value: Option<u64>) -> String {
@@ -347,35 +303,30 @@ mod imp {
             Kind::Ctor => {
                 // The constructor builds the pre-auth key on its own stack; log
                 // the first qwords of the frame so a later analysis can find it.
-                // SAFETY: guarded by `slice`.
-                if let Some(bytes) = unsafe { slice(a1, 32) } {
-                    line.push_str(&format!(" self32={}", hex_prefix(bytes, 32)));
+                if let Some(bytes) = slice(a1, 32) {
+                    line.push_str(&format!(" self32={}", hex_prefix(&bytes, 32)));
                 }
             }
             Kind::Init => {
                 line.push_str(&format!(" cipher={a2:#x} key={a4:#x} iv={a5:#x}"));
-                // SAFETY: guarded by `slice`.
-                if let Some(key) = unsafe { slice(a4, 32) } {
-                    line.push_str(&format!(" key32={}", hex_prefix(key, 32)));
+                if let Some(key) = slice(a4, 32) {
+                    line.push_str(&format!(" key32={}", hex_prefix(&key, 32)));
                 }
-                // SAFETY: guarded by `slice`.
-                if let Some(iv) = unsafe { slice(a5, 16) } {
-                    line.push_str(&format!(" iv16={}", hex_prefix(iv, 16)));
+                if let Some(iv) = slice(a5, 16) {
+                    line.push_str(&format!(" iv16={}", hex_prefix(&iv, 16)));
                 }
                 // A cipher context is 0x100-ish bytes; its first qword points
                 // at the EVP_CIPHER, which is enough to identify the algorithm.
-                // SAFETY: guarded by `slice`.
-                if let Some(ctx) = unsafe { slice(a1, 16) } {
-                    line.push_str(&format!(" ctx16={}", hex_prefix(ctx, 16)));
+                if let Some(ctx) = slice(a1, 16) {
+                    line.push_str(&format!(" ctx16={}", hex_prefix(&ctx, 16)));
                 }
             }
             Kind::Update => {
                 // `inl` is the fifth argument (an integer, not a pointer) and
                 // `outl` is the `int *` in the third.
                 line.push_str(&format!(" in={a5} outl={a3:#x}"));
-                // SAFETY: guarded by `slice`.
-                if let Some(plain) = unsafe { slice(a4, 32) } {
-                    line.push_str(&format!(" in32={}", hex_prefix(plain, 32)));
+                if let Some(plain) = slice(a4, 32) {
+                    line.push_str(&format!(" in32={}", hex_prefix(&plain, 32)));
                 }
             }
             Kind::Final => {}
@@ -383,9 +334,8 @@ mod imp {
                 line.push_str(&format!(" ctrl={a2:#x} len={a3}"));
                 if a2 == CTRL_GET_TAG {
                     let want = (a3 as usize).min(GCM_TAG_BYTES as usize);
-                    // SAFETY: guarded by `slice`.
-                    if let Some(tag) = unsafe { slice(a4, want) } {
-                        line.push_str(&format!(" tag{want}={}", hex_prefix(tag, want)));
+                    if let Some(tag) = slice(a4, want) {
+                        line.push_str(&format!(" tag{want}={}", hex_prefix(&tag, want)));
                     }
                 }
             }
@@ -401,8 +351,7 @@ mod imp {
         match target.kind {
             Kind::Update => {
                 let plaintext = a5;
-                // SAFETY: `a3` is the `int *outl` the call just filled in.
-                let produced = unsafe { read_u32(a3) }.map(u64::from);
+                let produced = read_u32(a3).map(u64::from);
                 LAST_IN[slot].store(plaintext, Ordering::Relaxed);
                 LAST_OUT[slot].store(produced.unwrap_or(u64::MAX), Ordering::Relaxed);
                 if produced.is_some_and(|len| len != ciphertext_len(plaintext)) {
@@ -428,8 +377,7 @@ mod imp {
                 ));
             }
             Kind::Final => {
-                // SAFETY: `a3` is the `int *outl` the call just filled in.
-                let produced = unsafe { read_u32(a3) }.map(u64::from);
+                let produced = read_u32(a3).map(u64::from);
                 if let Some(value) = produced {
                     LAST_OUT[slot].store(value, Ordering::Relaxed);
                 }
@@ -540,22 +488,15 @@ mod imp {
         let handlers = handlers();
         for (index, target) in TARGETS.iter().enumerate() {
             let address = module as usize + target.rva;
-            // SAFETY: the range is only compared after `readable` proves it is
-            // mapped, and a readable range cannot fault.
-            let seen = if unsafe { readable(address, target.signature.len()) } {
-                // SAFETY: `readable` just proved the range is mapped.
-                unsafe { core::slice::from_raw_parts(address as *const u8, target.signature.len()) }
-            } else {
-                &[]
-            };
-            if seen != target.signature {
+            let seen = safe::read_bytes(address, target.signature.len()).unwrap_or_default();
+            if seen.as_slice() != target.signature {
                 let detail = if seen.is_empty() {
                     format!("unmapped at {address:#x}")
                 } else {
                     format!(
                         "prologue mismatch at {address:#x}: want {} got {}",
                         hex_prefix(target.signature, target.signature.len()),
-                        hex_prefix(seen, seen.len())
+                        hex_prefix(&seen, seen.len())
                     )
                 };
                 hook_log(format!(
@@ -634,13 +575,12 @@ mod imp {
             .iter()
             .map(|target: &Target| {
                 let address = module as usize + target.rva;
-                // SAFETY: guarded by `readable` inside `slice`.
-                let bytes = unsafe { slice(address as u64, target.signature.len()) };
+                let bytes = slice(address as u64, target.signature.len());
                 match bytes {
                     Some(bytes) => format!(
                         " {}: {}",
                         target.name,
-                        hex_prefix(bytes, target.signature.len())
+                        hex_prefix(&bytes, target.signature.len())
                     ),
                     None => format!(" {}: unmapped", target.name),
                 }

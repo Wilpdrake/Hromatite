@@ -1,7 +1,7 @@
 //! Narrow, safe wrappers for the Win32 calls needed outside the raw modules.
 //! Each wrapper owns the complete pointer/buffer setup and checks OS results.
 
-use crate::raw::ffi;
+use crate::ffi;
 
 pub fn current_process_id() -> u32 {
     // SAFETY: parameterless Win32 query with no pointer preconditions.
@@ -11,6 +11,38 @@ pub fn current_process_id() -> u32 {
 pub fn current_thread_id() -> u32 {
     // SAFETY: parameterless Win32 query with no pointer preconditions.
     unsafe { ffi::GetCurrentThreadId() }
+}
+
+/// Look up a loaded module handle by name without increasing its reference count.
+pub fn module_handle(name: &str) -> Option<usize> {
+    #[cfg(target_os = "windows")]
+    {
+        let w = ffi::wide(name);
+        // SAFETY: `w` is NUL-terminated UTF-16 and lives for the synchronous call.
+        let m = unsafe { ffi::GetModuleHandleW(w.as_ptr()) };
+        (!m.is_null()).then_some(m as usize)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Monotonic tick counter in milliseconds since boot (or process start on host).
+pub fn tick_count_ms() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: parameterless Win32 query with no pointer preconditions.
+        unsafe { ffi::GetTickCount64() }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
 }
 
 /// Thread ids owned by this process. Allocation is limited by the OS snapshot.

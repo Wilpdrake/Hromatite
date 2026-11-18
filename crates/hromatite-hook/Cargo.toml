@@ -1,0 +1,15 @@
+[package]
+name = "hromatite-hook"
+version = "0.1.0"
+edition = "2024"
+description = "Unified x64 inline hook engine, 2-pass trampoline relocator, midhook, VMT, IAT and HookSet"
+
+[lib]
+name = "hromatite_hook"
+path = "src/lib.rs"
+
+[dependencies]
+hromatite-win = { path = "../hromatite-win" }
+
+[lints]
+workspace = true

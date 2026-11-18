@@ -1,26 +1,24 @@
 //! A small process-wide manager for inline hooks.
 //!
-//! `hook::hook_inline` and `midhook::install` patch one address each; they keep
+//! `inline::hook_inline` and `midhook::install` patch one address each; they keep
 //! no shared state. [`HookSet`] is the registry that owns them: it refuses a
 //! second hook on a target, a hook whose target lies inside another hook's
 //! overwritten window, and a target that is not readable, then tracks every
 //! active entry so it can be uninstalled or cleared later.
-//!
-//! The registry mutex is held only for the few instructions that read or mutate
-//! the vector. It is dropped before the engine is called and before any
-//! `unhook` write: a blocking mutex on Unity's managed thread would hang the
-//! game, so no guard is ever held across a call into the game.
+
+#![forbid(unsafe_code)]
 
 use std::sync::{Mutex, MutexGuard};
 
-use crate::log;
-use super::hook::{self, Hook};
-use super::midhook::{self, MidHook};
+use hromatite_win::{log, memory as safe};
+
+use crate::inline::{self, Hook};
+use crate::midhook::{self, MidHook};
 
 /// Which engine owns a registry entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// Function entry (`hook::hook_inline`).
+    /// Function entry (`inline::hook_inline`).
     Inline,
     /// Mid-function (`midhook::install`).
     Mid,
@@ -82,8 +80,6 @@ impl HookSet {
         }
     }
 
-    /// Lock the registry, recovering from poisoning instead of panicking: a
-    /// poisoned set is still better served than taking the game down.
     fn lock(&self) -> MutexGuard<'_, Vec<Entry>> {
         match self.hooks.lock() {
             Ok(g) => g,
@@ -102,27 +98,22 @@ impl HookSet {
     }
 
     fn install(&self, target: usize, detour: usize, kind: Kind) -> Result<(), HookError> {
-        // Registry checks first: they are cheap and touch no game memory, so a
-        // duplicate is refused even before the target is validated.
         {
             let g = self.lock();
             if g.iter().any(|e| e.active && e.target == target) {
                 return Err(HookError::DuplicateTarget);
             }
-            if g
-                .iter()
+            if g.iter()
                 .any(|e| e.active && target >= e.target && target < e.end)
             {
                 return Err(HookError::AddressOccupied);
             }
         }
-        if target < 0x10000 || !crate::safe::readable_range(target, 5) {
+        if target < 0x10000 || !safe::readable_range(target, 5) {
             return Err(HookError::Unreadable);
         }
-        // The engine runs without the registry lock: it allocates a page,
-        // writes the trampoline and patches the target.
         let slot = match kind {
-            Kind::Inline => hook::hook_inline(target, detour).map(Slot::Inline),
+            Kind::Inline => inline::hook_inline(target, detour).map(Slot::Inline),
             Kind::Mid => midhook::install(target, detour).map(Slot::Mid),
         };
         let slot = slot.ok_or(HookError::InstallFailed)?;
@@ -132,10 +123,6 @@ impl HookSet {
                 Slot::Mid(h) => h.prologue,
             };
         let mut g = self.lock();
-        // A concurrent install may have taken the same target while we patched.
-        // Drop the registry guard, then put the fresh patch's bytes back: its
-        // snapshot was taken after the winner's patch, so this restores the
-        // winner instead of leaving an untracked jump behind.
         if g.iter().any(|e| e.active && e.target == target) {
             drop(g);
             match slot {
@@ -158,7 +145,10 @@ impl HookSet {
         });
         log::log_tag(
             "hookset",
-            &format!("install: {kind:?} {target:#x} -> {detour:#x} (window {}b)", end - target),
+            &format!(
+                "install: {kind:?} {target:#x} -> {detour:#x} (window {}b)",
+                end - target
+            ),
         );
         Ok(())
     }
@@ -234,8 +224,6 @@ impl HookSet {
         self.len() == 0
     }
 
-    /// Test-only: register an entry without touching game memory, so the
-    /// duplicate/occupancy policy can be exercised on the host.
     #[cfg(test)]
     fn seed(&self, target: usize, detour: usize, kind: Kind, prologue: usize) {
         let mut g = self.lock();
@@ -288,8 +276,6 @@ mod tests {
             Err(HookError::AddressOccupied),
             "the last patched byte is still inside"
         );
-        // `end` is exclusive: the byte after the window is free. On the host it
-        // is not mapped, so the refusal is the readability gate, not occupancy.
         assert_eq!(set.install_mid(A + 5, B), Err(HookError::Unreadable));
     }
 

@@ -90,7 +90,7 @@ pub fn module(pid: u32, name: &str) -> Option<(usize, usize)> {
 /// the normal end-of-list / corrupt-list signal (never deref without it: a bad
 /// `Flink` is an AV inside `DllMain`, and the game dies with it).
 fn read_ptr(addr: usize) -> Option<usize> {
-    crate::safe::read_usize(addr)
+    crate::memory::read_usize(addr)
 }
 
 /// Remove our own LDR_DATA_TABLE_ENTRY from the PEB module lists.
@@ -104,7 +104,7 @@ fn read_ptr(addr: usize) -> Option<usize> {
 ///   entry+0x00 Flink/Blink, +0x10 DllBase, +0x20 SizeOfImage,
 ///   +0x30 FullDllName, +0x40 BaseDllName.
 pub fn unlink_from_peb(module_base: usize) -> bool {
-    use crate::safe;
+    use crate::memory;
     let peb: usize;
     // SAFETY: Win64 guarantees GS:[0x60] is the current thread's PEB. The asm
     // changes no flags, stack or other registers and does not dereference Rust data.
@@ -147,12 +147,12 @@ pub fn unlink_from_peb(module_base: usize) -> bool {
                 None => break,
             };
             // splice out — only if all four writes land in readable memory
-            let ok = safe::write_usize(blink, flink)
-                && safe::write_usize(flink.wrapping_add(8), blink)
+            let ok = memory::write_usize(blink, flink)
+                && memory::write_usize(flink.wrapping_add(8), blink)
                 // drop from the load/in-memory lists is not needed for
                 // enumeration by name; zeroing our own links keeps it tidy.
-                && safe::write_usize(cur, cur)
-                && safe::write_usize(cur + 8, cur);
+                && memory::write_usize(cur, cur)
+                && memory::write_usize(cur + 8, cur);
             if !ok {
                 crate::log::log(&format!(
                     "peb: entry for {module_base:#x} found at {cur:#x} but a link is unreadable"
@@ -203,31 +203,25 @@ impl Region {
 /// scan has to reach the heap as well.
 pub fn regions(max_regions: usize) -> Vec<Region> {
     let mut out = Vec::new();
-    // SAFETY: every iteration provides a correctly sized MBI output buffer;
-    // address progression is bounded by `top` and stops on a failed/empty query.
-    unsafe {
-        let mut addr = 0x10000usize;
-        let top = 0x0000_7FFF_FFFF_0000usize;
-        while addr < top && out.len() < max_regions {
-            let mut mbi = MEMORY_BASIC_INFORMATION::default();
-            let n = VirtualQuery(
-                addr as *const core::ffi::c_void,
-                &mut mbi,
-                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            );
-            if n == 0 || mbi.RegionSize == 0 {
-                break;
-            }
-            if mbi.State == MEM_COMMIT {
-                out.push(Region {
-                    base: mbi.BaseAddress,
-                    size: mbi.RegionSize,
-                    protect: mbi.Protect,
-                    ty: mbi.Type,
-                });
-            }
-            addr = mbi.BaseAddress.wrapping_add(mbi.RegionSize);
+    let mut addr = 0x10000usize;
+    let top = 0x0000_7FFF_FFFF_0000usize;
+    while addr < top && out.len() < max_regions {
+        let Some(region) = crate::memory::query_region(addr) else {
+            break;
+        };
+        if region.is_committed() {
+            out.push(Region {
+                base: region.base,
+                size: region.size,
+                protect: region.protect,
+                ty: region.ty,
+            });
         }
+        let next = region.base.wrapping_add(region.size);
+        if next <= addr {
+            break;
+        }
+        addr = next;
     }
     out
 }
@@ -291,21 +285,10 @@ pub fn own_module_path(name: &str) -> Option<std::path::PathBuf> {
 
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
-    let w = wide(name);
-    // SAFETY: `w` is NUL-terminated UTF-16 and remains alive throughout the call.
-    let h = unsafe { GetModuleHandleW(w.as_ptr()) };
-    if h.is_null() {
-        return None;
-    }
-    let base = h as usize;
-    // SizeOfImage is at OptionalHeader + 56 for both PE32 and PE32+.
-    // Read the header through `safe`: wine's apiset "handles" are not images.
-    let e_lfanew = crate::safe::read_u32(base + 0x3C)? as usize;
-    let opt = base.checked_add(e_lfanew)?.checked_add(4 + 20)?;
-    let size = crate::safe::read_u32(opt + 56)? as usize;
+    let base = crate::sys::module_handle(name)?;
+    let size = crate::pe::live_image_size(base)?;
     Some((base, size))
 }
-
 
 #[cfg(test)]
 mod region_tests {
@@ -325,10 +308,16 @@ mod region_tests {
         // `.text` is normally PAGE_EXECUTE_READ; missing it made the swapchain
         // scan report "no executable region" for dxgi.dll.
         for protect in [0x10, 0x20, 0x40, 0x80] {
-            assert!(region(protect).executable(), "{protect:#x} must be executable");
+            assert!(
+                region(protect).executable(),
+                "{protect:#x} must be executable"
+            );
         }
         for protect in [0x01, 0x02, 0x04, 0x08, 0x00] {
-            assert!(!region(protect).executable(), "{protect:#x} must not be executable");
+            assert!(
+                !region(protect).executable(),
+                "{protect:#x} must not be executable"
+            );
         }
     }
 

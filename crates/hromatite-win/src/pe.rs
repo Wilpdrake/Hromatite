@@ -1,10 +1,12 @@
-//! Checked PE input parsing. Every offset originates in the input file, so all
-//! reads are bounds-checked and malformed data returns an error, never a panic.
+//! Checked PE input parsing and safe live-image export helpers. Every offset
+//! originates in an input file or in-memory image, so all reads are
+//! bounds-checked and malformed data returns an error or `None`, never a panic.
 
 #![forbid(unsafe_code)]
 
 const MAX_SECTIONS: usize = 96;
 const MAX_IMAGE_SIZE: usize = 1024 * 1024 * 1024;
+const MAX_LIVE_EXPORTS: usize = 8192;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Section {
@@ -185,6 +187,76 @@ impl PeImage {
             is_64,
         })
     }
+}
+
+/// Read `SizeOfImage` from a live PE module mapped at `base` using safe
+/// guarded reads.
+pub fn live_image_size(base: usize) -> Option<usize> {
+    if base == 0 || crate::memory::read_u16(base)? != 0x5A4D {
+        return None;
+    }
+    let e_lfanew = crate::memory::read_u32(base.checked_add(0x3C)?)? as usize;
+    let nt = base.checked_add(e_lfanew)?;
+    if crate::memory::read_u32(nt)? != 0x0000_4550 {
+        return None;
+    }
+    let opt = nt.checked_add(24)?;
+    let size = crate::memory::read_u32(opt.checked_add(56)?)? as usize;
+    (size != 0 && size <= MAX_IMAGE_SIZE).then_some(size)
+}
+
+/// Resolve an export by name through the PE export directory of a live loaded
+/// module at `base`, using checked `memory::read_*` reads instead of raw pointer
+/// dereferences.
+pub fn resolve_live_export(base: usize, name: &str) -> Option<usize> {
+    if base == 0 || crate::memory::read_u16(base)? != 0x5A4D {
+        return None;
+    }
+    let e_lfanew = crate::memory::read_u32(base.checked_add(0x3C)?)? as usize;
+    let nt = base.checked_add(e_lfanew)?;
+    if crate::memory::read_u32(nt)? != 0x0000_4550 {
+        return None;
+    }
+    let opt = nt.checked_add(24)?;
+    let magic = crate::memory::read_u16(opt)?;
+    let dir_off = match magic {
+        0x20B => 112,
+        0x10B => 96,
+        _ => return None,
+    };
+    let export_rva = crate::memory::read_u32(opt.checked_add(dir_off)?)? as usize;
+    if export_rva == 0 {
+        return None;
+    }
+    let directory = base.checked_add(export_rva)?;
+    let number_of_functions = crate::memory::read_u32(directory.checked_add(20)?)? as usize;
+    let number_of_names = crate::memory::read_u32(directory.checked_add(24)?)? as usize;
+    let address_of_functions = crate::memory::read_u32(directory.checked_add(28)?)? as usize;
+    let address_of_names = crate::memory::read_u32(directory.checked_add(32)?)? as usize;
+    let address_of_name_ordinals = crate::memory::read_u32(directory.checked_add(36)?)? as usize;
+
+    let names_base = base.checked_add(address_of_names)?;
+    let ordinals_base = base.checked_add(address_of_name_ordinals)?;
+    let functions_base = base.checked_add(address_of_functions)?;
+
+    let max_name_len = name.len().checked_add(1)?.max(64);
+    for index in 0..number_of_names.min(MAX_LIVE_EXPORTS) {
+        let name_rva = crate::memory::read_u32(names_base.checked_add(index * 4)?)? as usize;
+        let candidate_addr = base.checked_add(name_rva)?;
+        if let Some(candidate) = crate::memory::ascii_at(candidate_addr, max_name_len)
+            && candidate == name
+        {
+            let ordinal =
+                crate::memory::read_u16(ordinals_base.checked_add(index * 2)?)? as usize;
+            if ordinal >= number_of_functions {
+                return None;
+            }
+            let rva =
+                crate::memory::read_u32(functions_base.checked_add(ordinal * 4)?)? as usize;
+            return (rva != 0).then(|| base.checked_add(rva)).flatten();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -1,30 +1,8 @@
 //! Virtual-method-table (VMT) hooks — the mechanism behind Kiero's `bind`.
-//!
-//! A COM object begins with a pointer to its vtable, an array of function
-//! pointers. Swapping one entry redirects every *future* virtual call made
-//! through any object that shares that table, which is exactly what a
-//! `Present`/`ResizeBuffers` hook needs and what an inline patch cannot do for
-//! a per-object implementation.
-//!
-//! Two properties shape this module:
-//!
-//! * **The table is usually read-only.** `dxgi.dll`/`d3d11.dll` keep their
-//!   vtables in `.rdata`, so a slot is written only between
-//!   `VirtualProtect(PAGE_READWRITE)` and a restore of the previous protection.
-//! * **A slot can be shared.** Every swapchain instance created by one
-//!   implementation points at the same table, so hooking slot 8 twice would
-//!   silently chain two detours. Claims are therefore tracked per
-//!   `(table, index)` and a second claim is refused until the first is released
-//!   by [`VmtHook::unhook`].
-//!
-//! Nothing here dereferences an unvalidated address: reads go through
-//! [`TableMem`], whose live implementation is [`crate::safe`], and writes go
-//! through the same backend after the protection change. `Option`/`bool` is
-//! the contract for every rejected address or OS failure.
 
-use crate::ffi;
-use crate::log;
 use std::sync::Mutex;
+
+use hromatite_win::{ffi, log, memory as safe};
 
 /// Page granularity of `VirtualProtect`; slots are never split across pages.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -35,12 +13,6 @@ const PAGE_SIZE: usize = 0x1000;
 const MIN_ADDRESS: usize = 0x10000;
 
 /// Byte access and page protection for one virtual-method table.
-///
-/// The live implementation ([`Live`]) reads through [`crate::safe`] and writes
-/// through the same checked OS copy after a protection change, so a bad address
-/// is an `Err`-shaped `None`/`false` instead of an access violation. Tests
-/// substitute an in-memory address space, which keeps the slot/claim logic
-/// target-independent and exercisable on the Linux host.
 pub trait TableMem: Send + Sync {
     /// One little-endian word, or `None` when the range is not readable.
     fn read_u64(&self, addr: usize) -> Option<u64>;
@@ -54,11 +26,6 @@ pub trait TableMem: Send + Sync {
 
 // --------------------------------------------------------------- live backend
 
-/// `VirtualProtect` over the whole pages that cover `addr..addr+len`.
-///
-/// Page granularity is why the length is rounded *up*: a slot at the very end
-/// of a page straddles into the next one, and that page has to be writable too
-/// or the store faults.
 #[cfg(windows)]
 fn protect_pages(addr: usize, len: usize, prot: u32) -> Option<u32> {
     if len == 0 {
@@ -95,13 +62,13 @@ fn flush_range(addr: usize, len: usize) {
 #[cfg(not(windows))]
 fn flush_range(_addr: usize, _len: usize) {}
 
-/// The process's own address space: [`crate::safe`] reads, `VirtualProtect` +
+/// The process's own address space: [`hromatite_win::memory`] reads, `VirtualProtect` +
 /// `WriteProcessMemory` writes.
 pub struct Live;
 
 impl TableMem for Live {
     fn read_u64(&self, addr: usize) -> Option<u64> {
-        crate::safe::read_u64(addr)
+        safe::read_u64(addr)
     }
 
     fn protect(&self, addr: usize, len: usize, prot: u32) -> Option<u32> {
@@ -109,7 +76,7 @@ impl TableMem for Live {
     }
 
     fn write_u64(&self, addr: usize, value: u64) -> bool {
-        crate::safe::write_usize(addr, value as usize)
+        safe::write_usize(addr, value as usize)
     }
 
     fn flush(&self, addr: usize, len: usize) {
@@ -119,10 +86,6 @@ impl TableMem for Live {
 
 // ------------------------------------------------------------------- claims
 
-/// `(table, index)` pairs that currently hold a detour. A slot shared by two
-/// objects is one claim, so the second object's `hook` is refused rather than
-/// chaining detours through each other. A `Vec` keeps the static const while
-/// the claim count stays in single digits.
 static CLAIMED: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 fn claim(table: usize, index: u32) -> bool {
@@ -148,9 +111,6 @@ fn release(table: usize, index: u32) {
 // --------------------------------------------------------------------- Vmt
 
 /// One object's vtable: the object pointer and the table it points at.
-///
-/// The backend is a reference so the same slot/claim logic runs unchanged
-/// against a synthetic table in tests; [`Vmt::new`] always uses [`Live`].
 pub struct Vmt<'a> {
     object: usize,
     table: usize,
@@ -172,9 +132,6 @@ impl<'a> Vmt<'a> {
         if table < MIN_ADDRESS {
             return None;
         }
-        // The table itself has to be readable for at least one slot: a
-        // dangling first qword is the common result of pointing at a random
-        // object rather than a COM interface.
         mem.read_u64(table)?;
         Some(Self {
             object,
@@ -203,11 +160,6 @@ impl<'a> Vmt<'a> {
     }
 
     /// Replace slot `index` with `detour`, remembering the original entry.
-    ///
-    /// Refuses when the slot is unreadable, the detour is not a plausible code
-    /// address, or the slot is already claimed by another [`VmtHook`]. On
-    /// success the table page is back to its previous protection and the slot
-    /// reads `detour`.
     pub fn hook(&mut self, index: u32, detour: usize) -> Option<VmtHook<'a>> {
         let at = self.slot_address(index)?;
         if detour < MIN_ADDRESS {
@@ -232,8 +184,6 @@ impl<'a> Vmt<'a> {
             return None;
         }
         if original == 0 {
-            // A zero entry is padding or an unimplemented slot, not a method:
-            // forwarding to it would jump to address zero.
             log::log_tag("vmt", &format!("hook: slot {index} at {at:#x} is empty"));
             return None;
         }
@@ -247,7 +197,9 @@ impl<'a> Vmt<'a> {
             );
             return None;
         }
-        let old_protect = match self.mem.protect(at, core::mem::size_of::<usize>(), ffi::PAGE_READWRITE)
+        let old_protect = match self
+            .mem
+            .protect(at, core::mem::size_of::<usize>(), ffi::PAGE_READWRITE)
         {
             Some(previous) => previous,
             None => {
@@ -261,8 +213,6 @@ impl<'a> Vmt<'a> {
         };
         let wrote = self.mem.write_u64(at, detour as u64)
             && self.mem.read_u64(at) == Some(detour as u64);
-        // Restore even when the write failed, so a rejected hook leaves no
-        // writable `.rdata` page behind.
         let restored = self.mem.protect(at, core::mem::size_of::<usize>(), old_protect);
         self.mem.flush(at, core::mem::size_of::<usize>());
         if !wrote {
@@ -300,8 +250,7 @@ impl<'a> Vmt<'a> {
 // ----------------------------------------------------------------- VmtHook
 
 /// One installed VMT swap. `unhook` puts the original entry back and releases
-/// the claim; dropping without `unhook` leaves the slot patched (deliberately
-/// — same contract as [`crate::hook::Hook`]).
+/// the claim; dropping without `unhook` leaves the slot patched.
 pub struct VmtHook<'a> {
     table: usize,
     index: u32,
@@ -320,8 +269,6 @@ impl VmtHook<'_> {
         self.index
     }
 
-    /// The entry that was in the slot before the swap; forward to this to call
-    /// the game's own implementation.
     pub fn original(&self) -> usize {
         self.original
     }
@@ -335,8 +282,7 @@ impl VmtHook<'_> {
         self.table.checked_add(offset)
     }
 
-    /// Restore the original entry and release the claim. Idempotent: a second
-    /// call reports `true` without touching memory.
+    /// Restore the original entry and release the claim. Idempotent.
     pub fn unhook(&mut self) -> bool {
         if self.detached {
             return true;
@@ -397,16 +343,12 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// The claim table is process-global and every fixture uses the same
-    /// synthetic address, so the tests that hook have to be serialised.
     static ORDER: Mutex<()> = Mutex::new(());
 
     fn lock_order() -> std::sync::MutexGuard<'static, ()> {
         ORDER.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A faithful in-test address space: one buffer with page-granular
-    /// protection, so the real claim/protect/restore ordering is exercised.
     struct TestMem {
         base: usize,
         inner: Mutex<Inner>,
@@ -422,7 +364,6 @@ mod tests {
     impl TestMem {
         const BASE: usize = 0x1_4000_0000;
 
-        /// `page_prot` maps a page offset (0-based) to its initial protection.
         fn new(len: usize, page_prot: &[u32]) -> Self {
             let mut prot = HashMap::new();
             let pages = len.div_ceil(PAGE_SIZE);
@@ -444,7 +385,6 @@ mod tests {
             addr & !(PAGE_SIZE - 1)
         }
 
-        /// Absolute -> buffer offset, for fixtures.
         fn offset(&self, addr: usize) -> Option<usize> {
             addr.checked_sub(self.base)
         }
@@ -464,8 +404,6 @@ mod tests {
                 .unwrap_or(ffi::PAGE_NOACCESS)
         }
 
-        /// Fixture setup: change a page's protection without recording a
-        /// `protect` call (the calls under test are the hook's own).
         fn set_protect(&self, page: usize, prot: u32) {
             self.inner.lock().unwrap().prot.insert(page, prot);
         }
@@ -546,15 +484,10 @@ mod tests {
         }
     }
 
-    /// One object whose first qword points at a table of `slots` fake entries.
-    /// The object sits on a writable page, the table on a read-only one — the
-    /// `.rdata` situation a real `dxgi.dll` vtable is in.
     fn fixture(slots: usize) -> (TestMem, usize, usize) {
         let object = TestMem::BASE;
         let table = TestMem::BASE + PAGE_SIZE + 0x100;
         let len = table - TestMem::BASE + slots * 8 + 0x100;
-        // Populate first, then make the table read-only: a real vtable lives in
-        // `.rdata` and cannot be written directly.
         let mem = TestMem::new(len, &[ffi::PAGE_READWRITE, ffi::PAGE_READWRITE]);
         mem.write_u64(object, table as u64);
         for index in 0..slots {
@@ -575,7 +508,6 @@ mod tests {
         assert_eq!(vmt.slot(0), Some(0x7FF0_0000_0000));
         assert_eq!(vmt.slot(8), Some(0x7FF0_0000_0000 + 8 * 0x100));
         assert_eq!(vmt.slot(17), Some(0x7FF0_0000_0000 + 17 * 0x100));
-        // Past the fixture: unreadable rather than a invented value.
         assert_eq!(vmt.slot(4096), None);
     }
 
@@ -587,7 +519,6 @@ mod tests {
         assert!(Vmt::with_mem(0, &mem).is_none(), "null is not an object");
         assert!(Vmt::with_mem(0x1000, &mem).is_none(), "reserved sentinel");
 
-        // An object whose first qword is zero has no table at all.
         let blank = TestMem::new(PAGE_SIZE, &[ffi::PAGE_READWRITE]);
         assert!(Vmt::with_mem(TestMem::BASE, &blank).is_none());
     }
@@ -607,7 +538,6 @@ mod tests {
         assert!(!hook.is_detached());
         assert_eq!(vmt.slot(8), Some(detour), "the swap is visible immediately");
 
-        // The write went through a protection flip and the flip was undone.
         let calls = mem.protect_calls();
         assert!(
             calls.iter().any(|&(page, prot)| {
@@ -643,7 +573,6 @@ mod tests {
             second.hook(8, 0x7FF0_0000_2000).is_none(),
             "the slot is shared by every object of this implementation"
         );
-        // A different slot of the same table is still available.
         let mut other_slot = second.hook(13, 0x7FF0_0000_3000).expect("another slot");
 
         assert!(first_hook.unhook());
@@ -667,14 +596,12 @@ mod tests {
     #[test]
     fn an_unreadable_slot_is_refused_and_leaves_no_writable_page() {
         let _order = lock_order();
-        // A table whose page is PAGE_NOACCESS cannot be swapped.
         let object = TestMem::BASE;
         let table = TestMem::BASE + PAGE_SIZE;
         let mem = TestMem::new(PAGE_SIZE * 2, &[ffi::PAGE_READWRITE, ffi::PAGE_NOACCESS]);
         mem.write_u64(object, table as u64);
         assert!(Vmt::with_mem(object, &mem).is_none());
 
-        // A readable table with a hole in it: slot 64 was never populated.
         let (mem, object, _table) = fixture(1);
         let mut vmt = Vmt::with_mem(object, &mem).expect("vtable");
         assert!(vmt.hook(64, 0x7FF0_0000_5000).is_none());
@@ -684,9 +611,6 @@ mod tests {
     #[test]
     fn a_write_the_backend_refuses_releases_the_claim() {
         let _order = lock_order();
-        // A backend whose store always fails must not leave the slot claimed:
-        // the next attempt has to reach the backend again, not be refused as a
-        // double hook.
         let failing = FailingWrites {
             inner: fixture(2).0,
         };
@@ -695,7 +619,6 @@ mod tests {
         assert!(vmt.hook(0, 0x7FF0_0000_7000).is_none());
     }
 
-    /// TestMem whose writes always fail, to exercise the claim-release path.
     struct FailingWrites {
         inner: TestMem,
     }

@@ -797,8 +797,7 @@ pub fn image_span(maps: &[MapEntry], base: u64) -> (u64, u64) {
 #[cfg(windows)]
 mod live {
     use super::*;
-    use hromatite_core::ffi::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS};
-    use hromatite_core::safe;
+    use hromatite_win::memory as safe;
 
     /// [`ReadAt`] over one region of our own address space, with a byte budget.
     pub struct RegionRead {
@@ -854,21 +853,11 @@ mod live {
         let mut address = 0usize;
         let mut seen = 0usize;
         let mut stopped_early = false;
-        let mut info = MEMORY_BASIC_INFORMATION::default();
         while address < usize::MAX - 0x1000 {
-            let written = unsafe {
-                // SAFETY: `info` is a stack struct of the exact layout the API
-                // writes, and the length argument is its size.
-                hromatite_core::ffi::VirtualQuery(
-                    address as *const core::ffi::c_void,
-                    &mut info,
-                    core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                )
-            };
-            if written == 0 || info.RegionSize == 0 {
+            let Some(info) = safe::query_region(address) else {
                 break;
-            }
-            let Some(next) = info.BaseAddress.checked_add(info.RegionSize) else {
+            };
+            let Some(next) = info.base.checked_add(info.size) else {
                 break;
             };
             if next <= address {
@@ -885,13 +874,11 @@ mod live {
             if seen.is_multiple_of(64) {
                 safe::scan_yield();
             }
-            let readable =
-                info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0;
             let region = Region {
-                base: info.BaseAddress,
-                size: info.RegionSize,
-                protect: info.Protect,
-                readable,
+                base: info.base,
+                size: info.size,
+                protect: info.protect,
+                readable: info.is_readable(),
             };
             if !visit(region) {
                 stopped_early = true;
@@ -1002,24 +989,12 @@ mod live {
 
     /// `VirtualQuery` for one address: the region containing it.
     fn region_at(address: usize) -> Option<Region> {
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        let written = unsafe {
-            // SAFETY: `info` is a stack struct of the layout the API writes and
-            // `address` only names a page; nothing is dereferenced here.
-            hromatite_core::ffi::VirtualQuery(
-                address as *const core::ffi::c_void,
-                &mut info,
-                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if written == 0 || info.RegionSize == 0 {
-            return None;
-        }
+        let info = safe::query_region(address)?;
         Some(Region {
-            base: info.BaseAddress,
-            size: info.RegionSize,
-            protect: info.Protect,
-            readable: info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0,
+            base: info.base,
+            size: info.size,
+            protect: info.protect,
+            readable: info.is_readable(),
         })
     }
 }
@@ -1274,7 +1249,7 @@ impl ReadAt for NativeMemRead {
             return None;
         }
         let mut buffer = vec![0u8; len];
-        let result = hromatite_core::veh::call_with(|| {
+        let result = hromatite_win::veh::call_with(|| {
             // SAFETY: `at` comes from a `maps` entry of this process and `len`
             // stays inside that mapping; the vectored handler converts a fault
             // into `Err` instead of killing the game.

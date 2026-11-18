@@ -54,8 +54,6 @@ pub mod forge;
 #[allow(unsafe_code)]
 pub mod m3probe;
 #[allow(unsafe_code)]
-pub mod hook;
-#[allow(unsafe_code)]
 pub mod keyhunt;
 pub mod payload;
 pub mod report;
@@ -67,7 +65,8 @@ pub use capture::{CaptureFile, Frame as CapturedFrame};
 pub use codec::{ChecksumKind, CodecError, Frame, Header, WIRE_BODY_LEN, WIRE_HEARTBEAT_LEN};
 pub use eos::{Counters as HookCounters, HookEvent, Hooks};
 pub use eventlog::{Event, JsonlLog};
-pub use hook::Hook;
+pub use hromatite_hook::abs as hook;
+pub use hromatite_hook::abs::Hook;
 pub use payload::{HeartbeatPayload, PAYLOAD_LEN};
 pub use session::{Beat, EacSession};
 pub use tap::CaptureTap;

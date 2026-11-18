@@ -12,10 +12,12 @@ hromatite-abi = { path = "../hromatite-abi" }
 # The payload's own `help` is generated from this shared table, so the in-game
 # text and the host palette can never disagree.
 hromatite-commands = { path = "../hromatite-commands" }
+hromatite-hook = { path = "../hromatite-hook" }
 # The D3D11 backend turns one nuklear `Frame` into `DrawIndexed` calls. The crate
 # is dependency-free (its only build dependency is the C shim compiler), so the
 # resident linking it costs nothing at runtime.
 hromatite-nuklear = { path = "../hromatite-nuklear" }
+hromatite-win = { path = "../hromatite-win", features = ["remote"] }
 
 [lints]
 workspace = true

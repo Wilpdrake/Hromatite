@@ -9,18 +9,18 @@
 //! callers therefore retain the existing VEH guard around scans. `Option` and
 //! `Result` remain the only contract for rejected addresses and OS failures.
 
+pub use hromatite_hook::vmt;
+#[allow(unused_imports)]
+pub use hromatite_win::{ffi, memory, memscan, sys};
+
 pub mod console;
 pub mod d3d11;
-pub mod discover;
 pub(crate) mod d3d11_shaders;
-pub mod context;
-pub mod ffi;
+pub mod discover;
 pub mod gcguard;
 pub mod hook;
-pub mod hookset;
 pub mod hostapi;
 pub mod hot;
-pub mod iat;
 pub mod il2cpp;
 // Kiero-style presentation hook: a VMT swap of IDXGISwapChain::Present.
 pub mod kiero;
@@ -30,13 +30,6 @@ pub mod localmap;
 // site is not wired on master, so nothing references it yet.
 #[allow(dead_code)]
 pub mod m3dump;
-pub mod memory;
-pub mod memscan;
-pub mod midhook;
 pub mod photon;
 pub mod playerloop;
-pub mod procs;
-pub mod remote;
-pub mod sys;
 pub mod ui;
-pub mod vmt;

@@ -6,7 +6,9 @@ members = [
     "crates/hromatite-dll",
     "crates/hromatite-eac",
     "crates/hromatite-features",
+    "crates/hromatite-hook",
     "crates/hromatite-nuklear",
+    "crates/hromatite-win",
     "crates/test-target",
 ]
 resolver = "3"

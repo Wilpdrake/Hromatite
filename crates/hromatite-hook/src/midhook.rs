@@ -1,30 +1,18 @@
-//! Mid-function inline hooks — the safetyhook capability `hook.rs` lacks.
-//!
-//! `hook.rs` patches a function *entry*: the first instruction(s) move to a
-//! trampoline and the entry jumps to the detour. A mid-function hook picks an
-//! arbitrary instruction boundary inside a function, so a detour can observe or
-//! replace a value half-way through. The trampoline is the relocated copy of
-//! the overwritten window followed by an absolute jump back to
-//! `target + prologue`; the original is patched with `jmp rel32` through the
-//! same relay slot the entry engine uses, so the detour may live anywhere.
-//!
-//! Relocation policy is deliberately exact: every copied instruction must keep
-//! its absolute meaning. An opcode the decoder does not know, a relative
-//! branch whose destination lies inside the overwritten window, or a `rel8`
-//! displacement that no longer fits after the move is *refused* with a log
-//! line instead of being approximated. safetyhook can synthesise a continue
-//! block for those cases; that machinery is out of scope here.
+//! Mid-function inline hooks — 5-byte `jmp rel32` + relay page at an arbitrary
+//! instruction boundary inside a function.
 //!
 //! [`plan`] is the pure half (bytes in, bytes out) and is unit-tested on the
 //! host; [`install`] adds the OS writes and only does real work where the
 //! Win32 memory APIs exist.
 
-use crate::ffi;
-use crate::log;
-use super::hook::{
-    adjusted_disp32, alloc_near, branch_into_prologue, decode_span, flush, rel32_ok,
-    set_range_protect, write_mode, write_window, PAGE_SIZE, RELAY_OFF,
+use hromatite_win::{ffi, log, memory as safe};
+
+use crate::decode::decode_span;
+use crate::inline::RELAY_OFF;
+use crate::mem::{
+    PAGE_SIZE, alloc_near, flush, set_range_protect, write_mode, write_window,
 };
+use crate::tramp::{adjusted_disp32, branch_into_prologue, rel32_ok};
 
 /// Bytes replaced by the patched `jmp rel32`.
 const PATCH_LEN: usize = 5;
@@ -82,10 +70,6 @@ fn rel_displacement(chunk: &[u8], off: usize, bits: u8) -> Option<i64> {
 }
 
 /// Relocate the overwritten window for a trampoline at `trampoline`.
-///
-/// `head` must be the bytes at `target`; `trampoline` is the page the copy will
-/// live in. The returned [`Plan::code`] is the copy plus the absolute jump back
-/// to `target + prologue`.
 pub(crate) fn plan(target: usize, head: &[u8], trampoline: usize) -> Result<Plan, PlanError> {
     let (prologue, insns) = decode_span(head, PATCH_LEN).ok_or(PlanError::Undecodable)?;
     if prologue > head.len() {
@@ -97,7 +81,7 @@ pub(crate) fn plan(target: usize, head: &[u8], trampoline: usize) -> Result<Plan
     let mut off = 0usize;
     for ins in &insns {
         let mut chunk = head[off..off + ins.len].to_vec();
-        if let Some((rel_off, bits)) = ins.rel {
+        if let Some((rel_off, bits)) = ins.rel_field() {
             let disp = rel_displacement(&chunk, rel_off, bits).ok_or(PlanError::Undecodable)?;
             if branch_into_prologue(target, prologue, off, ins.len, disp) {
                 return Err(PlanError::BranchIntoWindow);
@@ -112,7 +96,7 @@ pub(crate) fn plan(target: usize, head: &[u8], trampoline: usize) -> Result<Plan
                 chunk[rel_off] = adjusted as u8;
             }
         }
-        if let Some(rip_off) = ins.rip {
+        if let Some(rip_off) = ins.rip_field() {
             let raw = chunk[rip_off..rip_off + 4]
                 .try_into()
                 .map_err(|_| PlanError::Undecodable)?;
@@ -160,23 +144,17 @@ pub struct MidHook {
 }
 
 /// Install a mid-function hook at `target`.
-///
-/// The instruction window starting at `target` is copied to a fresh page near
-/// the target (so the patched `jmp rel32` can reach it), relocated, and
-/// followed by an absolute jump back to `target + prologue`. The target is then
-/// patched to jump to a relay in that page, which jumps absolutely to `detour`.
-///
-/// Returns `None` (with a log line) when the address is unreadable, the window
-/// contains an opcode we do not decode, a relative branch lands inside the
-/// window, or a displacement stops fitting after relocation. See [`plan`].
 pub fn install(target: usize, detour: usize) -> Option<MidHook> {
     if target < 0x10000 {
-        log::log_tag("midhook", &format!("install: {target:#x} is below 0x10000, refusing"));
+        log::log_tag(
+            "midhook",
+            &format!("install: {target:#x} is below 0x10000, refusing"),
+        );
         return None;
     }
-    let head = match crate::safe::read_bytes(target, HEAD_LEN) {
+    let head = match safe::read_bytes(target, HEAD_LEN) {
         Some(head) => head,
-        None => match crate::safe::read_bytes(target, MIN_HEAD_LEN) {
+        None => match safe::read_bytes(target, MIN_HEAD_LEN) {
             Some(head) => head,
             None => {
                 log::log_tag("midhook", &format!("install: {target:#x} is not readable"));
@@ -197,7 +175,10 @@ pub fn install(target: usize, detour: usize) -> Option<MidHook> {
     let p = match plan(target, &head, trampoline) {
         Ok(p) => p,
         Err(reason) => {
-            log::log_tag("midhook", &format!("install: {target:#x} refused: {reason:?}"));
+            log::log_tag(
+                "midhook",
+                &format!("install: {target:#x} refused: {reason:?}"),
+            );
             return None;
         }
     };
@@ -212,8 +193,6 @@ pub fn install(target: usize, detour: usize) -> Option<MidHook> {
         core::ptr::copy_nonoverlapping(p.code.as_ptr(), trampoline as *mut u8, p.code.len());
         core::ptr::copy_nonoverlapping(relay.as_ptr(), (trampoline + RELAY_OFF) as *mut u8, 14);
     }
-    // Left RW on purpose: the relay still has to be filled, and only the final
-    // target patch makes anyone jump here.
     if set_range_protect(trampoline, PAGE_SIZE, ffi::PAGE_EXECUTE_READWRITE).is_none() {
         log::log_tag("midhook", "install: VirtualProtect(RWX) on trampoline failed");
         return None;
@@ -246,7 +225,7 @@ pub fn install(target: usize, detour: usize) -> Option<MidHook> {
     let base16 = p.base16;
     let o16 = target - base16;
     let mut orig32 = [0u8; 32];
-    let got = crate::safe::read_upto(base16, 32);
+    let got = safe::read_upto(base16, 32);
     if got.len() < o16 + PATCH_LEN || got.len() < 16 {
         log::log_tag(
             "midhook",
@@ -262,7 +241,10 @@ pub fn install(target: usize, detour: usize) -> Option<MidHook> {
     let old_prot = match set_range_protect(target, p.prologue + 8, ffi::PAGE_EXECUTE_READWRITE) {
         Some(old) => old,
         None => {
-            log::log_tag("midhook", &format!("install: VirtualProtect(RWX) at {target:#x} failed"));
+            log::log_tag(
+                "midhook",
+                &format!("install: VirtualProtect(RWX) at {target:#x} failed"),
+            );
             return None;
         }
     };
@@ -308,10 +290,6 @@ pub fn install(target: usize, detour: usize) -> Option<MidHook> {
 }
 
 impl MidHook {
-    /// Write the saved window back atomically, without the OS protection calls.
-    ///
-    /// Split out of [`unhook`] so the restore payload can be exercised on an
-    /// owned buffer; `unhook` adds the `VirtualProtect` bracket around it.
     fn restore_atomic(&self) -> bool {
         if self.wmode == 0 {
             return false;
@@ -361,7 +339,6 @@ impl MidHook {
                 &format!("unhook: {:#x} FAILED (protect or store)", self.target),
             );
         }
-        // Keep the page: another thread may still be executing the trampoline.
         let _ = (self.alloc_base, self.alloc_size);
         ok
     }
@@ -378,10 +355,14 @@ impl MidHook {
         )
     }
 
-    /// Test-only constructor: build a hook whose restore payload points at an
-    /// owned buffer, so `restore_atomic` can be exercised without OS calls.
     #[cfg(test)]
-    fn from_parts(target: usize, base16: usize, wmode: u8, orig32: [u8; 32], prologue: usize) -> Self {
+    fn from_parts(
+        target: usize,
+        base16: usize,
+        wmode: u8,
+        orig32: [u8; 32],
+        prologue: usize,
+    ) -> Self {
         Self {
             target,
             detour: 0,
@@ -405,7 +386,6 @@ mod tests {
 
     #[test]
     fn plan_relocates_rip_relative_and_jumps_back_past_the_window() {
-        // mov rax, [rip+0x1000] (7 bytes); sub rsp, 0x28
         let head = [
             0x48, 0x8B, 0x05, 0x00, 0x10, 0x00, 0x00, 0x48, 0x83, 0xEC, 0x28,
         ];
@@ -413,11 +393,8 @@ mod tests {
         let p = plan(TARGET, &head, tramp).expect("plan");
         assert_eq!(p.prologue, 7, "the first instruction alone covers the jmp");
         assert_eq!(p.orig, head[..7], "the exact overwritten bytes are recorded");
-        // disp 0x1000 at next-rip TARGET+7; moved to tramp+7 it must shift by
-        // -delta so the absolute address is unchanged.
         let got = i32::from_le_bytes(p.code[3..7].try_into().unwrap());
         assert_eq!(got, 0x1000 - 0x1_0000);
-        // Tail: ff 25 00 00 00 00 + qword(TARGET + 7).
         let tail = &p.code[p.code.len() - 14..];
         assert_eq!(&tail[..6], &[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
         assert_eq!(
@@ -429,41 +406,34 @@ mod tests {
 
     #[test]
     fn a_branch_into_the_overwritten_window_is_refused() {
-        // jmp rel8 +0 -> TARGET+2, inside the 5-byte window; nops fill to 5.
         let rel8 = [0xEB, 0x00, 0x90, 0x90, 0x90];
         assert_eq!(
             plan(TARGET, &rel8, TARGET + 0x1000),
             Err(PlanError::BranchIntoWindow)
         );
-        // jmp rel32 -3 -> TARGET+2, also inside.
         let rel32 = [0xE9, 0xFD, 0xFF, 0xFF, 0xFF];
         assert_eq!(
             plan(TARGET, &rel32, TARGET + 0x1000),
             Err(PlanError::BranchIntoWindow)
         );
-        // A branch to the continuation (TARGET+5) is fine: it is outside.
-        // rel32, so the 4 KiB move cannot push it out of range.
         let cont = [0xE9, 0x00, 0x00, 0x00, 0x00];
         assert!(plan(TARGET, &cont, TARGET + 0x1000).is_ok());
     }
 
     #[test]
     fn a_rel8_that_cannot_reach_after_the_move_is_refused() {
-        // jmp rel8 +5 -> TARGET+7, outside the window.
         let head = [0xEB, 0x05, 0x90, 0x90, 0x90];
         assert_eq!(
             plan(TARGET, &head, TARGET + 0x1000),
             Err(PlanError::Rel8OutOfRange),
             "a 4 KiB move cannot stay in i8"
         );
-        // The same bytes survive a zero-distance move.
         let p = plan(TARGET, &head, TARGET).expect("delta zero");
         assert_eq!(p.code[1], 5);
     }
 
     #[test]
     fn an_unknown_opcode_is_refused() {
-        // VEX prefix: deliberately outside the decoder subset.
         let head = [0xC5, 0xF8, 0x77, 0x90, 0x90];
         assert_eq!(plan(TARGET, &head, TARGET + 0x1000), Err(PlanError::Undecodable));
     }

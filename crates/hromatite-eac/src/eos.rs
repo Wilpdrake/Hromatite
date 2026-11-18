@@ -679,7 +679,7 @@ impl Hooks {
         )];
         // `EAC_IAT=1` evidence: which caller slots hold a detour and what they
         // held before, so a live run can tell an IAT hit from an export hit.
-        lines.push(hromatite_core::iat::status());
+        lines.push(hromatite_hook::iat::status());
         lines.push(epoch_line());
         lines.push(format!(
             "eac.blind: armed={} notify_suppressed={} poll_no_violation={} build_id={} sysreq={} \
@@ -743,12 +743,9 @@ impl Hooks {
 
     #[cfg(windows)]
     fn install(&mut self) -> Result<Vec<Report>, String> {
-        // SAFETY: the module name is a NUL-terminated ASCII literal and the call
-        // only queries the loader.
-        let module = unsafe { win::GetModuleHandleA(c"EOSSDK-Win64-Shipping.dll".as_ptr()) };
-        if module == 0 {
+        let Some(module) = hromatite_win::sys::module_handle(EOSSDK) else {
             return Err(format!("{EOSSDK} is not loaded"));
-        }
+        };
         reset_state();
 
         let capture_path = std::env::var_os("HROMATITE_EAC_CAPTURE")
@@ -996,7 +993,7 @@ impl Hooks {
         for (index, name) in EXPORTS.iter().enumerate() {
             // Resolve by name through the export directory, like the shim: the
             // SDK's PE headers are intact (it is a normal loaded module).
-            let target = resolve_export(module, name);
+            let target = hromatite_win::pe::resolve_live_export(module, name);
             match target {
                 Some(target) => {
                     // SAFETY: `target` is the entry of an exported function and
@@ -1004,6 +1001,9 @@ impl Hooks {
                     // arity for the slot.
                     match unsafe { hook::install(target, handlers[index], name) } {
                         Ok(installed) => {
+                            if installed.mode == 1 {
+                                hook_log(format!("[hook] {name}: {}", installed.describe()));
+                            }
                             TRAMPS[index].store(installed.tramp, Ordering::Release);
                             reports.push(Report {
                                 name,
@@ -1169,6 +1169,7 @@ static EVP_CALLS: [AtomicU64; EVP_SLOTS] = [const { AtomicU64::new(0) }; EVP_SLO
 /// Log `key`/`iv` (init-shaped hooks) or a small buffer dump (generic ones).
 #[cfg(windows)]
 fn log_evp(slot: usize, calls: u64, a1: u64, a2: u64, a4: u64, a5: u64, a6: u64) {
+    use hromatite_win::memory as safe;
     let target = &EVP_TARGETS[slot];
     let mut line = format!(
         "[evp] {} #{calls} arg1={a1:#x} arg2={a2:#x} arg4={a4:#x} arg5={a5:#x} arg6={a6:#x}",
@@ -1177,29 +1178,26 @@ fn log_evp(slot: usize, calls: u64, a1: u64, a2: u64, a4: u64, a5: u64, a6: u64)
     match target.kind {
         EvpKind::CtxNew => {}
         EvpKind::Init => {
-            // SAFETY: only read after `readable` confirmed the 32 bytes.
-            if a4 != 0 && unsafe { hook::readable(a4 as usize, 32) } {
-                // SAFETY: `readable` just proved the 32 bytes are mapped.
-                let key = unsafe { core::slice::from_raw_parts(a4 as *const u8, 32) };
-                line.push_str(&format!(" key32={}", hex_prefix(key, 32)));
+            if a4 != 0
+                && let Some(key) = safe::read_bytes(a4 as usize, 32)
+            {
+                line.push_str(&format!(" key32={}", hex_prefix(&key, 32)));
             }
-            // SAFETY: only read after `readable` confirmed the 16 bytes.
-            if a5 != 0 && unsafe { hook::readable(a5 as usize, 16) } {
-                // SAFETY: `readable` just proved the 16 bytes are mapped.
-                let iv = unsafe { core::slice::from_raw_parts(a5 as *const u8, 16) };
+            if a5 != 0
+                && let Some(iv) = safe::read_bytes(a5 as usize, 16)
+            {
                 line.push_str(&format!(
                     " iv12={} iv16={}",
                     hex_prefix(&iv[..12], 12),
-                    hex_prefix(iv, 16)
+                    hex_prefix(&iv, 16)
                 ));
             }
         }
         EvpKind::Generic => {
-            // SAFETY: only read after `readable` confirmed the 32 bytes.
-            if a4 != 0 && unsafe { hook::readable(a4 as usize, 32) } {
-                // SAFETY: `readable` just proved the 32 bytes are mapped.
-                let bytes = unsafe { core::slice::from_raw_parts(a4 as *const u8, 32) };
-                line.push_str(&format!(" data32={}", hex_prefix(bytes, 32)));
+            if a4 != 0
+                && let Some(bytes) = safe::read_bytes(a4 as usize, 32)
+            {
+                line.push_str(&format!(" data32={}", hex_prefix(&bytes, 32)));
             }
             if a5 < 0x1_0000 {
                 line.push_str(&format!(" arg5_u32={a5:#x}"));
@@ -1252,7 +1250,8 @@ evp_detour!(evp_slot4, 4);
 
 /// Install the EVP probes. Every target must match its recorded prologue.
 #[cfg(windows)]
-fn install_evp(module: isize, reports: &mut Vec<Report>) {
+fn install_evp(module: usize, reports: &mut Vec<Report>) {
+    use hromatite_win::memory as safe;
     let handlers: [usize; EVP_SLOTS] = [
         evp_slot0 as *const () as usize,
         evp_slot1 as *const () as usize,
@@ -1261,13 +1260,9 @@ fn install_evp(module: isize, reports: &mut Vec<Report>) {
         evp_slot4 as *const () as usize,
     ];
     for (index, target) in EVP_TARGETS.iter().enumerate() {
-        let address = module as usize + target.rva;
-        // SAFETY: the signature bytes are read only after `readable` proves the
-        // range is mapped, and a readable range cannot fault.
-        let matches = unsafe { hook::readable(address, target.signature.len()) }
-            // SAFETY: `readable` just proved the range is mapped.
-            && unsafe { core::slice::from_raw_parts(address as *const u8, target.signature.len()) }
-                == target.signature;
+        let address = module + target.rva;
+        let matches = safe::read_bytes(address, target.signature.len())
+            .is_some_and(|seen| seen.as_slice() == target.signature);
         if !matches {
             reports.push(Report {
                 name: target.name,
@@ -1282,6 +1277,9 @@ fn install_evp(module: isize, reports: &mut Vec<Report>) {
         // listing, and the handler has the same six-integer ABI.
         match unsafe { hook::install(address, handlers[index], target.name) } {
             Ok(installed) => {
+                if installed.mode == 1 {
+                    hook_log(format!("[hook] {}: {}", target.name, installed.describe()));
+                }
                 EVP_TRAMPS[index].store(installed.tramp, Ordering::Release);
                 reports.push(Report {
                     name: target.name,
@@ -1351,7 +1349,7 @@ fn handlers() -> [usize; HK_COUNT] {
 /// frame evidence) and `hromatite.log`.
 fn iat_line(line: &str) {
     hook_log_blocking(line);
-    hromatite_core::log::log_tag("iat", line);
+    hromatite_win::log::log_tag("iat", line);
 }
 
 /// `EAC_IAT=1`: rewrite the EOSSDK import slots of every loaded module.
@@ -1395,17 +1393,17 @@ pub fn module_report(arg: &str) -> Vec<String> {
 /// Windows body of [`install_iat`].
 #[cfg(windows)]
 fn iat_install() -> usize {
-    use hromatite_core::iat;
+    use hromatite_hook::iat;
     let handlers = handlers();
     // The three game modules first, then every other module of the process: an
     // EOS plugin can live in a module we have never heard of, and the walk is
     // cheap (one header read per module).
     let mut names: Vec<String> = vec![
-        hromatite_core::GAME_EXE.to_string(),
-        hromatite_core::GAME_ASSEMBLY.to_string(),
-        hromatite_core::UNITY_PLAYER.to_string(),
+        hromatite_win::GAME_EXE.to_string(),
+        hromatite_win::GAME_ASSEMBLY.to_string(),
+        hromatite_win::UNITY_PLAYER.to_string(),
     ];
-    for (name, _, _) in hromatite_core::procs::modules(std::process::id()) {
+    for (name, _, _) in hromatite_win::procs::modules(std::process::id()) {
         if !names.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
             names.push(name);
         }
@@ -1510,108 +1508,6 @@ fn note_overhead(delta: i32) {
     }
     OVERHEAD_MIN.fetch_min(delta, Ordering::Relaxed);
     OVERHEAD_MAX.fetch_max(delta, Ordering::Relaxed);
-}
-
-// ------------------------------------------------------------- Win32 surface
-
-#[cfg(windows)]
-mod win {
-    use core::ffi::c_char;
-
-    pub type Handle = isize;
-
-    unsafe extern "system" {
-        pub fn GetModuleHandleA(name: *const c_char) -> Handle;
-    }
-
-    #[repr(C)]
-    pub struct DosHeader {
-        pub magic: u16,
-        pub rest: [u16; 29],
-        pub lfanew: i32,
-    }
-
-    /// Just enough of `IMAGE_EXPORT_DIRECTORY`.
-    #[repr(C)]
-    pub struct ExportDirectory {
-        pub _characteristics: u32,
-        pub _timestamp: u32,
-        pub _major_version: u16,
-        pub _minor_version: u16,
-        pub name: u32,
-        pub base: u32,
-        pub number_of_functions: u32,
-        pub number_of_names: u32,
-        pub address_of_functions: u32,
-        pub address_of_names: u32,
-        pub address_of_name_ordinals: u32,
-    }
-}
-
-/// Resolve an export by name through the PE export directory.
-///
-/// `GetProcAddress` would do, but walking the directory is what the shim does
-/// and it also works for a module whose loader entry points were redirected by
-/// another tool. Returns `None` for a missing name or a malformed image.
-#[cfg(windows)]
-fn resolve_export(module: isize, name: &str) -> Option<usize> {
-    use win::{DosHeader, ExportDirectory};
-    let base = module as usize;
-    if base == 0 {
-        return None;
-    }
-    // SAFETY: a loaded module starts with a readable DOS header.
-    let dos = unsafe { &*(base as *const DosHeader) };
-    if dos.magic != 0x5A4D {
-        return None;
-    }
-    let nt = base + dos.lfanew as usize;
-    // SAFETY: `e_lfanew` points at the NT headers of a loaded PE image.
-    let signature = unsafe { core::ptr::read_unaligned(nt as *const u32) };
-    if signature != 0x0000_4550 {
-        return None;
-    }
-    // Optional header: magic u16 at +24, data directories at +112 (PE32+).
-    // SAFETY: PE32+ images have the fixed optional-header prefix.
-    let magic = unsafe { core::ptr::read_unaligned((nt + 24) as *const u16) };
-    if magic != 0x20B {
-        return None;
-    }
-    // SAFETY: export directory entry 0 is at optional header + 112.
-    let export_rva = unsafe { core::ptr::read_unaligned((nt + 24 + 112) as *const u32) } as usize;
-    if export_rva == 0 {
-        return None;
-    }
-    let directory = base + export_rva;
-    // SAFETY: the export directory RVA points inside the loaded image.
-    let exports = unsafe { &*(directory as *const ExportDirectory) };
-    let names_base = base + exports.address_of_names as usize;
-    let ordinals_base = base + exports.address_of_name_ordinals as usize;
-    let functions_base = base + exports.address_of_functions as usize;
-
-    for index in 0..exports.number_of_names as usize {
-        // SAFETY: the name pointer table has `number_of_names` entries.
-        let name_rva =
-            unsafe { core::ptr::read_unaligned((names_base + index * 4) as *const u32) } as usize;
-        let candidate = base + name_rva;
-        // SAFETY: export names are NUL-terminated ASCII inside the image.
-        let candidate = unsafe { std::ffi::CStr::from_ptr(candidate as *const core::ffi::c_char) };
-        if candidate.to_bytes() == name.as_bytes() {
-            // SAFETY: ordinal and function RVAs are parallel arrays.
-            let ordinal =
-                unsafe { core::ptr::read_unaligned((ordinals_base + index * 2) as *const u16) }
-                    as usize;
-            if ordinal >= exports.number_of_functions as usize {
-                return None;
-            }
-            // SAFETY: ordinal indexes the function RVA table.
-            let rva =
-                unsafe { core::ptr::read_unaligned((functions_base + ordinal * 4) as *const u32) }
-                    as usize;
-            return (rva != 0).then_some(base + rva);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------- handlers
@@ -2798,7 +2694,7 @@ unsafe extern "system" fn hook_poll_status(
     if BLIND.load(Ordering::Relaxed) {
         let suppressed = BLIND_POLL.fetch_add(1, Ordering::Relaxed) + 1;
         if a3 != 0 {
-            let _ = hromatite_core::safe::write_bytes(a3 as usize, &0u32.to_le_bytes());
+            let _ = hromatite_win::memory::write_bytes(a3 as usize, &0u32.to_le_bytes());
         }
         if suppressed <= 5 || suppressed.is_multiple_of(200) {
             hook_log(format!(
@@ -2892,10 +2788,11 @@ unsafe extern "system" fn hook_build_id(
     // SAFETY: untouched argument registers.
     let result = unsafe { call_tramp(HK_BUILD_ID, a1, a2, a3, a4, a5, a6) };
     if BLIND.load(Ordering::Relaxed) && a3 != 0 {
-        let real = hromatite_core::safe::read_u32(a3 as usize).unwrap_or(0);
+        let real = hromatite_win::memory::read_u32(a3 as usize).unwrap_or(0);
         if BLIND_BUILD_SET.load(Ordering::Relaxed) {
             let managed = BLIND_BUILD_ID.load(Ordering::Relaxed);
-            let written = hromatite_core::safe::write_bytes(a3 as usize, &managed.to_le_bytes());
+            let written =
+                hromatite_win::memory::write_bytes(a3 as usize, &managed.to_le_bytes());
             let suppressed = BLIND_BUILD.fetch_add(1, Ordering::Relaxed) + 1;
             if suppressed <= 5 || suppressed.is_multiple_of(50) {
                 hook_log(format!(
@@ -2935,9 +2832,9 @@ unsafe extern "system" fn hook_sysreq(a1: u64, a2: u64, a3: u64, a4: u64, a5: u6
     // SAFETY: untouched argument registers.
     let result = unsafe { call_tramp(HK_SYSREQ, a1, a2, a3, a4, a5, a6) };
     if BLIND.load(Ordering::Relaxed) && a3 != 0 {
-        let real = hromatite_core::safe::read_u32(a3 as usize).unwrap_or(0);
+        let real = hromatite_win::memory::read_u32(a3 as usize).unwrap_or(0);
         let managed = BLIND_SYSREQ_VALUE.load(Ordering::Relaxed);
-        let written = hromatite_core::safe::write_bytes(a3 as usize, &managed.to_le_bytes());
+        let written = hromatite_win::memory::write_bytes(a3 as usize, &managed.to_le_bytes());
         let suppressed = BLIND_SYSREQ.fetch_add(1, Ordering::Relaxed) + 1;
         if suppressed <= 5 || suppressed.is_multiple_of(50) {
             hook_log(format!(

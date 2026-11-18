@@ -1,0 +1,17 @@
+[package]
+name = "hromatite-win"
+version = "0.1.0"
+edition = "2024"
+description = "Win32 FFI, safe memory/VirtualQuery, VEH guard, PE parser, procs/PEB, SHA-256 and file logging"
+
+[lib]
+name = "hromatite_win"
+path = "src/lib.rs"
+
+[features]
+remote = []
+
+[dependencies]
+
+[lints]
+workspace = true

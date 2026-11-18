@@ -110,8 +110,3 @@ pub fn guard<T>(label: &str, f: impl FnOnce() -> T) -> Option<T> {
         }
     }
 }
-
-#[macro_export]
-macro_rules! hlog {
-    ($($arg:tt)*) => { $crate::log::log(&format!($($arg)*)) };
-}

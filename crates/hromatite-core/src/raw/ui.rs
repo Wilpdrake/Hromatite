@@ -101,19 +101,12 @@ pub fn install() -> bool {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::ffi::{
+        GetAsyncKeyState, GetClientRect, GetCursorPos, GetForegroundWindow, ScreenToClient,
+    };
     use crate::raw::d3d11::{swapchain_desc, Backend};
     use core::cell::RefCell;
     use hromatite_nuklear::{Input, Keys, Nk};
-
-    // User32: the panel is driven by the window's own mouse and keyboard state,
-    // so no Unity call is needed and the UI works before il2cpp is up.
-    unsafe extern "system" {
-        fn GetForegroundWindow() -> isize;
-        fn GetClientRect(window: isize, rect: *mut i32) -> i32;
-        fn GetCursorPos(point: *mut i32) -> i32;
-        fn ScreenToClient(window: isize, point: *mut i32) -> i32;
-        fn GetAsyncKeyState(key: i32) -> i16;
-    }
 
     const VK_LBUTTON: i32 = 0x01;
     const VK_BACK: i32 = 0x08;

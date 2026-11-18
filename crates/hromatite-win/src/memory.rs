@@ -141,53 +141,73 @@ pub fn scan_yield() {
     }
 }
 
-/// A numeric region description plus an optional *owned* byte snapshot.
-///
-/// Numeric fields never authorise dereferencing. `read_*_in_span` either reads
-/// this owned copy, or asks the OS to copy memory with `ReadProcessMemory`.
+/// One queried virtual memory region returned by [`query_region`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryRegion {
+    pub base: usize,
+    pub size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub ty: u32,
+}
+
+impl MemoryRegion {
+    pub fn end(&self) -> usize {
+        self.base.saturating_add(self.size)
+    }
+
+    pub fn is_committed(&self) -> bool {
+        self.state == MEM_COMMIT
+    }
+
+    pub fn is_readable(&self) -> bool {
+        let p = self.protect & 0xFF;
+        self.state == MEM_COMMIT
+            && p != PAGE_NOACCESS
+            && p != 0
+            && (self.protect & PAGE_GUARD) == 0
+    }
+}
+
+/// Query the virtual memory region containing `addr` via `VirtualQuery`.
+pub fn query_region(addr: usize) -> Option<MemoryRegion> {
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `mbi` is a live output buffer of the exact size passed to
+    // VirtualQuery; `addr` is only inspected as an opaque address.
+    let n = unsafe {
+        VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &mut mbi,
+            core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if n == 0 || mbi.RegionSize == 0 {
+        return None;
+    }
+    Some(MemoryRegion {
+        base: mbi.BaseAddress,
+        size: mbi.RegionSize,
+        state: mbi.State,
+        protect: mbi.Protect,
+        ty: mbi.Type,
+    })
+}
+
+/// A numeric region description for validated bounds checks.
 #[derive(Clone, Debug)]
 pub struct Span {
     base: usize,
     size: usize,
     protect: u32,
-    snapshot_base: usize,
-    bytes: Vec<u8>,
 }
 
 impl Span {
-    /// Construct an empty range. Reads use OS copies until `refresh` fills the
-    /// owned snapshot. No address is ever dereferenced merely because it is here.
+    /// Construct a region range without dereferencing any address.
     pub fn from_parts(base: usize, size: usize, protect: u32) -> Self {
         Self {
             base,
             size,
             protect,
-            snapshot_base: 0,
-            bytes: Vec::new(),
-        }
-    }
-
-    /// Copy a region once and iterate the owned bytes without further FFI calls.
-    pub fn from_snapshot(base: usize, size: usize, protect: u32) -> Option<Self> {
-        let mut span = Self::from_parts(base, size, protect);
-        span.refresh(base, size, protect).then_some(span)
-    }
-
-    /// Refresh the snapshot, reusing its allocation across 64 KiB scan chunks.
-    pub fn refresh(&mut self, base: usize, size: usize, protect: u32) -> bool {
-        self.base = base;
-        self.size = size;
-        self.protect = protect;
-        self.snapshot_base = base;
-        self.bytes.resize(size, 0);
-        if size == 0 {
-            return true;
-        }
-        if read_copy(base, &mut self.bytes) {
-            true
-        } else {
-            self.bytes.clear();
-            false
         }
     }
 
@@ -207,7 +227,7 @@ impl Span {
         addr >= self.base && addr.checked_add(len).is_some_and(|end| end <= self.end())
     }
 
-    fn writable(&self) -> bool {
+    pub fn writable(&self) -> bool {
         matches!(
             self.protect & 0xFF,
             crate::ffi::PAGE_READWRITE
@@ -215,138 +235,6 @@ impl Span {
                 | crate::ffi::PAGE_EXECUTE_READWRITE
                 | crate::ffi::PAGE_EXECUTE_WRITECOPY
         ) && self.protect & crate::ffi::PAGE_GUARD == 0
-    }
-
-    fn snapshot(&self, addr: usize, len: usize) -> Option<&[u8]> {
-        if self.bytes.is_empty() || self.snapshot_base != self.base {
-            return None;
-        }
-        let offset = addr.checked_sub(self.snapshot_base)?;
-        let end = offset.checked_add(len)?;
-        self.bytes.get(offset..end)
-    }
-
-    /// Borrow the owned snapshot. Its lifetime is tied to this Span, never to
-    /// the live region it was copied from.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    #[cfg(test)]
-    fn from_owned_bytes(bytes: &[u8], protect: u32) -> Self {
-        Self {
-            base: bytes.as_ptr() as usize,
-            size: bytes.len(),
-            protect,
-            snapshot_base: bytes.as_ptr() as usize,
-            bytes: bytes.to_vec(),
-        }
-    }
-
-    #[cfg(test)]
-    fn set_range(&mut self, base: usize, size: usize) {
-        self.base = base;
-        self.size = size;
-        self.snapshot_base = base;
-    }
-}
-
-/// One 64-bit word from an owned snapshot or an OS-mediated copy.
-pub fn read_u64_in_span(span: &Span, addr: usize) -> Option<u64> {
-    if !span.contains(addr, 8) {
-        return None;
-    }
-    if let Some(bytes) = span.snapshot(addr, 8) {
-        return Some(u64::from_le_bytes(bytes.try_into().ok()?));
-    }
-    read_u64(addr)
-}
-
-pub fn read_usize_in_span(span: &Span, addr: usize) -> Option<usize> {
-    read_u64_in_span(span, addr).map(|v| v as usize)
-}
-
-pub fn read_u8_in_span(span: &Span, addr: usize) -> Option<u8> {
-    if !span.contains(addr, 1) {
-        return None;
-    }
-    if let Some(bytes) = span.snapshot(addr, 1) {
-        return bytes.first().copied();
-    }
-    read_u8(addr)
-}
-
-/// Compare a complete byte pattern inside one validated region snapshot.
-pub fn matches_in_span(span: &Span, addr: usize, pat: &[u8]) -> bool {
-    if pat.is_empty() || !span.contains(addr, pat.len()) {
-        return false;
-    }
-    if read_u8_in_span(span, addr) != pat.first().copied() {
-        return false;
-    }
-    if pat.len() == 1 {
-        return true;
-    }
-    if let Some(bytes) = span.snapshot(addr, pat.len()) {
-        return bytes == pat;
-    }
-    read_bytes(addr, pat.len()).is_some_and(|bytes| bytes == pat)
-}
-
-/// Reused bounded cursor over a large address range. `next_chunk` refreshes
-/// the owned Span to the next window, extending it by `overlap` bytes for
-/// patterns that straddle the boundary: candidates never start in that tail.
-pub struct ScanChunks {
-    next: usize,
-    end: usize,
-    protect: u32,
-    window: usize,
-    overlap: usize,
-    span: Span,
-    failed: bool,
-}
-
-impl ScanChunks {
-    pub fn new(base: usize, size: usize, protect: u32, window: usize, overlap: usize) -> Self {
-        let window = window.clamp(1, 1024 * 1024);
-        Self {
-            next: base,
-            end: base.saturating_add(size),
-            protect,
-            window,
-            overlap: overlap.min(window),
-            span: Span::from_parts(base, 0, protect),
-            failed: false,
-        }
-    }
-
-    pub fn next_chunk(&mut self) -> bool {
-        if self.next >= self.end {
-            return false;
-        }
-        let remaining = self.end - self.next;
-        let body = remaining.min(self.window);
-        let tail = self.overlap.min(remaining - body);
-        self.next = self.next.saturating_add(body);
-        let ok = self
-            .span
-            .refresh(self.next - body, body + tail, self.protect);
-        self.failed = !ok;
-        ok
-    }
-
-    /// Exclusive start limit for candidates. The overlap tail is lookahead for
-    /// the current chunk, not a second range of candidate start addresses.
-    pub fn candidate_end(&self) -> usize {
-        self.next
-    }
-
-    pub fn failed(&self) -> bool {
-        self.failed
-    }
-
-    pub fn span(&self) -> &Span {
-        &self.span
     }
 }
 
@@ -381,28 +269,11 @@ pub fn span_at(addr: usize) -> Option<Span> {
     if addr == 0 {
         return None;
     }
-    // SAFETY: `mbi` is a live output buffer of exactly the passed size; the
-    // query only borrows `addr` as an opaque address and does not dereference it.
-    unsafe {
-        let mut mbi = MEMORY_BASIC_INFORMATION::default();
-        let n = VirtualQuery(
-            addr as *const core::ffi::c_void,
-            &mut mbi,
-            core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        );
-        if n == 0 || mbi.State != MEM_COMMIT || mbi.RegionSize == 0 {
-            return None;
-        }
-        let p = mbi.Protect & 0xFF;
-        if p == PAGE_NOACCESS || p == 0 || (mbi.Protect & PAGE_GUARD) != 0 {
-            return None;
-        }
-        Some(Span::from_parts(
-            mbi.BaseAddress,
-            mbi.RegionSize,
-            mbi.Protect,
-        ))
+    let region = query_region(addr)?;
+    if !region.is_readable() {
+        return None;
     }
+    Some(Span::from_parts(region.base, region.size, region.protect))
 }
 
 /// Is the single byte/word at `addr` safe to touch?
@@ -444,7 +315,7 @@ pub fn readable_range(addr: usize, len: usize) -> bool {
     true
 }
 
-fn writable_range(addr: usize, len: usize) -> bool {
+pub fn writable_range(addr: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
@@ -487,6 +358,29 @@ pub fn read_copy(addr: usize, buf: &mut [u8]) -> bool {
         )
     };
     ok != 0 && copied == buf.len()
+}
+
+/// Copy as many bytes from `addr` into `buf` as the OS can transfer in one
+/// `ReadProcessMemory` call, returning the number of bytes actually copied
+/// (even on a partial copy across an unmapped hole where Win32 returns 0).
+pub fn read_partial(addr: usize, buf: &mut [u8]) -> usize {
+    if buf.is_empty() || addr == 0 {
+        return 0;
+    }
+    let mut copied = 0usize;
+    // SAFETY: `buf` is a live writable slice of `buf.len()` bytes and `copied`
+    // is a valid output pointer; the OS copies out of the current process
+    // without dereferencing `addr` in Rust.
+    let _ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            addr as *const u8,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut copied,
+        )
+    };
+    copied.min(buf.len())
 }
 
 /// Copy as much of `addr..addr+len` as is contiguous-readable. Partial reads are
@@ -562,8 +456,6 @@ pub fn write_usize(addr: usize, v: usize) -> bool {
     if !writable_range(addr, core::mem::size_of::<usize>()) {
         return false;
     }
-    // SAFETY: `writable_range` accepted the complete output range, and the
-    // unaligned store cannot overlap any Rust reference held by this function.
     write_bytes(addr, &v.to_le_bytes())
 }
 
@@ -670,96 +562,66 @@ pub fn utf16_lossy(p: usize, max: usize) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Offsets (relative to `hay`) of every 8-byte word equal to `want`, capped.
-/// The caller passes a validated `Span`, so the loop itself does no per-word
-/// `VirtualQuery`.
-pub fn find_qword_in_span(span: &Span, want: u64, max: usize, out: &mut Vec<usize>) {
-    let Some(mut a) = span.base.checked_add(7).map(|v| v & !7usize) else {
-        return;
-    };
-    let end = span.end().saturating_sub(8);
-    while a <= end && out.len() < max {
-        if read_u64_in_span(span, a) == Some(want) {
-            out.push(a);
-        }
-        a += 8;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> [u8; 24] {
-        [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]
-    }
-
-    fn fixture_span(bytes: &[u8]) -> Span {
-        Span::from_owned_bytes(bytes, crate::ffi::PAGE_READWRITE)
-    }
-
     #[test]
-    fn span_reads_are_bounds_checked() {
-        let bytes = fixture();
-        let mut span = fixture_span(&bytes);
-        let base = span.base();
-        span.set_range(base, 16);
-        let first = u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(read_u64_in_span(&span, base), Some(first));
-        assert_eq!(read_u64_in_span(&span, base + 9), None);
-        assert_eq!(read_u8_in_span(&span, base + 15), Some(0));
-        assert_eq!(read_u8_in_span(&span, base + 16), None);
-        assert!(matches_in_span(&span, base + 7, &[8, 9]));
-        assert!(!matches_in_span(&span, base + 9, &[9, 0]));
-        assert!(!span.contains(usize::MAX - 4, 8));
-    }
+    fn span_bounds_and_writability_are_checked() {
+        let rw = Span::from_parts(0x1000, 16, crate::ffi::PAGE_READWRITE);
+        assert_eq!(rw.base(), 0x1000);
+        assert_eq!(rw.end(), 0x1010);
+        assert_eq!(rw.protect(), crate::ffi::PAGE_READWRITE);
+        assert!(rw.contains(0x1000, 8));
+        assert!(rw.contains(0x1008, 8));
+        assert!(!rw.contains(0x1009, 8));
+        assert!(!rw.contains(usize::MAX - 4, 8));
+        assert!(rw.writable());
 
-    #[test]
-    fn candidate_limit_does_not_duplicate_the_next_chunk_start() {
-        let base = 0x10000usize;
-        let mut chunks = ScanChunks::new(
-            base,
-            64 * 1024 + 32,
-            crate::ffi::PAGE_READONLY,
-            64 * 1024,
-            4,
+        let ro = Span::from_parts(0x1000, 16, crate::ffi::PAGE_READONLY);
+        assert!(!ro.writable());
+
+        let guarded = Span::from_parts(
+            0x1000,
+            16,
+            crate::ffi::PAGE_READWRITE | crate::ffi::PAGE_GUARD,
         );
-        // Position the cursor exactly after the first logical body, as
-        // next_chunk() leaves it. The extra four bytes are lookahead only.
-        chunks.next = base + 64 * 1024;
-        let last = chunks.candidate_end().saturating_sub(4);
-        assert!(
-            base + 64 * 1024 > last,
-            "a match at the next chunk base would duplicate"
-        );
-        assert_eq!(last, base + 64 * 1024 - 4);
+        assert!(!guarded.writable());
     }
 
     #[test]
-    fn refresh_failure_is_reported_not_confused_with_end_of_scan() {
-        let mut chunks = ScanChunks::new(1, 4096, crate::ffi::PAGE_READONLY, 64, 0);
-        assert!(
-            !chunks.next_chunk(),
-            "address 1 must not be treated as a valid region"
-        );
-        assert!(chunks.failed());
+    fn memory_region_readability_rejects_uncommitted_and_guard_pages() {
+        let ok = MemoryRegion {
+            base: 0x1000,
+            size: 0x1000,
+            state: MEM_COMMIT,
+            protect: crate::ffi::PAGE_READONLY,
+            ty: crate::ffi::MEM_IMAGE,
+        };
+        assert!(ok.is_committed());
+        assert!(ok.is_readable());
+        assert_eq!(ok.end(), 0x2000);
+
+        let guard = MemoryRegion {
+            protect: crate::ffi::PAGE_READWRITE | PAGE_GUARD,
+            ..ok
+        };
+        assert!(!guard.is_readable());
+
+        let reserved = MemoryRegion {
+            state: crate::ffi::MEM_RESERVE,
+            ..ok
+        };
+        assert!(!reserved.is_committed());
+        assert!(!reserved.is_readable());
     }
 
     #[test]
-    fn qword_scan_handles_alignment_and_address_overflow() {
-        let bytes = fixture();
-        let mut span = fixture_span(&bytes);
-        let base = span.base();
-        span.set_range(base + 1, 23);
-        let mut out = Vec::new();
-        find_qword_in_span(&span, 0, 8, &mut out);
-        assert_eq!(out.len(), 1);
-
-        let invalid = Span::from_parts(usize::MAX - 4, 8, crate::ffi::PAGE_READWRITE);
-        out.clear();
-        find_qword_in_span(&invalid, 0, 8, &mut out);
-        assert!(out.is_empty());
+    fn host_reads_fail_closed_without_panicking() {
+        let mut buf = [0u8; 8];
+        assert!(!read_copy(0, &mut buf));
+        assert_eq!(read_partial(0, &mut buf), 0);
+        assert!(read_bytes(0, 8).is_none());
+        assert!(read_upto(0, 8).is_empty());
     }
 }
