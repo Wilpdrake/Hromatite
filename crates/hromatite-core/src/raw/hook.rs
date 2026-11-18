@@ -1717,38 +1717,39 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
     if crate::lateupdate::resolve(selector).is_some() {
         return true;
     }
-    let index = match selector {
-        Selector::Address(_) => return false,
-        Selector::Index(index) => index,
-        Selector::Auto => {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                log::log_tag(
-                    "late",
-                    &format!(
-                        "auto target is exactly {}; no arbitrary fallback",
-                        crate::lateupdate::AUTO_CLASS
-                    ),
-                );
-            }
-            if crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256 {
-                return false;
-            }
-            crate::lateupdate::AUTO_TYPE_INDEX
+    if let Selector::Auto = selector {
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log::log_tag(
+                "late",
+                &format!(
+                    "auto target is exactly {}; no arbitrary fallback",
+                    crate::lateupdate::AUTO_CLASS
+                ),
+            );
         }
-    };
-    let Some((ga, gasize)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
-        return false;
-    };
-    let f = ga.wrapping_add(crate::m3::IMAGE_GET_CLASS_RVA as usize);
-    if f < ga || f >= ga.saturating_add(gasize) {
-        return false;
     }
     let Some(corlib) = crate::il2cpp::find_domain() else {
         return false;
     };
     let Some(image) = crate::m3::image_of(corlib, "Assembly-CSharp") else {
         return false;
+    };
+    // A pinned type index describes one metadata build. When the game update
+    // moved it, ask il2cpp by name — one call instead of walking up to 120k
+    // classes through image_get_class.
+    if matches!(selector, Selector::Auto)
+        && crate::symbols::GAMEASSEMBLY_SHA256 != crate::lateupdate::AUTO_BUILD_SHA256
+    {
+        return materialise_by_name(image);
+    }
+    let Some(f) = crate::m3::image_get_class_addr() else {
+        return false;
+    };
+    let index = match selector {
+        Selector::Auto => crate::lateupdate::AUTO_TYPE_INDEX,
+        Selector::Index(index) => index,
+        Selector::Address(_) => return false,
     };
     // SAFETY: f is the build-measured il2cpp_image_get_class(image, index) and
     // is called only from the injection stub. The class may initialize lazily,
@@ -1759,6 +1760,43 @@ pub fn materialise_late_class(selector: crate::lateupdate::Selector) -> bool {
         // In auto mode this re-checks the fully-qualified name. A changed type
         // index must never turn into a hook on an unrelated method.
         && crate::lateupdate::resolve(selector).is_some()
+}
+
+/// `il2cpp_class_from_name(image, namespace, name)` for the auto target.
+///
+/// The two C strings live in static storage: the runtime keeps the pointers it
+/// was given, so stack buffers would dangle.
+fn materialise_by_name(image: usize) -> bool {
+    use std::sync::OnceLock;
+    static NAMES: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+    let Some(function) = crate::m3::class_from_name_addr() else {
+        return false;
+    };
+    let (namespace, name) = match crate::lateupdate::AUTO_CLASS.rsplit_once('.') {
+        Some(parts) => parts,
+        None => ("", crate::lateupdate::AUTO_CLASS),
+    };
+    let (namespace, name) = NAMES.get_or_init(|| {
+        let mut ns = namespace.as_bytes().to_vec();
+        ns.push(0);
+        let mut class = name.as_bytes().to_vec();
+        class.push(0);
+        (ns, class)
+    });
+    // SAFETY: f is the build-measured il2cpp_class_from_name; the two pointers
+    // are NUL-terminated and outlive the process.
+    let class = unsafe {
+        crate::veh::call3(
+            function,
+            image,
+            namespace.as_ptr() as usize,
+            name.as_ptr() as usize,
+        )
+    }
+    .unwrap_or(0);
+    class >= 0x10000
+        && crate::safe::readable_at(class)
+        && crate::lateupdate::resolve(crate::lateupdate::Selector::Auto).is_some()
 }
 
 fn env_flag(name: &str) -> bool {

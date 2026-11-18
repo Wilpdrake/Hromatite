@@ -292,11 +292,7 @@ fn class_or_materialise(ns: &str, name: &str, assembly: &str) -> Option<usize> {
     if let Some((_, c)) = crate::m3::find(ns, name, 120_000).first() {
         return Some(*c);
     }
-    let (ga, gasize) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
-    let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
-    if f + 8 > ga + gasize {
-        return None;
-    }
+    let f = crate::m3::image_get_class_addr()?;
     let first = crate::il2cpp::find_domain()?;
     let image = crate::m3::image_of(first, assembly)?;
     for i in 0..40_000usize {
@@ -949,22 +945,18 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let asm = if a1.is_empty() { "Assembly-CSharp" } else { a1 };
             let filt = a2.to_ascii_lowercase();
             let max = parse_addr(rest.trim()).unwrap_or(30_000).min(60_000);
-            let (ga, gasize) = match crate::procs::own_module(crate::GAME_ASSEMBLY) {
-                Some(v) => v,
-                None => {
-                    return (
-                        vec!["m3l: GameAssembly.dll not loaded".into()],
-                        Action::None,
-                    );
-                }
-            };
-            let f = ga + crate::m3::IMAGE_GET_CLASS_RVA as usize;
-            if f + 8 > ga + gasize {
+            if crate::procs::own_module(crate::GAME_ASSEMBLY).is_none() {
+                return (
+                    vec!["m3l: GameAssembly.dll not loaded".into()],
+                    Action::None,
+                );
+            }
+            let Some(f) = crate::m3::image_get_class_addr() else {
                 return (
                     vec!["m3l: image_get_class outside the module".into()],
                     Action::None,
                 );
-            }
+            };
             let first = match crate::il2cpp::find_domain() {
                 Some(v) => v,
                 None => {
@@ -1059,7 +1051,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     Some(img) => {
                         out.push(format!(
                             "  {want}: image {img:#x}, il2cpp_image_get_class {:#x}",
-                            crate::m3::IMAGE_GET_CLASS_RVA
+                            crate::m3::image_get_class_addr().unwrap_or(0)
                         ));
                     }
                     None => out.push(format!("  {want}: not found")),

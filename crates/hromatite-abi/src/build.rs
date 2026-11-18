@@ -52,6 +52,10 @@ pub struct Il2cppAnchors {
     pub get_corlib: u32,
     /// `il2cpp_image_get_class(image, index)`.
     pub image_get_class: u32,
+    /// `il2cpp_class_from_name(image, namespace, name)` — one call instead of
+    /// enumerating the image's classes when the pinned type index no longer
+    /// applies to a newer build.
+    pub class_from_name: u32,
     /// `s_TypeInfoDefinitionTable` slot (holds `Il2CppClass**`).
     pub class_table: u32,
 }
@@ -132,6 +136,7 @@ pub const BUILD_648F61B1: Build = Build {
     il2cpp: Il2cppAnchors {
         get_corlib: 0x00c2_7f00,
         image_get_class: 0x00c2_a330,
+        class_from_name: 0x00c2_8050,
         class_table: 0x0e66_c870,
     },
     layout: Layout {
@@ -180,6 +185,7 @@ pub const BUILD_245768F2: Build = Build {
     il2cpp: Il2cppAnchors {
         get_corlib: 0x00c2_9c70,
         image_get_class: 0x00c2_c0a0,
+        class_from_name: 0x00c2_9dc0,
         class_table: 0x0e66_f0d0,
     },
     layout: Layout {
@@ -305,6 +311,7 @@ mod tests {
         assert_eq!(old.gc.thread_list_cs, 0xe6b_b100);
         assert_eq!(old.il2cpp.get_corlib, 0xc2_7f00);
         assert_eq!(old.il2cpp.image_get_class, 0xc2_a330);
+        assert_eq!(old.il2cpp.class_from_name, 0xc2_8050);
         assert_eq!(old.il2cpp.class_table, 0xe66_c870);
         assert_eq!(old.layout.class_parent, 0x10);
         assert_eq!(old.layout.class_methods, 0x50);
@@ -336,6 +343,7 @@ mod tests {
         assert_eq!(new.gc.thread_list_cs, 0xe6b_d800);
         assert_eq!(new.il2cpp.get_corlib, 0xc2_9c70);
         assert_eq!(new.il2cpp.image_get_class, 0xc2_c0a0);
+        assert_eq!(new.il2cpp.class_from_name, 0xc2_9dc0);
         assert_eq!(new.il2cpp.class_table, 0xe66_f0d0);
         assert_eq!(new.layout.class_parent, 0xa0);
         assert_eq!(new.layout.class_methods, 0x58);

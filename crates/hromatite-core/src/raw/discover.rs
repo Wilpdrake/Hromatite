@@ -412,7 +412,14 @@ pub fn il2cpp_anchors(base: usize, size: usize) -> Option<Il2cppAnchors> {
             "discover: il2cpp anchors corlib={get_corlib:#x} image_get_class={image_get_class:#x} class_table={class_table:#x}"
         ),
     );
-    Some(Il2cppAnchors { get_corlib, image_get_class, class_table })
+    Some(Il2cppAnchors {
+        get_corlib,
+        image_get_class,
+        // `il2cpp_class_from_name` cannot be derived from shapes yet; a zero
+        // anchor makes that path refuse instead of calling the module base.
+        class_from_name: 0,
+        class_table,
+    })
 }
 
 #[cfg(test)]

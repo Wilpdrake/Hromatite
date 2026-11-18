@@ -1,83 +1,111 @@
-//! Unity 6 (6000.0.x) il2cpp layout as measured on this build.
+//! Unity 6 (6000.0.x) il2cpp layout read straight out of the game's memory.
 //!
-//! Everything here was verified live (2026-11-15, sha256 `648f61b1…`):
+//! **Every offset and RVA here is per build** and comes from
+//! `hromatite_abi::build` (selected by the SHA-256 of the loaded
+//! `GameAssembly.dll`). A literal in this file is a bug: the previous build
+//! moved the image stride (`0x48` → `0x50`), the class `methods` slot
+//! (`0x50` → `0x58`), `parent` (`0x10` → `0xa0`), the `MethodInfo.name` slot
+//! (`0x18` → `0x20`) and the `FieldInfo` stride (`0x28` → `0x20`). When the build
+//! cannot be identified every accessor returns `None` and the caller must
+//! refuse, never guess.
 //!
 //! ```text
-//! GameAssembly .data +0xe66c870  → Il2CppClass**  (s_TypeInfoDefinitionTable,
-//!                                  indexed by typeDefinitionIndex, lazily filled)
+//! 648f61b1…                       245768f2…
+//! GameAssembly .data +0xe66c870  → Il2CppClass**  (+0xe66f0d0)
 //! Il2CppClass +0x00              → const Il2CppImage*
 //!            +0x18              → const char* namespaze
-//!            +0x50              → const MethodInfo**  (array of pointers)
-//!            +0x80              → FieldInfo[]         (inline records)
+//!            +0x50 (+0x58)      → const MethodInfo**  (array of pointers)
+//!            +0x80 (+0x88)      → FieldInfo[]         (inline records)
 //!            +0x98              → const char* name
+//!            +0x10 (+0xa0)      → Il2CppClass* parent
 //!            +0x124             → uint16 fieldsCount
-//! FieldInfo  +0x00              → const Il2CppType*
-//!            +0x08              → int32 offset
-//!            +0x10              → const char* name
-//!            +0x18              → uint32 token
-//!            +0x20              → Il2CppClass* parent        (stride 0x28)
 //! MethodInfo +0x00              → methodPointer
-//!            +0x18              → const char* name
-//!            +0x20              → const Il2CppType* return_type
-//!            +0x28              → Il2CppClass* klass
+//!            +0x18 (+0x20)      → const char* name
+//!            +0x20 (+0x28)      → const Il2CppType* return_type
 //!            +0x30              → parameters
+//!            +0x4c / +0x52      → u16 flags / u8 parameters_count
+//! FieldInfo  +0x00              → const char* name        (0x10 → 0x00)
+//!            +0x08              → int32 offset
+//!            +0x08 (+0x10)      → const Il2CppType* type
 //! ```
 //!
 //! The image array is not the "domain": `il2cpp_get_corlib` returns the *corlib
-//! `Il2CppImage`*, and the images of every assembly are laid out back to back.
-//! The strides and field offsets differ per build, so they come from the build
-//! descriptor: `0x48` stride with the name at `+0x08` on `648f61b1…`, `0x50`
-//! with the name at `+0x08` on `245768f2…` (the file name moved from `+0x40` to
-//! `+0x18`). A literal here is exactly the bug that stopped the LateUpdate
-//! anchor from finding `Assembly-CSharp` on a newer game build.
-//!
-//! `il2cpp_image_get_class` is `GEsTfKaEfsh` at RVA 0xc2a330 (verified live:
-//! index 167 of UnityEngine.CoreModule returns `Camera`). Reading the class
-//! table directly needs no API call at all, which is why this module is safe
-//! from the game's own thread.
+//! `Il2CppImage`*, and the images of every assembly are laid out back to back
+//! (stride `0x48` / `0x50`, short name at `+0x08` on both). `il2cpp_image_get_class`
+//! (`0xc2a330` / `0xc2c0a0`), `il2cpp_class_from_name` (`0xc28050` / `0xc29dc0`)
+//! and the class table pointer come from the same descriptor. Reading the class
+//! table needs no API call at all, which is why this module is safe from the
+//! game's own thread.
 
 #![forbid(unsafe_code)]
+
+use core::mem::size_of;
+
+use hromatite_abi::build::{Il2cppAnchors, Layout};
 
 use crate::procs;
 use crate::safe;
 
-/// `Il2CppClass**` (s_TypeInfoDefinitionTable) inside GameAssembly `.data`.
-pub const CLASS_TABLE_RVA: u32 = 0x0e66_c870;
-/// Offset of `il2cpp_image_get_class` (GEsTfKaEfsh).
-pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_a330;
-/// Offset of `il2cpp_class_get_fields` (verified by disassembly: reads
-/// `class+0x80` and the u16 count at `class+0x124`).
-pub const CLASS_GET_FIELDS_RVA: u32 = 0x00c2_8070;
-/// Offset of `il2cpp_class_from_name` (thunk `jmp`).
-pub const CLASS_FROM_NAME_RVA: u32 = 0x00c2_8050;
+/// Descriptor of the module this process is attached to.
+#[cfg(target_os = "windows")]
+pub fn loaded_build() -> Option<&'static hromatite_abi::build::Build> {
+    let (base, size) = procs::own_module(crate::GAME_ASSEMBLY)?;
+    crate::buildinfo::resolve(base, size)
+}
 
-pub const CLASS_IMAGE_OFF: usize = 0x00;
-pub const CLASS_NS_OFF: usize = 0x18;
-pub const CLASS_METHODS_OFF: usize = 0x50;
-pub const CLASS_FIELDS_OFF: usize = 0x80;
-pub const CLASS_NAME_OFF: usize = 0x98;
-pub const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
+/// Host builds have no module: every accessor below then reports "unavailable".
+#[cfg(not(target_os = "windows"))]
+pub fn loaded_build() -> Option<&'static hromatite_abi::build::Build> {
+    None
+}
 
-pub const FIELD_STRIDE: usize = 0x28;
-const FIELD_TYPE_OFF: usize = 0x00;
-const FIELD_NAME_OFF: usize = 0x10;
-// Verified by il2cpp_field_get_offset/value/set_value (tools/data/
-// il2cpp-export-names.json): offset is int32 at +0x08; token is at +0x18.
-const FIELD_OFFSET_OFF: usize = 0x08;
-const FIELD_PARENT_OFF: usize = 0x20;
+/// Struct layout of the loaded build.
+pub fn layout() -> Option<Layout> {
+    loaded_build().map(|build| build.layout)
+}
 
-const METHOD_NAME_OFF: usize = 0x18;
-const METHOD_RETURN_TYPE_OFF: usize = 0x20;
+/// il2cpp anchors (RVAs) of the loaded build.
+pub fn anchors() -> Option<Il2cppAnchors> {
+    loaded_build().map(|build| build.il2cpp)
+}
 
-fn method_return_kind_with<R, U>(mi: usize, read_usize: R, read_u32: U) -> u32
-where
-    R: FnOnce(usize) -> Option<usize>,
-    U: FnOnce(usize) -> Option<u32>,
-{
-    read_usize(mi + METHOD_RETURN_TYPE_OFF)
-        .and_then(|ty| read_u32(ty + 0x08))
-        .map(|bits| (bits >> 16) & 0xff)
-        .unwrap_or(u32::MAX)
+#[cfg(target_os = "windows")]
+fn module() -> Option<(usize, usize)> {
+    procs::own_module(crate::GAME_ASSEMBLY)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn module() -> Option<(usize, usize)> {
+    None
+}
+
+/// Absolute address of an il2cpp export inside the loaded module.
+fn function(rva: u32) -> Option<usize> {
+    if rva == 0 {
+        // Discovery leaves unknown anchors at zero; that is "no evidence", not
+        // "the module base".
+        return None;
+    }
+    let (base, size) = module()?;
+    let f = base.checked_add(rva as usize)?;
+    (f.checked_add(16)? <= base.checked_add(size)?).then_some(f)
+}
+
+/// `il2cpp_image_get_class(image, index)` of the loaded build.
+pub fn image_get_class_addr() -> Option<usize> {
+    function(anchors()?.image_get_class)
+}
+
+/// `il2cpp_class_from_name(image, namespace, name)` of the loaded build.
+pub fn class_from_name_addr() -> Option<usize> {
+    function(anchors()?.class_from_name)
+}
+
+fn name_at(ptr: usize) -> Option<String> {
+    if ptr < 0x10000 {
+        return Some(String::new());
+    }
+    safe::ascii_at(ptr, 256)
 }
 
 /// Resolved class table (cached: the pointer is stable for the run).
@@ -88,24 +116,17 @@ pub fn class_table() -> Option<usize> {
     if cached != 0 {
         return Some(cached);
     }
-    let (base, size) = procs::own_module(crate::GAME_ASSEMBLY)?;
-    let slot = base.checked_add(CLASS_TABLE_RVA as usize)?;
+    let (base, size) = module()?;
+    let slot = base.checked_add(anchors()?.class_table as usize)?;
     if slot + 8 > base + size && !safe::readable_at(slot) {
         return None;
     }
-    let t = safe::read_usize(slot)?;
-    if t < 0x10000 || !safe::readable_at(t) {
+    let table = safe::read_usize(slot)?;
+    if table < 0x10000 || !safe::readable_at(table) {
         return None;
     }
-    CACHE.store(t, Ordering::Relaxed);
-    Some(t)
-}
-
-fn name_at(ptr: usize) -> Option<String> {
-    if ptr < 0x10000 {
-        return Some(String::new());
-    }
-    safe::ascii_at(ptr, 256)
+    CACHE.store(table, Ordering::Relaxed);
+    Some(table)
 }
 
 /// `Il2CppClass*` for a `typeDefinitionIndex`.
@@ -115,12 +136,10 @@ pub fn class_at(index: usize) -> Option<usize> {
     (p >= 0x10000 && safe::readable_at(p)).then_some(p)
 }
 
-/// Parent class (`Il2CppClass.parent`, measured at `+0x10` on this build:
-/// Camera → Behaviour → Component → Object → System.Object).
-pub const CLASS_PARENT_OFF: usize = 0x10;
-
+/// Parent class (`Il2CppClass.parent`).
 pub fn parent(class: usize) -> Option<usize> {
-    let p = safe::read_usize(class + CLASS_PARENT_OFF)?;
+    let off = layout()?.class_parent as usize;
+    let p = safe::read_usize(class + off)?;
     (p >= 0x10000 && safe::readable_at(p)).then_some(p)
 }
 
@@ -152,13 +171,16 @@ pub fn method_in_chain(class: usize, name: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Class name/namespace (this build: name at +0x98, namespace at +0x18).
+/// Class name (`Il2CppClass.name`).
 pub fn class_name(class: usize) -> Option<String> {
-    name_at(safe::read_usize(class + CLASS_NAME_OFF)?)
+    let off = layout()?.class_name as usize;
+    name_at(safe::read_usize(class + off)?)
 }
 
+/// Class namespace (`Il2CppClass.namespaze`).
 pub fn class_namespace(class: usize) -> Option<String> {
-    name_at(safe::read_usize(class + CLASS_NS_OFF)?)
+    let off = layout()?.class_namespace as usize;
+    name_at(safe::read_usize(class + off)?)
 }
 
 pub fn class_full_name(class: usize) -> String {
@@ -229,30 +251,40 @@ pub struct Field {
     pub parent: usize,
 }
 
-fn field_offset(record: &[u8]) -> Option<u32> {
-    let bytes = record.get(FIELD_OFFSET_OFF..FIELD_OFFSET_OFF + size_of::<u32>())?;
+/// Read one `FieldInfo` record's `offset` (int32) at the build's slot.
+fn field_offset(record: &[u8], offset_slot: usize) -> Option<u32> {
+    let bytes = record.get(offset_slot..offset_slot + size_of::<u32>())?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-/// Fields of a class through the verified Unity 6 `FieldInfo` record.
+/// Fields of a class through the build's `FieldInfo` record.
 pub fn fields(class: usize) -> Vec<Field> {
     let mut out = Vec::new();
-    let ptr = match safe::read_usize(class + CLASS_FIELDS_OFF) {
+    let Some(shape) = layout() else {
+        return out;
+    };
+    let stride = shape.field_stride as usize;
+    let ptr = match safe::read_usize(class + shape.class_fields as usize) {
         Some(p) if p >= 0x10000 && safe::readable_at(p) => p,
         _ => return out,
     };
-    let count = safe::read_u16(class + CLASS_FIELDS_COUNT_OFF).unwrap_or(0) as usize;
+    let count = safe::read_u16(class + shape.class_fields_count as usize).unwrap_or(0) as usize;
     for i in 0..count.min(512) {
-        let e = ptr + i * FIELD_STRIDE;
-        let ty = safe::read_usize(e + FIELD_TYPE_OFF).unwrap_or(0);
-        let name = safe::read_usize(e + FIELD_NAME_OFF)
+        let e = ptr + i * stride;
+        let ty = safe::read_usize(e + shape.field_type as usize).unwrap_or(0);
+        let name = safe::read_usize(e + shape.field_name as usize)
             .and_then(name_at)
             .unwrap_or_default();
-        let off = safe::read_bytes(e, FIELD_STRIDE)
+        let off = safe::read_bytes(e, stride)
             .as_deref()
-            .and_then(field_offset)
+            .and_then(|record| field_offset(record, shape.field_offset as usize))
             .unwrap_or(0);
-        let parent = safe::read_usize(e + FIELD_PARENT_OFF).unwrap_or(0);
+        // `field_parent: 0` means the build no longer stores the owning class.
+        let parent = if shape.field_parent == 0 {
+            0
+        } else {
+            safe::read_usize(e + shape.field_parent as usize).unwrap_or(0)
+        };
         out.push(Field {
             name,
             ty,
@@ -274,13 +306,31 @@ pub struct Method {
     pub flags: u16,
 }
 
-/// Methods of a class (`class+0x50` is an array of `MethodInfo*`).
+fn method_return_kind_with<R, U>(mi: usize, return_slot: usize, read_usize: R, read_u32: U) -> u32
+where
+    R: FnOnce(usize) -> Option<usize>,
+    U: FnOnce(usize) -> Option<u32>,
+{
+    read_usize(mi + return_slot)
+        .and_then(|ty| read_u32(ty + 0x08))
+        .map(|bits| (bits >> 16) & 0xff)
+        .unwrap_or(u32::MAX)
+}
+
+/// Methods of a class (`Il2CppClass.methods` is an array of `MethodInfo*`).
 pub fn methods(class: usize) -> Vec<Method> {
     let mut out = Vec::new();
-    let arr = match safe::read_usize(class + CLASS_METHODS_OFF) {
+    let Some(shape) = layout() else {
+        return out;
+    };
+    let arr = match safe::read_usize(class + shape.class_methods as usize) {
         Some(p) if p >= 0x10000 && safe::readable_at(p) => p,
         _ => return out,
     };
+    let name_off = shape.method_name as usize;
+    let return_off = shape.method_return_type as usize;
+    let flags_off = shape.method_flags as usize;
+    let count_off = shape.method_param_count as usize;
     for i in 0..4096 {
         let mi = match safe::read_usize(arr + i * 8) {
             Some(p) => p,
@@ -289,16 +339,16 @@ pub fn methods(class: usize) -> Vec<Method> {
         if mi < 0x10000 || !safe::readable_at(mi) {
             break;
         }
-        let name = safe::read_usize(mi + METHOD_NAME_OFF)
+        let name = safe::read_usize(mi + name_off)
             .and_then(name_at)
             .unwrap_or_default();
         if name.is_empty() {
             break;
         }
         let entry = safe::read_usize(mi).unwrap_or(0);
-        let return_kind = method_return_kind_with(mi, safe::read_usize, safe::read_u32);
-        let parameters_count = safe::read_u8(mi + 0x52).unwrap_or(u8::MAX);
-        let flags = safe::read_u16(mi + 0x4c).unwrap_or(u16::MAX);
+        let return_kind = method_return_kind_with(mi, return_off, safe::read_usize, safe::read_u32);
+        let parameters_count = safe::read_u8(mi + count_off).unwrap_or(u8::MAX);
+        let flags = safe::read_u16(mi + flags_off).unwrap_or(u16::MAX);
         out.push(Method {
             name,
             entry,
@@ -315,37 +365,24 @@ pub fn methods(class: usize) -> Vec<Method> {
 ///
 /// `None` when the build cannot be identified — the caller must then refuse,
 /// never guess an offset.
-#[cfg(target_os = "windows")]
-pub fn image_layout() -> Option<hromatite_abi::build::Layout> {
-    let (base, size) = procs::own_module(crate::GAME_ASSEMBLY)?;
-    crate::buildinfo::layout_for(base, size)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn image_layout() -> Option<hromatite_abi::build::Layout> {
-    None
+pub fn image_layout() -> Option<Layout> {
+    layout()
 }
 
 /// `Il2CppImage*` of an assembly.
 ///
 /// The images are packed contiguously and `il2cpp_get_corlib` returns one of
 /// them, not the first: Assembly-CSharp sits several entries earlier on both
-/// known builds. **The stride and the name offset are build specific**
-/// (`0x48`/`+0x08` on `648f61b1…`, `0x50`/`+0x08` on `245768f2…`), so they come
-/// from the build descriptor; a literal here silently finds nothing on the next
-/// game update. Exact short names win over prefixes (`Assembly-CSharp` must not
-/// resolve to `Assembly-CSharp-firstpass`).
+/// known builds. **The stride and the name offset are build specific**, so they
+/// come from the build descriptor. Exact short names win over prefixes
+/// (`Assembly-CSharp` must not resolve to `Assembly-CSharp-firstpass`).
 pub fn image_of(corlib_image: usize, assembly: &str) -> Option<usize> {
     let layout = image_layout()?;
     image_of_with(corlib_image, assembly, &layout)
 }
 
 /// Same search with an explicit layout (testable without a live module).
-pub fn image_of_with(
-    corlib_image: usize,
-    assembly: &str,
-    layout: &hromatite_abi::build::Layout,
-) -> Option<usize> {
+pub fn image_of_with(corlib_image: usize, assembly: &str, layout: &Layout) -> Option<usize> {
     let stride = i64::from(layout.image_stride);
     if stride <= 0 {
         return None;
@@ -381,31 +418,39 @@ pub fn image_of_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{FIELD_STRIDE, field_offset, method_return_kind_with};
+    use super::{field_offset, method_return_kind_with};
 
+    /// Both builds keep the return descriptor next to the class pointer; the
+    /// slots differ by +8, so the accessor takes the slot as an argument.
     #[test]
-    fn return_type_uses_slot_0x20_not_class_slot_0x28() {
+    fn return_type_reads_the_descriptor_slot_not_the_class_slot() {
         const METHOD_INFO: usize = 0x1000;
         const RETURN_TYPE: usize = 0x6fff_f8c6_2f60;
         const CLASS: usize = 0x3034_4d10;
-        let kind = method_return_kind_with(
-            METHOD_INFO,
-            |address| match address {
-                x if x == METHOD_INFO + 0x20 => Some(RETURN_TYPE),
-                x if x == METHOD_INFO + 0x28 => Some(CLASS),
-                _ => None,
-            },
-            |address| (address == RETURN_TYPE + 0x08).then_some(0x8001_0000),
-        );
-        assert_eq!(kind, 1, "LateUpdate must be accepted as void");
+        for (return_slot, class_slot) in [(0x20usize, 0x28usize), (0x28, 0x30)] {
+            let kind = method_return_kind_with(
+                METHOD_INFO,
+                return_slot,
+                |address| match address {
+                    x if x == METHOD_INFO + return_slot => Some(RETURN_TYPE),
+                    x if x == METHOD_INFO + class_slot => Some(CLASS),
+                    _ => None,
+                },
+                |address| (address == RETURN_TYPE + 0x08).then_some(0x8001_0000),
+            );
+            assert_eq!(kind, 1, "LateUpdate must be accepted as void");
+        }
     }
 
+    /// `FieldInfo.offset` sits at `+0x08` on both builds; the record is 0x28 on
+    /// the old one and 0x20 on the new one, so a short slice must be rejected.
     #[test]
-    fn field_offset_comes_before_name_and_token_comes_after_it() {
-        let mut record = [0u8; FIELD_STRIDE];
-        record[0x08..0x0c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        record[0x18..0x1c].copy_from_slice(&0x0400_002au32.to_le_bytes());
-        assert_eq!(field_offset(&record), Some(0x1234_5678));
-        assert_eq!(field_offset(&record[..0x0b]), None);
+    fn field_offset_reads_the_descriptor_slot_and_rejects_short_records() {
+        for stride in [0x28usize, 0x20] {
+            let mut record = [0u8; 0x28];
+            record[0x08..0x0c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            assert_eq!(field_offset(&record[..stride], 0x08), Some(0x1234_5678));
+            assert_eq!(field_offset(&record[..0x0b], 0x08), None);
+        }
     }
 }
