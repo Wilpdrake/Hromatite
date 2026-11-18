@@ -626,6 +626,19 @@ fn exact_bytes(target: usize, length: usize) -> Option<Vec<u8>> {
     crate::safe::read_bytes(target, length)
 }
 
+/// Does this site already carry someone's jump?
+///
+/// `hook::patch` writes `E9 rel32`; `EB` and `FF 25` are the short and absolute
+/// forms other hookers use. None of the GC sites starts with those bytes in any
+/// build we know, so a match here means "already hooked", not "wrong build".
+fn looks_hooked(bytes: &[u8]) -> bool {
+    match bytes.first() {
+        Some(0xE9 | 0xEB) => true,
+        Some(0xFF) => bytes.get(1) == Some(&0x25),
+        _ => false,
+    }
+}
+
 /// Shape of an initialised `RTL_CRITICAL_SECTION` (identical in Windows and
 /// wine): `DebugInfo` is `-1` or a pointer, `LockCount` is `-1` when free or
 /// `>= 0` when held, `RecursionCount` is small, and `OwningThread` is 0 or a
@@ -715,20 +728,92 @@ pub fn install() -> bool {
     let entry = ga + anchors.suspend_entry as usize;
     let skip = ga + anchors.skip_close as usize;
     let after = ga + anchors.after_unlink as usize;
-    if (ENTRY_PREP.load(Ordering::Acquire) == 0
-        && exact_bytes(entry, SUSPEND_ENTRY_LEN)
-            .map(|head| valid_gc_suspend_entry(&head))
-            != Some(true))
-        || (SKIP_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(skip, SKIP_CLOSE_LEN)
-                .map(|head| valid_skip_close(&head))
-                != Some(true))
-        || (AFTER_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(after, AFTER_UNLINK_LEN)
-                .map(|head| valid_after_unlink(&head))
-                != Some(true))
+    // A second payload copy in the same process sees the *first* copy's jumps at
+    // these sites. That is not a build mismatch and must not be reported as
+    // "signatures do not match": the copy simply cannot own the sites twice.
+    let mut hooked = 0usize;
+    let mut broken: Vec<&str> = Vec::new();
+    struct SiteCheck {
+        address: usize,
+        length: usize,
+        valid: fn(&[u8]) -> bool,
+        label: &'static str,
+        prep: &'static AtomicUsize,
+    }
+    let checks = [
+        SiteCheck {
+            address: entry,
+            length: SUSPEND_ENTRY_LEN,
+            valid: valid_gc_suspend_entry,
+            label: "collector entry",
+            prep: &ENTRY_PREP,
+        },
+        SiteCheck {
+            address: skip,
+            length: SKIP_CLOSE_LEN,
+            valid: valid_skip_close,
+            label: "CloseHandle call",
+            prep: &SKIP_PREP,
+        },
+        SiteCheck {
+            address: after,
+            length: AFTER_UNLINK_LEN,
+            valid: valid_after_unlink,
+            label: "post-unlink sentinel",
+            prep: &AFTER_PREP,
+        },
+    ];
+    for SiteCheck {
+        address,
+        length,
+        valid,
+        label,
+        prep,
+    } in checks
     {
-        log::log_tag("gct", "entry guard: one or more live signatures do not match");
+        if prep.load(Ordering::Acquire) != 0 {
+            continue;
+        }
+        match exact_bytes(address, length) {
+            Some(bytes) if valid(&bytes) => {}
+            Some(bytes) if looks_hooked(&bytes) => {
+                hooked += 1;
+                log::log_tag(
+                    "gct",
+                    &format!("{label} at {address:#x} already carries a jump ({bytes:02x?})"),
+                );
+            }
+            Some(bytes) => {
+                broken.push(label);
+                log::log_tag(
+                    "gct",
+                    &format!("{label} at {address:#x} has unexpected bytes {bytes:02x?}"),
+                );
+            }
+            None => {
+                broken.push(label);
+                log::log_tag("gct", &format!("{label} at {address:#x} is unreadable"));
+            }
+        }
+    }
+    if !broken.is_empty() {
+        log::log_tag(
+            "gct",
+            &format!(
+                "entry guard: this module is not the build the anchors describe ({}); refusing",
+                broken.join(", ")
+            ),
+        );
+        return false;
+    }
+    if hooked > 0 {
+        log::log_tag(
+            "gct",
+            &format!(
+                "entry guard: {hooked} GC call site(s) are already detoured in this process — another \
+                 payload copy owns them, this copy stays dormant"
+            ),
+        );
         return false;
     }
     let Some(skip_prep) = stored_prep(&SKIP_PREP, skip) else {

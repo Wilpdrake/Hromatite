@@ -82,12 +82,73 @@ fn valid_corlib_getter(bytes: &[u8]) -> bool {
     bytes.len() == 8 && bytes[0..3] == [0x48, 0x8B, 0x05] && bytes[7] == 0xC3
 }
 
-/// Do the descriptor's own anchors describe the module at `base`?
+/// State of one anchor site in the loaded module.
 ///
-/// This is the cheap identity test: no hashing, four independent signatures.
-/// It is written as a reader closure so the rule itself is testable without a
-/// live process.
-pub fn anchors_match<F>(build: &Build, mut read: F) -> bool
+/// `Patched` exists because the identity test runs *inside* a process that may
+/// already carry our own inline hooks: `gcguard` turns the three GC call sites
+/// and the collector entry into `jmp rel32` long before anything asks who the
+/// build is. Treating those bytes as "the descriptor does not describe this
+/// module" produced a 253 MB file hash inside `DllMain` and then refused a
+/// perfectly valid descriptor — and a retried injection copy could never start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SiteState {
+    /// The descriptor's own bytes are present.
+    Original,
+    /// Someone (usually our own guard) already wrote a jump over the site.
+    Patched,
+    /// Readable, but neither the descriptor's shape nor a jump.
+    Mismatch,
+    /// Not readable at all.
+    Unreadable,
+}
+
+impl SiteState {
+    fn of(bytes: Option<&Vec<u8>>, valid: fn(&[u8]) -> bool) -> SiteState {
+        let Some(bytes) = bytes else {
+            return SiteState::Unreadable;
+        };
+        if valid(bytes) {
+            return SiteState::Original;
+        }
+        // `E9 rel32` is what `hook::patch` writes; `EB`/`FF 25` are the short and
+        // absolute jumps other hookers use. None of the tracked sites legitimately
+        // starts with those bytes in any build we know.
+        match bytes.first() {
+            Some(0xE9 | 0xEB) => SiteState::Patched,
+            Some(0xFF) if bytes.get(1) == Some(&0x25) => SiteState::Patched,
+            _ => SiteState::Mismatch,
+        }
+    }
+}
+
+/// Outcome of [`anchor_report`] over every anchor the GC guard relies on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnchorReport {
+    pub original: usize,
+    pub patched: usize,
+    pub mismatch: usize,
+    pub unreadable: usize,
+}
+
+impl AnchorReport {
+    /// A descriptor describes the module when no site contradicts it; sites that
+    /// are already hooked are ours (or another payload's) and prove nothing
+    /// either way.
+    pub fn matches(&self) -> bool {
+        self.mismatch == 0 && self.unreadable == 0
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "original={} patched={} mismatch={} unreadable={}",
+            self.original, self.patched, self.mismatch, self.unreadable
+        )
+    }
+}
+
+/// Per-site state for the shapes the GC guard patches. Reads are injected so the
+/// rule stays testable without a live process.
+pub fn anchor_report<F>(build: &Build, mut read: F) -> AnchorReport
 where
     F: FnMut(u32, usize) -> Option<Vec<u8>>,
 {
@@ -99,20 +160,34 @@ where
         (gc.context_call, CONTEXT_CALL_LEN, valid_context_call as fn(&[u8]) -> bool),
         (build.il2cpp.get_corlib, 8, valid_corlib_getter as fn(&[u8]) -> bool),
     ];
+    let mut report = AnchorReport::default();
     for (rva, length, check) in checks {
-        let Some(bytes) = read(rva, length) else {
-            return false;
-        };
-        if !check(&bytes) {
-            return false;
+        let bytes = read(rva, length);
+        match SiteState::of(bytes.as_ref(), check) {
+            SiteState::Original => report.original += 1,
+            SiteState::Patched => report.patched += 1,
+            SiteState::Mismatch => report.mismatch += 1,
+            SiteState::Unreadable => report.unreadable += 1,
         }
     }
-    true
+    report
+}
+
+/// Do the descriptor's own anchors describe the module at `base`?
+///
+/// This is the cheap identity test: no hashing, five independent signatures.
+/// It is written as a reader closure so the rule itself is testable without a
+/// live process.
+pub fn anchors_match<F>(build: &Build, read: F) -> bool
+where
+    F: FnMut(u32, usize) -> Option<Vec<u8>>,
+{
+    anchor_report(build, read).matches()
 }
 
 #[cfg(target_os = "windows")]
-fn module_anchor_match(base: usize, build: &Build) -> bool {
-    anchors_match(build, |rva, length| {
+fn module_report(base: usize, build: &Build) -> AnchorReport {
+    anchor_report(build, |rva, length| {
         crate::safe::read_bytes(base.wrapping_add(rva as usize), length)
     })
 }
@@ -153,15 +228,17 @@ pub fn loaded_sha_hex() -> Option<&'static str> {
         .get_or_init(|| {
             let (base, size) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
             if let Some(build) = selected() {
-                if module_anchor_match(base, build) {
+                let report = module_report(base, build);
+                if report.matches() {
                     return Some(compiled_sha().to_string());
                 }
                 crate::log::log_tag(
                     "buildgen",
                     &format!(
                         "loaded GameAssembly does not match the compiled descriptor {} \
-                         (anchors moved); identifying it by hash",
-                        &compiled_sha()[..compiled_sha().len().min(12)]
+                         ({}); identifying it by hash",
+                        &compiled_sha()[..compiled_sha().len().min(12)],
+                        report.describe()
                     ),
                 );
             }
@@ -197,19 +274,46 @@ pub fn loaded_sha_hex() -> Option<&'static str> {
 ///
 /// Order: the compiled descriptor when its anchors still match; otherwise the
 /// table entry for the loaded SHA; otherwise `None` (callers fall back to
-/// `raw::discover` or refuse to patch).
+/// `raw::discover` or refuse to patch). A descriptor found by hash is *also*
+/// checked against the module: a SHA says which file was loaded, not that the
+/// table entry's numbers were derived from it.
 pub fn resolve(base: usize, size: usize) -> Option<&'static Build> {
     #[cfg(target_os = "windows")]
     {
         let _ = size;
-        if let Some(build) = selected()
-            && module_anchor_match(base, build)
-        {
-            return Some(build);
+        if let Some(build) = selected() {
+            let report = module_report(base, build);
+            if report.matches() {
+                return Some(build);
+            }
+            crate::log::log_tag(
+                "buildgen",
+                &format!(
+                    "loaded GameAssembly does not match the compiled descriptor {} ({})",
+                    &compiled_sha()[..compiled_sha().len().min(12)],
+                    report.describe()
+                ),
+            );
         }
     }
     let _ = (base, size);
-    build::select(loaded_sha_hex()?)
+    let build = build::select(loaded_sha_hex()?)?;
+    #[cfg(target_os = "windows")]
+    {
+        let report = module_report(base, build);
+        if !report.matches() {
+            crate::log::log_tag(
+                "buildgen",
+                &format!(
+                    "descriptor for {} contradicts the loaded module ({}); using discovery instead",
+                    &build.sha256[..12],
+                    report.describe()
+                ),
+            );
+            return None;
+        }
+    }
+    Some(build)
 }
 
 /// GC anchors: from the descriptor that matches the loaded module, otherwise
@@ -475,6 +579,59 @@ mod tests {
     #[test]
     fn unreadable_pages_mean_no_match() {
         assert!(!anchors_match(descriptor(), |_, _| None));
+    }
+
+    /// The live shape of a process where the GC guard already installed: the
+    /// call sites carry `E9 rel32` jumps instead of their original bytes.
+    fn with_guard_installed(build: &Build, rva: u32, length: usize) -> Option<Vec<u8>> {
+        let gc = &build.gc;
+        let tracked = [
+            gc.suspend_entry,
+            gc.skip_close,
+            gc.after_unlink,
+            gc.context_call,
+        ];
+        if tracked.contains(&rva) {
+            let mut bytes = vec![0xE9, 0x11, 0x22, 0x33, 0x44];
+            bytes.resize(length, 0x90);
+            return Some(bytes);
+        }
+        shapes(build, rva, length, true)
+    }
+
+    #[test]
+    fn our_own_jumps_do_not_make_the_build_look_foreign() {
+        // Regression: the identity test runs after `gcguard` patched the very
+        // sites it reads, so a strict byte compare hashed 253 MB and then
+        // rejected a correct descriptor.
+        let build = descriptor();
+        let report = anchor_report(build, |rva, length| with_guard_installed(build, rva, length));
+        assert!(report.matches(), "unexpected report: {}", report.describe());
+        assert_eq!(report.patched, 4);
+        assert_eq!(report.mismatch, 0);
+        assert_eq!(report.original, 1);
+    }
+
+    #[test]
+    fn a_hook_shaped_site_is_not_a_license_to_guess() {
+        // One site hooked, one site genuinely different: still refused.
+        let build = descriptor();
+        let gc = &build.gc;
+        let report = anchor_report(build, |rva, length| {
+            if rva == gc.skip_close {
+                let mut bytes = vec![0xE9, 0, 0, 0, 0];
+                bytes.resize(length, 0);
+                return Some(bytes);
+            }
+            if rva == gc.after_unlink {
+                let mut bytes = vec![0x90; length];
+                bytes.resize(length, 0x90);
+                return Some(bytes);
+            }
+            shapes(build, rva, length, true)
+        });
+        assert!(!report.matches());
+        assert_eq!((report.patched, report.mismatch), (1, 1));
     }
 
     #[test]

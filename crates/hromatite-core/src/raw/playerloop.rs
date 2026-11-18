@@ -17,6 +17,30 @@ pub struct Entry {
 
 use crate::{console, log};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// Why a PlayerLoop installation attempt did not produce a hook.
+///
+/// The distinction matters: an empty subsystem list right after `GameAssembly`
+/// loads is *normal* (Unity builds the loop while it initialises), so the
+/// installer has to keep polling instead of refusing for the rest of the
+/// session. Only a populated loop that contradicts the selector is final.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProbeError {
+    /// Unity has not published this part of the loop yet; a retry can succeed.
+    NotReady(String),
+    /// The loop exists and cannot be used as asked; retrying changes nothing.
+    Fatal(String),
+}
+
+impl ProbeError {
+    fn message(&self) -> &str {
+        match self {
+            ProbeError::NotReady(reason) | ProbeError::Fatal(reason) => reason,
+        }
+    }
+}
+
 
 /// The addresses this module calls. Both come from the build descriptor (or
 /// `raw::discover` for an unknown build), never from a literal: the previous
@@ -113,24 +137,53 @@ fn plausible_type_name(name: &str) -> bool {
                 | b'>' | b'[' | b']' | b',' | b'/' | b'*'))
 }
 
+/// One read of the live loop: the entries plus how many of them lost their type
+/// name (an unnamed entry means the managed `Type` was not readable yet, which is
+/// exactly how an early read looks).
+struct Scan {
+    entries: Vec<Entry>,
+    unnamed: usize,
+}
+
 /// Read the public managed representation of the current native loop. No
 /// SetPlayerLoop/SetPlayerLoopInternal call is made anywhere in this module.
-pub fn snapshot() -> Result<Vec<Entry>, String> {
-    let api = api()?;
+fn scan() -> Result<Scan, ProbeError> {
+    let api = api().map_err(ProbeError::Fatal)?;
     let mut root = [0usize; 5];
     // SAFETY: GetCurrentPlayerLoop returns PlayerLoopSystem (0x28 bytes) via a
     // hidden output pointer in rcx. root is exactly that writable stack buffer.
     let answer = unsafe { crate::veh::call2(api.getter, root.as_mut_ptr() as usize, 0) }
-        .map_err(|error| format!("GetCurrentPlayerLoop faulted: {error}"))?;
+        .map_err(|error| ProbeError::Fatal(format!("GetCurrentPlayerLoop faulted: {error}")))?;
     if answer == 0 {
-        return Err("GetCurrentPlayerLoop returned NULL".into());
+        return Err(ProbeError::NotReady(
+            "GetCurrentPlayerLoop returned NULL".into(),
+        ));
     }
     let children = root[1];
-    let mut entries = Vec::new();
-    if children != 0 {
-        read_children(&api, children, "", 0, &mut entries)?;
+    if children == 0 {
+        return Err(ProbeError::NotReady(
+            "the player loop has no subsystem list yet".into(),
+        ));
     }
-    Ok(entries)
+    let mut scan = Scan {
+        entries: Vec::new(),
+        unnamed: 0,
+    };
+    read_children(&api, children, "", 0, &mut scan)?;
+    if scan.entries.is_empty() {
+        return Err(ProbeError::NotReady(
+            "the player loop subsystem list is still empty".into(),
+        ));
+    }
+    Ok(scan)
+}
+
+/// Snapshot for the console (`loopc`): every readiness state is reported as a
+/// plain message, the retry policy belongs to [`install`].
+pub fn snapshot() -> Result<Vec<Entry>, String> {
+    scan()
+        .map(|scan| scan.entries)
+        .map_err(|error| error.message().to_string())
 }
 
 fn read_children(
@@ -138,27 +191,32 @@ fn read_children(
     children: usize,
     prefix: &str,
     depth: usize,
-    entries: &mut Vec<Entry>,
-) -> Result<(), String> {
+    scan: &mut Scan,
+) -> Result<(), ProbeError> {
     if depth > 16 {
-        return Err("PlayerLoop nesting exceeds 16 levels".into());
+        return Err(ProbeError::Fatal(
+            "PlayerLoop nesting exceeds 16 levels".into(),
+        ));
     }
     let count = crate::safe::read_u32(children.wrapping_add(0x18))
-        .ok_or("PlayerLoop child array is unreadable")? as usize;
-    if count > 128 || entries.len().saturating_add(count) > 512 {
-        return Err(format!(
+        .ok_or_else(|| ProbeError::Fatal("PlayerLoop child array is unreadable".into()))?
+        as usize;
+    if count > 128 || scan.entries.len().saturating_add(count) > 512 {
+        return Err(ProbeError::Fatal(format!(
             "PlayerLoop child count {count} exceeds the safety bound"
-        ));
+        )));
     }
     for index in 0..count {
         let at = children.wrapping_add(0x20 + index * 0x28);
         let mut words = [0usize; 5];
         for (slot, word) in words.iter_mut().enumerate() {
-            *word = crate::safe::read_usize(at.wrapping_add(slot * 8))
-                .ok_or_else(|| format!("PlayerLoop child {index} qword {slot} is unreadable"))?;
+            *word = crate::safe::read_usize(at.wrapping_add(slot * 8)).ok_or_else(|| {
+                ProbeError::Fatal(format!("PlayerLoop child {index} qword {slot} is unreadable"))
+            })?;
         }
         let name = type_name(api, words[0]);
         let segment = if name.is_empty() {
+            scan.unnamed += 1;
             format!("#{index}")
         } else {
             name
@@ -169,12 +227,12 @@ fn read_children(
             format!("{prefix}/{segment}")
         };
         let nested = words[1];
-        let mut entry =
-            entry_from_words(index, path.clone(), words).ok_or("invalid PlayerLoop entry")?;
+        let mut entry = entry_from_words(index, path.clone(), words)
+            .ok_or_else(|| ProbeError::Fatal("invalid PlayerLoop entry".into()))?;
         entry.path = path.clone();
-        entries.push(entry);
+        scan.entries.push(entry);
         if nested != 0 {
-            read_children(api, nested, &path, depth + 1, entries)?;
+            read_children(api, nested, &path, depth + 1, scan)?;
         }
     }
     Ok(())
@@ -269,31 +327,85 @@ fn target_change_allowed(previous: usize, candidate: usize) -> bool {
     previous == 0 || previous == candidate
 }
 
-pub fn install(selector: &str) -> Result<Entry, String> {
-    if PLAYER_STATE.load(Ordering::Acquire) == PLAYER_ATTACHED {
-        let entry = PLAYER_ENTRY.load(Ordering::Acquire);
-        return Err(format!(
-            "a native PlayerLoop callback is already hooked at {entry:#x}"
+/// Pick the subsystem to hook, and say *why* nothing was picked.
+///
+/// An empty or unnamed loop is a transient state (Unity publishes it while it
+/// initialises), so it must not be reported as a final failure — that is what
+/// made `HROMATITE_PLAYER_LOOP=1` give up permanently a fraction of a second
+/// after `GameAssembly` loaded.
+fn select_or_probe(scan: &Scan, selector: &str) -> Result<Entry, ProbeError> {
+    if let Some(entry) = select_root(&scan.entries, selector) {
+        return Ok(entry);
+    }
+    if scan.entries.is_empty() {
+        return Err(ProbeError::NotReady(
+            "the player loop has no subsystems yet".into(),
         ));
     }
-    let entries = snapshot()?;
-    for line in describe_entries(&entries) {
-        log::log_tag("playerloop", &line);
+    if scan.unnamed > 0 {
+        return Err(ProbeError::NotReady(format!(
+            "no subsystem matched {selector:?} and {} of {} entries have no readable type name yet",
+            scan.unnamed,
+            scan.entries.len()
+        )));
     }
-    let selected = select_root(&entries, selector).ok_or_else(|| {
-        format!("one unambiguous root subsystem {selector:?} with a native callback is required")
-    })?;
+    // Unity assigns the native callbacks after it publishes the tree, so a named
+    // subsystem without one is still a transient state: keep polling, and let the
+    // deadline report it if it never fills in.
+    Err(ProbeError::NotReady(format!(
+        "no subsystem {selector:?} carries a native callback yet ({} entries, all named)",
+        scan.entries.len()
+    )))
+}
+
+/// How long the installer keeps polling for a populated loop.
+fn wait_budget_ms() -> u64 {
+    std::env::var("HROMATITE_PLAYER_LOOP_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .clamp(500, 120_000)
+}
+
+/// One installation attempt. Readiness problems come back as
+/// [`ProbeError::NotReady`] so [`install`] can retry them.
+fn try_install(selector: &str) -> Result<Entry, ProbeError> {
+    if PLAYER_STATE.load(Ordering::Acquire) == PLAYER_ATTACHED {
+        let entry = PLAYER_ENTRY.load(Ordering::Acquire);
+        return Err(ProbeError::Fatal(format!(
+            "a native PlayerLoop callback is already hooked at {entry:#x}"
+        )));
+    }
+    let scan = scan()?;
+    if scan.unnamed == 0 {
+        for line in describe_entries(&scan.entries) {
+            log::log_tag("playerloop", &line);
+        }
+    }
+    let selected = select_or_probe(&scan, selector)?;
     if selected.update_function < 0x10000 {
-        return Err("selected PlayerLoop updateFunction is NULL".into());
+        return Err(ProbeError::NotReady(format!(
+            "{selector:?} has no native updateFunction yet"
+        )));
     }
     // This build stores a slot with the actual code address as its first qword,
     // not executable bytes at updateFunction itself. Patch the loaded stub.
-    let target = native_callback_target(selected.update_function, crate::safe::read_usize)?;
+    let target = match native_callback_target(selected.update_function, crate::safe::read_usize) {
+        Ok(target) => target,
+        Err(reason) => return Err(ProbeError::NotReady(reason)),
+    };
+    log::log_tag(
+        "playerloop",
+        &format!(
+            "target: {} updateFunction slot {:#x} -> code {target:#x}",
+            selected.path, selected.update_function
+        ),
+    );
     let previous = PLAYER_ENTRY.load(Ordering::Acquire);
     if !target_change_allowed(previous, target) {
-        return Err(format!(
+        return Err(ProbeError::Fatal(format!(
             "another native PlayerLoop target is configured at {previous:#x}; restart before changing subsystems"
-        ));
+        )));
     }
     let known_code = [crate::GAME_ASSEMBLY, crate::UNITY_PLAYER]
         .into_iter()
@@ -302,12 +414,15 @@ pub fn install(selector: &str) -> Result<Entry, String> {
                 .is_some_and(|(base, size)| target >= base && target < base.saturating_add(size))
         });
     if !known_code {
-        return Err(format!(
+        return Err(ProbeError::Fatal(format!(
             "PlayerLoop updateFunction {target:#x} is outside GameAssembly/UnityPlayer"
-        ));
+        )));
     }
-    let prep = crate::hook::prepare(target)
-        .ok_or_else(|| format!("cannot prepare native PlayerLoop trampoline at {target:#x}"))?;
+    let prep = crate::hook::prepare(target).ok_or_else(|| {
+        ProbeError::Fatal(format!(
+            "cannot prepare native PlayerLoop trampoline at {target:#x}"
+        ))
+    })?;
     crate::hook::prepare_tick();
     log::log_tag(
         "playerloop",
@@ -325,7 +440,9 @@ pub fn install(selector: &str) -> Result<Entry, String> {
         PLAYER_ORIG.store(0, Ordering::Release);
         PLAYER_NAME.store(0, Ordering::Relaxed);
         PLAYER_STATE.store(PLAYER_DETACHED, Ordering::Release);
-        return Err("native PlayerLoop patch failed".into());
+        return Err(ProbeError::Fatal(
+            "native PlayerLoop patch failed".into(),
+        ));
     };
     crate::hook::register(hook);
     if PLAYER_STATE
@@ -337,7 +454,9 @@ pub fn install(selector: &str) -> Result<Entry, String> {
         )
         .is_err()
     {
-        return Err("native PlayerLoop callback was detached during installation".into());
+        return Err(ProbeError::Fatal(
+            "native PlayerLoop callback was detached during installation".into(),
+        ));
     }
     log::log_tag(
         "playerloop",
@@ -347,6 +466,50 @@ pub fn install(selector: &str) -> Result<Entry, String> {
         ),
     );
     Ok(selected)
+}
+
+/// Hook the selected root subsystem, polling until Unity has published the loop.
+///
+/// The payload is injected as soon as `GameAssembly` is mapped, which is
+/// *before* Unity builds its `PlayerLoopSystem` tree: a read at that moment sees
+/// eight roots with empty child arrays and no callbacks at all. The previous
+/// implementation treated that as a permanent failure, so PlayerLoop never hooked
+/// on a normal launch.
+pub fn install(selector: &str) -> Result<Entry, String> {
+    let budget_ms = wait_budget_ms();
+    let started = Instant::now();
+    let mut last = String::from("the player loop was never readable");
+    let outcome = crate::lateupdate::retry_for(
+        Duration::from_millis(budget_ms),
+        // Each attempt walks the whole loop and resolves every subsystem's type
+        // name, so 500 ms keeps the probing cheap without making a normal launch
+        // wait noticeably.
+        Duration::from_millis(500),
+        |attempt| match try_install(selector) {
+            Ok(entry) => Some(Ok(entry)),
+            Err(ProbeError::Fatal(reason)) => Some(Err(reason)),
+            Err(ProbeError::NotReady(reason)) => {
+                last = reason;
+                if attempt % 20 == 0 {
+                    log::log_tag(
+                        "playerloop",
+                        &format!(
+                            "waiting for the player loop: attempt {attempt}, elapsed {}ms/{budget_ms}ms, last: {last}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                }
+                None
+            }
+        },
+    );
+    match outcome {
+        Some(Ok(entry)) => Ok(entry),
+        Some(Err(reason)) => Err(reason),
+        None => Err(format!(
+            "the player loop did not become ready within {budget_ms}ms; last: {last}"
+        )),
+    }
 }
 
 fn refreshed_state(state: usize, current: Option<bool>) -> usize {
@@ -445,8 +608,9 @@ pub fn select_root(entries: &[Entry], selector: &str) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, PLAYER_ATTACHED, PLAYER_INSTALLING, entry_from_words, native_callback_target,
-        refreshed_state, run_with_original, select_root, target_change_allowed,
+        Entry, PLAYER_ATTACHED, PLAYER_INSTALLING, ProbeError, Scan, entry_from_words,
+        native_callback_target, refreshed_state, run_with_original, select_or_probe, select_root,
+        target_change_allowed, wait_budget_ms,
     };
 
     fn entries() -> Vec<Entry> {
@@ -566,5 +730,57 @@ mod tests {
             },
         );
         assert!(original_called);
+    }
+
+    fn scan_of(entries: Vec<Entry>, unnamed: usize) -> Scan {
+        Scan { entries, unnamed }
+    }
+
+    #[test]
+    fn an_empty_loop_is_a_readiness_state_not_a_failure() {
+        // Unity publishes the subsystem tree after the payload is mapped, so an
+        // early read must be retried instead of ending the installation.
+        let empty = scan_of(Vec::new(), 0);
+        assert!(matches!(
+            select_or_probe(&empty, "Update"),
+            Err(ProbeError::NotReady(_))
+        ));
+        let unnamed = scan_of(entries(), 2);
+        match select_or_probe(&unnamed, "PostLateUpdate") {
+            Err(ProbeError::NotReady(reason)) => assert!(reason.contains("no readable type name")),
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+        let named = scan_of(entries(), 0);
+        match select_or_probe(&named, "PostLateUpdate") {
+            Err(ProbeError::NotReady(reason)) => assert!(reason.contains("native callback yet")),
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+        assert_eq!(
+            select_or_probe(&named, "Update")
+                .expect("named Update is hookable")
+                .update_function,
+            0x12340
+        );
+    }
+
+    #[test]
+    fn the_wait_budget_is_bounded() {
+        // SAFETY: this test is the only writer of this variable in the crate's
+        // test binary, and it restores nothing: the value is written last and
+        // every case is checked immediately.
+        unsafe {
+            std::env::set_var("HROMATITE_PLAYER_LOOP_WAIT_MS", "0");
+        }
+        assert_eq!(wait_budget_ms(), 500);
+        // SAFETY: as above; a single-threaded assertion follows the write.
+        unsafe {
+            std::env::set_var("HROMATITE_PLAYER_LOOP_WAIT_MS", "999999");
+        }
+        assert_eq!(wait_budget_ms(), 120_000);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("HROMATITE_PLAYER_LOOP_WAIT_MS");
+        }
+        assert_eq!(wait_budget_ms(), 30_000);
     }
 }

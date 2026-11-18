@@ -4283,3 +4283,71 @@ takeover-режиму дефект надо закрыть: эмиттер об�
 - Проверено: `cargo build --workspace --release --target x86_64-pc-windows-gnu` — `Finished`,
   `cargo clippy --workspace --all-targets --release … -- -D warnings` — **0 замечаний**.
   Живой прогон не делался (игру запускает пользователь); `HROMATITE_PLAYER_LOOP` остаётся `0`.
+
+### 2026-11-18 — PlayerLoop: установка больше не сдаётся до того, как Unity построит loop
+
+- Коммит: этот (`fix(playerloop): retry until Unity publishes the loop; recognise our own patches`).
+  Файлы: `crates/hromatite-core/src/raw/playerloop.rs`, `crates/hromatite-core/src/buildinfo.rs`,
+  `crates/hromatite-core/src/raw/gcguard.rs`.
+- **Причина «PlayerLoop не хукается» доказана логами, а не гипотезой.** Wrapper инжектит
+  payload сразу, как только в `/proc` появился процесс игры, то есть **до** того, как Unity
+  построит дерево `PlayerLoopSystem`. Живые строки 1794791015:
+  `PlayerLoop: 8 root subsystem(s)` — у всех восьми `update=0x0`, а `children` указывают на
+  пустые массивы; сразу за ними
+  `PlayerLoop installation failed: one unambiguous root subsystem "Update" with a native callback
+  is required; no late fallback was started`. Установщик считал это окончательным отказом и
+  возвращался, поэтому режим `HROMATITE_PLAYER_LOOP=1` не работал никогда, если инжект успевал
+  раньше движка (успех 17.11 02:04 — это выигранная гонка, а не рабочая логика).
+- **Второй исторический отказ** (1794791495) — `prepare: unknown opcode in prologue at
+  0x6ffffc4d8378 (bytes 80 fb ae fa ff 6f 00 00)`: адрес был *слотом*, в нём лежал указатель
+  `0x6ffffaaefb80`. Развёртывание слота уже добавлено ранее; теперь в лог пишется пара
+  `target: <путь> updateFunction slot 0x… -> code 0x…`, чтобы такой случай был виден сразу.
+- **Что сделано в `playerloop`.** `scan()` различает «ещё не готово» (NULL из геттера, пустой
+  список, пустой массив) от настоящей ошибки, `select_or_probe()` — «нет совпадения и часть
+  имён не разрешилась» (`NotReady`, транзиентное состояние) от «loop населён, но такого
+  subsystem нет» (`Fatal`). `install()` крутит `lateupdate::retry_for` до
+  `HROMATITE_PLAYER_LOOP_WAIT_MS` (по умолчанию **30 000 мс**, клампится 500…120 000), шаг
+  **500 мс**, прогресс в лог каждые ~10 с; `Fatal` по-прежнему выходит сразу. Ожидание
+  безопасно: `procs::own_module` — это `GetModuleHandleW` + два чтения, а `Toolhelp` не
+  используется.
+- **Вторая причина, из-за которой сегодня не стартовал сам payload.** Живой образ читался с
+  хоста (`/proc/<pid>/mem`, base `0x6fffeaad0000`): сайты GC уже несут наши `E9`-прыжки
+  (`0xc43790 → e9 6b c9 08 ff`, `0xc43560`, `0xc43588`, `0xc43842`), тогда как в файле там
+  `48 89 5c 24 08 …`, `ff 15 …`, `48 8d 05 …`, `ff 15 …`; `get_corlib 0xc29c70` и
+  PlayerLoop-геттер `0x86ea320` совпадают с дескриптором байт в байт (проверено и офлайн по
+  `GameAssembly.dll` sha256 `245768f2…`, и в живой памяти). Из-за строгого сравнения
+  `anchors_match` идентичность ломалась **своими же** патчами: в логе
+  `buildgen: loaded GameAssembly does not match the compiled descriptor 245768f25214 (anchors
+  moved)` → хеш файла 253 МБ (1.3–2.7 с) → `[gct] entry guard: one or more live signatures do
+  not match` → `[dll] startup aborted` на каждой повторной инжекции.
+- **Что теперь.** В `buildinfo` появился `anchor_report`/`SiteState`
+  (`Original`/`Patched`/`Mismatch`/`Unreadable`): сайт, начинающийся с `E9`/`EB`/`FF 25`,
+  считается уже захуканным и **не** опровергает дескриптор; `matches()` требует нуля
+  `mismatch`/`unreadable`. `resolve()` теперь проверяет дескриптор, полученный **и по хешу**, и
+  при противоречии отказывается от него в пользу `raw::discover` (fail closed). В `gcguard`
+  различаются «сайты уже заняты другой копией payload» (своя же первая копия — вторая остаётся
+  спать, пишется `another payload copy owns them, this copy stays dormant`) и «модуль не той
+  сборки» (лог с именем конкретного сайта).
+- **Проверено.** `cargo test --workspace --target x86_64-unknown-linux-gnu --offline` —
+  **359** тестов, 0 падений (в т.ч. новые: `our_own_jumps_do_not_make_the_build_look_foreign`,
+  `a_hook_shaped_site_is_not_a_license_to_guess` (1 patched + 1 mismatch → отказ),
+  `an_empty_loop_is_a_readiness_state_not_a_failure`, `the_wait_budget_is_bounded`);
+  `cargo build --workspace --release --target x86_64-pc-windows-gnu` — OK
+  (`hromatite.dll` 2 472 662 Б, `hromatite_features.dll` 2 656 123 Б, 12:03);
+  `cargo clippy --workspace --all-targets --release -- -D warnings` (windows-gnu) — чисто.
+  Host-target clippy (`--target x86_64-unknown-linux-gnu`) по-прежнему падает на трёх
+  **чужих** замечаниях (`m3.rs` unused import, `raw/m3dump.rs` duplicated attribute,
+  `raw/hostapi.rs` needless return) — не трогал.
+- **`~/.hromatite-mode` переведён на master**: пути `HROMATITE_DLL`/`HROMATITE_FEATURE_DLL` →
+  `~/RustroverProjects/Hromatite/target/…` (до этого указывали на `Hromatite-replace`, сборку
+  06:51 без `claim_single_instance`, `tap` и per-build якорей — отсюда «две копии payload в
+  одном процессе» и ответы `loopc` из старого билда: `PlayerLoop RVAs belong to another
+  GameAssembly build`), `HROMATITE_PLAYER_LOOP=1`. Бэкап рядом.
+- **Осталось (нужен один обычный рестарт игры, запускает пользователь).** Критерий приёмки:
+  в логе `[playerloop] waiting for the player loop: attempt …` (0–2 строки, если гонка),
+  затем `[playerloop] target: … slot 0x… -> code 0x…`, `hooked UnityEngine.PlayerLoop.Update/…`,
+  `PlayerLoop runtime ready: hooked entry 0x…`; `loop` → `hits>0 (≈90/с)`, `last tid=0x…`;
+  в `buildgen` нет `does not match the compiled descriptor`, в `gcguard` нет
+  `signatures do not match`. Если вместо этого `PlayerLoop installations failed: no root
+  subsystem … (N entries, all named)` — значит имя цели не `Update` и нужен
+  `HROMATITE_PLAYER_LOOP_TARGET`.
