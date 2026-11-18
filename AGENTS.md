@@ -4689,3 +4689,36 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   IMPLEMENTATION ~25 360 строк) в worktree `feat/nuklear`. Бэкенд/биндинг — следующим шагом.
 - **Осталось:** дождаться агентских веток, влить последовательно (тесты + release + buildgen),
   затем бэкенд nuklear под D3D11 и живая приёмка (игру запускает пользователь).
+
+### 2026-11-18 — Kiero и SafetyHook: ветки готовы и проверены родителем (не слиты)
+
+- Коммит этого шага: документо-запись. Ветки `feat/kiero` и `feat/safetyhook` **не влиты**
+  (правило: мердж в master только с явного «ок» пользователя; вопрос задан, ответ не получен).
+- **`feat/safetyhook`** (worktree `Hromatite-midhook`, 7 коммитов, `+901/−10`): новые
+  `raw/midhook.rs` (mid-function хук: перенос окна инструкций из середины, continuation
+  `jmp [rip+0] → target+prologue`) и `raw/hookset.rs` (реестр хуков: учёт, откат, отказ на
+  дубль/чужое окно). `raw/hook.rs` — только `pub(crate)` на 9 функций движка, логика цела;
+  `raw/memory.rs` — 3 хост-стуба под `#[cfg(not(windows))]` (в Windows-сборку не идут).
+  **Проверено родителем:** `cargo test -p hromatite-core --target x86_64-unknown-linux-gnu
+  --offline` → **202 passed / 0 failed**, включая 13 новых.
+- **`feat/kiero`** (worktree `Hromatite-kiero`, 3 коммита, `+1450/−3`): новые
+  `raw/vmt.rs` (backend-трейт `TableMem` + `Live` поверх `safe`/`VirtualProtect`, реестр
+  занятых слотов, `Vmt::new/slot/hook`, `VmtHook::unhook`) и `raw/kiero.rs`
+  (`RenderType`/`Method`, `PRESENT_SLOT=8`, `RESIZE_BUFFERS_SLOT=13`, `present_detour` с
+   guard от реентри, `init`/`probe`/`hook_present_at`/`hook_module_export`/`render`).
+  **Проверено родителем:** те же 202 теста зелёные (13 новых), `log.rs` — аккуратный
+  `cfg`-фикс (на Windows поведение прежнее).
+- **ОТКЛОНЕНИЕ ОТ ПЛАНА, требует решения пользователя.** `docs/UI-NUKLEAR-PLAN.md` требовал
+  подменять слот через **копию vtable на объект**, чтобы не трогать `.rdata` `dxgi.dll`.
+  Реализовано **патч слота на месте** (`table + index*8`, `VirtualProtect(RW)` → COW-копия
+  страницы модуля). Это то, что делают Kiero/MinHook, и это проще; риск — модуль в памяти
+  расходится с файлом. **Но:** по `vrchat-eac-heartbeat`, Linux-клиент EAC перечисляет
+  только **ELF** через `dl_iterate_phdr`/`link_map` и хеширует их; PE-образы (`dxgi.dll` и
+  наш payload) в `link_map` не попадают → патч `.rdata` PE-модуля его memory-check'ом
+  не виден. То есть на Linux/Proton это, скорее всего, безопасно, но на Windows-сборке
+  игры — нет. Вопрос пользователю задан (копия vs как есть), ответа нет.
+- **Обвязка ещё не написана:** `kiero::init` только реконнайдит `dxgi.dll` (экспорты
+  фабрики), `hook_present_at(addr)` требует адрес swapchain от вызывающего. Поиск
+  swapchain игры (скан кучи за объектом с vtable, указывающей в код `dxgi.dll`) — в плане
+  как часть родителя, не сделан.
+- **`feat/nuklear`** (worktree `Hromatite-nuklear`) ещё работает на момент записи.
