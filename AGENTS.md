@@ -4893,3 +4893,30 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   старый ESP не проверяется; `HROMATITE_UI=1` — самый заметный для EAC элемент
   (патч слота vtable `dxgi.dll`), рядом с ним в префиксе нет файлов, которые можно
   менять при живом EAC.
+
+### 2026-11-18 — Сводный файл: скиллы профиля + память + состояние проекта
+
+- Коммит **`282a20b`** (`docs(project): single-file digest of project skills, memory
+  and repo state`). Файл — `docs/HROMATITE-SKILLS-AND-MEMORY.md` (9 979 строк,
+  742 434 Б), собран скриптом
+  `~/.hermes/profiles/blank/cache/scratch/build_summary.py`.
+- **Что внутри:** (1) память профиля `memories/{MEMORY.md,USER.md}` целиком;
+  (2) **полные тексты** проектных скиллов — `unity-il2cpp-modding`,
+  `vrchat-eac-heartbeat`, `reverse-engineer-anything`,
+  `software-development/x64-trampoline-relocation`,
+  `software-development/terminal-tui-development`: `SKILL.md` + все
+  `references/`, `scripts/`, `templates/` (в блоках кода, чтобы заголовки скиллов
+  не ломали оглавление); (3) справочная часть `AGENTS.md` (разделы 0–16);
+  (4) оглавление §17 со номерами строк (120 записей); (5) снимок репозитория:
+  git log/status/branch/worktree, крейты, размеры сборки, `tools/`, `.gitignore`,
+  `hromatite-mode`; (6) таблица `docs/`; (7) незакоммиченные правки.
+- **Чем подтверждено:** `git status` — файл добавлен и закоммичен; `wc -lc` —
+  9 979 строк / 742 434 Б; заголовки разделов 1–7 на месте; дайджест проверен
+  сверкой с источниками (число `##`-заголовков скилла `unity-il2cpp-modding`
+  в файле = 18 = в оригинале).
+- **Ограничение:** файл — снимок на 2026-11-18 21:xx; пересобирается скриптом,
+  а не правится руками. В него не вошли скиллы, не относящиеся к проекту
+  (Android/Vulpgram и прочее) — они остаются в профиле.
+- **Осталось:** код в `context.rs`/`d3d11.rs` всё ещё не закоммичен (см. предыдущую
+  запись); перед живым прогоном — пересобрать `cargo build --workspace --release
+  --target x86_64-pc-windows-gnu`.
