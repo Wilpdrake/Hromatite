@@ -17,6 +17,29 @@ pub enum Mode {
     Palette,
 }
 
+/// One followed log: its own history, scroll offset and follow state, so
+/// switching views never moves the other log's position.
+struct LogBuffer {
+    lines: VecDeque<LogLine>,
+    clear_before: usize,
+    follow: bool,
+    scroll_back: usize,
+    /// Lines that arrived while another view was active.
+    unread: usize,
+}
+
+impl LogBuffer {
+    fn new() -> Self {
+        Self {
+            lines: VecDeque::new(),
+            clear_before: 0,
+            follow: true,
+            scroll_back: 0,
+            unread: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
@@ -27,11 +50,9 @@ pub enum Action {
 }
 
 pub struct ConsoleModel {
-    lines: VecDeque<LogLine>,
-    clear_before: usize,
-    sequence: usize,
-    follow: bool,
-    scroll_back: usize,
+    buffers: Vec<LogBuffer>,
+    labels: Vec<&'static str>,
+    active_source: usize,
     errors_only: bool,
     search: String,
     mode: Mode,
@@ -67,11 +88,9 @@ pub struct ConsoleModel {
 impl ConsoleModel {
     pub fn new(demo: bool) -> Self {
         Self {
-            lines: VecDeque::new(),
-            clear_before: 0,
-            sequence: 0,
-            follow: true,
-            scroll_back: 0,
+            buffers: vec![LogBuffer::new()],
+            labels: vec!["payload"],
+            active_source: 0,
             errors_only: false,
             search: String::new(),
             mode: Mode::Command,
@@ -103,58 +122,230 @@ impl ConsoleModel {
         }
     }
 
+    /// Declare the followed logs. Existing buffers keep their history so a
+    /// re-plan never throws away what was already read.
+    pub fn configure_sources(&mut self, labels: &[&'static str]) {
+        if labels.is_empty() {
+            return;
+        }
+        for (index, label) in labels.iter().enumerate() {
+            match self.buffers.get_mut(index) {
+                Some(_) => self.labels[index] = label,
+                None => {
+                    self.labels.push(label);
+                    self.buffers.push(LogBuffer::new());
+                }
+            }
+        }
+        self.active_source = self.active_source.min(self.buffers.len() - 1);
+    }
+
+    pub fn source_labels(&self) -> &[&'static str] {
+        &self.labels
+    }
+
+    pub fn source_count(&self) -> usize {
+        self.buffers.len()
+    }
+
+    pub fn active_source(&self) -> usize {
+        self.active_source
+    }
+
+    /// Lines that arrived in this view since it was last shown.
+    pub fn source_unread(&self, index: usize) -> usize {
+        self.buffers.get(index).map_or(0, |buffer| buffer.unread)
+    }
+
+    /// Switch by index, label, `next`/`prev` or `+1`/`-1`. Returns the label.
+    pub fn select_source(&mut self, target: &str) -> Option<&'static str> {
+        let target = target.trim().to_ascii_lowercase();
+        if target.is_empty() {
+            return None;
+        }
+        let index = match target.as_str() {
+            "next" => (self.active_source + 1) % self.buffers.len(),
+            "prev" | "previous" => {
+                (self.active_source + self.buffers.len() - 1) % self.buffers.len()
+            }
+            _ => {
+                let position = self
+                    .labels
+                    .iter()
+                    .position(|label| *label == target)
+                    .or_else(|| {
+                        self.labels
+                            .iter()
+                            .position(|label| label.starts_with(&target))
+                    });
+                match position {
+                    Some(index) => index,
+                    None => target.parse::<usize>().ok()?.checked_sub(1)?,
+                }
+            }
+        };
+        if index >= self.buffers.len() {
+            return None;
+        }
+        self.show_source(index);
+        Some(self.labels[index])
+    }
+
+    fn show_source(&mut self, index: usize) {
+        self.active_source = index;
+        if let Some(buffer) = self.buffers.get_mut(index) {
+            buffer.unread = 0;
+        }
+        self.notice = format!(
+            "log view {}/{}: {}",
+            index + 1,
+            self.buffers.len(),
+            self.labels[index]
+        );
+    }
+
+    fn step_source(&mut self, forward: bool) {
+        let count = self.buffers.len();
+        if count < 2 {
+            self.notice = "only one log is followed".into();
+            return;
+        }
+        let index = if forward {
+            (self.active_source + 1) % count
+        } else {
+            (self.active_source + count - 1) % count
+        };
+        self.show_source(index);
+    }
+
+    /// The `logs` line: every followed log with its position and unread count.
+    pub fn source_summary(&self) -> String {
+        let mut text = String::from("logs:");
+        for (index, label) in self.labels.iter().enumerate() {
+            let unread = self.source_unread(index);
+            let name = if index == self.active_source {
+                format!("[{label}]")
+            } else {
+                (*label).to_string()
+            };
+            text.push_str(&format!(" {}){name}", index + 1));
+            if unread > 0 {
+                text.push_str(&format!("+{unread}"));
+            }
+        }
+        text
+    }
+
     pub fn ingest(&mut self, inputs: impl IntoIterator<Item = impl AsRef<str>>) {
-        let mut added_visible = 0;
+        self.ingest_from(0, inputs);
+    }
+
+    /// Append lines that came from `source`; telemetry is read from every
+    /// source, the view state only from the buffer that received them.
+    pub fn ingest_from(
+        &mut self,
+        source: usize,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        self.ingest_lines(source, inputs, true);
+    }
+
+    /// Backfill (startup replay, or the tail of a log the game just rotated
+    /// to): the same ingest path, but these lines are not "new" for the reader,
+    /// so they must not inflate the unread counter of a hidden view.
+    pub fn ingest_replay(
+        &mut self,
+        source: usize,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        self.ingest_lines(source, inputs, false);
+    }
+
+    fn ingest_lines(
+        &mut self,
+        source: usize,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+        count_unread: bool,
+    ) {
+        let source = source.min(self.buffers.len() - 1);
+        let mut prepared = Vec::new();
         for input in inputs {
             let line = parse_line(input.as_ref());
-            if let Some(status) = parse_hot_status(&line.raw) {
-                self.hot_status = Some(status);
-            }
-            if line.tag == "con"
-                && let Some((generation, abi)) = parse_feature_log(&line.message)
-            {
-                self.feature_generation = Some(generation);
-                self.feature_abi = Some(abi);
-            }
-            if line.tag == "late" {
-                self.last_late = Some(line.message.clone());
-            }
-            if line.tag == "gct" {
-                self.last_gc = Some(line.message.clone());
-            }
-            update_telemetry(self, &line);
+            self.observe(&line);
             let visible = self.matches_filters(&line);
-            self.lines.push_back(line);
-            self.sequence += 1;
-            if visible {
-                added_visible += 1;
+            prepared.push((line, visible));
+        }
+        let mut added_visible = 0;
+        let active = self.active_source;
+        let viewport_rows = self.viewport;
+        {
+            let buffer = &mut self.buffers[source];
+            for (line, visible) in prepared {
+                buffer.lines.push_back(line);
+                if visible {
+                    added_visible += 1;
+                }
+            }
+            if !buffer.follow {
+                buffer.scroll_back += added_visible;
+            }
+            if source != active && count_unread && added_visible > 0 {
+                buffer.unread += added_visible;
+            }
+            while buffer.lines.len() > MAX_LINES {
+                buffer.lines.pop_front();
+                buffer.clear_before = buffer.clear_before.saturating_sub(1);
             }
         }
-        if !self.follow {
-            self.scroll_back += added_visible;
+        let max_back = self.buffers[source]
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index >= self.buffers[source].clear_before)
+            .filter(|(_, line)| self.matches_filters(line))
+            .count()
+            .saturating_sub(viewport_rows);
+        let buffer = &mut self.buffers[source];
+        buffer.scroll_back = buffer.scroll_back.min(max_back);
+    }
+
+    fn observe(&mut self, line: &LogLine) {
+        if let Some(status) = parse_hot_status(&line.raw) {
+            self.hot_status = Some(status);
         }
-        while self.lines.len() > MAX_LINES {
-            self.lines.pop_front();
-            self.clear_before = self.clear_before.saturating_sub(1);
+        if line.tag == "con"
+            && let Some((generation, abi)) = parse_feature_log(&line.message)
+        {
+            self.feature_generation = Some(generation);
+            self.feature_abi = Some(abi);
         }
+        if line.tag == "late" {
+            self.last_late = Some(line.message.clone());
+        }
+        if line.tag == "gct" {
+            self.last_gc = Some(line.message.clone());
+        }
+        update_telemetry(self, line);
     }
 
     pub fn record_sent(&mut self, command: &str) {
-        self.ingest([format!("> {}", command.trim())]);
-        if let Some(line) = self.lines.back_mut() {
+        self.ingest_from(0, [format!("> {}", command.trim())]);
+        if let Some(line) = self.buffers[0].lines.back_mut() {
             line.tag = "tx".into();
         }
     }
 
     pub fn lines(&self) -> impl Iterator<Item = &LogLine> {
-        self.lines.iter()
+        self.buffers[self.active_source].lines.iter()
     }
 
     pub fn visible_lines(&self) -> Vec<&LogLine> {
-        self.lines
+        let buffer = &self.buffers[self.active_source];
+        buffer
+            .lines
             .iter()
             .enumerate()
-            .filter(|(index, _)| *index >= self.clear_before)
+            .filter(|(index, _)| *index >= buffer.clear_before)
             .map(|(_, line)| line)
             .filter(|line| self.matches_filters(line))
             .collect()
@@ -172,7 +363,7 @@ impl ConsoleModel {
             return Vec::new();
         }
         let max_back = visible.len().saturating_sub(height);
-        let back = self.scroll_back.min(max_back);
+        let back = self.buffers[self.active_source].scroll_back.min(max_back);
         let end = visible.len().saturating_sub(back);
         let start = end.saturating_sub(height);
         visible[start..end].to_vec()
@@ -223,11 +414,13 @@ impl ConsoleModel {
                 self.help_scroll = 0;
             }
             Key::F(2) => {
-                self.follow = !self.follow;
-                if self.follow {
-                    self.scroll_back = 0;
+                let buffer = &mut self.buffers[self.active_source];
+                buffer.follow = !buffer.follow;
+                if buffer.follow {
+                    buffer.scroll_back = 0;
                 }
-                self.notice = if self.follow {
+                let follow = buffer.follow;
+                self.notice = if follow {
                     "follow resumed".into()
                 } else {
                     "follow paused".into()
@@ -235,7 +428,7 @@ impl ConsoleModel {
             }
             Key::F(3) => {
                 self.errors_only = !self.errors_only;
-                self.scroll_back = 0;
+                self.buffers[self.active_source].scroll_back = 0;
                 self.notice = if self.errors_only {
                     "filter: errors + GC".into()
                 } else {
@@ -265,11 +458,14 @@ impl ConsoleModel {
                 return self.prepare_submission("reload".into());
             }
             Key::F(8) => {
-                self.clear_before = self.lines.len();
-                self.scroll_back = 0;
-                self.follow = true;
+                let buffer = &mut self.buffers[self.active_source];
+                buffer.clear_before = buffer.lines.len();
+                buffer.scroll_back = 0;
+                buffer.follow = true;
                 self.notice = "view cleared — log file unchanged".into();
             }
+            Key::F(9) => self.step_source(true),
+            Key::F(10) => self.step_source(false),
             Key::CtrlR => self.begin_search(),
             Key::Char('/') if self.mode == Mode::Command && self.active.is_empty() => {
                 self.begin_search()
@@ -387,12 +583,30 @@ impl ConsoleModel {
     /// scrolling can clamp instead of banking invisible offsets.
     pub fn set_viewport(&mut self, rows: usize) {
         self.viewport = rows.max(1);
-        self.scroll_back = self.scroll_back.min(self.max_scroll_back());
+        let maxima: Vec<usize> = (0..self.buffers.len())
+            .map(|index| self.buffer_max_scroll_back(index))
+            .collect();
+        for (buffer, max) in self.buffers.iter_mut().zip(maxima) {
+            buffer.scroll_back = buffer.scroll_back.min(max);
+        }
         self.help_scroll = self.help_scroll.min(self.max_help_scroll());
     }
 
+    /// Visible rows of one buffer, minus the body height.
+    fn buffer_max_scroll_back(&self, index: usize) -> usize {
+        let buffer = &self.buffers[index];
+        buffer
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| *position >= buffer.clear_before)
+            .filter(|(_, line)| self.matches_filters(line))
+            .count()
+            .saturating_sub(self.viewport)
+    }
+
     fn max_scroll_back(&self) -> usize {
-        self.visible_lines().len().saturating_sub(self.viewport)
+        self.buffer_max_scroll_back(self.active_source)
     }
 
     fn max_help_scroll(&self) -> usize {
@@ -441,12 +655,13 @@ impl ConsoleModel {
             WHEEL_ROWS
         };
         let max = self.max_scroll_back();
+        let buffer = &mut self.buffers[self.active_source];
         if matches!(key, Key::ScrollUp | Key::PgUp) {
-            self.scroll_back = (self.scroll_back + by).min(max);
+            buffer.scroll_back = (buffer.scroll_back + by).min(max);
         } else {
-            self.scroll_back = self.scroll_back.saturating_sub(by);
+            buffer.scroll_back = buffer.scroll_back.saturating_sub(by);
         }
-        self.follow = self.scroll_back == 0;
+        buffer.follow = buffer.scroll_back == 0;
         if max == 0 {
             self.notice = "log fits on screen — nothing to scroll".into();
         }
@@ -463,6 +678,9 @@ impl ConsoleModel {
             self.show_help = true;
             self.help_scroll = 0;
             return Action::None;
+        }
+        if let Some(action) = self.local_view_command(&submitted) {
+            return action;
         }
         let name = submitted.split_whitespace().next().unwrap_or("");
         let read_only_hot_status =
@@ -484,6 +702,31 @@ impl ConsoleModel {
         Action::Submit(submitted)
     }
 
+    /// `log` and `logs` are host-side: they never touch the command channel,
+    /// because the payload does not declare such a command.
+    fn local_view_command(&mut self, submitted: &str) -> Option<Action> {
+        let mut words = submitted.split_whitespace();
+        let name = words.next()?;
+        if !matches!(name, "log" | "logs") {
+            return None;
+        }
+        let argument = words.next();
+        self.pending_confirmation = None;
+        self.mode = Mode::Command;
+        self.history.push(submitted);
+        self.set_active_text("");
+        self.completions.clear();
+        let notice = match argument {
+            None => self.source_summary(),
+            Some(target) => match self.select_source(target) {
+                Some(label) => format!("log view: {label}"),
+                None => format!("no such log: {target} — logs: {}", self.labels.join(" ")),
+            },
+        };
+        self.notice = notice;
+        Some(Action::None)
+    }
+
     fn begin_search(&mut self) {
         self.saved_command = if self.mode == Mode::Command {
             self.active.clone()
@@ -499,8 +742,9 @@ impl ConsoleModel {
         self.history.reset_navigation();
         if self.mode == Mode::Search {
             self.search = self.active.clone();
-            self.scroll_back = 0;
-            self.follow = true;
+            let buffer = &mut self.buffers[self.active_source];
+            buffer.scroll_back = 0;
+            buffer.follow = true;
         }
         if self.mode == Mode::Palette {
             self.palette_selection = 0;
@@ -526,7 +770,7 @@ impl ConsoleModel {
 
     pub fn set_search(&mut self, query: &str) {
         self.search = query.to_string();
-        self.scroll_back = 0;
+        self.buffers[self.active_source].scroll_back = 0;
     }
 
     pub fn search(&self) -> &str {
@@ -538,11 +782,11 @@ impl ConsoleModel {
     }
 
     pub fn follow(&self) -> bool {
-        self.follow
+        self.buffers[self.active_source].follow
     }
 
     pub fn scroll_back(&self) -> usize {
-        self.scroll_back
+        self.buffers[self.active_source].scroll_back
     }
 
     pub fn errors_only(&self) -> bool {
@@ -669,6 +913,7 @@ pub fn field_manual(log_path: &str, log_size: &str, command_path: &str) -> Vec<S
         " local view: works without a live payload answer".into(),
         " enter send | tab complete | up/down command history".into(),
         " F4 or : payload commands | / or Ctrl-R log filter".into(),
+        " F9 / F10 switch log view | log <name> | logs lists".into(),
         " F2 follow | F3 errors+GC | PgUp/PgDn and wheel scroll".into(),
         " F5 refresh once | F6 auto: pos 1s, summary 5s".into(),
         " F7 reload (second Enter confirms) | F8 clear view only".into(),
@@ -962,6 +1207,108 @@ mod tests {
         assert_eq!(m.handle(Key::Enter), Action::None);
         assert_eq!(m.mode(), Mode::Command);
         assert_eq!(m.active_text(), "q ");
+    }
+
+    #[test]
+    fn switching_views_keeps_each_logs_history_scroll_and_unread_counter() {
+        let mut m = ConsoleModel::new(false);
+        m.configure_sources(&["payload", "game", "eac"]);
+        m.set_viewport(2);
+        m.ingest_from(0, ["[1] [con] p1", "[2] [con] p2", "[3] [con] p3"]);
+        m.ingest_from(1, ["2026 Log - g1", "2026 Log - g2"]);
+        assert_eq!(m.active_source(), 0);
+        assert_eq!(
+            m.source_unread(1),
+            2,
+            "a hidden log counts what it receives"
+        );
+
+        m.handle(Key::ScrollUp);
+        assert_eq!(m.scroll_back(), 1);
+        assert!(!m.follow());
+
+        m.handle(Key::F(9));
+        assert_eq!(m.active_source(), 1);
+        assert_eq!(m.source_unread(1), 0, "showing a log clears its counter");
+        assert!(m.follow(), "a view that was never scrolled keeps following");
+        assert_eq!(m.visible_lines().len(), 2);
+        assert!(m.visible_lines()[0].raw.contains("g1"));
+        assert!(
+            m.visible_lines()
+                .iter()
+                .all(|line| !line.raw.contains("p1")),
+            "views must not mix their lines"
+        );
+
+        m.handle(Key::F(10));
+        assert_eq!(m.active_source(), 0);
+        assert_eq!(m.scroll_back(), 1, "the paused position survived the trip");
+        assert!(!m.follow());
+
+        m.handle(Key::F(9));
+        m.handle(Key::F(9));
+        assert_eq!(m.active_source(), 2, "F9 wraps around the list");
+        m.handle(Key::F(9));
+        assert_eq!(m.active_source(), 0);
+    }
+
+    #[test]
+    fn log_commands_switch_views_locally_without_a_payload_roundtrip() {
+        let mut m = ConsoleModel::new(false);
+        m.configure_sources(&["payload", "game", "eac"]);
+
+        m.set_active_text("logs");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert!(m.notice().contains("1)[payload]"), "{}", m.notice());
+        assert!(m.notice().contains("3)eac"), "{}", m.notice());
+
+        m.set_active_text("log eac");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert_eq!(m.active_source(), 2);
+        assert_eq!(m.active_text(), "");
+
+        m.set_active_text("log 1");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert_eq!(m.active_source(), 0);
+
+        m.set_active_text("log next");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert_eq!(m.active_source(), 1);
+
+        m.set_active_text("log nonsense");
+        assert_eq!(m.handle(Key::Enter), Action::None);
+        assert!(m.notice().contains("no such log"), "{}", m.notice());
+        assert_eq!(m.active_source(), 1, "a bad name must not move the view");
+    }
+
+    #[test]
+    fn a_startup_replay_is_backfill_and_never_counts_as_unread() {
+        let mut m = ConsoleModel::new(false);
+        m.configure_sources(&["payload", "game"]);
+        m.ingest_replay(1, ["2026 Log - old line 1", "2026 Log - old line 2"]);
+        assert_eq!(m.source_unread(1), 0);
+        m.select_source("game");
+        assert_eq!(m.visible_lines().len(), 2, "replayed lines are still shown");
+        m.select_source("payload");
+        m.ingest_from(1, ["2026 Log - genuinely new"]);
+        assert_eq!(m.source_unread(1), 1);
+    }
+
+    #[test]
+    fn the_command_echo_lands_in_the_payload_view_that_will_answer_it() {
+        let mut m = ConsoleModel::new(false);
+        m.configure_sources(&["payload", "game"]);
+        m.select_source("game");
+        m.record_sent("pos");
+        assert_eq!(m.source_unread(0), 1);
+        assert!(
+            m.visible_lines()
+                .iter()
+                .all(|line| !line.raw.contains("> pos")),
+            "the echo belongs to the payload view, not to the game log"
+        );
+        m.select_source("payload");
+        assert!(m.visible_lines().last().unwrap().raw.contains("> pos"));
     }
 
     #[test]

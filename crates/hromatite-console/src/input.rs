@@ -165,6 +165,11 @@ fn decode_escape(bytes: &[u8]) -> Option<(Key, usize)> {
         ("17", b'~') => Key::F(6),
         ("18", b'~') => Key::F(7),
         ("19", b'~') => Key::F(8),
+        // F9/F10 switch the followed log; xterm sends CSI 20~ and CSI 21~.
+        ("20", b'~') => Key::F(9),
+        ("21", b'~') => Key::F(10),
+        ("23", b'~') => Key::F(11),
+        ("24", b'~') => Key::F(12),
         _ => Key::Ignore,
     };
     Some((key, end + 1))

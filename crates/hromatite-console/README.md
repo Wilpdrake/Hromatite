@@ -1,13 +1,36 @@
 # hromatite-console
 
 Interactive Linux host TUI for Hromatite's **existing** Proton file channel.
-It tails `hromatite.log` incrementally and opens `hromatite-cmd.txt` only with
+It tails the payload log `hromatite.log` (plus the game, EAC, GC, wrapper and
+launcher logs) incrementally and opens `hromatite-cmd.txt` only with
 `create + append`; it does not add any thread, socket or pipe to the game.
 The compact green/cyan dashboard shows link freshness, managed-tick rate, GC
 health, player count, camera and the most recent command/answer stream. `help`,
 `?` (both followed by Enter) or **F1** opens a local field manual with file paths
 and the complete key reference; unlike payload commands, it also works while the
 game log is stale or the payload is not answering.
+
+## Log views
+
+Every source is tailed at once and keeps its **own** history, scroll offset,
+follow state and unread counter, so switching never moves another log's
+position. Row 3 is the tab strip: `logs 2/7: payload [game] eac+28 …`.
+
+| View | File |
+| --- | --- |
+| `payload` | `PREFIX/drive_c/users/steamuser/hromatite.log` — command channel, tick, telemetry |
+| `game` | `…/AppData/LocalLow/VRChat/VRChat/output_log_*.txt` — newest Unity player log |
+| `eac` | `…/AppData/Roaming/EasyAntiCheat/*/*/anticheatlauncher.log` |
+| `hooks` | `…/drive_c/users/steamuser/hromatite_eac_hooks.log` — EAC frame log |
+| `gc` | `<game>/VRChat.gc.log` (`$HROMATITE_GCLOG` overrides) |
+| `stdout` | `$HROMATITE_DBG_DIR` or `~/.hromatite-logs/game-*.log` — wrapper capture |
+| `launch` | `~/.hromatite-launch.log` |
+
+Wildcards are re-resolved while the console runs (every ~2 s), so a game restart
+moves the view to the new session's file and replays its tail. Sources that do
+not exist yet simply stay empty; nothing is created. The payload log alone drives
+`LINKED`/`STALE` and the auto-telemetry gate, because it is the only one the
+payload answers on.
 
 ## Interactive operations
 
@@ -32,14 +55,17 @@ game log is stale or the payload is not answering.
   `esp` lines. No payload support was added for them.
 
 ```sh
-tools/hromatite-tui.sh [--prefix DIR] [--log FILE]
+tools/hromatite-tui.sh [--prefix DIR] [--log FILE] [--view NAME]
 ```
 
 The default prefix is `$HROMATITE_PREFIX`, or the VRChat app 438100 Proton
 prefix under `~/.local/share/Steam`. The usual paths are:
 
-- log: `PREFIX/drive_c/users/steamuser/hromatite.log`
+- payload log: `PREFIX/drive_c/users/steamuser/hromatite.log`
 - commands: `PREFIX/drive_c/users/steamuser/hromatite-cmd.txt`
+
+`--log FILE` replaces the payload source; `--view NAME` (or an index) picks the
+starting view, which also works with `--snapshot`.
 
 ## Keys
 
@@ -58,6 +84,8 @@ prefix under `~/.local/share/Steam`. The usual paths are:
 | F5 | Request `pos`, `who`, `late`, `gct` telemetry in one append |
 | F6 | Toggle rate-limited automatic telemetry |
 | F8 | Clear the view only, never truncate or modify the log |
+| F9 / F10 | Next / previous log view (the strip marks the active one and counts unread lines) |
+| `log <name|next|prev|N>`, `logs` | Switch or list log views locally — never sent to the payload |
 | Esc | Cancel confirmation or close the current view; in the command view, leave |
 | Ctrl-C | Leave and restore the original termios and screen |
 

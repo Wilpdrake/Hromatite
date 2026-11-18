@@ -8,10 +8,16 @@ use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Default, Clone)]
 pub struct RenderContext {
+    /// The payload log: it carries the command channel, so its freshness is what
+    /// LINKED/STALE reports.
     pub log_path: String,
     pub command_path: String,
     pub log_bytes: Option<u64>,
     pub log_age_secs: Option<u64>,
+    /// The log currently on screen, which may be the game, EAC or GC log.
+    pub view_path: String,
+    pub view_bytes: Option<u64>,
+    pub view_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,7 +82,7 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
         }
     };
     let age = context
-        .log_age_secs
+        .view_age_secs
         .map_or_else(|| "--".into(), |age| format!("{age}s"));
     let automatic = if !model.auto_refresh() {
         "OFF"
@@ -147,8 +153,29 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     } else {
         Style::Status
     };
-    lines[3] = "─".repeat(width);
-    styles[3] = Style::Dim;
+    // Row 3 is the log tab strip: it both shows which log is on screen and how
+    // many lines arrived in the ones that are not.
+    let labels = model.source_labels();
+    let mut strip = format!(
+        " logs {}/{}:",
+        model.active_source() + 1,
+        labels.len().max(1)
+    );
+    for (index, label) in labels.iter().enumerate() {
+        let unread = model.source_unread(index);
+        let name = if index == model.active_source() {
+            format!("[{label}]")
+        } else {
+            (*label).to_string()
+        };
+        strip.push_str(&format!(" {name}"));
+        if unread > 0 {
+            strip.push_str(&format!("+{unread}"));
+        }
+    }
+    strip.push_str("  F9/F10");
+    put(&mut lines[3], &strip, width);
+    styles[3] = Style::Accent;
 
     let body_start = 4;
     let body_len = body_rows(height);
@@ -221,10 +248,10 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
             styles[row] = Style::Normal;
         }
         let bytes = context
-            .log_bytes
+            .view_bytes
             .map(human_bytes)
             .unwrap_or_else(|| "--".into());
-        let help = crate::model::field_manual(&context.log_path, &bytes, &context.command_path);
+        let help = crate::model::field_manual(&context.view_path, &bytes, &context.command_path);
         let start = model
             .help_scroll()
             .min(help.len().saturating_sub(body_len.max(1)));
@@ -286,7 +313,7 @@ pub fn render(model: &ConsoleModel, context: &RenderContext, width: u16, height:
     let cursor = (input_row, (prompt_width + cursor_columns).min(width - 1));
 
     let help = if model.notice().is_empty() {
-        "F1 help  F4 commands  F5 refresh  F6 auto  / search  wheel/PgUp scroll  Esc back".into()
+        "F1 help  F4 commands  F9 log  F5 refresh  F6 auto  / search  wheel scroll  Esc back".into()
     } else {
         model.notice().to_string()
     };
@@ -412,7 +439,7 @@ fn sanitize_char(ch: char) -> char {
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
@@ -455,6 +482,9 @@ mod tests {
             command_path: "/demo/hromatite-cmd.txt".into(),
             log_bytes: Some(512),
             log_age_secs: Some(2),
+            view_path: "/demo/hromatite.log".into(),
+            view_bytes: Some(512),
+            view_age_secs: Some(2),
         };
         let frame = render(&model, &context, 100, 18);
         assert_eq!(frame.lines.len(), 18);
@@ -501,6 +531,9 @@ mod tests {
             command_path: "/pfx/hromatite-cmd.txt".into(),
             log_bytes: Some(512),
             log_age_secs: Some(0),
+            view_path: "/pfx/hromatite.log".into(),
+            view_bytes: Some(512),
+            view_age_secs: Some(0),
         };
         let text = render(&model, &context, 100, 20).lines.join("\n");
         assert!(text.contains("FIELD MANUAL"));
@@ -554,6 +587,48 @@ mod tests {
         assert_eq!(frame.cursor, (6, 23));
         for line in &frame.lines {
             assert_eq!(UnicodeWidthStr::width(line.as_str()), 24);
+        }
+    }
+
+    #[test]
+    fn the_tab_strip_names_the_followed_logs_and_marks_the_active_one() {
+        let mut model = ConsoleModel::new(false);
+        model.configure_sources(&["payload", "game", "eac"]);
+        model.ingest_from(1, ["2026-11-18 07:08:12  Log - [Behaviour] Entering Room"]);
+        let frame = render(&model, &RenderContext::default(), 100, 14);
+        let strip = frame.lines[3].clone();
+        assert!(strip.contains("logs 1/3"), "{strip}");
+        assert!(strip.contains("[payload]"), "{strip}");
+        assert!(strip.contains("game+1"), "{strip}");
+        assert!(strip.contains("F9/F10"), "{strip}");
+
+        model.select_source("game");
+        let frame = render(&model, &RenderContext::default(), 100, 14);
+        let strip = frame.lines[3].clone();
+        assert!(strip.contains("[game]"), "{strip}");
+        assert!(strip.contains("logs 2/3"), "{strip}");
+        assert!(
+            !strip.contains("game+1"),
+            "showing the view must drop its unread counter: {strip}"
+        );
+        assert!(frame.lines.join("\n").contains("Entering Room"));
+        for (row, line) in frame.lines.iter().enumerate() {
+            assert_eq!(
+                UnicodeWidthStr::width(line.as_str()),
+                100,
+                "row {row}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_terminal_truncates_the_tab_strip_without_breaking_geometry() {
+        let mut model = ConsoleModel::new(false);
+        model.configure_sources(&["payload", "game", "eac", "hooks", "gc", "stdout"]);
+        let frame = render(&model, &RenderContext::default(), 34, 12);
+        assert!(frame.lines[3].starts_with(" logs 1/6"));
+        for line in &frame.lines {
+            assert_eq!(UnicodeWidthStr::width(line.as_str()), 34);
         }
     }
 
