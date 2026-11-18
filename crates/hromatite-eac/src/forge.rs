@@ -155,6 +155,19 @@ impl BodyMode {
     }
 }
 
+/// `SessionId` of a 512-byte frame, without copying the body.
+///
+/// The epoch gate asks this of every live heartbeat, including the ones the
+/// takeover drops: the identity of the live session is the only evidence that
+/// the generator still belongs to an existing epoch.
+pub fn frame_session_id(frame: &[u8]) -> Option<u64> {
+    if frame.len() != FRAME_LEN || u16::from_le_bytes([*frame.first()?, *frame.get(1)?]) != VERSION
+    {
+        return None;
+    }
+    Some(u64::from_le_bytes(frame.get(4..12)?.try_into().ok()?))
+}
+
 /// Build one frame: header with `seq` and a fresh CRC over `template.body`.
 pub fn build_frame(template: &Template, seq: u64, mode: BodyMode) -> Vec<u8> {
     let mut frame = Vec::with_capacity(FRAME_LEN);

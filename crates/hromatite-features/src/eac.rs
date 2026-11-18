@@ -334,6 +334,9 @@ impl EacFeature {
             "eac.tick" => self.tick_command(),
             "eac.end" => self.end_command(arg),
             "eac.hooks" => self.hooks_command(arg),
+            // Read-only: locate the in-process ELF image of the anti-cheat
+            // client module (it is not a PE, so no module list can show it).
+            "eac.module" => (hromatite_eac::eos::module_report(arg), STATUS_OK),
             "eac.log" => self.log_command(arg),
             "eac.tail" => self.tail_command(arg),
             other => (
@@ -350,6 +353,7 @@ impl EacFeature {
             "eac.tick                       — emit one heartbeat now",
             "eac.end [reason]               — close the epoch (session_end record)",
             "eac.hooks [install|capture <path>|on|off] — EOSSDK hook status",
+            "eac.module [pages] [read=<bytes>] — locate the in-process ELF EAC image",
             "eac.log <path>                 — JSONL event log (32 MiB, 2 files)",
             "eac.tail <path>                — mirror output_log room markers",
         ]
