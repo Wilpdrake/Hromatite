@@ -19,6 +19,8 @@ pub mod hostapi;
 pub mod hot;
 pub mod iat;
 pub mod il2cpp;
+// Kiero-style presentation hook: a VMT swap of IDXGISwapChain::Present.
+pub mod kiero;
 pub mod localmap;
 // EAC_M3_DUMP diagnostic (raw byte dumps of the class table for
 // `~/EAC-RE/tools/m3dump_analyze.py`). Kept from `eac-cut`; the env-gated call

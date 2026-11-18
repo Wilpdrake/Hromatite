@@ -30,6 +30,7 @@ pub use raw::hook;
 pub use raw::hot as hot_runtime;
 pub use raw::iat;
 pub use raw::il2cpp;
+pub use raw::kiero;
 pub use raw::memory as safe;
 pub use raw::photon;
 pub use raw::playerloop;
