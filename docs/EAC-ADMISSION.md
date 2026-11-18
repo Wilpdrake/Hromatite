@@ -107,10 +107,10 @@ else {
 ```c
 void* wine_map_module(struct{void*begin; void*end;}* blob) {
     if (blob->begin == blob->end) return 0;
-    obj = create_shared_object(&local_88);                       // 0x13F/op 2
-    idx = obj_create(0x13F, &local_88, 2);                       // создать объект, вернуть индекс
+    // оба вызова — indirect через __guard_dispatch_icall, коды 0x13F и 1:
+    idx = dispatch(0x13F, &local_88, 2);                         // создать объект, вернуть индекс
     if ((int)idx < 0) return 0;
-    n = obj_write(1, idx, blob->begin, blob->end - blob->begin); // записать ELF целиком
+    n   = dispatch(1, idx, blob->begin, blob->end - blob->begin);// записать ELF целиком
     if (n != len) return 0;
     sprintf(path, 0x40, "/proc/self/fd/%i", idx);                // <-- fd-путь
     if (!dlopen_ptr) {                                           // ленивый резолв
