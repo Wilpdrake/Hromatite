@@ -32,3 +32,4 @@ pub mod playerloop;
 pub mod procs;
 pub mod remote;
 pub mod sys;
+pub mod vmt;

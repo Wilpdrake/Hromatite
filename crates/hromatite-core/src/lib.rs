@@ -35,6 +35,7 @@ pub use raw::photon;
 pub use raw::playerloop;
 pub use raw::procs;
 pub use raw::remote;
+pub use raw::vmt;
 
 pub const GAME_EXE: &str = "VRChat.exe";
 pub const GAME_ASSEMBLY: &str = "GameAssembly.dll";
