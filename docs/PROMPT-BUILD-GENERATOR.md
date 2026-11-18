@@ -118,13 +118,30 @@ Unity:  6000.0.67f1-DWR
 
 ### E. Остальные адреса рантайма
 
-Их тоже надо начать выводить (сейчас они прибиты к сборке `648f61b1…`):
-`playerloop::GET_CURRENT_PLAYER_LOOP_RVA` (0x86cda10), `CLASS_FROM_TYPE_RVA` (0xc28040),
-`lateupdate::AUTO_BUILD_SHA256`/`AUTO_CLASS` (индекс типа `#34575`), `WORKER_DISPATCH_RVA`
-(0xbf5ce0), `GC_UNREGISTER_RVA` (0xc41920). Выводить по структуре: `GetCurrentPlayerLoop`
-— экспорт, возвращающий managed-структуру 0x28 Б через скрытый out-указатель; трамплин
-воркеров — единственная ссылка на функцию, которая делает `CreateThread(…, tramp, …)`;
-`GC_unregister_my_thread` — берёт CS списка и вызывает `remove_thread`.
+**Сделано (2026-11-18), правила ниже — это то, что реально сработало; держать их как описание
+генератора, а не как TODO:** `runtime.get_current_player_loop` (`0x86cda10` → `0x86ea320`),
+`runtime.worker_dispatch` (`0xbf5ce0` → `0xbf7a60`), `runtime.gc_unregister`
+(`0xc41920` → `0xc43690`), `il2cpp.class_from_type` (`0xc28040` → `0xc29db0`).
+Выводятся в `tools/buildgen.py` (секция `runtime`) и в рантайме (`raw::discover`):
+
+* `GetCurrentPlayerLoop` — **не экспорт**, а скомпилированный managed-геттер: пролог
+  33 байта обнуляет 0x28-байтовую структуру (`RCX` — скрытый out-указатель), а внутри есть
+  `lea` на имя icall `UnityEngine.LowLevel.PlayerLoop::GetCurrentPlayerLoopInternal()`.
+  Правило: сигнатура + обязательная ссылка на эту строку (иначе кандидат отбрасывается).
+  Живёт в секции **`il2cpp`** (без точки), а не в `.text` — скан только `.text` не находит её
+  никогда.
+* диспетчер воркеров — уникальное 48-байтное тело, перекрёстно проверенное `lea` из
+  создателя потока (в `CreateThread` уходит именно этот адрес).
+* `GC_unregister_my_thread` — единственная функция, вызывающая `GC_remove_thread`; её
+  **вход берётся из `.pdata`**, а не обратным ходом по `0xCC`: у функции несколько
+  EH-фрагментов (`UNW_FLAG_CHAININFO`), и в байтах `rel32` полно `0xCC`, поэтому обратный
+  ход останавливается в середине функции (даёт `0xc41924` вместо `0xc41920`).
+* `gc.thread_list_cs` — **CS, которую входит `GC_suspend_all`** (`lea rcx` перед
+  `call [EnterCriticalSection]`), а не «самый частый lea перед таблицей»: старая эвристика
+  вернула строку `"CP1252"` и повесила игру на `EnterCriticalSection`.
+`lateupdate::AUTO_BUILD_SHA256`/`AUTO_CLASS` остаются прибитыми к одному билду, но это уже
+безопасно: индекс типа — лишь подсказка, имя перепроверяется, а при чужой сборке включается
+`il2cpp_class_from_name`.
 
 ## КАКИЕ АРТЕФАКТЫ ДОЛЖНЫ ПОЛУЧИТЬСЯ
 

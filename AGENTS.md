@@ -3530,3 +3530,75 @@ il2cpp одними чтениями памяти (без единого выз�
   `gap` 6912 мс против ожидаемых 2012. `eac.status`: `interval_ms=2012,
   observed=117, frame_len=512`, `tap_crc=155/155` (155 кадров, 0 ошибок CRC).
   Копия лога: `~/.hermes/profiles/ds/cache/scratch/live-heartbeat/eac-final.jsonl`.
+
+### 2026-11-18 — PlayerLoop починен: якоря больше не привязаны к SHA; генератор выводит всё
+
+- Коммит **`a2274f7`** (`feat(build): derive PlayerLoop, worker dispatch and GC unregister
+  per build`) + этот журнал.
+- **Симптом, который чинили.** `playerloop::snapshot` начинался с
+  `if symbols::GAMEASSEMBLY_SHA256 != lateupdate::AUTO_BUILD_SHA256 { return Err(...) }`,
+  поэтому на живой сборке `245768f2…` режим `HROMATITE_PLAYER_LOOP=1` не мог работать вообще:
+  геттер просто переехал (`0x86cda10` → `0x86ea320`). Такие же sha-гейты стояли на
+  worker-trace (`0xbf5ce0`/`0xc41920`), `CLASS_FROM_TYPE_RVA` и таблице `GC_threads[]`
+  в `gcthreads` (`0xe6bb180` вместо `0xe6bd8a0` — из-за этого **репер мёртвых записей на
+  новой сборке читал чужую память** и ничего не вычищал).
+- **Что теперь.** В `hromatite-abi::build` появились `RuntimeAnchors`
+  (`get_current_player_loop`, `worker_dispatch`, `gc_unregister`) и `il2cpp.class_from_type`;
+  `buildinfo::runtime_anchors` отдаёт их из дескриптора, иначе через `raw::discover`,
+  иначе `None` (последнее = не патчить). Гейтов по sha в этих путях больше нет.
+- **Правила вывода (проверены на двух сборках, офлайн и в Ghidra):**
+  * `GetCurrentPlayerLoop` — не экспорт, а скомпилированный managed-геттер: 33-байтный
+    пролог обнуляет 0x28-байтовую `PlayerLoopSystem` (`RCX` — скрытый out-указатель),
+    внутри — `lea` на имя icall `UnityEngine.LowLevel.PlayerLoop::GetCurrentPlayerLoopInternal()`.
+    Правило = сигнатура **плюс** обязательная ссылка на эту строку. Ключевая деталь: геттер
+    лежит в секции **`il2cpp`** (178 МБ, без точки), а не в `.text` — поэтому прежний
+    `.text`-скан «не находил» его и выглядел как «функции нет».
+    Ghidra (проект `/11.17/GameAssembly.dll`): `FUN_1886ea320` — `PUSH RBX; SUB RSP,0x50;
+    XORPS/MOVUPS [RCX], [RCX+0x10]; MOV [RCX+0x20],RAX; … LEA RCX,[0x18b981250];
+    CALL il2cpp_resolve_icall; … MOV [0x18e6a1ba8],RAX; CALL RAX` — ровно геттер.
+  * диспетчер воркеров — уникальное 48-байтное тело (`48 89 5C 24 08 … 83 FA 02`),
+    перекрёстная проверка: на него есть `lea` из создателя потока (`0xbf5e44` / `0xbf7bc4`).
+  * `GC_unregister_my_thread` — единственная функция с `call rel32` на `GC_remove_thread`;
+    вход берётся из **`.pdata`** с разворотом `UNW_FLAG_CHAININFO`. Обратный ход по `0xCC`
+    неверен: у функции несколько EH-фрагментов (`0xc43694`, `0xc436d1`, `0xc4375f`, `0xc43774`
+    → все цепляются к `0xc43690`), а в `rel32`-дисплейсментах полно байта `0xCC` — ход
+    останавливался на `0xc41924`/`0x4375f` вместо входа.
+  * `gc.thread_list_cs` — теперь **CS, которую входит `GC_suspend_all`**: `lea rcx` перед
+    `call [EnterCriticalSection]` внутри первых 0x260 байт функции. Старая эвристика
+    («самый частый lea в 0x200 байтах перед таблицей») вернула строку `"CP1252"` и повесила
+    игру. Значения: старая сборка `0xe6bb100` → **`0xe6bb140`**, новая остаётся
+    **`0xe6bd860`** (это и есть живая, проверенная 2026-11-18). В рантайме значение 0
+    допустимо: `gcguard` проверяет форму `RTL_CRITICAL_SECTION` и без неё просто отключает
+    санитизацию.
+- **Генератор (`tools/buildgen.py`) теперь воспроизводит свой же вывод.** Раньше он:
+  (1) не выводил `image_stride/image_name/image_filename` → `render_build` ронял компиляцию;
+  (2) выкидывал `il2cpp.class_from_name` из `build.rs` (обнулял его при регенерации);
+  (3) выдавал `thread_list_cs` = `0xe6bd800` (строка) для новой сборки. Теперь пишет
+  секцию `runtime`, все ключи `il2cpp`, `image_*` и семантическую CS. Плюс `merge_layout`:
+  если дескриптор этой же сборки уже содержит живое измерение и генератор с ним не
+  согласен, побеждает живое значение, а расхождение пишется в `note` (именно так поймано
+  `class_name`: перенесённый `il2cpp_class_get_name` читает `+0x98`, а в живой записи
+  `VRC.Udon.UdonManager` имя лежит в `+0x10`; теперь в дескрипторе `0x10` и есть строка
+  `class_name: 0x10 (kept from the live-verified descriptor; the generator derived 0x98)`).
+- **Чем подтверждено.** `tools/buildgen.py` на обеих сборках воспроизводит оракул целиком:
+  `648f61b1…` → gc 12 значений (CS `0xe6bb140`), il2cpp `0xc27f00/0xc2a330/0xc28050/0xc28040/
+  0xe66c870`, runtime `0x86cda10/0xbf5ce0/0xc41920`; `245768f2…` → CS `0xe6bd860`,
+  il2cpp `0xc29c70/0xc2c0a0/0xc29dc0/0xc29db0/0xe66f0d0`, runtime `0x86ea320/0xbf7a60/0xc43690`.
+  `tools/test_buildgen.py` — **13/13**, в том числе новый тест, который читает байтовые
+  константы прямо из `raw/discover.rs` и требует, чтобы они находились в обеих бинарниках
+  ровно по ожидаемым RVA (две копии шаблона — две возможности разойтись).
+  `cargo test --workspace` (linux): abi 8, commands 4, core 138, dll 5, eac 43+1,
+  features 16; clippy `--workspace --all-targets --release` (windows-gnu) `-D warnings` чисто;
+  `cargo build --workspace --release` для `x86_64-pc-windows-gnu` — OK.
+- **Что НЕ подтверждено (нужен живой прогон, игру запускает пользователь).**
+  (1) `HROMATITE_PLAYER_LOOP=1` на `245768f2…`: ждём `hooked UnityEngine.PlayerLoop.Update/
+  ScriptRunBehaviourUpdate at 0x…`, затем `loop` → `hits>0` и стабильный tid
+  (ориентир: ~90 вызовов/с, как на старой сборке); (2) в логе репера — `gc_threads @ … (rva
+  0xe6bd8a0)`, а не `0xe6bb180`; (3) `HROMATITE_GCT_TRACE=1` теперь ставит worker-trace и на
+  новой сборке (`worker trace installed: dispatcher=true, unregister=true, remove=true`).
+  Ничего из этого не заявляется проверенным до прогона.
+- **Осталось.** `lateupdate::AUTO_BUILD_SHA256`/`AUTO_TYPE_INDEX` по-прежнему описывают одну
+  сборку (но это лишь подсказка: имя перепроверяется, а на чужой сборке включается
+  `il2cpp_class_from_name`); `tools/buildgen.py` не выводит `image_stride` — это живое
+  измерение, и для новой сборки он честно пишет `0` + note (тогда `m3` откажется работать,
+  пока значение не впишут).
