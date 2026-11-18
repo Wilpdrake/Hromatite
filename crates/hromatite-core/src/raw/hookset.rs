@@ -133,7 +133,19 @@ impl HookSet {
             };
         let mut g = self.lock();
         // A concurrent install may have taken the same target while we patched.
+        // Drop the registry guard, then put the fresh patch's bytes back: its
+        // snapshot was taken after the winner's patch, so this restores the
+        // winner instead of leaving an untracked jump behind.
         if g.iter().any(|e| e.active && e.target == target) {
+            drop(g);
+            match slot {
+                Slot::Inline(mut h) => {
+                    h.unhook();
+                }
+                Slot::Mid(mut h) => {
+                    h.unhook();
+                }
+            }
             return Err(HookError::DuplicateTarget);
         }
         g.push(Entry {
