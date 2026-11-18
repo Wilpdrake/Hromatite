@@ -104,6 +104,15 @@ pub const SPECS: &[Spec] = &[
         scope: Scope::Both,
     },
     Spec {
+        name: "draw",
+        aliases: &[],
+        usage: "draw [on|off|status]",
+        summary: "in-game ESP drawn by the game's own renderer",
+        note: "оверлей внутри кадра игры: сетка/боксы рисует сама Unity (без хука графики)",
+        risk: Risk::ReadOnly,
+        scope: Scope::Feature,
+    },
+    Spec {
         name: "q",
         aliases: &["qword"],
         usage: "q <addr> [count]",

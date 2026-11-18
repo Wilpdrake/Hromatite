@@ -22,6 +22,10 @@
   "image_get_class": "0xc2a330",
   "class_from_name": "0xc28050",
   "class_from_type": "0xc28040",
+  "object_new": "0xc297c0",
+  "array_new": "0xc27f40",
+  "string_new": "0xc298e0",
+  "class_init": "0xc298b0",
   "class_table": "0xe66c870"
  },
  "runtime": {

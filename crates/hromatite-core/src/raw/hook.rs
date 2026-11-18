@@ -952,6 +952,7 @@ static LAST_MS: AtomicU64 = AtomicU64::new(0);
 static START_MS: AtomicU64 = AtomicU64::new(0);
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(250);
 static BUSY: AtomicBool = AtomicBool::new(false);
+static FRAME_BUSY: AtomicBool = AtomicBool::new(false);
 static READER: Mutex<Option<console::Reader>> = Mutex::new(None);
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
@@ -964,6 +965,13 @@ fn now_ms() -> u64 {
 /// BUSY flag keep re-entrant calls from overlapping a poll already in progress.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    // The per-frame feature entry is not throttled: `Graphics.DrawMesh` applies
+    // to exactly one frame, so a 4 Hz path would flash the in-game overlay
+    // instead of drawing it. It is bounded by contract (no file or command I/O).
+    if !FRAME_BUSY.swap(true, Ordering::AcqRel) {
+        let _ = log::guard("hook::frame", crate::raw::hot::frame);
+        FRAME_BUSY.store(false, Ordering::Release);
+    }
     let now = now_ms();
     let iv = crate::raw::hot::tick_interval_ms().max(1);
     let last = LAST_MS.load(Ordering::Relaxed);

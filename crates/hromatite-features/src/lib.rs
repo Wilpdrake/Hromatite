@@ -9,6 +9,7 @@ mod feature;
 mod host;
 mod m3;
 mod memory;
+mod render;
 mod telemetry;
 
 use feature::Feature;
@@ -172,7 +173,19 @@ extern "system" fn shutdown() {
     // resolved-pointer cache. A fresh generation is built only by `init`.
     // SAFETY: shutdown is serialized against every other lifecycle entry by
     // the resident, and no feature reference escapes an earlier invocation.
-    unsafe { *state() = None };
+    unsafe { *state() = None }
+}
+
+/// Per-frame entry: the resident calls this once per game frame, outside the
+/// throttled tick. It must stay bounded and free of file or console I/O.
+extern "system" fn frame() {
+    // SAFETY: the resident exclusively serializes this synchronous invocation on
+    // the established game thread; BUSY admission prevents re-entry from a host
+    // callback, and no reference escapes this call.
+    let state = unsafe { &mut *state() };
+    if let Some(feature) = state.as_mut() {
+        feature.frame();
+    }
 }
 
 static FEATURE_API: FeatureApiV1 = FeatureApiV1 {
@@ -181,6 +194,7 @@ static FEATURE_API: FeatureApiV1 = FeatureApiV1 {
     init,
     dispatch,
     tick,
+    frame,
     configure,
     shutdown,
 };
@@ -268,7 +282,10 @@ mod tests {
         let _serial = fake::serial();
         start(42);
         assert_eq!(send("feature"), STATUS_OK);
-        assert!(fake::message_log().contains("feature: generation=42 abi=1"));
+        assert!(
+            fake::message_log()
+                .contains(&format!("feature: generation=42 abi={ABI_VERSION}"))
+        );
 
         assert_eq!(configure("telemetry", "0"), STATUS_OK);
         assert_eq!(configure("memory", "0"), STATUS_OK);
@@ -354,6 +371,34 @@ mod tests {
         assert!(log.contains("usage: call <addr> [a1] [a2] [a3]"));
     }
 
+    /// `draw` is the in-game overlay switch: it must answer from the feature
+    /// image, stay off by default and never invent an unknown-command error.
+    #[test]
+    fn the_in_game_renderer_is_switched_by_the_draw_command() {
+        let _serial = fake::serial();
+        start(40);
+        assert_eq!(send("draw"), STATUS_OK);
+        assert_eq!(send("draw status"), STATUS_OK);
+        let initial = fake::message_log();
+        assert!(initial.contains("draw: off mode segments=0 players=0"), "{initial}");
+
+        assert_eq!(send("draw on"), STATUS_OK);
+        assert_eq!(send("draw status"), STATUS_OK);
+        assert!(
+            fake::message_log().contains("draw: on mode"),
+            "{}",
+            fake::message_log()
+        );
+
+        assert_eq!(send("draw off"), STATUS_OK);
+        assert_eq!(send("draw sideways"), STATUS_BAD_ARGUMENT);
+        assert!(
+            fake::message_log().contains("usage: draw [on|off|status]"),
+            "{}",
+            fake::message_log()
+        );
+    }
+
     #[test]
     fn m3_commands_use_the_measured_unity6_layout_and_host_guard() {
         let _serial = fake::serial();
@@ -408,7 +453,10 @@ mod tests {
         assert_eq!(send("m3f UnityEngine Camera"), STATUS_OK);
         assert!(fake::message_log().contains(&format!("table {replacement:#x}")));
         assert_eq!(send("feature"), STATUS_OK);
-        assert!(fake::message_log().contains("feature: generation=12 abi=1"));
+        assert!(
+            fake::message_log()
+                .contains(&format!("feature: generation=12 abi={ABI_VERSION}"))
+        );
     }
 
     #[test]

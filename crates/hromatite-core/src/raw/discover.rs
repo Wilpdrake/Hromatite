@@ -495,6 +495,14 @@ pub fn il2cpp_anchors(base: usize, size: usize) -> Option<Il2cppAnchors> {
         class_from_name: 0,
         class_from_type: 0,
         class_table,
+        // The object/array/string factories have no shape of their own either
+        // (they are ordinary exported functions with obfuscated names), so an
+        // unknown build cannot build managed buffers: the in-game renderer
+        // refuses instead of guessing.
+        object_new: 0,
+        array_new: 0,
+        string_new: 0,
+        class_init: 0,
     })
 }
 

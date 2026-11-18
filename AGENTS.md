@@ -39,6 +39,7 @@
 | Выход на классы/методы (`Il2CppImage`, `Il2CppClass`) | ✅ закрыто (2026-11-15): таблица классов `s_TypeInfoDefinitionTable` RVA `0xe66c870`; `il2cpp_image_get_class` = `GEsTfKaEfsh` @ `0xc2a330`; раскладки `Il2CppClass`/`FieldInfo`/`MethodInfo` сняты живьём (см. §17) |
 | Чтение игроков/позиций (M3) | ✅ `pos` (Camera.main → transform → position) и `who` (VRCPlayerApi: id + позиции) подтверждены в живой игре |
 | Запись в игру (M5) | ❌ |
+| In-game оверлей (рисует сама игра, без хука графики) | ✅ код + host-тесты; ⏳ живой приёмки не было (`draw on`, ABI v2 `frame`) |
 | L2 «двойная память» | ❌ спроектировано (§7.4), не написано |
 | Инцидент: EAC выкинул с «failed to verify installation integrity» (error 16) | ⚠️ причина не изолирована (см. §8.4) |
 | Падения `Fatal error in GC — SuspendThread loop failed` | ✅ причина найдена, лечится в рантайме: протухшая запись `GC_threads[]` у нормально завершившегося потока il2cpp — репер вычеркивает её за <1 с (см. §17, 2026-11-15) |
@@ -4351,3 +4352,68 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   `signatures do not match`. Если вместо этого `PlayerLoop installations failed: no root
   subsystem … (N entries, all named)` — значит имя цели не `Update` и нужен
   `HROMATITE_PLAYER_LOOP_TARGET`.
+
+### 2026-11-18 — In-game overlay: рисует сама игра (CommandBuffer-независимый mesh), ABI v2 с per-frame слотом
+
+- Коммит: см. следующий (`feat(render): draw the overlay with the game's own renderer`).
+  Файлы: `crates/hromatite-features/src/render.rs` (новый), `feature.rs`, `telemetry.rs`,
+  `m3.rs`, `hromatite-abi/src/lib.rs` (+`build.rs`), `raw/context.rs`, `raw/hostapi.rs`,
+  `raw/hook.rs`, `raw/hot.rs`, `raw/discover.rs`, `hromatite-commands`, `tools/buildgen.py`,
+  `tools/data/build-*.json`, `tools/test_buildgen.py`.
+- **Зачем.** Просьба: «in game overlay, скрытный, не ImGui который палится за секунды».
+  ImGui-оверлей (хук `dxgi!Present`/`vkQueuePresent` + свой поток + свой рендер) — это ровно
+  тот класс, который EAC ищет: изменённые file-backed страницы системного модуля, поток со
+  старт-адресом вне известных модулей, RWX/анонимный исполняемый регион. Поэтому выбран
+  путь «рисует сама игра»: никакого хука графики, никакого своего потока и своей графики.
+- **Что добавлено.**
+  * `Graphics.DrawMesh(mesh, matrix, material, layer)` каждый кадр + `Mesh.SetVertices`
+    на пересобранных вершинах. Геометрия — мировые координаты (бокс 0.76×1.85 м вокруг
+    `VRCPlayerApi.GetPosition`, толщина линии масштабируется дистанцией, 1.6 px).
+    Проекция не нужна: матрицы подставляет сама камера игры, поэтому боксы попадают
+    в кадр, в скриншоты игры и в зеркала.
+  * Managed-объекты создаются через il2cpp: `il2cpp_object_new` (Mesh, Material),
+    `il2cpp_array_new` (`Vector3[]` 4096 вершин, `int[]` индексов), `il2cpp_string_new`
+    (литерал из `.rdata` нашего образа), `il2cpp_runtime_class_init`,
+    `Shader.Find` c падбэком `Hidden/Internal-Colored → Sprites/Default → Unlit/Color →
+    UI/Default`, `Material.set_color`, `Material.SetInt` (`_ZTest`=8, `_ZWrite`=0,
+    `_Cull`=0 — через-стены), `Mesh.set_bounds` (огромный бокс, иначе Unity отсекает меш),
+    `Object.set_hideFlags`=61 (HideAndDontSave). Треугольники записаны в обе обмотки,
+    поэтому back-face culling линии не съедает.
+  * Классы резолвятся `il2cpp_class_from_name` (**один** вызов на класс), а не сканом
+    таблицы: скан 120k слотов × чтение имени на потоке игры — это секунды стоп-кадра.
+  * `draw [on|off|status]` в фиче + `HROMATITE_DRAW=1` из `~/.hromatite-mode`.
+    По умолчанию выключен и не делает ни одного вызова в игру.
+- **Почему ABI v2.** `hook::tick()` троттлит работу до `TICK_MS` (250 мс = 4 Гц), а
+  `Graphics.DrawMesh` действует ровно один кадр — на 4 Гц оверлей бы мигал, а поднимать
+  частоту тика нельзя: это файловое I/O командного файла и каденция EAC на каждом кадре.
+  Поэтому в `FeatureApiV1` добавлен слот `frame` (per-frame, без I/O), его зовёт
+  `hook::tick()` до троттлинга под `FRAME_BUSY`; `ABI_VERSION` = 2, старые образы фич
+  отклоняются по версии (они всё равно пересобираются из этого дерева).
+- **Чем подтверждено (реальные прогоны).** `cargo test --workspace --target
+  x86_64-unknown-linux-gnu` — abi 8, commands 4, core 189, eac 7+7+6, features 22
+  (новые: 4 геометрических, статус режима, `draw on/off/status/sideways`);
+  `cargo clippy --workspace --all-targets --release --target x86_64-pc-windows-gnu
+  -D warnings` — чисто; `cargo build --workspace --release` (windows-gnu) — OK,
+  `hromatite.dll` 2 479 399 Б, `hromatite_features.dll` 2 701 129 Б.
+  `tools/buildgen.py --update-descriptor`: генератор воспроизводит дескриптор байт в байт
+  (`object_new 0xc2b530`, `array_new 0xc29cb0`, `string_new 0xc2b650`, `class_init 0xc2b620`
+  для `245768f2…`; для `648f61b1…` значения из карты имён внесены в
+  `tools/data/build-648f61b13e4f.json`, т.к. старого бинаря уже нет);
+  `tools/test_buildgen.py` — 13/13.
+- **Что НЕ достигнуто (нужен живой прогон, игру запускает пользователь).** В игре не
+  проверялось ничего из этого: ни `Shader.Find`, ни `Graphics.DrawMesh`, ни видимость
+  боксов. Критерий приёмки: `draw on` → в логе `draw: managed API resolved — shader "…"
+  (0x…), DrawMesh 0x…, SetVertices 0x…`, затем `draw: in-game renderer ready — shader …`;
+  `draw status` → `mode segments>0 players=N`; в кадре появляется крест в центре и боксы
+  над аватарами. Если `renderer unavailable — none of the fallback shaders is present` —
+  значит нужен список шейдеров под этот билд; если `Graphics.DrawMesh(mesh, matrix,
+  material, layer) not found` — изменился набор перегрузок.
+- **Границы честности.** Это не «невидимый» оверлей: он виден в кадре (в этом и смысл),
+  виден в скриншотах и в зеркалах VRChat. Скрытность здесь в другом — в процессе игры не
+  появилось ни одного нового потока, модуля, исполняемой страницы или патча в
+  системных/графических DLL. Оговорка про VR: X11-слой (`crates/hromatite-overlay`)
+  остаётся для десктопной телеметрии, а этот рендер идёт через камеру игры.
+- **Хвост.** Текст (имена/дистанции) пока не рисуется — для него нужен либо bitmap-атлас
+  через `Texture2D.SetPixels32`, либо UGUI-`Text` с `Resources.GetBuiltinResource<Font>`;
+  это следующий шаг отдельным коммитом. Также стоит добавить в `tools/buildgen.py`
+  вывод `il2cpp_type_get_object`/`string_new_utf16`, если понадобится текст.

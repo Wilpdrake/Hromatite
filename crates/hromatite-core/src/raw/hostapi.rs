@@ -143,6 +143,13 @@ extern "system" fn host_guarded_call(
                     values[1] as usize,
                     values[2] as usize,
                 ),
+                4 => crate::veh::call4(
+                    address as usize,
+                    values[0] as usize,
+                    values[1] as usize,
+                    values[2] as usize,
+                    values[3] as usize,
+                ),
                 _ => unreachable!(),
             }
         };

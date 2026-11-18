@@ -401,7 +401,7 @@ pub fn call_guarded<R>(f: impl FnOnce() -> R) -> Result<R, Fault> {
     call_with_mode(f, true)
 }
 
-/// Call a raw function pointer with 0..3 integer/pointer arguments.
+/// Call a raw function pointer with 0..4 integer/pointer arguments.
 /// The signatures are `extern "system"` because that is how Win32/x64 code is
 /// called; on x64 the calling convention is the same for `"C"`, but being
 /// explicit keeps the intent clear.
@@ -467,5 +467,22 @@ pub unsafe fn call3(f: usize, a: usize, b: usize, c: usize) -> Result<usize, Fau
         let fp: extern "system" fn(usize, usize, usize) -> usize =
             unsafe { core::mem::transmute(f) };
         fp(a, b, c)
+    })
+}
+
+/// # Safety
+/// `f` must be an executable Win64 address with exactly this signature. All
+/// pointer arguments and callee side effects must be valid; a mismatched callee
+/// can corrupt memory even when it returns without raising an exception.
+pub unsafe fn call4(f: usize, a: usize, b: usize, c: usize, d: usize) -> Result<usize, Fault> {
+    if f == 0 {
+        return Ok(0);
+    }
+    call_with(|| {
+        // SAFETY: f is supplied for this exact Win64 signature; VEH captures
+        // this thread before the raw call and handles invalid addresses.
+        let fp: extern "system" fn(usize, usize, usize, usize) -> usize =
+            unsafe { core::mem::transmute(f) };
+        fp(a, b, c, d)
     })
 }

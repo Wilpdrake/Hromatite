@@ -672,6 +672,32 @@ mod imp {
             }
         }
 
+        /// Per-frame entry for the active generation. Unlike `feature_tick` this
+        /// runs on every game frame, so it must stay bounded; a fault retires the
+        /// generation exactly as a tick fault does.
+        fn feature_frame(&mut self) {
+            let Some(version) = self.model.active_version() else {
+                return;
+            };
+            if self.model.enter(version).is_err() {
+                return;
+            }
+            let api = self
+                .active
+                .as_ref()
+                .map(|generation| generation.image.api());
+            let result = api.map(|api| {
+                crate::log::guard("hot::feature::frame", || {
+                    // SAFETY: active generation cannot retire during this guarded call.
+                    unsafe { ((*api).frame)() }
+                })
+            });
+            let leave = self.model.leave(version);
+            if leave.is_err() || result.is_none() || result.is_some_and(|v| v.is_none()) {
+                let _ = self.rollback_current("feature frame fault");
+            }
+        }
+
         fn configure(&mut self, config: HotConfig) -> Result<(), String> {
             self.config = config;
             self.model.reconfigure(config);
@@ -971,6 +997,15 @@ mod imp {
         runtime.report();
     }
 
+    /// Per-frame dispatch into the active generation; no bootstrap, no command
+    /// polling, no reporting — those stay on the throttled tick.
+    pub(super) fn frame_impl() {
+        // SAFETY: the hook calls this on the same serialized game thread as
+        // `tick_impl`, and re-entry is excluded by the caller's frame flag.
+        let runtime = unsafe { &mut *runtime() };
+        runtime.feature_frame();
+    }
+
     pub(super) fn dispatch_impl(line: &str) -> bool {
         // SAFETY: the caller owns the same serialized hook::work context.
         unsafe { &mut *runtime() }.dispatch(line)
@@ -1149,6 +1184,15 @@ mod imp {
 pub fn tick() {
     #[cfg(target_os = "windows")]
     imp::tick_impl();
+}
+
+/// Per-frame feature work: called on every game frame *before* the throttled
+/// command/anti-cheat tick, so a feature that draws (the in-game overlay) is not
+/// limited to the 4 Hz tick rate. Bounded by contract: no file I/O, no command
+/// routing.
+pub fn frame() {
+    #[cfg(target_os = "windows")]
+    imp::frame_impl();
 }
 
 /// True only for reload transitions, where native work must not hold the game's

@@ -33,6 +33,9 @@ pub struct Field {
 pub struct Method {
     pub name: String,
     pub entry: usize,
+    /// Address of the `MethodInfo` record itself, for callers that must look at
+    /// the signature (parameter types) instead of guessing from the name.
+    pub info: usize,
     pub return_kind: u32,
     pub parameters_count: u8,
     pub flags: u16,
@@ -229,6 +232,7 @@ impl<'a> Metadata<'a> {
             out.push(Method {
                 name,
                 entry: self.host.read_usize(info).unwrap_or(0),
+                info,
                 return_kind: self.method_return_kind(info),
                 parameters_count: self.host.read_u8(info + 0x52).unwrap_or(u8::MAX),
                 flags: self.host.read_u16(info + 0x4c).unwrap_or(u16::MAX),
@@ -242,6 +246,28 @@ impl<'a> Metadata<'a> {
             .iter()
             .find(|method| method.name == name)
             .map_or(0, |method| method.entry)
+    }
+
+    /// `Il2CppTypeEnum` of the first parameter, read from the signature.
+    ///
+    /// Method overloads that only differ in the first parameter type (the two
+    /// `Material.SetInt` shapes, `string` versus `int`) are indistinguishable by
+    /// name and arity, so the type kind is the only honest discriminator.
+    pub fn first_parameter_kind(&self, info: usize) -> Option<u32> {
+        let parameters = self
+            .host
+            .read_usize(info.checked_add(self.layout.method_parameters as usize)?)?;
+        if parameters < 0x10000 {
+            return None;
+        }
+        let kind = self.host.read_usize(parameters)?;
+        if kind < 0x10000 {
+            return None;
+        }
+        // Same bitfield `method_return_kind` uses: the enum sits in bits 16..24.
+        self.host
+            .read_u32(kind.checked_add(0x08)?)
+            .map(|bits| (bits >> 16) & 0xff)
     }
 
     pub fn method_in_chain(&self, class: usize, name: &str) -> Option<(usize, usize)> {
@@ -299,6 +325,42 @@ impl<'a> Metadata<'a> {
 
     pub fn image_get_class_rva(&self) -> u32 {
         self.api.image_get_class
+    }
+
+    /// The build's il2cpp anchors, so a feature resolves each entry point once
+    /// instead of re-selecting the descriptor on every call.
+    pub fn api_anchors(&self) -> Il2cppAnchors {
+        self.api
+    }
+
+    /// Corlib image plus the record of another assembly, by short name.
+    pub fn image_of_assembly(&self, assembly: &str) -> Option<usize> {
+        let corlib = self.find_domain()?;
+        self.image_of(corlib, assembly)
+    }
+
+    /// `il2cpp_class_from_name(image, namespace, name)`: one call, and the only
+    /// way to reach a class the definition table has not materialised without
+    /// walking (and thereby materialising) the whole image.
+    pub fn class_by_name(&self, image: usize, namespace: &str, name: &str) -> Option<usize> {
+        let (base, size) = self.host.game_assembly_range();
+        if self.api.class_from_name == 0 {
+            return None;
+        }
+        let function = base.checked_add(self.api.class_from_name as usize)?;
+        if function.checked_add(8)? > base.checked_add(size)? {
+            return None;
+        }
+        let namespace = std::ffi::CString::new(namespace).ok()?;
+        let name = std::ffi::CString::new(name).ok()?;
+        let class = self
+            .host
+            .call(
+                function,
+                &[image, namespace.as_ptr() as usize, name.as_ptr() as usize],
+            )
+            .ok()?;
+        (class >= 0x10000).then_some(class)
     }
 
     fn image_get_class(&self) -> Option<usize> {

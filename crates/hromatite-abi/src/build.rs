@@ -65,6 +65,18 @@ pub struct Il2cppAnchors {
     pub class_from_type: u32,
     /// `s_TypeInfoDefinitionTable` slot (holds `Il2CppClass**`).
     pub class_table: u32,
+    /// `il2cpp_object_new(Il2CppClass*)` — a managed instance with the class's
+    /// own allocator, so Unity's GC sees it as a normal object.
+    pub object_new: u32,
+    /// `il2cpp_array_new(Il2CppClass*, uintptr_t)` — the element class plus the
+    /// length; used for the overlay's `Vector3[]` and `int[]` buffers.
+    pub array_new: u32,
+    /// `il2cpp_string_new(const char*)` — copies the characters into the game's
+    /// heap, so a `&'static` literal in this image may be passed and dropped.
+    pub string_new: u32,
+    /// `il2cpp_runtime_class_init(Il2CppClass*)` — finishes the lazy type
+    /// initializer before an instance or an array of it is created.
+    pub class_init: u32,
 }
 
 /// Entry points of the tick sources and of the opt-in GC diagnostics.
@@ -174,6 +186,10 @@ pub const BUILD_648F61B1: Build = Build {
         class_from_name: 0x00c2_8050,
         class_from_type: 0x00c2_8040,
         class_table: 0x0e66_c870,
+        object_new: 0x00c2_97c0,
+        array_new: 0x00c2_7f40,
+        string_new: 0x00c2_98e0,
+        class_init: 0x00c2_98b0,
     },
     runtime: RuntimeAnchors {
         get_current_player_loop: 0x086c_da10,
@@ -229,6 +245,10 @@ pub const BUILD_245768F2: Build = Build {
         class_from_name: 0x00c2_9dc0,
         class_from_type: 0x00c2_9db0,
         class_table: 0x0e66_f0d0,
+        object_new: 0x00c2_b530,
+        array_new: 0x00c2_9cb0,
+        string_new: 0x00c2_b650,
+        class_init: 0x00c2_b620,
     },
     runtime: RuntimeAnchors {
         get_current_player_loop: 0x086e_a320,
@@ -364,6 +384,10 @@ mod tests {
         assert_eq!(old.il2cpp.class_from_name, 0xc2_8050);
         assert_eq!(old.il2cpp.class_from_type, 0xc2_8040);
         assert_eq!(old.il2cpp.class_table, 0xe66_c870);
+        assert_eq!(old.il2cpp.object_new, 0x00c2_97c0);
+        assert_eq!(old.il2cpp.array_new, 0x00c2_7f40);
+        assert_eq!(old.il2cpp.string_new, 0x00c2_98e0);
+        assert_eq!(old.il2cpp.class_init, 0x00c2_98b0);
         assert_eq!(old.runtime.get_current_player_loop, 0x086c_da10);
         assert_eq!(old.runtime.worker_dispatch, 0x00bf_5ce0);
         assert_eq!(old.runtime.gc_unregister, 0x00c4_1920);
@@ -405,6 +429,10 @@ mod tests {
         assert_eq!(new.il2cpp.class_from_name, 0xc2_9dc0);
         assert_eq!(new.il2cpp.class_from_type, 0xc2_9db0);
         assert_eq!(new.il2cpp.class_table, 0xe66_f0d0);
+        assert_eq!(new.il2cpp.object_new, 0x00c2_b530);
+        assert_eq!(new.il2cpp.array_new, 0x00c2_9cb0);
+        assert_eq!(new.il2cpp.string_new, 0x00c2_b650);
+        assert_eq!(new.il2cpp.class_init, 0x00c2_b620);
         assert_eq!(
             new.runtime.get_current_player_loop, 0x086e_a320,
             "verified in Ghidra: zeroes the 0x28-byte PlayerLoopSystem and resolves the icall"

@@ -5,7 +5,46 @@
 use crate::m3::{CLASS_MAX, Metadata};
 use hromatite_abi::{STATUS_NOT_READY, STATUS_OK};
 
-type Vec3 = (f32, f32, f32);
+pub(crate) type Vec3 = (f32, f32, f32);
+
+/// One read of the world for the in-game renderer: player positions plus where
+/// the camera is and where it looks. Refreshed at a fraction of the frame rate.
+pub(crate) struct Scene {
+    pub players: Vec<(usize, Vec3)>,
+    pub eye: Option<Vec3>,
+    pub forward: Option<Vec3>,
+}
+
+/// Player body positions and the camera pose, reusing the same resolved SDK and
+/// camera entries the `who`/`esp` commands use.
+pub(crate) fn scene(metadata: &mut Metadata<'_>, cache: &mut Cache) -> Option<Scene> {
+    let sdk = sdk(metadata, cache)?;
+    let players = enumerate_players(metadata, &sdk, false)
+        .map(|players| {
+            players
+                .rows
+                .into_iter()
+                .filter_map(|row| row.pos.map(|pos| (row.id, pos)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut eye = None;
+    let mut forward = None;
+    if let Some(camera) = camera(metadata, cache)
+        && let Ok(instance) = metadata.host.call(camera.get_main, &[])
+        && instance >= 0x10000
+        && let Ok(transform) = metadata.host.call(camera.get_transform, &[instance])
+        && transform >= 0x10000
+    {
+        eye = call_vec3(metadata, camera.tr_position, transform);
+        forward = call_vec3(metadata, camera.tr_forward, transform);
+    }
+    Some(Scene {
+        players,
+        eye,
+        forward,
+    })
+}
 
 #[derive(Clone, Copy)]
 struct Sdk {

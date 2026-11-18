@@ -4,6 +4,7 @@ use crate::eac::{EacFeature, INTERVAL_RANGE};
 use crate::host::Host;
 use crate::m3::{Cache as MetadataCache, Metadata};
 use crate::memory::{bytes, decode_hex, parse_addr, qwords};
+use crate::render::Renderer;
 use crate::telemetry::Cache as TelemetryCache;
 use hromatite_abi::{
     ABI_VERSION, HostApiV1, STATUS_BAD_ARGUMENT, STATUS_ERROR, STATUS_NOT_READY, STATUS_OK,
@@ -18,10 +19,17 @@ pub struct Feature {
     metadata_cache: MetadataCache,
     telemetry_cache: TelemetryCache,
     eac: EacFeature,
+    render: Renderer,
 }
 
 impl Feature {
     pub fn new(host: HostApiV1, generation: u64) -> Self {
+        let mut render = Renderer::default();
+        // The wrapper exports this from `~/.hromatite-mode`, so the overlay can
+        // come up with the game instead of waiting for a console command.
+        if std::env::var("HROMATITE_DRAW").is_ok_and(|value| value.trim() == "1") {
+            render.set(true);
+        }
         Self {
             host: Host::new(host),
             generation,
@@ -31,15 +39,29 @@ impl Feature {
             metadata_cache: MetadataCache::default(),
             telemetry_cache: TelemetryCache::default(),
             eac: EacFeature::new(),
+            render,
         }
     }
 
-    /// Managed tick: anti-cheat housekeeping only (heartbeat cadence, game-log
-    /// mirror). Bounded file I/O, no game-memory access, no native calls.
+    /// Throttled managed tick: anti-cheat housekeeping (heartbeat cadence, the
+    /// game-log mirror) and command routing. Bounded file I/O lives here and
+    /// never on the per-frame path.
     pub fn tick(&mut self) {
         for line in self.eac.tick() {
             self.host.log(&line);
         }
+    }
+
+    /// Per-frame managed work on the same game thread: one draw call for the
+    /// in-game overlay. No file I/O, no command routing, bounded game calls.
+    pub fn frame(&mut self) {
+        if !self.render.enabled() {
+            return;
+        }
+        let Some(mut metadata) = Metadata::new(&self.host, &mut self.metadata_cache) else {
+            return;
+        };
+        self.render.frame(&mut metadata, &mut self.telemetry_cache);
     }
 
     pub fn respond(&self, lines: impl IntoIterator<Item = String>, status: i32) -> i32 {
@@ -124,6 +146,7 @@ impl Feature {
             "memory" => self.memory = enabled,
             "m3" => self.m3 = enabled,
             "eac" => self.eac.set_enabled(enabled),
+            "draw" => self.render.set(enabled),
             "eac_auto" => self.eac.set_auto(enabled),
             "eac_autosession" => self.eac.set_autosession(enabled),
             "eac_hooks" => self.eac.set_hooks_enabled(enabled),
@@ -206,6 +229,22 @@ impl Feature {
                 STATUS_OK,
             ),
             "help" | "?" => self.respond(help_lines(), STATUS_OK),
+            // In-game ESP: the game's own renderer draws it, see `render.rs`.
+            "draw" => match a1.to_ascii_lowercase().as_str() {
+                "" | "status" => self.respond(self.render.status(), STATUS_OK),
+                "on" | "1" => {
+                    self.render.set(true);
+                    self.respond(
+                        ["draw: on — the mesh is built on the next game frame".to_string()],
+                        STATUS_OK,
+                    )
+                }
+                "off" | "0" => {
+                    self.render.set(false);
+                    self.respond(["draw: off".to_string()], STATUS_OK)
+                }
+                other => self.error(format!("usage: draw [on|off|status] (got '{other}')")),
+            },
             "q" | "qword" => match parse_addr(a1) {
                 Some(address) => {
                     let count = a2.parse::<usize>().unwrap_or(8);

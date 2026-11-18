@@ -637,6 +637,14 @@ def il2cpp_anchors(pe: PE, names: dict[str, int], runtime_cache: dict | None):
             # the module base.
             "class_from_name": names.get("il2cpp_class_from_name", 0),
             "class_from_type": names.get("il2cpp_class_from_il2cpp_type", 0),
+            # Object/array/string factories the overlay needs to build managed
+            # buffers: `il2cpp_object_new` + `il2cpp_array_new` allocate through
+            # the game's own heap so Unity's GC owns the memory, and
+            # `il2cpp_string_new` copies a literal out of this image.
+            "object_new": names.get("il2cpp_object_new", 0),
+            "array_new": names.get("il2cpp_array_new", 0),
+            "string_new": names.get("il2cpp_string_new", 0),
+            "class_init": names.get("il2cpp_runtime_class_init", 0),
             "class_table": class_table,
         },
         {"getters": [(hex(rva), hex(global_rva), hex(value)) for rva, global_rva, value in getters]},
@@ -1366,7 +1374,17 @@ def render_build(descriptor: dict) -> str:
         lines.append(f"        {key}: {word(gc[key])},")
     lines.append("    },")
     lines.append("    il2cpp: Il2cppAnchors {")
-    for key in ("get_corlib", "image_get_class", "class_from_name", "class_from_type", "class_table"):
+    for key in (
+        "get_corlib",
+        "image_get_class",
+        "class_from_name",
+        "class_from_type",
+        "class_table",
+        "object_new",
+        "array_new",
+        "string_new",
+        "class_init",
+    ):
         value = il2cpp.get(key)
         lines.append(f"        {key}: {word(value) if value else '0x0000_0000'},")
     lines.append("    },")

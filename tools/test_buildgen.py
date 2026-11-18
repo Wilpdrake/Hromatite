@@ -57,6 +57,10 @@ ORACLE = {
             "class_from_name": 0xC28050,
             "class_from_type": 0xC28040,
             "class_table": 0xE66C870,
+            "object_new": 0xC297C0,
+            "array_new": 0xC27F40,
+            "string_new": 0xC298E0,
+            "class_init": 0xC298B0,
         },
         "runtime": {
             "get_current_player_loop": 0x86CDA10,
@@ -106,6 +110,10 @@ ORACLE = {
             "class_from_name": 0xC29DC0,
             "class_from_type": 0xC29DB0,
             "class_table": 0xE66F0D0,
+            "object_new": 0xC2B530,
+            "array_new": 0xC29CB0,
+            "string_new": 0xC2B650,
+            "class_init": 0xC2B620,
         },
         "runtime": {
             "get_current_player_loop": 0x86EA320,
