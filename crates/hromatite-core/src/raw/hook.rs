@@ -1341,9 +1341,6 @@ pub fn install_gc_context_guard() -> bool {
 static GC_DISPATCH_ORIG: AtomicUsize = AtomicUsize::new(0);
 static GC_UNREGISTER_ORIG: AtomicUsize = AtomicUsize::new(0);
 
-pub const WORKER_DISPATCH_RVA: u32 = 0xbf5ce0;
-pub const GC_UNREGISTER_RVA: u32 = 0xc41920;
-
 /// Record the real worker body before the shared OS trampoline can free its
 /// argument block. `RCX=inner`, with `{thread,fn,arg}` at offsets 0/8/16.
 ///
@@ -1381,7 +1378,7 @@ pub unsafe extern "system" fn gc_unregister_detour() -> usize {
         return 0;
     }
     // SAFETY: original is the trampoline for the no-argument, EAX-returning
-    // unregister function at GC_UNREGISTER_RVA.
+    // unregister function whose entry the descriptor provides.
     let f: unsafe extern "system" fn() -> usize = unsafe { core::mem::transmute(original) };
     // SAFETY: the no-argument trampoline supplies the original execution context.
     unsafe { f() }
@@ -1390,8 +1387,6 @@ pub unsafe extern "system" fn gc_unregister_detour() -> usize {
 static GC_REMOVE_ORIG: AtomicUsize = AtomicUsize::new(0);
 static EXIT_THREAD_ORIG: AtomicUsize = AtomicUsize::new(0);
 static END_THREAD_EX_ORIG: AtomicUsize = AtomicUsize::new(0);
-
-pub const GC_REMOVE_RVA: u32 = 0xc417b0;
 
 /// The actual deletion of a Boehm record. `FUN_180c417b0(DWORD tid)`: it walks
 /// the bucket without a NULL check, `CloseHandle`s the duplicated handle and
@@ -1408,7 +1403,8 @@ pub unsafe extern "system" fn gc_remove_detour(tid: u32) -> usize {
         return 0;
     }
     // SAFETY: original is the trampoline for the one-argument removal function
-    // at GC_REMOVE_RVA; the argument is forwarded unchanged.
+    // the descriptor named as `gc.remove_thread`; the argument is forwarded
+    // unchanged.
     let f: unsafe extern "system" fn(u32) -> usize = unsafe { core::mem::transmute(original) };
     // SAFETY: as above — tid is the original caller's value.
     unsafe { f(tid) }
@@ -1531,30 +1527,44 @@ fn install_gc_trace_at(
 
 /// Install worker provenance hooks only when explicitly requested. These
 /// diagnostic detours execute from the same plaintext image as LateUpdate.
+///
+/// The three targets are not exports: the dispatcher and the GC removal are
+/// derived per build (descriptor, else `raw::discover`). When any of them is
+/// unknown this refuses; patching a guessed address is worse than losing a
+/// diagnostic.
 pub fn install_gc_worker_trace() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
-        log::log_tag(
-            "gct",
-            "worker trace disabled: dispatcher/unregister RVAs are only known for build 648f61b1",
-        );
-        return false;
-    }
-    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, size)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "worker trace disabled: GameAssembly is not loaded");
         return false;
     };
+    let Some(runtime) = crate::buildinfo::runtime_anchors(ga, size) else {
+        log::log_tag(
+            "gct",
+            "worker trace disabled: no runtime anchors for this GameAssembly build",
+        );
+        return false;
+    };
+    let Some(gc) = crate::buildinfo::gc_anchors(ga, size) else {
+        log::log_tag("gct", "worker trace disabled: no GC anchors for this build");
+        return false;
+    };
+    if runtime.worker_dispatch == 0 || runtime.gc_unregister == 0 {
+        log::log_tag(
+            "gct",
+            "worker trace disabled: dispatcher/unregister were not derived for this build",
+        );
+        return false;
+    }
     let dispatch = install_gc_trace_at(
         ga,
-        WORKER_DISPATCH_RVA,
+        runtime.worker_dispatch,
         &GC_DISPATCH_ORIG,
         gc_worker_detour as *const () as usize,
         "worker dispatcher",
     );
     let unregister = install_gc_trace_at(
         ga,
-        GC_UNREGISTER_RVA,
+        runtime.gc_unregister,
         &GC_UNREGISTER_ORIG,
         gc_unregister_detour as *const () as usize,
         "GC unregister",
@@ -1564,7 +1574,7 @@ pub fn install_gc_worker_trace() -> bool {
     // "the body skipped the call" from "our hook sat on the wrong wrapper".
     let remove = install_gc_trace_at(
         ga,
-        GC_REMOVE_RVA,
+        gc.remove_thread,
         &GC_REMOVE_ORIG,
         gc_remove_detour as *const () as usize,
         "GC remove thread",

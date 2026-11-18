@@ -47,13 +47,14 @@ fn image(address: u64, name: &str, name_address: u64) {
 }
 
 fn class(index: usize, address: u64, namespace: &str, name: &str, methods: &[(&str, u64)]) {
+    let layout = layout();
     fake::put_u64(CLASS_TABLE + index as u64 * 8, address);
     fake::map_zeroed(address, 0x200);
     fake::put_u64(address, CORLIB_IMAGE);
     fake::put_ascii(address + 0x200, namespace);
     fake::put_ascii(address + 0x300, name);
-    fake::put_u64(address + 0x18, address + 0x200);
-    fake::put_u64(address + 0x98, address + 0x300);
+    fake::put_u64(address + u64::from(layout.class_namespace), address + 0x200);
+    fake::put_u64(address + u64::from(layout.class_name), address + 0x300);
 
     let array = address + 0x800;
     let infos = address + 0x1000;

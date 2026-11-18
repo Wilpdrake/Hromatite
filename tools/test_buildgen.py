@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 import sys
 import unittest
@@ -48,9 +49,20 @@ ORACLE = {
             "suspend_abort": 0xC41B65,
             "advance_bucket": 0xC41C6A,
             "threads": 0xE6BB180,
-            "thread_list_cs": 0xE6BB100,
+            "thread_list_cs": 0xE6BB140,
         },
-        "il2cpp": {"get_corlib": 0xC27F00, "image_get_class": 0xC2A330, "class_table": 0xE66C870},
+        "il2cpp": {
+            "get_corlib": 0xC27F00,
+            "image_get_class": 0xC2A330,
+            "class_from_name": 0xC28050,
+            "class_from_type": 0xC28040,
+            "class_table": 0xE66C870,
+        },
+        "runtime": {
+            "get_current_player_loop": 0x86CDA10,
+            "worker_dispatch": 0xBF5CE0,
+            "gc_unregister": 0xC41920,
+        },
         "layout": {
             "class_parent": 0x10,
             "class_namespace": 0x18,
@@ -68,6 +80,9 @@ ORACLE = {
             "method_parameters": 0x30,
             "method_flags": 0x4C,
             "method_param_count": 0x52,
+            "image_stride": 0x48,
+            "image_name": 0x08,
+            "image_filename": 0x40,
         },
     },
     "245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb": {
@@ -83,15 +98,28 @@ ORACLE = {
             "suspend_abort": 0xC438D5,
             "advance_bucket": 0xC439DA,
             "threads": 0xE6BD8A0,
-            "thread_list_cs": 0xE6BD800,
+            "thread_list_cs": 0xE6BD860,
         },
-        "il2cpp": {"get_corlib": 0xC29C70, "image_get_class": 0xC2C0A0, "class_table": 0xE66F0D0},
+        "il2cpp": {
+            "get_corlib": 0xC29C70,
+            "image_get_class": 0xC2C0A0,
+            "class_from_name": 0xC29DC0,
+            "class_from_type": 0xC29DB0,
+            "class_table": 0xE66F0D0,
+        },
+        "runtime": {
+            "get_current_player_loop": 0x86EA320,
+            "worker_dispatch": 0xBF7A60,
+            "gc_unregister": 0xC43690,
+        },
         "layout": {
             "class_parent": 0xA0,
             "class_namespace": 0x18,
             "class_methods": 0x58,
             "class_fields": 0x88,
-            "class_name": 0x98,
+            # live-measured on the VRC.Udon.UdonManager class record; the
+            # transferred il2cpp_class_get_name reads +0x98 on this build
+            "class_name": 0x10,
             "class_fields_count": 0x124,
             "field_stride": 0x20,
             "field_name": 0x00,
@@ -103,6 +131,9 @@ ORACLE = {
             "method_parameters": 0x30,
             "method_flags": 0x4C,
             "method_param_count": 0x52,
+            "image_stride": 0x50,
+            "image_name": 0x08,
+            "image_filename": 0x18,
         },
     },
 }
@@ -213,8 +244,17 @@ class ReferenceBuilds(unittest.TestCase):
         names = self._names(sha)
         il2cpp, _ = bg.il2cpp_anchors(pe, names, None)
         self.assertEqual(il2cpp, expected["il2cpp"])
-        layout, _ = bg.layout(pe, names)
-        self.assertEqual(layout, expected["layout"])
+        runtime, _ = bg.runtime_anchors(pe, gc)
+        self.assertEqual(runtime, expected["runtime"])
+        layout, notes = bg.layout(pe, names)
+        live = {
+            key: int(value, 16)
+            for key, value in json.load(
+                open(os.path.join(REPO, "tools", "data", f"build-{sha[:12]}.json"))
+            )["layout"].items()
+        }
+        layout, notes = bg.merge_layout(layout, live, notes)
+        self.assertEqual(layout, expected["layout"], notes)
         return sha
 
     def test_previous_build_reproduces_the_oracle(self):
@@ -244,13 +284,64 @@ class ReferenceBuilds(unittest.TestCase):
             expected = ORACLE.get(descriptor["sha256"])
             if expected is None:
                 continue
-            for section in ("gc", "il2cpp", "layout"):
+            for section in ("gc", "il2cpp", "runtime", "layout"):
                 for key, value in expected[section].items():
                     self.assertEqual(
                         int(descriptor[section][key], 16),
                         value,
                         f"{name}: {section}.{key}",
                     )
+
+
+class RustShapes(unittest.TestCase):
+    """The runtime (`raw::discover`) and this generator must agree byte for byte.
+
+    Two copies of a pattern are two chances to rot: if one is edited, the other
+    silently stops finding the getter.  This test reads the constants out of the
+    Rust source and looks for them in both reference binaries.
+    """
+
+    SHAPES = {
+        "PLAYER_LOOP_PROLOGUE": ("il2cpp", {
+            "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b": 0x86CDA10,
+            "245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb": 0x86EA320,
+        }),
+        "WORKER_DISPATCH_BODY": (".text", {
+            "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b": 0xBF5CE0,
+            "245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb": 0xBF7A60,
+        }),
+    }
+
+    def _rust_bytes(self, name: str) -> bytes:
+        source = open(os.path.join(REPO, "crates", "hromatite-core", "src", "raw", "discover.rs")).read()
+        start = source.index(f"const {name}: &[u8] = &[")
+        body = source[start : source.index("];", start)]
+        return bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})", body))
+
+    def test_runtime_patterns_match_the_reference_binaries(self):
+        binaries = {
+            "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b": OLD_BINARY,
+            "245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb": os.path.join(GAME_DIR, "GameAssembly.dll"),
+        }
+        for name, (section, expected) in self.SHAPES.items():
+            needle = self._rust_bytes(name)
+            self.assertGreater(len(needle), 8, name)
+            for sha, path in binaries.items():
+                if not os.path.exists(path):
+                    continue
+                pe = bg.PE(path)
+                blob = pe.crange(section)
+                hits = [pe.crva(section) + hit for hit in bg.find_all(blob, needle)]
+                self.assertEqual(hits, [expected[sha]], f"{name} in {sha[:12]}")
+
+    def test_the_icall_name_the_getter_caches_is_the_same_string(self):
+        source = open(os.path.join(REPO, "crates", "hromatite-core", "src", "raw", "discover.rs")).read()
+        self.assertIn(bg.PLAYER_LOOP_ICALL.decode(), source)
+        for path in (OLD_BINARY, os.path.join(GAME_DIR, "GameAssembly.dll")):
+            if not os.path.exists(path):
+                continue
+            pe = bg.PE(path)
+            self.assertIn(bg.PLAYER_LOOP_ICALL, pe.crange(".rdata"))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ process.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -63,8 +64,24 @@ SUSPEND_ADVANCE_BUCKET = 0x24A
 REMOVE_SKIP_CLOSE = 0x40
 REMOVE_UNLINKED_NEXT = 0x46
 REMOVE_AFTER_UNLINK = 0x68
-STW_CS_DISTANCE = 0x40
 BUCKETS_BYTES = 0x800
+
+# Non-export entry points: each rule is a byte shape plus one independent
+# cross-check, because these addresses are patched, not merely called.
+#
+# `GetCurrentPlayerLoop` is the compiled managed getter: it zeroes the 0x28-byte
+# `PlayerLoopSystem` it was handed in RCX and then resolves the icall
+# `...PlayerLoop::GetCurrentPlayerLoopInternal()` once, caching the pointer.
+PLAYER_LOOP_PROLOGUE = bytes.fromhex(
+    "40534883ec5033c0c7442460000000000f57c0488bd90f11010f11411048894120"
+)
+PLAYER_LOOP_ICALL = b"UnityEngine.LowLevel.PlayerLoop::GetCurrentPlayerLoopInternal()"
+# il2cpp's thread dispatcher: `RCX = {thread*, fn, arg}`; it bumps the thread's
+# flags word, then calls the trampoline.  Same bytes on both measured builds.
+WORKER_DISPATCH = bytes.fromhex(
+    "48895c240848896c2410488974241848897c242041564883ec20488bd9488b31"
+    "488b46088b90f800000083e2fb83fa02"
+)
 
 
 class BuildgenError(RuntimeError):
@@ -98,6 +115,7 @@ class PE:
         self.export_rva, self.export_size = struct.unpack_from("<II", data, dirs)
         self.reloc_rva, self.reloc_size = struct.unpack_from("<II", data, dirs + 5 * 8)
         self.import_rva, self.import_size = struct.unpack_from("<II", data, dirs + 8)
+        self.exc_rva, self.exc_size = struct.unpack_from("<II", data, dirs + 3 * 8)
         self.sections: list[tuple[str, int, int, int, int]] = []
         table = optional + opt_size
         for index in range(sections):
@@ -108,6 +126,7 @@ class PE:
         self.exports = self._exports()
         self.relocs = self._relocs()
         self.imports = self._imports()
+        self.pdata = self._pdata()
 
     # -- raw access ---------------------------------------------------------
 
@@ -245,6 +264,61 @@ class PE:
             cursor += 20
         return out
 
+    # -- function boundaries ------------------------------------------------
+
+    def _pdata(self):
+        """`RUNTIME_FUNCTION` table: `begin -> (end, unwind_info_rva)`.
+
+        Byte walking back from an instruction is not a function finder: rel32
+        displacements are full of `0xCC` bytes.  The exception directory is
+        exact, but Windows emits one entry per C++ EH scope, so the entry that
+        contains an address is often a *fragment*; `function_at` follows
+        `UNW_FLAG_CHAININFO` up to the primary entry.
+        """
+        out: dict[int, tuple[int, int]] = {}
+        if not self.exc_rva or not self.exc_size:
+            return out
+        blob = self.read_rva(self.exc_rva, self.exc_size) or b""
+        for index in range(len(blob) // 12):
+            begin, end, unwind = struct.unpack_from("<III", blob, index * 12)
+            if begin == 0 and end == 0:
+                break
+            out[begin] = (end, unwind)
+        return out
+
+    def function_at(self, rva: int):
+        """Primary entry of the function that contains `rva`, or None."""
+        if not self.pdata:
+            return None
+        starts = getattr(self, "_pdata_starts", None)
+        if starts is None:
+            starts = sorted(self.pdata)
+            self._pdata_starts = starts
+        index = bisect.bisect_right(starts, rva) - 1
+        if index < 0:
+            return None
+        begin = starts[index]
+        end, unwind = self.pdata[begin]
+        if not begin <= rva < end:
+            return None
+        for _ in range(8):
+            info = self.read_rva(unwind, 4) or b""
+            # UNW_FLAG_CHAININFO (0x4) means "this is a scope inside another
+            # function"; the primary entry is the end of the chain.
+            if len(info) < 4 or ((info[0] >> 3) & 0x4) == 0:
+                return begin
+            count = info[2]
+            offset = 4 + 2 * count + (2 if count & 1 else 0)
+            chained = self.read_rva(unwind + offset, 12)
+            if not chained:
+                return begin
+            parent = struct.unpack_from("<I", chained, 0)[0]
+            entry = self.pdata.get(parent)
+            if entry is None:
+                return begin
+            begin, unwind = parent, entry[1]
+        return begin
+
     # -- helpers used by the name transfer ----------------------------------
 
     def masked_body(self, rva: int, nxt: int):
@@ -341,11 +415,11 @@ def follow_thunks(pe, rva: int, hops: int = 4) -> int:
     raise BuildgenError(f"thunk chain at {rva:#x} is too long")
 
 
-def iat_slot_of(body: bytes, offset: int):
+def iat_slot_of(body: bytes, offset: int, body_rva: int = 0):
     """`FF 15 disp32` -> the IAT slot RVA it calls through."""
     if body[offset : offset + 2] != b"\xff\x15" or offset + 6 > len(body):
         return None
-    return offset + 6 + struct.unpack_from("<i", body, offset + 2)[0]
+    return body_rva + offset + 6 + struct.unpack_from("<i", body, offset + 2)[0]
 
 
 def function_start(hay: bytes, hay_rva: int, site_off: int, limit: int = 0x100) -> int:
@@ -393,7 +467,7 @@ def gc_anchors(pe: PE):
     if text[at(SUSPEND_ADVANCE_BUCKET) - text_rva : at(SUSPEND_ADVANCE_BUCKET) - text_rva + 4] != b"\x49\x83\xc7\x08":
         raise BuildgenError("bucket advance is not `add r15,8`")
 
-    context_slot = iat_slot_of(text, at(SUSPEND_CONTEXT_CALL) - text_rva)
+    context_slot = iat_slot_of(text, at(SUSPEND_CONTEXT_CALL) - text_rva, text_rva)
     context_name = pe.imports.get(context_slot, (None, None))[1] if context_slot is not None else None
     evidence["context_call"] = context_name or "shape only"
 
@@ -410,12 +484,12 @@ def gc_anchors(pe: PE):
         raise BuildgenError("no `lea r14,[rip]` before the bucket walk")
     disp = struct.unpack_from("<i", text, lea_off + 3)[0]
     threads = rip_target(text_rva + lea_off, disp, 7)
-    remove_thread = function_start(text, text_rva, lea_off)
+    remove_thread = pe.function_at(text_rva + lea_off) or function_start(text, text_rva, lea_off)
     remove_off = remove_thread - text_rva
 
     if text[remove_off + REMOVE_SKIP_CLOSE : remove_off + REMOVE_SKIP_CLOSE + 2] != b"\xff\x15":
         raise BuildgenError("remove_thread does not call through an IAT slot at +0x40")
-    close_slot = iat_slot_of(text, remove_off + REMOVE_SKIP_CLOSE)
+    close_slot = iat_slot_of(text, remove_off + REMOVE_SKIP_CLOSE, text_rva)
     close_name = pe.imports.get(close_slot, (None, None))[1] if close_slot is not None else None
     if close_name and close_name != "CloseHandle":
         raise BuildgenError(f"remove_thread +0x40 calls {close_name}, not CloseHandle")
@@ -450,29 +524,41 @@ def gc_anchors(pe: PE):
         "suspend_abort": at(SUSPEND_ABORT),
         "advance_bucket": at(SUSPEND_ADVANCE_BUCKET),
         "threads": threads,
-        "thread_list_cs": list_cs(text, text_rva, threads, threads - STW_CS_DISTANCE),
+        "thread_list_cs": collector_cs(pe, entry, text, text_rva),
     }
     return anchors, evidence
 
 
-def list_cs(text: bytes, text_rva: int, threads: int, stw: int) -> int:
-    """Most-referenced lea target in the 0x200 bytes before the table."""
-    counts: dict[int, int] = {}
-    low = threads - 0x200
-    for index in range(len(text) - 7):
-        if text[index : index + 2] != b"\x48\x8d":
+def collector_cs(pe: PE, entry: int, text: bytes, text_rva: int) -> int:
+    """The critical section `GC_suspend_all` enters.
+
+    The old heuristic ("most referenced lea target just before the table")
+    pointed at the string `"CP1252"` on the next build and hung the game on an
+    `EnterCriticalSection` that never returns.  The collector's own lock is what
+    the entry guard must hold, and it is named by one instruction: the `lea rcx`
+    that feeds `call [EnterCriticalSection]` inside the stop-the-world pass.
+    """
+    offset = entry - text_rva
+    body = text[offset : offset + 0x260]
+    votes: dict[int, int] = {}
+    for site in find_all(body, b"\xff\x15"):
+        slot = iat_slot_of(body, site, text_rva + offset)
+        if pe.imports.get(slot, (None, None))[1] != "EnterCriticalSection":
             continue
-        if text[index + 2] & 0xC7 != 0x05:
-            continue
-        target = rip_target(text_rva + index, struct.unpack_from("<i", text, index + 3)[0], 7)
-        if not low <= target < threads or target == stw:
-            continue
-        if target % 8:  # a CRITICAL_SECTION starts on a pointer boundary
-            continue
-        counts[target] = counts.get(target, 0) + 1
-    if not counts:
-        return 0
-    return max(counts.items(), key=lambda item: (item[1], -item[0]))[0]
+        for back in range(site - 3, max(site - 18, 0), -1):
+            if body[back : back + 3] != b"\x48\x8d\x0d":
+                continue
+            target = rip_target(text_rva + offset + back, struct.unpack_from("<i", body, back + 3)[0], 7)
+            votes[target] = votes.get(target, 0) + 1
+            break
+    if len(votes) != 1:
+        raise BuildgenError(
+            f"GC_suspend_all enters {len(votes)} critical section(s); refusing to guess"
+        )
+    target = next(iter(votes))
+    if target % 8:
+        raise BuildgenError(f"GC_suspend_all lock {target:#x} is not pointer aligned")
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -546,9 +632,126 @@ def il2cpp_anchors(pe: PE, names: dict[str, int], runtime_cache: dict | None):
         {
             "get_corlib": get_corlib,
             "image_get_class": image_get_class,
+            # Both come from the transfered export map; a build whose map lost
+            # them gets 0 and the name-based callers refuse instead of calling
+            # the module base.
+            "class_from_name": names.get("il2cpp_class_from_name", 0),
+            "class_from_type": names.get("il2cpp_class_from_il2cpp_type", 0),
             "class_table": class_table,
         },
         {"getters": [(hex(rva), hex(global_rva), hex(value)) for rva, global_rva, value in getters]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# non-export entry points (PlayerLoop getter, worker dispatcher, GC unregister)
+# ---------------------------------------------------------------------------
+
+
+def code_sections(pe: PE):
+    """`(name, rva, blob)` for the sections that hold executable code.
+
+    IL2CPP emits the managed methods into its own `il2cpp` section (178 MB on
+    the current build), *not* into `.text` — a `.text`-only scan silently finds
+    nothing, which is exactly how the PlayerLoop getter used to look "missing".
+    """
+    out = []
+    for name in (".text", "il2cpp"):
+        entry = pe.section(name)
+        if entry is None:
+            continue
+        out.append((name, entry[1], pe.crange(name)))
+    return out
+
+
+def find_in_code(pe: PE, needle: bytes, limit: int = 8):
+    """Every `(rva, blob, offset)` where `needle` starts inside a code section."""
+    out = []
+    for name, rva, blob in code_sections(pe):
+        for hit in find_all(blob, needle):
+            out.append((name, rva + hit, blob, hit))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def lea_refs_to(body: bytes, body_rva: int, target: int):
+    """Offsets of `lea reg,[rip+d]` inside `body` that point at `target`."""
+    out = []
+    for site in range(len(body) - 7):
+        if body[site : site + 2] not in (b"\x48\x8d", b"\x4c\x8d"):
+            continue
+        if body[site + 2] & 0xC7 != 0x05:
+            continue
+        if rip_target(body_rva + site, struct.unpack_from("<i", body, site + 3)[0], 7) == target:
+            out.append(body_rva + site)
+    return out
+
+
+def player_loop_getter(pe: PE):
+    """The compiled `PlayerLoop.GetCurrentPlayerLoop`, by shape + icall name."""
+    rdata_rva, rdata = pe.crva(".rdata"), pe.crange(".rdata")
+    at = rdata.find(PLAYER_LOOP_ICALL)
+    if at < 0:
+        raise BuildgenError("the PlayerLoop icall name is not in .rdata")
+    icall = rdata_rva + at
+    candidates = find_in_code(pe, PLAYER_LOOP_PROLOGUE)
+    proven = []
+    for _, rva, _, _ in candidates:
+        body = pe.read_rva(rva, 0x80) or b""
+        refs = lea_refs_to(body, rva, icall)
+        if refs:
+            proven.append((rva, refs))
+    if len(proven) != 1:
+        raise BuildgenError(
+            f"{len(candidates)} PlayerLoop-shaped prologue(s), {len(proven)} of them resolve the icall; "
+            "refusing to guess"
+        )
+    return proven[0][0], proven[0][1]
+
+
+def worker_dispatch(pe: PE, text: bytes, text_rva: int):
+    """il2cpp's thread dispatcher, cross-checked by the creator that leas it."""
+    at = find_all(text, WORKER_DISPATCH)
+    if len(at) != 1:
+        raise BuildgenError(f"{len(at)} worker-dispatch bodies found, need exactly one")
+    dispatch = text_rva + at[0]
+    if not lea_targets(text, text_rva, dispatch):
+        raise BuildgenError("nothing refers to the worker dispatcher; shape matched by accident")
+    return dispatch
+
+
+def gc_unregister(pe: PE, remove_thread: int, text: bytes, text_rva: int):
+    """The one function that calls `GC_remove_thread` (`GC_unregister_my_thread`)."""
+    callers = set()
+    for index in find_all(text, b"\xe8"):
+        dest = rip_target(text_rva + index, struct.unpack_from("<i", text, index + 1)[0], 5)
+        if dest != remove_thread:
+            continue
+        callers.add(pe.function_at(text_rva + index) or function_start(text, text_rva, index))
+    if len(callers) != 1:
+        raise BuildgenError(f"{len(callers)} functions call GC_remove_thread, need exactly one")
+    return callers.pop()
+
+
+def runtime_anchors(pe: PE, gc):
+    text, text_rva = pe.crange(".text"), pe.crva(".text")
+    getter, refs = player_loop_getter(pe)
+    dispatch = worker_dispatch(pe, text, text_rva)
+    unregister = gc_unregister(pe, gc["remove_thread"], text, text_rva)
+    return (
+        {
+            "get_current_player_loop": getter,
+            "worker_dispatch": dispatch,
+            "gc_unregister": unregister,
+        },
+        {
+            "get_current_player_loop": f"{getter:#x} (0x28-byte out struct zeroed, icall referenced at "
+            + ", ".join(f"{r:#x}" for r in refs)
+            + ")",
+            "worker_dispatch": f"{dispatch:#x} (unique body, referenced by its creator)",
+            "gc_unregister": f"{unregister:#x} (only caller of GC_remove_thread {gc['remove_thread']:#x}; .pdata entry)",
+        },
     )
 
 
@@ -783,8 +986,44 @@ def layout(pe: PE, names: dict[str, int]):
         "method_parameters",
         "method_flags",
         "method_param_count",
+        # Not derivable from code shapes: the image table is walked with a
+        # constant while the records are contiguous, so only a live process can
+        # measure it.  A descriptor that already carries a value for this build
+        # keeps it (see `merge_layout`); a brand-new build gets 0 and m3 refuses.
+        "image_stride",
+        "image_name",
+        "image_filename",
     ]
+    for key in ("image_stride", "image_name", "image_filename"):
+        values.setdefault(key, 0)
     return {key: values[key] for key in ordered}, notes
+
+
+def merge_layout(derived: dict[str, int], existing: dict[str, int], notes: list[str]):
+    """Keep what a live session measured when the generator disagrees.
+
+    The export-name transfer can land on an ICF alias (it does for
+    `il2cpp_class_get_name` on 245768f2: the transferred getter reads `+0x98`,
+    while the live class record has its name at `+0x10`).  A descriptor that
+    already exists for this exact SHA was read out of a running game, so it wins
+    and the disagreement is reported instead of silently applied.
+    """
+    merged = dict(derived)
+    for key in ("image_stride", "image_name", "image_filename"):
+        if existing.get(key):
+            merged[key] = existing[key]
+        elif not merged.get(key):
+            notes.append(f"{key}: 0 (never derived offline; measure it in a live process)")
+    for key, value in existing.items():
+        if not value or key not in merged:
+            continue
+        if merged[key] != value:
+            notes.append(
+                f"{key}: {value:#x} (kept from the live-verified descriptor; "
+                f"the generator derived {merged[key]:#x})"
+            )
+            merged[key] = value
+    return merged, notes
 
 
 # ---------------------------------------------------------------------------
@@ -792,30 +1031,20 @@ def layout(pe: PE, names: dict[str, int]):
 # ---------------------------------------------------------------------------
 
 
-def extra_anchors(pe: PE, names: dict[str, int], gc: dict[str, int]):
-    out: dict[str, object] = {}
-    text, text_rva = pe.crange(".text"), pe.crva(".text")
-    # GC_unregister_my_thread: the function that calls GC_remove_thread.
-    callers = []
-    target = gc["remove_thread"]
-    for index in range(len(text) - 5):
-        if text[index] != 0xE8:
-            continue
-        dest = text_rva + index + 5 + struct.unpack_from("<i", text, index + 1)[0]
-        if dest == target:
-            callers.append(function_start(text, text_rva, index))
-    out["gc_unregister"] = sorted(set(callers))
-    out["class_from_type"] = names.get("il2cpp_class_from_il2cpp_type")
-    out["known_names"] = sorted(
-        name
-        for name in (
-            "il2cpp_class_from_il2cpp_type",
-            "il2cpp_image_get_class",
-            "il2cpp_get_corlib",
-        )
-        if name in names
-    )
-    return out
+def extra_anchors(pe: PE, names: dict[str, int]):
+    """Diagnostic extras that are not part of the runtime contract."""
+    return {
+        "class_from_type": names.get("il2cpp_class_from_il2cpp_type"),
+        "known_names": sorted(
+            name
+            for name in (
+                "il2cpp_class_from_il2cpp_type",
+                "il2cpp_image_get_class",
+                "il2cpp_get_corlib",
+            )
+            if name in names
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1030,21 +1259,28 @@ def run(
         report["problems"].append(f"il2cpp anchors: {error}")
         il2cpp, il2cpp_evidence = None, {"error": str(error)}
 
-    # 3. layouts
+    # 3. layouts (merged with what a live session already measured)
     layout_values, layout_notes = {}, []
+    existing_layout = {}
+    if runtime_cache:
+        existing_layout = {
+            key: int(value, 16) for key, value in (runtime_cache.get("layout") or {}).items()
+        }
     if names:
         try:
             layout_values, layout_notes = layout(pe, names)
+            layout_values, layout_notes = merge_layout(layout_values, existing_layout, layout_notes)
         except BuildgenError as error:
             report["problems"].append(f"layout: {error}")
     else:
         report["problems"].append("layout: needs transferred export names")
 
-    extra = extra_anchors(pe, names, gc) if names else {"gc_unregister": []}
-    gc_unregister = extra.get("gc_unregister") or []
-    if not isinstance(gc_unregister, list):
-        gc_unregister = []
-    class_from_type = extra.get("class_from_type")
+    extra = extra_anchors(pe, names) if names else {}
+    runtime, runtime_evidence = {}, {"error": "not derived"}
+    try:
+        runtime, runtime_evidence = runtime_anchors(pe, gc)
+    except BuildgenError as error:
+        report["problems"].append(f"runtime anchors: {error}")
 
     descriptor = {
         "schema": "hromatite/build/1",
@@ -1053,21 +1289,32 @@ def run(
         "unity": report["unity"],
         "gc": {key: f"{value:#x}" for key, value in gc.items()},
         "il2cpp": {key: f"{value:#x}" for key, value in (il2cpp or {}).items()} if il2cpp else {},
+        "runtime": {key: f"{value:#x}" for key, value in runtime.items()},
         "layout": {key: f"{value:#x}" for key, value in layout_values.items()},
         "extra": {
-            "gc_unregister": [f"{value:#x}" for value in gc_unregister],
-            "class_from_type": f"{class_from_type:#x}" if class_from_type else None,
+            "class_from_type": (
+                f"{extra['class_from_type']:#x}" if extra.get("class_from_type") else None
+            ),
+            "known_names": extra.get("known_names", []),
         },
-        "evidence": {"gc": gc_evidence, "il2cpp": il2cpp_evidence, "layout": layout_notes},
+        "evidence": {
+            "gc": gc_evidence,
+            "il2cpp": il2cpp_evidence,
+            "runtime": runtime_evidence,
+            "layout": layout_notes,
+        },
         "note": "; ".join(
-            layout_notes
-            + ["gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)"]
-        ),
+            [f"runtime.{key}: {value}" for key, value in runtime_evidence.items()] + layout_notes
+            if runtime
+            else layout_notes + [str(runtime_evidence)]
+        ).strip("; "),
         "verified": bool(il2cpp)
+        and bool(runtime)
         and not [note for note in layout_notes if ": 0 (" in note and not note.startswith("field_parent")],
     }
     report["gc"] = descriptor["gc"]
     report["il2cpp"] = descriptor["il2cpp"]
+    report["runtime"] = descriptor["runtime"]
     report["layout"] = descriptor["layout"]
     report["notes"] = layout_notes
     report["extra"] = descriptor["extra"]
@@ -1119,8 +1366,14 @@ def render_build(descriptor: dict) -> str:
         lines.append(f"        {key}: {word(gc[key])},")
     lines.append("    },")
     lines.append("    il2cpp: Il2cppAnchors {")
-    for key in ("get_corlib", "image_get_class", "class_table"):
+    for key in ("get_corlib", "image_get_class", "class_from_name", "class_from_type", "class_table"):
         value = il2cpp.get(key)
+        lines.append(f"        {key}: {word(value) if value else '0x0000_0000'},")
+    lines.append("    },")
+    lines.append("    runtime: RuntimeAnchors {")
+    runtime = descriptor.get("runtime", {})
+    for key in ("get_current_player_loop", "worker_dispatch", "gc_unregister"):
+        value = runtime.get(key)
         lines.append(f"        {key}: {word(value) if value else '0x0000_0000'},")
     lines.append("    },")
     lines.append("    layout: Layout {")
@@ -1141,6 +1394,9 @@ def render_build(descriptor: dict) -> str:
         "method_parameters",
         "method_flags",
         "method_param_count",
+        "image_stride",
+        "image_name",
+        "image_filename",
     ):
         lines.append(f"        {key}: {small(layout.get(key, '0x0'))},")
     lines.append("    },")

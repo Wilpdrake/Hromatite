@@ -15,19 +15,26 @@
   "suspend_abort": "0xc438d5",
   "advance_bucket": "0xc439da",
   "threads": "0xe6bd8a0",
-  "thread_list_cs": "0xe6bd800"
+  "thread_list_cs": "0xe6bd860"
  },
  "il2cpp": {
   "get_corlib": "0xc29c70",
   "image_get_class": "0xc2c0a0",
+  "class_from_name": "0xc29dc0",
+  "class_from_type": "0xc29db0",
   "class_table": "0xe66f0d0"
+ },
+ "runtime": {
+  "get_current_player_loop": "0x86ea320",
+  "worker_dispatch": "0xbf7a60",
+  "gc_unregister": "0xc43690"
  },
  "layout": {
   "class_parent": "0xa0",
   "class_namespace": "0x18",
   "class_methods": "0x58",
   "class_fields": "0x88",
-  "class_name": "0x98",
+  "class_name": "0x10",
   "class_fields_count": "0x124",
   "field_stride": "0x20",
   "field_name": "0x0",
@@ -38,18 +45,23 @@
   "method_return_type": "0x28",
   "method_parameters": "0x30",
   "method_flags": "0x4c",
-  "method_param_count": "0x52"
+  "method_param_count": "0x52",
+  "image_stride": "0x50",
+  "image_name": "0x8",
+  "image_filename": "0x18"
  },
  "extra": {
-  "gc_unregister": [
-   "0xc43734"
-  ],
-  "class_from_type": "0xc29db0"
+  "class_from_type": "0xc29db0",
+  "known_names": [
+   "il2cpp_class_from_il2cpp_type",
+   "il2cpp_get_corlib",
+   "il2cpp_image_get_class"
+  ]
  },
  "evidence": {
   "gc": {
-   "context_call": "shape only",
-   "skip_close": "shape only",
+   "context_call": "GetThreadContext",
+   "skip_close": "CloseHandle",
    "unlinked_next": "0xc43520+0x46"
   },
   "il2cpp": {
@@ -71,11 +83,17 @@
     ]
    ]
   },
+  "runtime": {
+   "get_current_player_loop": "0x86ea320 (0x28-byte out struct zeroed, icall referenced at 0x86ea34d)",
+   "worker_dispatch": "0xbf7a60 (unique body, referenced by its creator)",
+   "gc_unregister": "0xc43690 (only caller of GC_remove_thread 0xc43520; .pdata entry)"
+  },
   "layout": [
    "field_parent: 0 (no il2cpp_field_get_parent export on this build)",
-   "method_return_type: 0x28 (heuristic: name+8; no function reads it in this build)"
+   "method_return_type: 0x28 (heuristic: name+8; no function reads it in this build)",
+   "class_name: 0x10 (kept from the live-verified descriptor; the generator derived 0x98)"
   ]
  },
- "note": "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (heuristic: name+8; no function reads it in this build); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
+ "note": "runtime.get_current_player_loop: 0x86ea320 (0x28-byte out struct zeroed, icall referenced at 0x86ea34d); runtime.worker_dispatch: 0xbf7a60 (unique body, referenced by its creator); runtime.gc_unregister: 0xc43690 (only caller of GC_remove_thread 0xc43520; .pdata entry); field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (heuristic: name+8; no function reads it in this build); class_name: 0x10 (kept from the live-verified descriptor; the generator derived 0x98)",
  "verified": true
 }

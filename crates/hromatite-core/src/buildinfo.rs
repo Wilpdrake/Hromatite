@@ -21,7 +21,7 @@
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 
-use hromatite_abi::build::{self, Build, GcAnchors, Il2cppAnchors, Layout};
+use hromatite_abi::build::{self, Build, GcAnchors, Il2cppAnchors, Layout, RuntimeAnchors};
 
 use crate::raw::discover;
 
@@ -233,6 +233,30 @@ pub fn il2cpp_anchors(module_base: usize, module_size: usize) -> Option<Il2cppAn
     Some(anchors)
 }
 
+/// Non-export entry points (PlayerLoop getter, worker dispatcher, GC unregister).
+///
+/// Same policy: the descriptor for the loaded build, otherwise the shape rules
+/// in `raw::discover`, otherwise `None` — a caller that cannot tell which
+/// address to patch must not patch anything.
+pub fn runtime_anchors(module_base: usize, module_size: usize) -> Option<RuntimeAnchors> {
+    if let Some(build) = resolve(module_base, module_size) {
+        if build.runtime.get_current_player_loop != 0 {
+            return Some(build.runtime);
+        }
+        crate::log::log_tag(
+            "playerloop",
+            &format!(
+                "build {} has no runtime anchors; deriving them from the image",
+                &build.sha256[..12]
+            ),
+        );
+    }
+    let gc = gc_anchors(module_base, module_size)?;
+    let anchors = discover::runtime_anchors(module_base, module_size, &gc)?;
+    write_discovery_cache(module_base, module_size);
+    Some(anchors)
+}
+
 /// Struct offsets for the loaded build (`None` = unknown build, features must
 /// refuse rather than guess).
 pub fn layout_for(module_base: usize, module_size: usize) -> Option<Layout> {
@@ -265,6 +289,7 @@ pub fn render_discovery_cache(
     sha: &str,
     gc: &GcAnchors,
     il2cpp: Option<&Il2cppAnchors>,
+    runtime: Option<&RuntimeAnchors>,
 ) -> String {
     let gc_json = format!(
         "{{\"remove_thread\": \"{}\", \"skip_close\": \"{}\", \"unlinked_next\": \"{}\", \
@@ -286,17 +311,30 @@ pub fn render_discovery_cache(
     );
     let il2cpp_json = match il2cpp {
         Some(anchors) => format!(
-            "{{\"get_corlib\": \"{}\", \"image_get_class\": \"{}\", \"class_table\": \"{}\"}}",
+            "{{\"get_corlib\": \"{}\", \"image_get_class\": \"{}\", \"class_from_name\": \"{}\", \
+             \"class_from_type\": \"{}\", \"class_table\": \"{}\"}}",
             hex_address(anchors.get_corlib),
             hex_address(anchors.image_get_class),
+            hex_address(anchors.class_from_name),
+            hex_address(anchors.class_from_type),
             hex_address(anchors.class_table),
+        ),
+        None => "{}".to_string(),
+    };
+    let runtime_json = match runtime {
+        Some(anchors) => format!(
+            "{{\"get_current_player_loop\": \"{}\", \"worker_dispatch\": \"{}\", \
+             \"gc_unregister\": \"{}\"}}",
+            hex_address(anchors.get_current_player_loop),
+            hex_address(anchors.worker_dispatch),
+            hex_address(anchors.gc_unregister),
         ),
         None => "{}".to_string(),
     };
     format!(
         "{{\"schema\": \"hromatite/build/1\", \"source\": \"runtime raw::discover\", \
          \"sha256\": \"{sha}\", \"unity\": \"unknown\", \"gc\": {gc_json}, \
-         \"il2cpp\": {il2cpp_json}, \"layout\": {{}}, \
+         \"il2cpp\": {il2cpp_json}, \"runtime\": {runtime_json}, \"layout\": {{}}, \
          \"note\": \"derived at runtime; struct layouts are not discoverable, \
          run tools/buildgen.py to promote this into a descriptor\"}}"
     )
@@ -323,8 +361,9 @@ fn write_discovery_cache(module_base: usize, module_size: usize) {
         );
         return;
     };
+    let runtime = discover::runtime_anchors(module_base, module_size, &gc);
     let path = cache_path(&sha[..sha.len().min(12)]);
-    let json = render_discovery_cache(sha, &gc, il2cpp.as_ref());
+    let json = render_discovery_cache(sha, &gc, il2cpp.as_ref(), runtime.as_ref());
     match std::fs::write(&path, json) {
         Ok(()) => crate::log::log_tag(
             "buildgen",
@@ -455,11 +494,12 @@ mod tests {
     #[test]
     fn discovery_cache_is_valid_json_with_the_expected_sections() {
         let build = descriptor();
-        let json = render_discovery_cache(build.sha256, &build.gc, Some(&build.il2cpp));
+        let json = render_discovery_cache(build.sha256, &build.gc, Some(&build.il2cpp), Some(&build.runtime));
         assert!(json.contains("\"schema\": \"hromatite/build/1\""));
         assert!(json.contains("\"source\": \"runtime raw::discover\""));
         assert!(json.contains("\"remove_thread\""));
         assert!(json.contains("\"class_table\""));
+        assert!(json.contains("\"get_current_player_loop\""));
         assert!(json.contains("\"layout\": {}"));
         assert!(json.contains(build.sha256));
     }

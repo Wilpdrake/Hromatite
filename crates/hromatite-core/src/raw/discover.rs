@@ -17,7 +17,7 @@
 
 #![forbid(unsafe_code)]
 
-use hromatite_abi::build::{GcAnchors, Il2cppAnchors};
+use hromatite_abi::build::{GcAnchors, Il2cppAnchors, RuntimeAnchors};
 
 use crate::{log, safe};
 
@@ -36,9 +36,6 @@ const SUSPEND_ADVANCE_BUCKET: u32 = 0x24a;
 const REMOVE_SKIP_CLOSE: u32 = 0x40;
 const REMOVE_UNLINKED_NEXT: u32 = 0x46;
 const REMOVE_AFTER_UNLINK: u32 = 0x68;
-/// The stop-the-world critical section sits this far before `GC_threads[]`
-/// (`BUCKETS * 8` bytes of bucket heads follow it).
-const STW_CS_DISTANCE: u32 = 0x40;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Section {
@@ -53,8 +50,17 @@ pub struct Image {
     /// `.data` bounds; kept for heap/table scanning callers.
     #[allow(dead_code)]
     pub data: Section,
+    /// IL2CPP's own code section (`il2cpp`, no leading dot). Managed methods
+    /// live here, not in `.text`: a `.text`-only scan finds no PlayerLoop.
+    pub il2cpp: Option<Section>,
+    /// `.pdata` (exception directory payload): the only exact source of
+    /// function boundaries — byte walks stop on `0xCC` bytes inside rel32
+    /// displacements and C++ EH scopes add entries *inside* one function.
+    pub pdata: Section,
     pub export_dir: u32,
     pub export_dir_size: u32,
+    pub import_dir: u32,
+    pub import_dir_size: u32,
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -86,7 +92,13 @@ pub fn image(base: usize, size: usize) -> Option<Image> {
     let dirs = optional + 112;
     let export_dir = u32_at(&headers, dirs)?;
     let export_dir_size = u32_at(&headers, dirs + 4)?;
-    let mut found = [None; 3];
+    let exception = Section {
+        rva: u32_at(&headers, dirs + 3 * 8)?,
+        size: u32_at(&headers, dirs + 3 * 8 + 4)?,
+    };
+    let import_dir = u32_at(&headers, dirs + 8 * 8)?;
+    let import_dir_size = u32_at(&headers, dirs + 8 * 8 + 4)?;
+    let mut found = [None; 4];
     for index in 0..sections {
         let entry = optional + optional_size + index * 40;
         let name = headers.get(entry..entry + 8)?;
@@ -96,6 +108,7 @@ pub fn image(base: usize, size: usize) -> Option<Image> {
             b".text" => 0,
             b".rdata" => 1,
             b".data" => 2,
+            b"il2cpp" => 3,
             _ => continue,
         };
         let limit = size.saturating_sub(rva as usize) as u32;
@@ -105,8 +118,12 @@ pub fn image(base: usize, size: usize) -> Option<Image> {
         text: found[0]?,
         rdata: found[1]?,
         data: found[2]?,
+        il2cpp: found[3],
+        pdata: exception,
         export_dir,
         export_dir_size,
+        import_dir,
+        import_dir_size,
     })
 }
 
@@ -341,8 +358,13 @@ pub fn gc_anchors(base: usize, size: usize) -> Option<GcAnchors> {
             return None;
         }
     }
-    let stw = threads.wrapping_sub(STW_CS_DISTANCE);
-    let list_cs = discover_list_cs(&text, image.text.rva, threads, stw).unwrap_or(0);
+    let list_cs = collector_cs(base, image, &text, entry).unwrap_or(0);
+    if list_cs == 0 {
+        log::log_tag(
+            "gct",
+            "discover: the collector's critical section was not derived; sanitisation stays off",
+        );
+    }
     let anchors = GcAnchors {
         remove_thread,
         skip_close: remove_thread.wrapping_add(REMOVE_SKIP_CLOSE),
@@ -367,35 +389,88 @@ pub fn gc_anchors(base: usize, size: usize) -> Option<GcAnchors> {
     Some(anchors)
 }
 
-/// The thread-list critical section is the most-referenced lea target in the
-/// window before the table, excluding the stop-the-world lock itself.
-fn discover_list_cs(text: &[u8], text_rva: u32, threads: u32, stw: u32) -> Option<u32> {
-    let mut best: Option<(u32, usize)> = None;
-    let low = threads.wrapping_sub(0x200);
-    for offset in 0..text.len().saturating_sub(7) {
-        if text.get(offset..offset + 2) != Some(&[0x48, 0x8D]) {
+/// The critical section `GC_suspend_all` enters — Boehm's collector lock.
+///
+/// The old heuristic ("most-referenced lea target in the 0x200 bytes before the
+/// table") picked the string `"CP1252"` on the next build, and
+/// `EnterCriticalSection` on a string never returns: the game hung. The lock is
+/// named by one instruction instead — the `lea rcx` that feeds
+/// `call [EnterCriticalSection]` inside the stop-the-world pass.
+fn collector_cs(base: usize, image: Image, text: &[u8], entry: u32) -> Option<u32> {
+    let offset = (entry.wrapping_sub(image.text.rva)) as usize;
+    let body = text.get(offset..offset.checked_add(0x260)?)?;
+    let body_rva = entry;
+    let mut votes: Vec<u32> = Vec::new();
+    for site in find_all(body, &[0xFF, 0x15]) {
+        let Some(disp) = i32_at(body, site + 2) else { continue };
+        let slot = body_rva.wrapping_add(site as u32).wrapping_add(6).wrapping_add(disp as u32);
+        if iat_import_name(base, image, slot).as_deref() != Some("EnterCriticalSection") {
             continue;
         }
-        let Some(modrm) = text.get(offset + 2).copied() else { continue };
-        if modrm & 0xC7 != 0x05 {
-            continue;
-        }
-        let Some(disp) = i32_at(text, offset + 3) else { continue };
-        let target = text_rva
-            .wrapping_add(offset as u32)
-            .wrapping_add(7)
-            .wrapping_add(disp as u32);
-        if target < low || target >= threads || target == stw {
-            continue;
-        }
-        match &mut best {
-            Some((_, count)) if *count >= 2 => *count += 1,
-            Some((name, count)) if *name == target => *count += 1,
-            Some(_) => {}
-            None => best = Some((target, 1)),
+        let lowest = site.saturating_sub(18);
+        for back in (lowest..site).rev() {
+            if body.get(back..back + 3) != Some(&[0x48, 0x8D, 0x0D]) {
+                continue;
+            }
+            let Some(disp) = i32_at(body, back + 3) else { continue };
+            let target = body_rva
+                .wrapping_add(back as u32)
+                .wrapping_add(7)
+                .wrapping_add(disp as u32);
+            if !target.is_multiple_of(8) {
+                continue;
+            }
+            votes.push(target);
+            break;
         }
     }
-    best.map(|(target, _)| target)
+    votes.sort_unstable();
+    votes.dedup();
+    match votes.as_slice() {
+        [only] => Some(*only),
+        other => {
+            log::log_tag(
+                "gct",
+                &format!(
+                    "discover: GC_suspend_all enters {} critical section(s); refusing to guess",
+                    other.len()
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Name of the import a thunk slot points at (`IMAGE_THUNK_DATA` -> hint/name).
+fn iat_import_name(base: usize, image: Image, slot: u32) -> Option<String> {
+    if image.import_dir == 0 {
+        return None;
+    }
+    let mut cursor = 0usize;
+    while cursor < image.import_dir_size as usize {
+        let descriptor = safe::read_bytes(base + image.import_dir as usize + cursor, 20)?;
+        if descriptor.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        let first_thunk = u32_at(&descriptor, 16)?;
+        let thunk_rva = u32_at(&descriptor, 0).filter(|value| *value != 0).unwrap_or(first_thunk);
+        if slot >= first_thunk {
+            let index = (slot - first_thunk) / 8;
+            if index < 4096 {
+                let value = safe::read_u64(base + thunk_rva as usize + index as usize * 8)?;
+                if value != 0 && value >> 63 == 0 {
+                    let name = safe::read_upto(base + (value & 0x7FFF_FFFF) as usize + 2, 64);
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let bytes: &[u8] = name.split(|byte| *byte == 0).next().unwrap_or(&[]);
+                    return Some(String::from_utf8_lossy(bytes).into_owned());
+                }
+            }
+        }
+        cursor += 20;
+    }
+    None
 }
 
 /// il2cpp entry points derived from the image alone.
@@ -418,7 +493,243 @@ pub fn il2cpp_anchors(base: usize, size: usize) -> Option<Il2cppAnchors> {
         // `il2cpp_class_from_name` cannot be derived from shapes yet; a zero
         // anchor makes that path refuse instead of calling the module base.
         class_from_name: 0,
+        class_from_type: 0,
         class_table,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// non-export entry points (PlayerLoop getter, worker dispatcher, GC unregister)
+// ---------------------------------------------------------------------------
+
+/// Prologue of the compiled managed `PlayerLoop.GetCurrentPlayerLoop`: it zeroes
+/// the 0x28-byte `PlayerLoopSystem` it was handed in RCX.
+const PLAYER_LOOP_PROLOGUE: &[u8] = &[
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x33, 0xC0, 0xC7, 0x44, 0x24, 0x60, 0x00, 0x00, 0x00,
+    0x00, 0x0F, 0x57, 0xC0, 0x48, 0x8B, 0xD9, 0x0F, 0x11, 0x01, 0x0F, 0x11, 0x41, 0x10, 0x48,
+    0x89, 0x41, 0x20,
+];
+
+/// The icall the getter caches. A build that renames it fails closed here rather
+/// than somewhere inside the collector.
+const PLAYER_LOOP_ICALL: &[u8] = b"UnityEngine.LowLevel.PlayerLoop::GetCurrentPlayerLoopInternal()";
+
+/// il2cpp's thread dispatcher: `RCX = {thread*, fn, arg}`, and it bumps the
+/// thread's flags word before calling the shared trampoline.
+const WORKER_DISPATCH_BODY: &[u8] = &[
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
+    0x48, 0x89, 0x7C, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48,
+    0x8B, 0x31, 0x48, 0x8B, 0x46, 0x08, 0x8B, 0x90, 0xF8, 0x00, 0x00, 0x00, 0x83, 0xE2, 0xFB,
+    0x83, 0xFA, 0x02,
+];
+
+/// `lea reg,[rip+d]` sites in `body` that point at `target`.
+pub(crate) fn lea_sites(body: &[u8], body_rva: u32, target: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for site in 0..body.len().saturating_sub(7) {
+        if body[site..site + 2] != [0x48, 0x8D] && body[site..site + 2] != [0x4C, 0x8D] {
+            continue;
+        }
+        if body[site + 2] & 0xC7 != 0x05 {
+            continue;
+        }
+        let Some(disp) = i32_at(body, site + 3) else { continue };
+        let rip = body_rva.wrapping_add(site as u32).wrapping_add(7);
+        if rip.wrapping_add(disp as u32) == target {
+            out.push(body_rva.wrapping_add(site as u32));
+        }
+    }
+    out
+}
+
+/// `call rel32` sites in `body` that land on `target`.
+pub(crate) fn call_sites(body: &[u8], body_rva: u32, target: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for site in find_all(body, &[0xE8]) {
+        let Some(disp) = i32_at(body, site + 1) else { continue };
+        let rip = body_rva.wrapping_add(site as u32).wrapping_add(5);
+        if rip.wrapping_add(disp as u32) == target {
+            out.push(body_rva.wrapping_add(site as u32));
+        }
+    }
+    out
+}
+
+/// Function entry that contains `rva`, from the exception directory.
+///
+/// Entries are `{begin, end, unwind}` and sorted by `begin`; Windows emits one
+/// entry per C++ EH scope, so the containing entry is usually a *fragment*. The
+/// chained UNWIND_INFO points at its parent, and following that chain ends at
+/// the primary entry — which is the address a detour must patch.
+pub(crate) fn function_at(
+    entries: &[u8],
+    rva: u32,
+    unwind_info: impl FnMut(u32) -> Option<Vec<u8>>,
+) -> Option<u32> {
+    let count = entries.len() / 12;
+    if count == 0 {
+        return None;
+    }
+    let (mut low, mut high) = (0usize, count);
+    while low < high {
+        let middle = (low + high) / 2;
+        let begin = u32_at(entries, middle * 12)?;
+        if begin <= rva {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if low == 0 {
+        return None;
+    }
+    let begin = u32_at(entries, (low - 1) * 12)?;
+    let end = u32_at(entries, (low - 1) * 12 + 4)?;
+    if !(begin <= rva && rva < end) {
+        return None;
+    }
+    primary_from(entries, begin, unwind_info)
+}
+
+fn entries_index_of(entries: &[u8], begin: u32) -> Option<usize> {
+    let count = entries.len() / 12;
+    let (mut low, mut high) = (0usize, count);
+    while low < high {
+        let middle = (low + high) / 2;
+        let value = u32_at(entries, middle * 12)?;
+        match value.cmp(&begin) {
+            core::cmp::Ordering::Less => low = middle + 1,
+            core::cmp::Ordering::Greater => high = middle,
+            core::cmp::Ordering::Equal => return Some(middle),
+        }
+    }
+    None
+}
+
+fn primary_from(
+    entries: &[u8],
+    begin: u32,
+    mut unwind_info: impl FnMut(u32) -> Option<Vec<u8>>,
+) -> Option<u32> {
+    let mut current = begin;
+    for _ in 0..8 {
+        let index = entries_index_of(entries, current)?;
+        let unwind = u32_at(entries, index * 12 + 8)?;
+        let info = unwind_info(unwind)?;
+        if info.len() < 4 || info[0] >> 3 & 0x4 == 0 {
+            return Some(current);
+        }
+        let codes = info[2] as usize;
+        let offset = 4 + 2 * codes + if codes & 1 == 1 { 2 } else { 0 };
+        let parent = info.get(offset..offset + 4)?;
+        current = u32::from_le_bytes(parent.try_into().ok()?);
+    }
+    Some(current)
+}
+
+fn read_pdata(base: usize, image: Image) -> Vec<u8> {
+    if image.pdata.size == 0 {
+        return Vec::new();
+    }
+    safe::read_bytes(base + image.pdata.rva as usize, image.pdata.size as usize).unwrap_or_default()
+}
+
+fn unwind_reader(base: usize) -> impl FnMut(u32) -> Option<Vec<u8>> {
+    move |rva: u32| {
+        let bytes = safe::read_upto(base + rva as usize, 32);
+        (bytes.len() >= 4).then_some(bytes)
+    }
+}
+
+/// The compiled `PlayerLoop.GetCurrentPlayerLoop`, by prologue shape plus the
+/// icall it caches. `.text` first, then the IL2CPP code section that actually
+/// holds managed methods.
+fn player_loop_getter(base: usize, image: Image) -> Option<u32> {
+    let icall = *find_in_section(base, image.rdata, PLAYER_LOOP_ICALL, 1).first()?;
+    let mut sections = vec![image.text];
+    sections.extend(image.il2cpp);
+    let mut proven = Vec::new();
+    for section in sections {
+        for start in find_in_section(base, section, PLAYER_LOOP_PROLOGUE, 8) {
+            let Some(body) = safe::read_bytes(base + start as usize, 0x80) else {
+                continue;
+            };
+            if !lea_sites(&body, start, icall).is_empty() {
+                proven.push(start);
+            }
+        }
+    }
+    match proven.len() {
+        1 => Some(proven[0]),
+        _ => {
+            log::log_tag(
+                "playerloop",
+                &format!(
+                    "discover: {} PlayerLoop candidates resolve the icall; refusing to guess",
+                    proven.len()
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// il2cpp's thread dispatcher: unique body, cross-checked by the `lea` its
+/// creator uses to hand it to `CreateThread`.
+fn worker_dispatch(text: &[u8], text_rva: u32) -> Option<u32> {
+    let hits = find_all(text, WORKER_DISPATCH_BODY);
+    if hits.len() != 1 {
+        log::log_tag(
+            "gct",
+            &format!("discover: {} worker-dispatch bodies, refusing", hits.len()),
+        );
+        return None;
+    }
+    let dispatch = text_rva.wrapping_add(hits[0] as u32);
+    if lea_sites(text, text_rva, dispatch).is_empty() {
+        log::log_tag("gct", "discover: nothing refers to the worker dispatcher");
+        return None;
+    }
+    Some(dispatch)
+}
+
+/// Runtime anchors derived from the image alone (`gc` supplies the one address
+/// this rule starts from: `GC_remove_thread`).
+pub fn runtime_anchors(base: usize, size: usize, gc: &GcAnchors) -> Option<RuntimeAnchors> {
+    let image = image(base, size)?;
+    let text = read_text(base, image)?;
+    let getter = player_loop_getter(base, image)?;
+    let dispatch = worker_dispatch(&text, image.text.rva)?;
+    let entries = read_pdata(base, image);
+    let mut callers = Vec::new();
+    for site in call_sites(&text, image.text.rva, gc.remove_thread) {
+        let mut reader = unwind_reader(base);
+        if let Some(entry) = function_at(&entries, site, &mut reader) {
+            callers.push(entry);
+        }
+    }
+    callers.sort_unstable();
+    callers.dedup();
+    let [unregister] = callers.as_slice() else {
+        log::log_tag(
+            "gct",
+            &format!(
+                "discover: {} function(s) call GC_remove_thread, refusing",
+                callers.len()
+            ),
+        );
+        return None;
+    };
+    log::log_tag(
+        "playerloop",
+        &format!(
+            "discover: player_loop={getter:#x} worker_dispatch={dispatch:#x} gc_unregister={unregister:#x}"
+        ),
+    );
+    Some(RuntimeAnchors {
+        get_current_player_loop: getter,
+        worker_dispatch: dispatch,
+        gc_unregister: *unregister,
     })
 }
 
@@ -495,5 +806,69 @@ mod tests {
         assert_eq!(naked_getter_global(&text, 0x1000, 0), Some(0x100));
         text[7] = 0x90;
         assert_eq!(naked_getter_global(&text, 0x1000, 0), None);
+    }
+
+    #[test]
+    fn lea_sites_find_rip_relative_references() {
+        let mut body = vec![0x90; 0x20];
+        let target = 0x9000u32;
+        let disp = (target as i64 - (0x1004 + 7)) as i32;
+        body[4..7].copy_from_slice(&[0x48, 0x8D, 0x0D]);
+        body[7..11].copy_from_slice(&disp.to_le_bytes());
+        assert_eq!(lea_sites(&body, 0x1000, target), vec![0x1004]);
+        assert!(lea_sites(&body, 0x1000, target + 1).is_empty());
+    }
+
+    #[test]
+    fn call_sites_find_rel32_callers() {
+        let mut body = vec![0x90; 16];
+        let target = 0x8000u32;
+        let disp = (target as i64 - (0x1004 + 5)) as i32;
+        body[4] = 0xE8;
+        body[5..9].copy_from_slice(&disp.to_le_bytes());
+        assert_eq!(call_sites(&body, 0x1000, target), vec![0x1004]);
+        assert!(call_sites(&body, 0x1000, target + 1).is_empty());
+    }
+
+    fn pdata(entries: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (begin, end, unwind) in entries {
+            out.extend_from_slice(&begin.to_le_bytes());
+            out.extend_from_slice(&end.to_le_bytes());
+            out.extend_from_slice(&unwind.to_le_bytes());
+        }
+        out
+    }
+
+    /// A chained UNWIND_INFO points at its parent; the fragment is *inside* the
+    /// function, so the byte walk would land in the middle of it.
+    #[test]
+    fn function_at_follows_the_eh_chain_to_the_primary_entry() {
+        // 0x4000 = primary (no chained flag), 0x4020 = fragment chained to it.
+        let entries = pdata(&[(0x4000, 0x4004, 0x5000), (0x4020, 0x4100, 0x5010)]);
+        let unwind = |rva: u32| -> Option<Vec<u8>> {
+            match rva {
+                0x5000 => Some(vec![0x01, 0x00, 0x00, 0x00]),
+                // version 1, flags 4 (UNW_FLAG_CHAININFO), 0 codes, parent 0x4000
+                0x5010 => Some(vec![0x21, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00]),
+                _ => None,
+            }
+        };
+        assert_eq!(function_at(&entries, 0x4030, unwind), Some(0x4000));
+        assert_eq!(function_at(&entries, 0x4002, |_| Some(vec![1, 0, 0, 0])), Some(0x4000));
+        // Outside every entry: refuse rather than guess.
+        assert_eq!(function_at(&entries, 0x4200, unwind), None);
+        assert_eq!(function_at(&[], 0x4000, unwind), None);
+    }
+
+    #[test]
+    fn player_loop_prologue_and_dispatcher_bodies_are_intact() {
+        // Guard against a silent edit: both are byte-for-byte copies of the two
+        // reference builds, so their length and edges matter.
+        assert_eq!(PLAYER_LOOP_PROLOGUE.len(), 0x21);
+        assert_eq!(PLAYER_LOOP_PROLOGUE[..7], [0x40, 0x53, 0x48, 0x83, 0xEC, 0x50, 0x33]);
+        assert_eq!(WORKER_DISPATCH_BODY.len(), 0x30);
+        assert_eq!(WORKER_DISPATCH_BODY[..4], [0x48, 0x89, 0x5C, 0x24]);
+        assert!(PLAYER_LOOP_ICALL.starts_with(b"UnityEngine.LowLevel.PlayerLoop::"));
     }
 }
