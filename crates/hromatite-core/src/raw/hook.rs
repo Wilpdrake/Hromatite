@@ -1534,11 +1534,37 @@ fn work() {
 /// `test eax,eax` and `jne`. The trampoline carries all three instructions;
 /// live and synthetic results therefore share Boehm's original success branch
 /// instead of falling into its retry loop.
-const GC_CONTEXT_CALL_RVA: usize = 0xc41ad2;
-const GC_CONTEXT_CALL_SIGNATURE: [u8; 8] = [0xff, 0x15, 0x60, 0x78, 0xac, 0x0a, 0x85, 0xc0];
+///
+/// 2026-11-17 build (`245768f2…`): `FUN_180c43790`, call at `+0xb2`, retry limit
+/// `0xf4240` at `+0x107`, INT3 abort at `+0x145` (Ghidra). Previous build: 0xc41ad2.
+const GC_CONTEXT_CALL_RVA: usize = 0xc43842;
+
+/// Compare `bytes` with a signature where `None` matches any byte.
+///
+/// The displaced bytes are IAT `call [rip+disp32]` / RIP-relative `lea`
+/// operands: they encode the build's import and data layout, not the code block
+/// being identified, so a game patch changes them while the block stays the same.
+pub(crate) fn masked_signature_matches(bytes: &[u8], pattern: &[Option<u8>]) -> bool {
+    bytes.len() >= pattern.len()
+        && pattern
+            .iter()
+            .zip(bytes)
+            .all(|(expected, actual)| expected.is_none_or(|byte| byte == *actual))
+}
+
+const GC_CONTEXT_CALL_SIGNATURE: &[Option<u8>] = &[
+    Some(0xff),
+    Some(0x15),
+    None,
+    None,
+    None,
+    None,
+    Some(0x85),
+    Some(0xc0),
+];
 
 fn valid_gc_context_call_site(bytes: &[u8]) -> bool {
-    bytes.starts_with(&GC_CONTEXT_CALL_SIGNATURE)
+    masked_signature_matches(bytes, GC_CONTEXT_CALL_SIGNATURE)
 }
 
 static GC_CONTEXT_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -1595,7 +1621,7 @@ unsafe fn write_synthetic_dead_context_raw(context: *mut u8) {
     }
 }
 
-const GC_THREADS_RVA: usize = 0x0e6b_b180;
+const GC_THREADS_RVA: usize = 0x0e6b_d8a0;
 
 /// Find and unlink the record owning `handle` while Boehm holds its stop-world
 /// lock. Every access is a direct unaligned scalar access into static table /
@@ -1605,7 +1631,7 @@ const GC_THREADS_RVA: usize = 0x0e6b_b180;
 /// `base` must address all 256 writable GC_threads bucket pointers. Reachable
 /// records must have the measured next/id/handle layout and remain allocated
 /// and writable for the duration of the stop-world traversal.
-unsafe fn unlink_by_handle_raw(base: usize, handle: usize) -> Option<u32> {
+unsafe fn unlink_by_handle_raw(base: usize, handle: usize) -> Option<(u32, usize)> {
     if base == 0 {
         return None;
     }
@@ -1635,7 +1661,7 @@ unsafe fn unlink_by_handle_raw(base: usize, handle: usize) -> Option<u32> {
                 // SAFETY: predecessor is either the validated bucket link or a
                 // previously traversed live record's writable next field.
                 unsafe { core::ptr::write_unaligned(predecessor as *mut usize, next) };
-                return Some(id);
+                return Some((id, next));
             }
             previous = current;
             // SAFETY: same live record contract as the field loads above.
@@ -1662,7 +1688,7 @@ unsafe fn complete_dead_gc_call_raw(
     // best-effort unlink so resume can never observe a corrupt context.
     unsafe { write_synthetic_dead_context_raw(context) };
     // SAFETY: Boehm owns the stop-world lock for both operations.
-    let removed = unsafe { unlink_by_handle_raw(base, handle) };
+    let removed = unsafe { unlink_by_handle_raw(base, handle) }.map(|(id, _)| id);
     (1, removed)
 }
 
@@ -1726,11 +1752,166 @@ pub unsafe extern "system" fn gc_context_detour() -> ! {
     );
 }
 
-#[allow(dead_code)]
+// ---- SuspendThread call-site guard -----------------------------------------
+//
+// `GC_suspend_all` calls SuspendThread *before* GetThreadContext, and wine
+// answers `-1` / ERROR_ACCESS_DENIED for a thread that has already terminated.
+// For a leaked record the context guard is therefore never reached: Boehm walks
+// into its retry loop and aborts with `SuspendThread loop failed`. Measured
+// 2026-11-18 — exactly that fired once per session and only the last-resort VEH
+// kept the game alive, after Boehm had already printed the message.
+//
+// This site lets us skip such a record before the abort: when the handle is
+// signalled, splice the node out and resume with the record's saved `next`, the
+// same resumption the VEH uses.
+
+const GC_SUSPEND_CALL_RVA: usize = 0xc43826;
+const GC_PROCESS_RECORD_RVA: usize = 0xc43800;
+const GC_ADVANCE_BUCKET_RVA: usize = 0xc439da;
+
+static GC_SUSPEND_TRAMP: AtomicUsize = AtomicUsize::new(0);
+static GC_SUSPEND_RESUME: AtomicUsize = AtomicUsize::new(0);
+static GC_SUSPEND_GA: AtomicUsize = AtomicUsize::new(0);
+
+/// Decide what the SuspendThread call site does for this handle.
+///
+/// Returns `next | 1` when the record was spliced out (bit 0 is free: records
+/// are 16-byte aligned) and the collector must resume at `next`, or 0 when the
+/// original call has to run.
+///
+/// # Safety
+/// Reached from the naked stub with RCX = the record's handle, exactly as the
+/// patched `call [SuspendThread]` receives it.
+unsafe extern "system" fn gc_suspend_route(handle: usize) -> usize {
+    let base = GC_THREADS_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return 0;
+    }
+    // SAFETY: RCX is Boehm's own handle for the record it is about to suspend.
+    let wait = unsafe { ffi::WaitForSingleObject(handle as ffi::HANDLE, 0) };
+    if wait != 0 {
+        // A live (or merely suspended) thread is Boehm's business, not ours.
+        return 0;
+    }
+    // SAFETY: WAIT_OBJECT_0 proves the thread is fully gone; the table walk below
+    // is bounded and stops at the first unreadable link.
+    let Some((id, next)) = (unsafe { unlink_by_handle_raw(base, handle) }) else {
+        return 0;
+    };
+    // No module lookup here: this runs inside a collection, so the base is cached
+    // at install time instead of walking the module list.
+    let ga = GC_SUSPEND_GA.load(Ordering::Acquire);
+    if ga == 0 {
+        return 0;
+    }
+    GC_SUSPEND_RESUME.store(
+        if next != 0 {
+            ga + GC_PROCESS_RECORD_RVA
+        } else {
+            ga + GC_ADVANCE_BUCKET_RVA
+        },
+        Ordering::Release,
+    );
+    note_inline_repair(id);
+    next | 1
+}
+
+/// Tail-jump entry for the patched `call [SuspendThread]`, which sits 8 bytes
+/// after `mov rcx,[rbx+0x10]` — so RCX carries the handle and RBX the record.
+///
+/// # Safety
+/// May only be patched over the validated 11-byte
+/// `call [rip+disp]; cmp eax,-1; je` window in `GC_suspend_all`.
+#[unsafe(naked)]
+pub unsafe extern "system" fn gc_suspend_detour() -> ! {
+    core::arch::naked_asm!(
+        // Entry RSP is 16-byte aligned at this call site; the shadow area plus one
+        // save slot keeps the router ABI-legal and lets us restore RCX.
+        "sub rsp, 0x30",
+        "mov [rsp + 0x20], rcx",
+        "call {route}",
+        "mov rcx, [rsp + 0x20]",
+        "add rsp, 0x30",
+        "test al, 1",
+        "jz 2f",
+        // Repaired: continue at the saved next record; the spliced one is never
+        // touched again (RBX is what the loop dereferences next).
+        "and rax, -2",
+        "mov rbx, rax",
+        "mov r11, qword ptr [rip + {resume}]",
+        "jmp r11",
+        "2:",
+        "jmp qword ptr [rip + {tramp}]",
+        route = sym gc_suspend_route,
+        resume = sym GC_SUSPEND_RESUME,
+        tramp = sym GC_SUSPEND_TRAMP,
+    );
+}
+
+fn install_gc_suspend_guard() -> bool {
+    if GC_SUSPEND_TRAMP.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+    if !crate::gamebuild::is_supported() {
+        log::log_tag(
+            "gct",
+            "suspend guard disabled: RVA/signature belongs to another GameAssembly build",
+        );
+        return false;
+    }
+    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+        log::log_tag("gct", "suspend guard disabled: GameAssembly is not loaded");
+        return false;
+    };
+    let target = ga.wrapping_add(GC_SUSPEND_CALL_RVA);
+    let Some(head) = crate::safe::read_bytes(target, 11) else {
+        log::log_tag(
+            "gct",
+            "suspend guard disabled: Boehm SuspendThread call-site is unreadable",
+        );
+        return false;
+    };
+    // `call [rip+disp32]` (6) + `cmp eax,-1` (3) + `je rel8` (2).
+    if head[..2] != [0xff, 0x15] || head[6..9] != [0x83, 0xf8, 0xff] || head[9] != 0x74 {
+        log::log_tag(
+            "gct",
+            "suspend guard disabled: loaded SuspendThread call-site signature mismatch",
+        );
+        return false;
+    }
+    let Some(prep) = prepare_span(target, 11) else {
+        log::log_tag(
+            "gct",
+            "Boehm SuspendThread call-site trampoline rejected",
+        );
+        return false;
+    };
+    if prep.prologue != 11 {
+        log::log_tag(
+            "gct",
+            "suspend guard disabled: trampoline did not copy call; cmp; je exactly",
+        );
+        return false;
+    }
+    // Publish before the patch: a collector that enters immediately after the
+    // write must find the destination.
+    GC_SUSPEND_GA.store(ga, Ordering::Release);
+    GC_SUSPEND_TRAMP.store(prep.trampoline, Ordering::Release);
+    let Some(hook) = patch(&prep, gc_suspend_detour as *const () as usize) else {
+        GC_SUSPEND_TRAMP.store(0, Ordering::Release);
+        log::log_tag("gct", "suspend guard disabled: patch rejected");
+        return false;
+    };
+    register(hook);
+    log::log_tag(
+        "gct",
+        "suspend guard: SuspendThread call-site protected (dead records are skipped before the abort)",
+    );
+    true
+}
+
 fn install_legacy_gc_context_guard() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
+    if !crate::gamebuild::is_supported() {
         log::log_tag(
             "gct",
             "inline guard disabled: RVA/signature belongs to another GameAssembly build",
@@ -1804,7 +1985,23 @@ fn install_legacy_gc_context_guard() -> bool {
 /// The previous mid-function installer remains above only for its regression
 /// fixtures and disassembly references; it is not used at runtime.
 pub fn install_gc_context_guard() -> bool {
-    crate::raw::gcguard::install()
+    // Three pieces, all lock-free:
+    //   1. gcguard: entry marker + handle ordering (unlink -> CloseHandle -> free)
+    //   2. GetThreadContext call-site repair (proved live before v1 replaced it;
+    //      it went inert when the entry sanitize took over and must be armed
+    //      again now that the entry no longer removes anything)
+    //   3. SuspendThread call-site repair (wine fails the suspend for a
+    //      terminated thread, so the context guard alone is never reached)
+    let ordering = crate::raw::gcguard::install();
+    let context = install_legacy_gc_context_guard();
+    let suspend = install_gc_suspend_guard();
+    log::log_tag(
+        "gct",
+        &format!(
+            "GC guards: ordering={ordering} context_call={context} suspend_call={suspend}"
+        ),
+    );
+    ordering && context && suspend
 }
 
 // ---- worker-body provenance (why did a GC record leak?) -------------------
@@ -1812,8 +2009,13 @@ pub fn install_gc_context_guard() -> bool {
 static GC_DISPATCH_ORIG: AtomicUsize = AtomicUsize::new(0);
 static GC_UNREGISTER_ORIG: AtomicUsize = AtomicUsize::new(0);
 
-pub const WORKER_DISPATCH_RVA: u32 = 0xbf5ce0;
-pub const GC_UNREGISTER_RVA: u32 = 0xc41920;
+/// Shared il2cpp worker dispatcher (`{thread,fn,arg}` in one block).
+///
+/// 2026-11-17: old `0xbf5ce0` shifted to `0xbf7a60`; the first 32 bytes are
+/// byte-identical to the previous build's block, which is what identifies it.
+pub const WORKER_DISPATCH_RVA: u32 = 0xbf7a60;
+/// `GC_unregister_my_thread`: old `0xc41920` → `0xc43690`.
+pub const GC_UNREGISTER_RVA: u32 = 0xc43690;
 
 /// Record the real worker body before the shared OS trampoline can free its
 /// argument block. `RCX=inner`, with `{thread,fn,arg}` at offsets 0/8/16.
@@ -1862,12 +2064,15 @@ static GC_REMOVE_ORIG: AtomicUsize = AtomicUsize::new(0);
 static EXIT_THREAD_ORIG: AtomicUsize = AtomicUsize::new(0);
 static END_THREAD_EX_ORIG: AtomicUsize = AtomicUsize::new(0);
 
-pub const GC_REMOVE_RVA: u32 = 0xc417b0;
+pub const GC_REMOVE_RVA: u32 = 0xc43520;
 
-/// The actual deletion of a Boehm record. `FUN_180c417b0(DWORD tid)`: it walks
+/// The actual deletion of a Boehm record. `FUN_180c43520(DWORD tid)`: it walks
 /// the bucket without a NULL check, `CloseHandle`s the duplicated handle and
 /// `GC_free`s the record. Hooking the wrapper `GC_unregister_my_thread` only
 /// proves somebody asked; this proves the record went away.
+///
+/// 2026-11-17 build: `0xc43520` (was `0xc417b0`), confirmed by Ghidra:
+/// `LEA R14,[0x18e6bd8a0]`, `CALL [0x18b708088]` (CloseHandle) at `+0x40`.
 ///
 /// # Safety
 /// The detour preserves the one-DWORD argument in `ECX` and forwards the
@@ -2003,9 +2208,7 @@ fn install_gc_trace_at(
 /// Install worker provenance hooks only when explicitly requested. These
 /// diagnostic detours execute from the same plaintext image as LateUpdate.
 pub fn install_gc_worker_trace() -> bool {
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
-    {
+    if !crate::gamebuild::is_supported() {
         log::log_tag(
             "gct",
             "worker trace disabled: RVA map belongs to another GameAssembly build",
@@ -2812,7 +3015,20 @@ mod tests {
 
         assert!(valid_gc_context_call_site(&loaded));
         assert_eq!(prologue_len(&loaded, 14), Some(14));
-        for index in 0..8 {
+
+        // Bytes 2..6 are the IAT displacement of `call [rip+disp32]`: it encodes
+        // the build's import layout, not the block, so a game patch changes it
+        // and the guard must still recognise its own call-site.
+        for index in 2..6 {
+            let mut moved = loaded;
+            moved[index] ^= 0xff;
+            assert!(
+                valid_gc_context_call_site(&moved),
+                "byte {index} is a rel32 displacement, not the version gate"
+            );
+        }
+        // Opcode bytes are the gate.
+        for index in [0usize, 1, 6, 7] {
             let mut changed = loaded;
             changed[index] ^= 1;
             assert!(
@@ -2900,7 +3116,11 @@ mod tests {
         // with the measured ABI layout; every pointer remains live and writable.
         let removed = unsafe { unlink_by_handle_raw(table.as_mut_ptr() as usize, 0x2020) };
 
-        assert_eq!(removed, Some(0x222));
+        assert_eq!(
+            removed,
+            Some((0x222, third)),
+            "the caller also needs the record's saved next pointer"
+        );
         assert_eq!(records[0].next, third);
         assert_eq!(
             records[1].next, third,
