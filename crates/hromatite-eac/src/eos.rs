@@ -951,7 +951,7 @@ impl Hooks {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or_else(|| (interval.saturating_mul(4)).max(epoch::DEFAULT_STALE_MS));
-        epoch_lock().set_stale_ms(stale);
+        epoch_try(|gate| gate.set_stale_ms(stale));
         hook_log_blocking(&format!(
             "[epoch] gate armed stale_ms={stale} interval_ms={interval}"
         ));
@@ -1260,7 +1260,7 @@ fn reset_state() {
     BLIND_BUILD.store(0, Ordering::Relaxed);
     BLIND_SYSREQ.store(0, Ordering::Relaxed);
     // A fresh install is a fresh epoch: nothing armed, nothing learned.
-    epoch_lock().reset();
+    epoch_reset();
     if let Ok(mut events) = EVENTS.lock() {
         events.clear();
     }
@@ -1683,39 +1683,54 @@ fn drop_active(now: u64) -> bool {
 // time it is about to send, whether the session it learned is still the one the
 // anti-cheat module is in.
 
-/// Blocking lock; a poisoned gate is not a reason to stop sending.
+/// Gate access that never blocks a caller.
+///
+/// The gate is touched from two threads that must never wait on each other: the
+/// SDK thread (inside `BeginSession` and the message wrapper) and the emitter.
+/// A panic-longjmp does not run `Drop`, so a leaked guard could not be recovered
+/// — the policy is therefore "skip the observation, keep the game". A missed
+/// observation costs one cadence; a missed stop is caught on the next slot.
+fn epoch_try<R>(f: impl FnOnce(&mut epoch::Gate) -> R) -> Option<R> {
+    EPOCH.try_lock().ok().map(|mut gate| f(&mut gate))
+}
+
+/// Blocking lock for tests only.
+///
+/// Production callers never wait on the gate: it is touched from the SDK thread
+/// (inside `BeginSession` and the message wrapper) and from the emitter, and a
+/// panic-longjmp does not run `Drop`, so a leaked guard would hang the game.
+#[cfg(test)]
 fn epoch_lock() -> std::sync::MutexGuard<'static, epoch::Gate> {
     EPOCH.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// One `eac.hooks` / `eac.status` line.
 fn epoch_line() -> String {
-    epoch_lock().line()
+    epoch_try(|gate| gate.line()).unwrap_or_else(|| "gate busy".to_string())
 }
 
 /// Record a live 512-byte frame. Called from the SDK thread on every heartbeat,
 /// so it must not block: a skipped observation costs one cadence, not a decision.
 fn epoch_note_live(sid: u64, now_ms: u64) {
-    if let Ok(mut gate) = EPOCH.try_lock() {
-        gate.note_live(sid, now_ms);
-    }
+    epoch_try(|gate| gate.note_live(sid, now_ms));
 }
 
 /// `BeginSession`: the previous session, its template and its evidence are gone.
+///
+/// Also non-blocking: it runs on the SDK thread, and the gate's own verdict stops
+/// a dead session on the next slot even if this reset is skipped.
 fn epoch_reset() {
-    epoch_lock().reset();
+    epoch_try(epoch::Gate::reset);
 }
 
 /// Try to take over `sid` at `now_ms`; refused unless the module is still there.
 fn epoch_arm(sid: u64, now_ms: u64) -> bool {
-    let mut gate = epoch_lock();
-    let armed = gate.arm(sid, now_ms);
-    drop(gate);
+    let armed = epoch_try(|gate| gate.arm(sid, now_ms)).unwrap_or(false);
     if !armed {
         let waited = now_ms.saturating_sub(EPOCH_WAIT_MS.load(Ordering::Relaxed));
         if waited >= 5_000 {
             EPOCH_WAIT_MS.store(now_ms, Ordering::Relaxed);
-            let line = epoch_lock().line();
+            let line = epoch_line();
             hook_log(format!(
                 "[epoch] arm refused sid=0x{sid:x} — no fresh live frame of it; {line}"
             ));
@@ -1729,16 +1744,23 @@ fn epoch_arm(sid: u64, now_ms: u64) -> bool {
 /// A `Stop` is latched and reported once, and the caller must also forget the
 /// learned template: a re-arm has to come from the *new* session's frames.
 fn epoch_allows(now_ms: u64) -> bool {
-    let mut gate = epoch_lock();
-    match gate.verdict(now_ms) {
-        epoch::Verdict::Emit => true,
-        epoch::Verdict::Idle => false,
+    // `Ok(true)` = emit, `Ok(false)` = stay idle, `Err(stop)` = stop for good.
+    let verdict = epoch_try(|gate| match gate.verdict(now_ms) {
+        epoch::Verdict::Emit => Ok(true),
+        epoch::Verdict::Idle => Ok(false),
         epoch::Verdict::Stop(stop) => {
             if gate.stopped().is_some() {
-                return false;
+                return Ok(false);
             }
             gate.latched(epoch::Verdict::Stop(stop));
-            drop(gate);
+            Err(stop)
+        }
+    });
+    match verdict {
+        Some(Ok(allowed)) => allowed,
+        Some(Err(stop)) => {
+            // Logging and forgetting happen with the lock released: neither is
+            // safe to do while another thread may be waiting for the gate.
             hook_log_blocking(&format!(
                 "[epoch] stop {} emitted={} — no frame of a dead epoch is sent",
                 stop.line(),
@@ -1747,6 +1769,9 @@ fn epoch_allows(now_ms: u64) -> bool {
             forge_forget();
             false
         }
+        // Gate busy: skip this slot rather than block the caller. The next slot
+        // asks again, and a dead session keeps being refused until then.
+        None => false,
     }
 }
 
