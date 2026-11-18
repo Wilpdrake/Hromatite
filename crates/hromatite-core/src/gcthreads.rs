@@ -40,11 +40,11 @@ const OFF_ID: usize = 0x08;
 const OFF_HANDLE: usize = 0x10;
 const OFF_STACK_BASE: usize = 0x18;
 
-/// RVAs of `GC_threads[]` candidates, from static analysis of this build
-/// (GameAssembly sha256 `648f61b1…`). Re-derive them after a game update:
-/// search `.text` for `c1 e8 08` (shr eax,8) followed by `33 c1` and a
-/// `mov (%r14,%rsi,8),%rbx` / `cmp %ecx,0x8(%rbx)` chain.
-pub const CANDIDATE_RVAS: &[u32] = &[0x0e6b_b180, 0x0e66_b180, 0x0e66_c760];
+/// RVAs of `GC_threads[]`, measured per build (2026-11-17 = `245768f2…`).
+/// Re-derive after a game update: `GC_remove_thread` starts with
+/// `LEA R14,[<table>]` (absolute, so xrefs do not show it) and the table is a
+/// 256-entry array of bucket pointers whose records read `{next,id,handle,stack}`.
+pub const CANDIDATE_RVAS: &[u32] = &[0x0e6b_d8a0, 0x0e6b_b180, 0x0e66_b180, 0x0e66_c760];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {

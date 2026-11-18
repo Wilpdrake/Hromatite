@@ -7,6 +7,7 @@
 
 pub mod crc;
 pub mod crypto;
+pub mod gamebuild;
 pub mod gcthreads;
 pub mod hot;
 pub mod lateupdate;

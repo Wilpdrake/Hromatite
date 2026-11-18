@@ -16,13 +16,13 @@
 
 use hromatite_core::{m3, procs, safe, GAME_ASSEMBLY};
 
-/// The table RVA measured on the previous build; the search is centred on it.
-const LEGACY_TABLE_RVA: usize = 0x0e66_c870;
+/// The table RVA measured on the 2026-11-17 build; the search is centred on it.
+const LEGACY_TABLE_RVA: usize = 0x0e66_f0d0;
 /// How far around the legacy RVA the scan looks (±8 MiB).
 const SEARCH_RADIUS: usize = 8 * 1024 * 1024;
-/// `Il2CppClass` fields the probe validates.
+/// `Il2CppClass` fields the probe validates (2026-11-17 layout).
 const CLASS_NS_OFF: usize = 0x18;
-const CLASS_NAME_OFF: usize = 0x98;
+const CLASS_NAME_OFF: usize = 0x10;
 /// How many consecutive entries must look like classes before a slot counts.
 const MIN_SCORE: usize = 24;
 /// How many entries are scored per candidate slot.

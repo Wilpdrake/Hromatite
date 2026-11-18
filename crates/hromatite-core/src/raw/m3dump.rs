@@ -419,15 +419,15 @@ mod win {
                         )),
                     }
                     // A slot that points at an array of `MethodInfo*` (each of
-                    // which has its name at +0x18) is worth naming out loud: that
-                    // is how the offline analyzer re-finds `methods_off`.
+                    // which has its name at `m3::METHOD_NAME_OFF`) is worth
+                    // naming out loud: that is how the offline analyzer
+                    // re-finds `methods_off`.
                     if readable {
                         let names: Vec<String> = (0..3)
                             .filter_map(|i| {
                                 let pointer = safe::read_usize(value + i * 8)?;
-                                // `Il2CppClass.methods` → `MethodInfo.name` is +0x18
-                                // (m3::METHOD_NAME_OFF, private to that module).
-                                string_at(pointer.checked_add(0x18)?)
+                                // `Il2CppClass.methods` → `MethodInfo.name`.
+                                string_at(pointer.checked_add(m3::METHOD_NAME_OFF)?)
                                     .filter(|name| name.len() >= 3 && identifier_like(name))
                             })
                             .collect();

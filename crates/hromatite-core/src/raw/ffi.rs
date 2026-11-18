@@ -183,6 +183,9 @@ unsafe extern "system" {
     pub fn OpenProcess(access: u32, inherit: BOOL, pid: u32) -> HANDLE;
     pub fn OpenThread(access: u32, inherit: BOOL, tid: u32) -> HANDLE;
     pub fn CloseHandle(h: HANDLE) -> BOOL;
+    /// `CreateMutexW(attrs, initial_owner, name)`: a named object in the wine
+    /// server namespace, visible to every process of the same prefix.
+    pub fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> HANDLE;
     /// ntdll: `ThreadQuerySetWin32StartAddress` (class 9) fills a `PVOID`.
     pub fn NtQueryInformationThread(
         h: HANDLE,

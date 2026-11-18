@@ -226,6 +226,44 @@ pub fn regions(max_regions: usize) -> Vec<Region> {
     out
 }
 
+/// Claim a process-wide named object so a second copy of the payload stays
+/// dormant.
+///
+/// Manual mapping does not register the module in the PEB, so a retrying
+/// launcher cannot see an already injected copy and maps another one (measured:
+/// three copies in one process, each installing its own VEH and hooks). A named
+/// mutex lives in the wine server object namespace, so every copy sees it no
+/// matter how it was loaded.
+///
+/// Returns `true` when this call created the object (this is the first copy),
+/// `false` when another copy already holds it. Failure to create the object is
+/// treated as "first copy": this guard must never block the payload.
+pub fn claim_single_instance(name: &str) -> bool {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let wide_name = wide(name);
+    // SAFETY: `wide_name` is NUL-terminated UTF-16 and lives for the call; the
+    // returned handle is null or an owned reference to a kernel object.
+    let handle = unsafe { CreateMutexW(core::ptr::null(), 0, wide_name.as_ptr()) };
+    if handle.is_null() {
+        return true;
+    }
+    // SAFETY: GetLastError has no preconditions and is read immediately after
+    // the call that may have set it.
+    let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already {
+        // We only opened the existing object, so drop our reference to it.
+        // SAFETY: the handle came from CreateMutexW and is not used afterwards.
+        unsafe {
+            CloseHandle(handle);
+        }
+        return false;
+    }
+    // Deliberately not closed: the object must outlive this call so the next
+    // copy sees it. A HANDLE is a raw pointer, so nothing is leaked by Rust.
+    let _ = handle;
+    true
+}
+
 /// Module base + size inside *our own* process (used by the injected DLL).
 pub fn own_module(name: &str) -> Option<(usize, usize)> {
     let w = wide(name);

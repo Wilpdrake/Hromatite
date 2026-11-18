@@ -6,20 +6,23 @@ use crate::host::Host;
 use crate::memory::parse_addr;
 use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 
-pub const CLASS_TABLE_RVA: u32 = 0x0e66_c870;
+pub const CLASS_TABLE_RVA: u32 = 0x0e66_f0d0;
 pub const IMAGE_GET_CLASS_RVA: u32 = 0x00c2_c0a0;
 pub const CORLIB_IMAGE_GETTER_RVA: u32 = 0x00c2_9c70;
 pub const CLASS_MAX: usize = 120_000;
 
-const CLASS_PARENT_OFF: usize = 0x10;
+/// `Il2CppClass` on the 2026-11-17 build (`245768f2…`), measured live.
+const CLASS_PARENT_OFF: usize = 0xa0;
 const CLASS_NS_OFF: usize = 0x18;
-const CLASS_METHODS_OFF: usize = 0x50;
-const CLASS_FIELDS_OFF: usize = 0x80;
-const CLASS_NAME_OFF: usize = 0x98;
+const CLASS_METHODS_OFF: usize = 0x58;
+const CLASS_FIELDS_OFF: usize = 0x88;
+const CLASS_NAME_OFF: usize = 0x10;
 const CLASS_FIELDS_COUNT_OFF: usize = 0x124;
-const FIELD_STRIDE: usize = 0x28;
-const METHOD_NAME_OFF: usize = 0x18;
-const METHOD_RETURN_TYPE_OFF: usize = 0x20;
+const CLASS_METHODS_COUNT_OFF: usize = 0x120;
+/// `FieldInfo`: name@0x00, offset@0x08, token@0x0c, type@0x10, parent@0x18.
+const FIELD_STRIDE: usize = 0x20;
+const METHOD_NAME_OFF: usize = 0x20;
+const METHOD_RETURN_TYPE_OFF: usize = 0x28;
 
 #[derive(Debug, Default)]
 pub struct Cache {
@@ -172,14 +175,14 @@ impl<'a> Metadata<'a> {
             let record = pointer + index * FIELD_STRIDE;
             let name = self
                 .host
-                .read_usize(record + 0x10)
+                .read_usize(record)
                 .and_then(|pointer| self.name_at(pointer))
                 .unwrap_or_default();
             out.push(Field {
                 name,
-                ty: self.host.read_usize(record).unwrap_or(0),
+                ty: self.host.read_usize(record + 0x10).unwrap_or(0),
                 offset_or_index: self.host.read_u32(record + 0x08).unwrap_or(0),
-                parent: self.host.read_usize(record + 0x20).unwrap_or(0),
+                parent: self.host.read_usize(record + 0x18).unwrap_or(0),
             });
         }
         out
@@ -199,7 +202,18 @@ impl<'a> Metadata<'a> {
             Some(array) if array >= 0x10000 && self.host.read_u8(array).is_some() => array,
             _ => return out,
         };
-        for index in 0..4096 {
+        // The `MethodInfo**` array is not NULL-terminated on this build, so the
+        // class's own count bounds the walk.
+        let declared = self
+            .host
+            .read_u16(class + CLASS_METHODS_COUNT_OFF)
+            .unwrap_or(0) as usize;
+        let limit = if declared == 0 {
+            4096
+        } else {
+            declared.min(4096)
+        };
+        for index in 0..limit {
             let info = match self.host.read_usize(array + index * 8) {
                 Some(info) => info,
                 None => break,
