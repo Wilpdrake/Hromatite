@@ -626,6 +626,31 @@ fn exact_bytes(target: usize, length: usize) -> Option<Vec<u8>> {
     crate::safe::read_bytes(target, length)
 }
 
+/// Shape of an initialised `RTL_CRITICAL_SECTION` (identical in Windows and
+/// wine): `DebugInfo` is `-1` or a pointer, `LockCount` is `-1` when free or
+/// `>= 0` when held, `RecursionCount` is small, and `OwningThread` is 0 or a
+/// plausible handle. Anything else is not a lock and must never be entered.
+fn critical_section_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 24 {
+        return false;
+    }
+    let debug_info = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default());
+    let lock_count = i32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default());
+    let recursion = i32::from_le_bytes(bytes[12..16].try_into().unwrap_or_default());
+    let owner = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_default());
+    // `DebugInfo` is -1 or a user-space pointer; a value with the high bit set
+    // is a string word, not debug info.
+    let debug_ok = debug_info == u64::MAX || (0x10000..0x0000_8000_0000_0000).contains(&debug_info);
+    debug_ok
+        && (-1..=0x1_0000).contains(&lock_count)
+        && (0..=0x100).contains(&recursion)
+        && (owner == 0 || owner < 0x1_0000_0000)
+}
+
+fn looks_like_critical_section(address: usize) -> bool {
+    crate::safe::read_bytes(address, 24).is_some_and(|bytes| critical_section_shape(&bytes))
+}
+
 fn stored_prep(slot: &AtomicUsize, target: usize) -> Option<&'static Prep> {
     if slot.load(Ordering::Acquire) == 0 {
         let prep = Box::new(prepare(target)?);
@@ -713,7 +738,24 @@ pub fn install() -> bool {
     SUSPEND_ABORT_ADDR.store(ga + anchors.suspend_abort as usize, Ordering::Release);
     ADVANCE_BUCKET_ADDR.store(ga + anchors.advance_bucket as usize, Ordering::Release);
     THREADS_BASE.store(ga + anchors.threads as usize, Ordering::Release);
-    THREAD_LIST_CS.store(ga + anchors.thread_list_cs as usize, Ordering::Release);
+    // A wrong `thread_list_cs` used to *hang* the game: `EnterCriticalSection`
+    // on a non-lock spins forever, and the previous build's heuristic pointed at
+    // a plain string. Accept only the shape of an initialised critical section
+    // and otherwise run without sanitisation instead of freezing.
+    let cs_address = ga + anchors.thread_list_cs as usize;
+    let cs = if looks_like_critical_section(cs_address) {
+        cs_address
+    } else {
+        log::log_tag(
+            "gct",
+            &format!(
+                "thread-list lock {cs_address:#x} is not an initialised CRITICAL_SECTION; \
+                 sanitisation disabled"
+            ),
+        );
+        0
+    };
+    THREAD_LIST_CS.store(cs, Ordering::Release);
     SKIP_ORIG.store(skip_prep.trampoline, Ordering::Release);
     AFTER_ORIG.store(after_prep.trampoline, Ordering::Release);
     ENTRY_ORIG.store(entry_prep.trampoline, Ordering::Release);
@@ -738,6 +780,33 @@ pub fn install() -> bool {
 mod tests {
     use super::*;
     static LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The check that would have prevented the 245768f2 hang: an initialised,
+    /// unlocked `RTL_CRITICAL_SECTION` versus the bytes the old heuristic
+    /// pointed at (a plain "CP1252" string).
+    #[test]
+    fn only_initialised_critical_sections_are_accepted() {
+        let mut free = [0u8; 24];
+        free[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // DebugInfo = -1
+        free[8..12].copy_from_slice(&(-1i32).to_le_bytes()); // LockCount = -1
+        assert!(super::critical_section_shape(&free));
+
+        let mut held = free;
+        held[8..12].copy_from_slice(&3i32.to_le_bytes());
+        held[12..16].copy_from_slice(&1i32.to_le_bytes());
+        held[16..24].copy_from_slice(&0x1234u64.to_le_bytes());
+        assert!(super::critical_section_shape(&held), "a held lock is still a lock");
+
+        let mut not_a_lock = [0u8; 24];
+        // Exactly the bytes the heuristic pointed at in 245768f2: the string
+        // "CP1252" behind a small integer word — never a lock.
+        not_a_lock
+            .copy_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0x80, 0xfd, 0xff, 0, 0, 0, 0, 0, 0,
+                                b'C', b'P', b'1', b'2', b'5', b'2', 0, 0]);
+        assert!(!super::critical_section_shape(&not_a_lock));
+        assert!(!super::critical_section_shape(&not_a_lock[..12]));
+        assert!(!super::critical_section_shape(&[0u8; 24]), "all zero");
+    }
 
     #[repr(C)]
     struct Record {

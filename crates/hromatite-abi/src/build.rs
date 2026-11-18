@@ -180,7 +180,7 @@ pub const BUILD_245768F2: Build = Build {
         suspend_abort: 0x00c4_38d5,
         advance_bucket: 0x00c4_39da,
         threads: 0x0e6b_d8a0,
-        thread_list_cs: 0x0e6b_d800,
+        thread_list_cs: 0x0e6b_d860,
     },
     il2cpp: Il2cppAnchors {
         get_corlib: 0x00c2_9c70,
@@ -210,7 +210,7 @@ pub const BUILD_245768F2: Build = Build {
         image_filename: 0x18,
     },
     verified: true,
-    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (measured: LateUpdate return descriptor is void); image_stride: 0x50 and image_filename: 0x18 measured live on pid 1071305; class_name: 0x10 measured on the live Il2CppClass record of VRC.Udon.UdonManager (0x98 reads 0 there, so the previous build's slot does not carry over); gc.thread_list_cs: most-referenced 8-byte-aligned lea target before the table (heuristic)",
+    note: "field_parent: 0 (no il2cpp_field_get_parent export on this build); method_return_type: 0x28 (measured: LateUpdate return descriptor is void); image_stride: 0x50 and image_filename: 0x18 measured live on pid 1071305; class_name: 0x10 measured on the live Il2CppClass record of VRC.Udon.UdonManager (0x98 reads 0 there, so the previous build's slot does not carry over); gc.thread_list_cs: 0xe6bd860 derived from the two `call [EnterCriticalSection]` sites, and its bytes are an initialised RTL_CRITICAL_SECTION (DebugInfo -1, LockCount -1) — the old heuristic 0xe6bd800 held the string \"CP1252\" and hung the game",
 };
 
 pub static KNOWN: &[Build] = &[
@@ -342,7 +342,10 @@ mod tests {
         assert_eq!(new.gc.suspend_abort, 0xc4_38d5);
         assert_eq!(new.gc.advance_bucket, 0xc4_39da);
         assert_eq!(new.gc.threads, 0xe6b_d8a0);
-        assert_eq!(new.gc.thread_list_cs, 0xe6b_d800);
+        assert_eq!(
+            new.gc.thread_list_cs, 0xe6b_d860,
+            "derived from the two `call [EnterCriticalSection]` sites in this build"
+        );
         assert_eq!(new.il2cpp.get_corlib, 0xc2_9c70);
         assert_eq!(new.il2cpp.image_get_class, 0xc2_c0a0);
         assert_eq!(new.il2cpp.class_from_name, 0xc2_9dc0);
