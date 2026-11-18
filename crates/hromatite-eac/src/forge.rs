@@ -311,16 +311,21 @@ impl Config {
 // Whole-report stream (`EAC_FORGE_STREAM=<path>`)
 // ===========================================================================
 
-/// Length of the plaintext message header carried by the body of the frame that
-/// starts a report (`StartData`). Verified on every capture in
-/// `~/EAC-RE/evidence` (`findings/report_stream.md` §1).
-pub const MSG_HEADER_LEN: usize = 0x20;
-/// `+0x00 u32` — declared length of the message block.
+/// Bytes of a message-start body that precede the integrity records.
+///
+/// Measured on every capture in `~/EAC-RE/evidence`: seven `u32` fields
+/// (`0x00..0x1C`), the 48-byte per-session blob (`0x1C..0x4C`) and two more
+/// bytes (`0x4C..0x4E`) before the first record.
+pub const MSG_HEADER_LEN: usize = 0x4E;
+/// Length of the fixed `u32` fields in front of the blob (7 x `u32`).
+pub const MSG_FIELDS_LEN: usize = 0x1C;
+/// `+0x00 u32` — declared block length. **Not** the message size: it stays
+/// `1592` for action 13 and `2302` for action 4 across messages that are 35 to
+/// 209 frames long, so a generator must copy it rather than recompute it.
 pub const MSG_TOTAL_LEN_OFF: usize = 0x00;
-/// `+0x04 u32` — message counter; `1` for the first report of every session.
-pub const MSG_COUNTER_OFF: usize = 0x04;
-/// `+0x08 u32` — per-report nonce (differs between the two reports of one
-/// session, constant inside one report).
+/// `+0x04 u32` — constant `1` in every observed message (meaning unknown).
+pub const MSG_CONSTANT_OFF: usize = 0x04;
+/// `+0x08 u32` — per-message nonce (differs between messages of one session).
 pub const MSG_NONCE_OFF: usize = 0x08;
 /// `+0x0C u32` — constant `5` in every observed report (unknown meaning).
 pub const MSG_MODE_OFF: usize = 0x0C;
@@ -328,8 +333,10 @@ pub const MSG_MODE_OFF: usize = 0x0C;
 pub const MSG_ACTION_OFF: usize = 0x10;
 /// `+0x14 u32` — constant `3` in every observed report (unknown meaning).
 pub const MSG_KIND_OFF: usize = 0x14;
-/// `+0x18 u8` — per-report flags byte (`0x16` / `0x23` in `control_0009`).
-pub const MSG_FLAGS_OFF: usize = 0x18;
+/// `+0x18 u32` — message counter, `+1` per message (`22 -> 35` in
+/// `control_0009`, `157` in the 2026-11-18 live session). The low byte of this
+/// counter is what earlier notes mis-read as a "flags byte".
+pub const MSG_COUNTER_OFF: usize = 0x18;
 /// `+0x1C` — 48-byte per-session blob (constant inside one session, different
 /// between sessions; `findings/frame_structure.md` §5).
 pub const MSG_BLOB_OFF: usize = 0x1C;
@@ -338,6 +345,9 @@ pub const MSG_BLOB_LEN: usize = 48;
 /// Length of one integrity record inside a message.
 pub const RECORD_LEN: usize = 16;
 /// `Flags` bit 1: this frame ends a logical message.
+///
+/// Never observed on a 512-byte frame (a message simply ends where the next
+/// `StartData` begins), so the generator must not invent it.
 pub const FLAG_END: u16 = 0x0002;
 
 /// Declared message length for a report carried by `frames` full frames.
@@ -354,20 +364,21 @@ pub fn message_total_len(frames: usize) -> u32 {
 /// How the 32-byte message header's `total_len` is produced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TotalMode {
-    /// `frames * 512 - 24` for the frames we actually emit (the documented
-    /// hypothesis; default).
+    /// Copy the recorded value from the source report byte for byte
+    /// (the default: `+0x00` is a constant per action, not a frame count).
     #[default]
-    Frames,
-    /// Copy the recorded value from the source report byte for byte.
     Recorded,
+    /// `frames * 512 - 24`, the old hypothesis. Kept only as an experiment;
+    /// it contradicts every measured message (35..209 frames, same value).
+    Frames,
 }
 
 impl TotalMode {
-    /// Parse `EAC_FORGE_STREAM_TOTAL` (`frames` default, `recorded` opt-in).
+    /// Parse `EAC_FORGE_STREAM_TOTAL` (`recorded` default, `frames` opt-in).
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::trim) {
-            Some("recorded") | Some("copy") | Some("src") => Self::Recorded,
-            _ => Self::Frames,
+            Some("frames") | Some("count") => Self::Frames,
+            _ => Self::Recorded,
         }
     }
 
@@ -463,25 +474,44 @@ impl Via {
     }
 }
 
-/// The plaintext 32-byte message header of a report.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The plaintext message header of a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
-    /// `+0x00` — declared block length.
+    /// `+0x00` — declared block length (constant per action; copy, never derive
+    /// it from the frame count).
     pub total_len: u32,
-    /// `+0x04` — message counter.
-    pub counter: u32,
-    /// `+0x08` — per-report nonce.
+    /// `+0x04` — constant `1` in every observed message.
+    pub constant: u32,
+    /// `+0x08` — per-message nonce.
     pub nonce: u32,
     /// `+0x0C` — constant `5`.
     pub mode: u32,
-    /// `+0x10` — report action.
+    /// `+0x10` — report action (`13` first, `4` later).
     pub action: u32,
     /// `+0x14` — constant `3`.
     pub kind: u32,
-    /// `+0x18` — per-report flags byte.
-    pub flags: u8,
-    /// `+0x1C` — first `u32` of the 48-byte per-session blob.
-    pub blob: u32,
+    /// `+0x18` — message counter, `+1` per message.
+    pub counter: u32,
+    /// `+0x1C` — 48-byte per-session blob.
+    pub blob: [u8; MSG_BLOB_LEN],
+}
+
+impl Default for MessageHeader {
+    /// Constants stay at their observed values so a message whose header could
+    /// not be parsed is still shaped like a real one; the rest is zero, which
+    /// makes a bad write visible in the capture instead of plausible.
+    fn default() -> Self {
+        Self {
+            total_len: 0,
+            constant: 1,
+            nonce: 0,
+            mode: 5,
+            action: 0,
+            kind: 3,
+            counter: 0,
+            blob: [0u8; MSG_BLOB_LEN],
+        }
+    }
 }
 
 /// Little-endian `u32` at `at`, or `None` when `buf` is too short.
@@ -500,43 +530,42 @@ fn put_u32(buf: &mut [u8], at: usize, value: u32) {
 impl MessageHeader {
     /// Parse the header at the start of a `StartData` frame's body.
     pub fn parse(body: &[u8]) -> Option<Self> {
-        if body.len() < MSG_HEADER_LEN {
+        if body.len() < MSG_BLOB_OFF + MSG_BLOB_LEN {
             return None;
         }
         Some(Self {
             total_len: u32_at(body, MSG_TOTAL_LEN_OFF)?,
-            counter: u32_at(body, MSG_COUNTER_OFF)?,
+            constant: u32_at(body, MSG_CONSTANT_OFF)?,
             nonce: u32_at(body, MSG_NONCE_OFF)?,
             mode: u32_at(body, MSG_MODE_OFF)?,
             action: u32_at(body, MSG_ACTION_OFF)?,
             kind: u32_at(body, MSG_KIND_OFF)?,
-            flags: body[MSG_FLAGS_OFF],
-            blob: u32_at(body, MSG_BLOB_OFF)?,
+            counter: u32_at(body, MSG_COUNTER_OFF)?,
+            blob: body
+                .get(MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN)?
+                .try_into()
+                .ok()?,
         })
     }
 
     /// Write the header back into `body`.
     ///
-    /// `blob` is the full 48-byte per-session blob: `None` keeps whatever the
-    /// recording had after the first `u32`, `Some` overwrites all 48 bytes (the
-    /// `notes`/`bump` modes). Returns `false` when `body` is too short.
+    /// `blob` overrides the per-session blob (`EAC_FORGE_BLOB` or the live
+    /// session's own); `None` keeps the one this header was parsed with.
+    /// Returns `false` when `body` is too short.
     pub fn write(&self, body: &mut [u8], blob: Option<&[u8; MSG_BLOB_LEN]>) -> bool {
-        if body.len() < MSG_HEADER_LEN {
+        if body.len() < MSG_BLOB_OFF + MSG_BLOB_LEN {
             return false;
         }
         put_u32(body, MSG_TOTAL_LEN_OFF, self.total_len);
-        put_u32(body, MSG_COUNTER_OFF, self.counter);
+        put_u32(body, MSG_CONSTANT_OFF, self.constant);
         put_u32(body, MSG_NONCE_OFF, self.nonce);
         put_u32(body, MSG_MODE_OFF, self.mode);
         put_u32(body, MSG_ACTION_OFF, self.action);
         put_u32(body, MSG_KIND_OFF, self.kind);
-        body[MSG_FLAGS_OFF] = self.flags;
-        put_u32(body, MSG_BLOB_OFF, self.blob);
-        if let Some(blob) = blob
-            && let Some(slot) = body.get_mut(MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN)
-        {
-            slot.copy_from_slice(blob);
-        }
+        put_u32(body, MSG_COUNTER_OFF, self.counter);
+        let blob = blob.unwrap_or(&self.blob);
+        body[MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN].copy_from_slice(blob);
         true
     }
 }
@@ -546,30 +575,6 @@ pub fn recorded_blob(body: &[u8]) -> Option<[u8; MSG_BLOB_LEN]> {
     body.get(MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN)?
         .try_into()
         .ok()
-}
-
-/// A per-session blob of our own, derived from `session_id` and `nonce`.
-///
-/// The recorded blob is 48 bytes of session material that a stranger cannot
-/// mint; this is a deterministic stand-in with the same shape (`notes`/`bump`),
-/// so a live run tells us whether the server actually compares it.
-pub fn session_blob(session_id: u64, nonce: u32) -> [u8; MSG_BLOB_LEN] {
-    let mut state = session_id
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(u64::from(nonce).wrapping_mul(0xbf58_476d_1ce4_e5b9));
-    let mut out = [0u8; MSG_BLOB_LEN];
-    for chunk in out.chunks_mut(8) {
-        // SplitMix64: cheap, deterministic, no dependency.
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let bytes = z.to_le_bytes();
-        let len = chunk.len().min(8);
-        chunk[..len].copy_from_slice(&bytes[..len]);
-    }
-    out
 }
 
 /// Add `delta` to the trailing `u32` of every whole 16-byte record of `body`.
@@ -988,13 +993,13 @@ mod tests {
     fn body_with_header() -> Vec<u8> {
         let header = MessageHeader {
             total_len: 0x638,
-            counter: 1,
+            constant: 1,
             nonce: 0x94bb_79c6,
             mode: 5,
             action: 13,
             kind: 3,
-            flags: 0x16,
-            blob: 0x1ee3_a0ff,
+            counter: 157,
+            blob: [0x11; MSG_BLOB_LEN],
         };
         let mut body = vec![0xA5u8; BODY_LEN];
         assert!(header.write(&mut body, None));
@@ -1004,32 +1009,33 @@ mod tests {
     #[test]
     fn the_message_header_parses_and_rewrites_field_by_field() {
         let mut body = body_with_header();
-        let parsed = MessageHeader::parse(&body).expect("32-byte header");
+        let parsed = MessageHeader::parse(&body).expect("message header");
         assert_eq!(parsed.total_len, 0x638);
-        assert_eq!(parsed.counter, 1, "first report of a session");
+        assert_eq!(parsed.constant, 1, "0x04 is a constant, not a counter");
+        assert_eq!(parsed.counter, 157, "the counter lives at 0x18");
         assert_eq!(parsed.nonce, 0x94bb_79c6);
         assert_eq!(parsed.mode, 5);
         assert_eq!(parsed.action, 13, "action of the first report");
         assert_eq!(parsed.kind, 3);
-        assert_eq!(parsed.flags, 0x16);
-        assert_eq!(parsed.blob, 0x1ee3_a0ff);
+        assert_eq!(parsed.blob, [0x11; MSG_BLOB_LEN]);
 
-        // The rest of the 48-byte blob is untouched by a plain write.
+        // A plain write keeps the blob and only touches the fields.
         let mut rewritten = body.clone();
         let mut next = parsed;
-        next.total_len = 0x11280;
-        next.counter = 2;
+        next.total_len = 0x638;
+        next.counter = 158;
         next.nonce = parsed.nonce.wrapping_add(1);
         assert!(next.write(&mut rewritten, None));
         let again = MessageHeader::parse(&rewritten).expect("header");
-        assert_eq!(again.total_len, 0x11280);
-        assert_eq!(again.counter, 2);
-        assert_eq!(again.nonce, 0x94bb_79c7, "nonce advances per report");
+        assert_eq!(again.total_len, 0x638);
+        assert_eq!(again.counter, 158);
+        assert_eq!(again.constant, 1);
+        assert_eq!(again.nonce, 0x94bb_79c7, "nonce advances per message");
         assert_eq!(again.action, 13, "action stays the recording's");
         assert_eq!(&rewritten[MSG_HEADER_LEN..], &body[MSG_HEADER_LEN..]);
 
-        // A blob of ours replaces all 48 recorded bytes.
-        let ours = session_blob(0x158b, 7);
+        // An explicit blob replaces all 48 recorded bytes.
+        let ours = [0x42u8; MSG_BLOB_LEN];
         let before = recorded_blob(&body).expect("recorded blob");
         assert!(next.write(&mut rewritten, Some(&ours)));
         assert_eq!(recorded_blob(&rewritten), Some(ours));
@@ -1040,24 +1046,27 @@ mod tests {
     }
 
     #[test]
-    fn the_declared_length_is_the_frame_count_times_512_minus_the_header() {
-        assert_eq!(message_total_len(1), 488);
-        assert_eq!(message_total_len(4), 2_024, "4 * 512 - 24");
-        assert_eq!(message_total_len(144), 144 * 512 - 24, "a full report");
-        assert_eq!(message_total_len(144), 73_704);
-        // The recording's two headers are byte counts of a *partial* block,
-        // which is why `TotalMode::Recorded` exists as the fidelity variant.
-        assert_eq!(3 * 488 + 128, 1_592, "0x638 of control_0009");
-        assert_eq!(4 * 488 + 350, 2_302, "0x8fe of control_0009");
+    fn the_declared_length_is_a_constant_per_action_not_a_frame_count() {
+        // Measured on 17 sessions and 2106 frames: `+0x00` stays 1592 for
+        // action 13 and 2302 for action 4 while the message carrying it is
+        // 35..209 frames long, so `TotalMode::Frames` must stay opt-in.
+        assert_eq!(message_total_len(1), 488, "legacy helper, opt-in only");
+        assert_eq!(message_total_len(4), 2_024);
+        assert_eq!(MSG_HEADER_LEN, 0x4E, "records start after the blob");
+        assert_eq!(MSG_BLOB_OFF + MSG_BLOB_LEN, 0x4C);
     }
 
     #[test]
-    fn our_blob_is_deterministic_and_bound_to_the_session_and_nonce() {
-        let a = session_blob(0x158b, 1);
-        assert_eq!(a, session_blob(0x158b, 1), "same inputs, same blob");
-        assert_ne!(a, session_blob(0x158b, 2), "nonce changes the blob");
-        assert_ne!(a, session_blob(0x158c, 1), "session changes the blob");
-        assert_ne!(&a[..8], &[0u8; 8][..], "not all zeroes");
+    fn a_blob_is_copied_from_the_recording_or_from_the_live_header() {
+        let body = body_with_header();
+        assert_eq!(recorded_blob(&body), Some([0x11; MSG_BLOB_LEN]));
+        assert_eq!(
+            &body[MSG_BLOB_OFF..MSG_BLOB_OFF + MSG_BLOB_LEN],
+            &[0x11; MSG_BLOB_LEN]
+        );
+        // There is no derivation of our own any more: a session blob that was
+        // not observed cannot be minted, and pretending otherwise is what made
+        // the earlier stream tests meaningless.
     }
 
     #[test]
@@ -1104,7 +1113,7 @@ mod tests {
         assert_eq!(config.path, PathBuf::from("/tmp/a.bin"));
         assert_eq!(config.body, StreamBody::Copy);
         assert_eq!(config.via, Via::Wrapper);
-        assert_eq!(config.total, TotalMode::Frames);
+        assert_eq!(config.total, TotalMode::Recorded, "copy the recorded value");
         assert_eq!(config.interval_ms, INTERVAL_MS);
         assert_eq!(config.after_ms, DEFAULT_AFTER_MS);
         assert!(!config.looping);

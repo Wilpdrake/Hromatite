@@ -262,16 +262,15 @@ fn split_messages(frames: &[Frame]) -> Vec<Range<usize>> {
     out
 }
 
-/// Message boundary flags: `StartData` on the first frame, `EndData` on the
-/// last, every other bit kept from the recording.
+/// Message boundary flags: `StartData` on the first frame only.
 ///
-/// The recording never shows `EndData` on a long report (the run ends before
-/// the report does, `findings/report_stream.md` §4.4), but a message that
-/// declares `total_len` and then simply stops is exactly what a receiver has to
-/// guess about — so the generator marks the boundary instead of hiding it.
-fn boundary_flags(source: u16, first: bool, last: bool) -> u16 {
+/// The recording never shows `EndData` on a 512-byte frame — a message simply
+/// ends where the next `StartData` begins — so the generator must not invent
+/// the bit (setting it was one more way the earlier streams contradicted the
+/// live ones).
+fn boundary_flags(source: u16, first: bool) -> u16 {
     let keep = source & !(FLAG_START | FLAG_END);
-    keep | if first { FLAG_START } else { 0 } | if last { FLAG_END } else { 0 }
+    keep | if first { FLAG_START } else { 0 }
 }
 
 /// How the `EAC_FORGE_STREAM` generator renders a recorded report.
@@ -335,7 +334,7 @@ impl GenConfig {
             nonce: None,
             counter: None,
             blob: None,
-            total: TotalMode::Frames,
+            total: TotalMode::Recorded,
             interval_ms: forge::INTERVAL_MS,
             spool: None,
         }
@@ -364,10 +363,13 @@ pub struct Generator {
     session: u64,
     /// Next `Sequence`.
     seq: u64,
-    nonce: u32,
+    /// `EAC_FORGE_NONCE`: override for every message; `None` keeps each
+    /// message's recorded nonce (they differ between messages of a session).
+    nonce: Option<u32>,
     counter: u32,
-    /// The per-session blob to write in the `notes`/`bump` modes.
-    blob: [u8; MSG_BLOB_LEN],
+    /// Explicit per-session blob (`EAC_FORGE_BLOB` or the live session's own
+    /// header). `None` keeps the recording's blob; it is never minted.
+    blob: Option<[u8; MSG_BLOB_LEN]>,
     msg: usize,
     pos: usize,
     emitted: u64,
@@ -401,15 +403,14 @@ impl Generator {
         let recorded_seq = u64::from_le_bytes(first.data[12..20].try_into().ok()?);
         let session = config.session.unwrap_or(recorded_session);
         let seq = config.seq.unwrap_or_else(|| recorded_seq.wrapping_add(1));
-        let nonce = config
-            .nonce
-            .unwrap_or_else(|| headers.first().map(|h| h.nonce).unwrap_or(0));
+        // No derivation of our own: a session blob that was not observed cannot
+        // be minted, so the recording's 48 bytes stay unless the operator (or
+        // the live template) supplies the session's real one.
+        let nonce = config.nonce;
         let counter = config
             .counter
             .unwrap_or_else(|| headers.first().map(|h| h.counter).unwrap_or(1));
-        let blob = config
-            .blob
-            .unwrap_or_else(|| forge::session_blob(session, nonce));
+        let blob = config.blob;
         Some(Self {
             frames: report.frames.iter().map(|f| f.data.clone()).collect(),
             messages,
@@ -483,8 +484,8 @@ impl Generator {
         self.recorded_session
     }
 
-    /// The nonce the *next* message will carry.
-    pub fn nonce(&self) -> u32 {
+    /// The nonce override the *next* message will carry, if any.
+    pub fn nonce(&self) -> Option<u32> {
         self.nonce
     }
 
@@ -508,9 +509,10 @@ impl Generator {
             return false;
         }
         self.loops = self.loops.wrapping_add(1);
-        self.nonce = self.nonce.wrapping_add(1);
+        if let Some(nonce) = self.nonce.as_mut() {
+            *nonce = nonce.wrapping_add(1);
+        }
         self.counter = self.counter.wrapping_add(1);
-        self.blob = forge::session_blob(self.session, self.nonce);
         self.msg = 0;
         self.pos = 0;
         true
@@ -530,6 +532,9 @@ impl Generator {
                     self.pos = 0;
                     if self.msg < self.messages.len() {
                         self.counter = self.counter.wrapping_add(1);
+                        if let Some(nonce) = self.nonce.as_mut() {
+                            *nonce = nonce.wrapping_add(1);
+                        }
                         continue;
                     }
                     if !self.next_report() {
@@ -547,7 +552,6 @@ impl Generator {
         let range = self.messages.get(self.msg)?.clone();
         let length = range.len();
         let first = self.pos == 0;
-        let last = self.pos + 1 == length;
         let index = range.start + self.pos;
         let mut body = self.frames.get(index)?[HEADER_LEN..].to_vec();
 
@@ -558,13 +562,10 @@ impl Generator {
                 TotalMode::Recorded => header.total_len,
             };
             header.counter = self.counter;
-            header.nonce = self.nonce;
-            let blob = if self.body.owns_blob() {
-                Some(self.blob)
-            } else {
-                None
-            };
-            header.write(&mut body, blob.as_ref());
+            if let Some(nonce) = self.nonce {
+                header.nonce = nonce;
+            }
+            header.write(&mut body, self.blob.as_ref());
         }
         if self.body.bumps_records() {
             // The message header sits in front of the records only in the frame
@@ -580,7 +581,7 @@ impl Generator {
         let frame = forge::seal_frame(
             self.session,
             seq,
-            boundary_flags(source_flags, first, last),
+            boundary_flags(source_flags, first),
             &body,
         );
         self.pos += 1;
@@ -1249,41 +1250,27 @@ mod tests {
             .expect("second header");
         assert_eq!(first.mode, 5);
         assert_eq!(first.kind, 3);
-        assert_eq!(first.counter, 1, "first report of the session");
-        assert_eq!(second.counter, 1, "counter restarts per report here");
+        assert_eq!(first.constant, 1, "0x04 is the constant, not the counter");
+        assert_eq!(first.counter, 22, "message counter of control_0009");
+        assert_eq!(second.counter, 35, "counter +1 per message");
         assert_eq!(first.action, 13, "first report action");
         assert_eq!(second.action, 4, "later report action");
-        assert_ne!(first.nonce, second.nonce, "nonce is per report");
-        checks += 7;
+        assert_ne!(first.nonce, second.nonce, "nonce is per message");
+        checks += 8;
 
         let blob_a = forge::recorded_blob(&report.frame(0).expect("frame")[HEADER_LEN..])
             .expect("first blob");
         let blob_b = forge::recorded_blob(&report.frame(117).expect("frame")[HEADER_LEN..])
             .expect("second blob");
         assert_eq!(blob_a, blob_b, "the per-session blob is constant");
-        assert_eq!(
-            &blob_a[..4],
-            &first.blob.to_le_bytes(),
-            "blob starts at 0x1C"
-        );
+        assert_eq!(&blob_a[..4], &first.blob[..4], "blob starts at 0x1C");
         checks += 2;
 
-        // (5) `total_len` is a byte count of whole fragments plus a tail.
-        for (name, header) in [("first", first), ("second", second)] {
-            let total = header.total_len as usize;
-            let found = (1..=8usize)
-                .filter_map(|k| {
-                    let tail = total.checked_sub(k * 488)?;
-                    (1..=488).contains(&tail).then_some((k, tail))
-                })
-                .next();
-            assert_eq!(
-                found,
-                Some(if name == "first" { (3, 128) } else { (4, 350) }),
-                "{name} total_len {total:#x}"
-            );
-            checks += 1;
-        }
+        // (5) `total_len` is a constant per action, not a frame count: both
+        // messages stay at their own value while their lengths differ (117 vs
+        // 4 frames).
+        assert_eq!(first.total_len, 1_592, "action 13 header");
+        assert_eq!(second.total_len, 2_302, "action 4 header");
 
         // The cadence the generator reproduces.
         let mut dts: Vec<u32> = report.dt_ms().collect();
@@ -1321,8 +1308,8 @@ mod tests {
         assert_eq!(generator.messages(), 2);
         assert_eq!(generator.message_len(), 117);
         assert_eq!(generator.session(), 0x0bad_c0de);
-        assert_eq!(generator.nonce(), 0x94bb_79c6, "continues the recording");
-        assert_eq!(generator.counter(), 1);
+        assert_eq!(generator.nonce(), None, "no override: nonces come from the file");
+        assert_eq!(generator.counter(), 22, "continues the recording's counter");
 
         let mut frames = Vec::new();
         while let Some(frame) = generator.next_frame() {
@@ -1347,9 +1334,9 @@ mod tests {
                 "StartData only on the first frame"
             );
             assert_eq!(
-                flags & FLAG_END != 0,
-                index == 116,
-                "EndData only on the last frame"
+                flags & FLAG_END,
+                0,
+                "EndData is never set (frame {index})"
             );
             checks += 6;
         }
@@ -1375,13 +1362,12 @@ mod tests {
         let header =
             forge::MessageHeader::parse(&frames[0][HEADER_LEN..]).expect("generated header");
         assert_eq!(
-            header.total_len,
-            117 * FRAME_LEN as u32 - HEADER_LEN as u32,
-            "total_len follows the frame count"
+            header.total_len, 1_592,
+            "total_len is the recorded constant, not 117*512-24"
         );
-        assert_eq!(header.counter, 1);
-        assert_eq!(header.nonce, 0x94bb_79c6);
-        assert_eq!(header.action, 13, "action as recorded");
+        assert_eq!(header.counter, 22, "the recording's message counter");
+        assert_eq!(header.nonce, 0x94bb_79c6, "recorded nonce, no override");
+        assert_eq!(header.constant, 1);
         assert_eq!(header.mode, 5);
         assert_eq!(header.kind, 3);
         assert_eq!(
@@ -1417,7 +1403,9 @@ mod tests {
         config.looping = true;
         config.session = Some(0x158b);
         let mut generator = Generator::new(&recorded, &config).expect("frames");
-        let base_nonce = generator.nonce();
+        let recorded_header =
+            forge::MessageHeader::parse(&recorded.frame(0).expect("frame")[HEADER_LEN..])
+                .expect("header");
 
         let mut frames = Vec::new();
         for _ in 0..(117 + 4 + 1) {
@@ -1429,16 +1417,14 @@ mod tests {
         assert_ne!(second.as_slice(), frames[0].as_slice());
         let header = forge::MessageHeader::parse(&second[HEADER_LEN..]).expect("header");
         assert_eq!(
-            header.nonce,
-            base_nonce.wrapping_add(1),
-            "nonce++ per report"
+            header.nonce, recorded_header.nonce,
+            "no override keeps the recording's nonce"
         );
-        assert_eq!(header.counter, 2, "counter +1 per message");
+        assert_eq!(header.counter, recorded_header.counter + 1, "counter +1 per message");
         assert_eq!(flags_of(second) & FLAG_START, FLAG_START, "StartData again");
         assert_eq!(
-            header.total_len,
-            117 * FRAME_LEN as u32 - HEADER_LEN as u32,
-            "total_len of the repeated report"
+            header.total_len, recorded_header.total_len,
+            "total_len stays the recorded constant"
         );
         // Sequence keeps growing across the wrap.
         assert_eq!(seq_of(second), seq_of(&frames[116]) + 1);
@@ -1452,47 +1438,42 @@ mod tests {
     }
 
     #[test]
-    fn the_notes_mode_swaps_only_the_per_session_blob() {
+    fn an_explicit_blob_is_written_and_otherwise_the_recording_owns_it() {
         let Some(bytes) = real_capture() else {
             return;
         };
         let recorded = Report::from_bytes(&bytes);
-        let mut config = GenConfig::plain();
-        config.body = StreamBody::Notes;
-        config.session = Some(0x158b);
-        let mut generator = Generator::new(&recorded, &config).expect("frames");
-        let first = generator.next_frame().expect("frame");
-        let second = generator.next_frame().expect("frame");
-
-        let blob = forge::recorded_blob(&first[HEADER_LEN..]).expect("blob");
-        let recorded_blob =
-            forge::recorded_blob(&recorded.frame(0).expect("frame")[HEADER_LEN..]).expect("blob");
-        assert_ne!(blob, recorded_blob, "our blob, not the recording's");
-        assert_eq!(
-            blob,
-            forge::session_blob(0x158b, 0x94bb_79c6),
-            "ours is derived from the session and the nonce"
-        );
-        let header = forge::MessageHeader::parse(&first[HEADER_LEN..]).expect("header");
-        assert_eq!(
-            &blob[..4],
-            &header.blob.to_le_bytes(),
-            "0x1C is the blob's head"
-        );
-        // Only the 48 blob bytes differ inside the header.
         let source = recorded.frame(0).expect("frame");
-        // `total_len` is ours (frame count), everything else before the blob is
-        // the recording's.
+        let recorded_blob =
+            forge::recorded_blob(&source[HEADER_LEN..]).expect("recorded blob");
+
+        // Default: the blob is the recording's, byte for byte.
+        let mut config = GenConfig::plain();
+        config.session = Some(0x158b);
+        let mut plain = Generator::new(&recorded, &config).expect("frames");
+        let first = plain.next_frame().expect("frame");
         assert_eq!(
-            &first[HEADER_LEN + forge::MSG_COUNTER_OFF..HEADER_LEN + forge::MSG_BLOB_OFF],
-            &source[HEADER_LEN + forge::MSG_COUNTER_OFF..HEADER_LEN + forge::MSG_BLOB_OFF]
+            forge::recorded_blob(&first[HEADER_LEN..]),
+            Some(recorded_blob),
+            "copy keeps the recording's blob"
         );
+
+        // An explicit blob (the live session's own header, or EAC_FORGE_BLOB)
+        // replaces all 48 bytes; nothing is derived any more.
+        let ours = [0x5Au8; MSG_BLOB_LEN];
+        assert_ne!(ours, recorded_blob);
+        config.blob = Some(ours);
+        config.body = StreamBody::Notes;
+        let mut with_blob = Generator::new(&recorded, &config).expect("frames");
+        let first = with_blob.next_frame().expect("frame");
+        assert_eq!(forge::recorded_blob(&first[HEADER_LEN..]), Some(ours));
         assert_eq!(
             &first[HEADER_LEN + forge::MSG_BLOB_OFF + MSG_BLOB_LEN..],
             &source[HEADER_LEN + forge::MSG_BLOB_OFF + MSG_BLOB_LEN..],
             "the records after the blob are untouched"
         );
         // The next frame carries no header at all (not a message start).
+        let second = with_blob.next_frame().expect("frame");
         assert_eq!(
             &second[HEADER_LEN..],
             &recorded.frame(1).expect("frame")[HEADER_LEN..],
