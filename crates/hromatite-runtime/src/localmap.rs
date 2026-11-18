@@ -18,13 +18,13 @@
 // The public M1 surface is consumed by the separate hot-reload integration.
 #![allow(dead_code)]
 
-use crate::pe::PeImage;
+use hromatite_core::pe::PeImage;
 
 fn verify_artifact_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("verified feature digest must contain 64 hexadecimal characters".into());
     }
-    let actual = crate::sha256::hex_digest(bytes);
+    let actual = hromatite_core::sha256::hex_digest(bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(format!(
             "feature bytes SHA-256 mismatch: got {actual}, expected {expected}"
@@ -306,10 +306,18 @@ fn feature_api_range_valid(base: usize, size: usize, api: usize) -> bool {
 fn feature_api_bytes_valid(bytes: &[u8]) -> bool {
     use hromatite_abi::FeatureApiV1;
     let table_size = core::mem::size_of::<FeatureApiV1>();
-    if bytes.len() != table_size
-        || !read_u32(bytes, 0).is_ok_and(|size| size as usize >= table_size)
-        || !read_u32(bytes, 4).is_ok_and(|version| version == hromatite_abi::ABI_VERSION)
-    {
+    if bytes.len() != table_size {
+        return false;
+    }
+    // The header check is the same predicate the producer uses, evaluated on the
+    // two fields read as plain bytes.
+    let header_ok = match (read_u32(bytes, 0), read_u32(bytes, 4)) {
+        (Ok(struct_size), Ok(abi_version)) => {
+            hromatite_abi::feature_header_fields_valid(struct_size, abi_version)
+        }
+        _ => false,
+    };
+    if !header_ok {
         return false;
     }
     // Do not form &FeatureApiV1 until every non-nullable Rust function pointer
@@ -319,6 +327,9 @@ fn feature_api_bytes_valid(bytes: &[u8]) -> bool {
         core::mem::offset_of!(FeatureApiV1, init),
         core::mem::offset_of!(FeatureApiV1, dispatch),
         core::mem::offset_of!(FeatureApiV1, tick),
+        // ABI v2 added the per-frame entry; a v1 image copied over this table
+        // would leave it null and fault on the first drawn frame.
+        core::mem::offset_of!(FeatureApiV1, frame),
         core::mem::offset_of!(FeatureApiV1, configure),
         core::mem::offset_of!(FeatureApiV1, shutdown),
     ]
@@ -376,7 +387,7 @@ fn push_cleanup_error(errors: &mut Vec<String>, stage: &str, result: Result<(), 
 /// Keep zeroed headers accessible as the proven remote mapper does; NOACCESS
 /// here turns an otherwise valid attach into an AV before feature init runs.
 fn erased_headers_protection() -> u32 {
-    crate::ffi::PAGE_READWRITE
+    hromatite_core::ffi::PAGE_READWRITE
 }
 
 fn protection_plan(pe: &PeImage) -> Result<Vec<(u32, u32, u32)>, String> {
@@ -405,11 +416,11 @@ fn protection_plan(pe: &PeImage) -> Result<Vec<(u32, u32, u32)>, String> {
             return Err("section and erased headers share a protection page".into());
         }
         let protection = if section.is_executable() {
-            crate::ffi::PAGE_EXECUTE_READ
+            hromatite_core::ffi::PAGE_EXECUTE_READ
         } else if section.characteristics & 0x8000_0000 != 0 {
-            crate::ffi::PAGE_READWRITE
+            hromatite_core::ffi::PAGE_READWRITE
         } else {
-            crate::ffi::PAGE_READONLY
+            hromatite_core::ffi::PAGE_READONLY
         };
         pages.push((start, end, protection));
     }
@@ -617,8 +628,8 @@ mod imp {
         feature_api_bytes_valid, feature_api_range_valid, finish_import_resolution,
         protection_plan, push_cleanup_error, resolve_imports_with,
     };
-    use crate::pe::PeImage;
-    use crate::raw::{ffi, memory};
+    use hromatite_core::pe::PeImage;
+    use hromatite_core::{ffi, safe as memory};
     use hromatite_abi::{FeatureApiV1, FeatureEntryFn};
 
     #[derive(Clone)]
@@ -844,7 +855,7 @@ mod imp {
         fn find_export_anywhere(&mut self, name: &str) -> Result<Option<usize>, String> {
             // SAFETY: parameterless process-id query.
             let pid = unsafe { ffi::GetCurrentProcessId() };
-            for (_, base, _) in crate::procs::modules(pid).into_iter().take(512) {
+            for (_, base, _) in hromatite_core::procs::modules(pid).into_iter().take(512) {
                 let Some(module) = LiveModule::from_base(base) else {
                     continue;
                 };
@@ -887,7 +898,7 @@ mod imp {
     }
 
     fn guarded_tls(base: usize, callback_rva: u32, reason: u32) -> Result<(), String> {
-        crate::veh::call_guarded(|| {
+        hromatite_core::veh::call_guarded(|| {
             // SAFETY: the callback was validated in an executable image section;
             // the inner VEH boundary returns here before mapper cleanup must run.
             unsafe { tls_callback(base, callback_rva, reason) };
@@ -896,7 +907,7 @@ mod imp {
     }
 
     fn guarded_dll_main(base: usize, entry_rva: u32, reason: u32) -> Result<i32, String> {
-        crate::veh::call_guarded(|| {
+        hromatite_core::veh::call_guarded(|| {
             // SAFETY: the entry was validated in an executable image section;
             // returning through this inner guard keeps failed-load cleanup reachable.
             unsafe { dll_main(base, entry_rva, reason) }
@@ -1078,7 +1089,7 @@ mod imp {
             // validated as executable. hromatite_feature_v1 has no arguments.
             let feature: FeatureEntryFn =
                 unsafe { core::mem::transmute(base + feature_entry as usize) };
-            let api = crate::veh::call_guarded(|| feature())
+            let api = hromatite_core::veh::call_guarded(|| feature())
                 .map_err(|fault| format!("hromatite_feature_v1: {fault}"))?;
             if api.is_null() {
                 return Err("hromatite_feature_v1 returned null".into());
@@ -1213,7 +1224,7 @@ mod tests {
             0x7fff_1234_5000
         );
     }
-    use crate::pe::PeImage;
+    use hromatite_core::pe::PeImage;
 
     fn fixture() -> Vec<u8> {
         let mut data = vec![0u8; 0x800];
@@ -1398,13 +1409,13 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                (0x1000, 0x1000, crate::ffi::PAGE_EXECUTE_READ),
-                (0x2000, 0x1000, crate::ffi::PAGE_READWRITE)
+                (0x1000, 0x1000, hromatite_core::ffi::PAGE_EXECUTE_READ),
+                (0x2000, 0x1000, hromatite_core::ffi::PAGE_READWRITE)
             ]
         );
         assert!(
             plan.iter()
-                .all(|entry| entry.2 != crate::ffi::PAGE_EXECUTE_READWRITE)
+                .all(|entry| entry.2 != hromatite_core::ffi::PAGE_EXECUTE_READWRITE)
         );
     }
 
@@ -1489,7 +1500,7 @@ mod tests {
 
     #[test]
     fn load_verified_rejects_a_different_generation_before_mapping() {
-        let expected = crate::sha256::hex_digest(b"generation-one");
+        let expected = hromatite_core::sha256::hex_digest(b"generation-one");
         assert!(super::verify_artifact_digest(b"generation-one", &expected).is_ok());
         assert!(super::verify_artifact_digest(b"generation-two", &expected).is_err());
         assert!(super::verify_artifact_digest(b"generation-one", "not-a-full-digest").is_err());
@@ -1538,6 +1549,7 @@ mod tests {
             core::mem::offset_of!(FeatureApiV1, init),
             core::mem::offset_of!(FeatureApiV1, dispatch),
             core::mem::offset_of!(FeatureApiV1, tick),
+            core::mem::offset_of!(FeatureApiV1, frame),
             core::mem::offset_of!(FeatureApiV1, configure),
         ] {
             bytes[offset..offset + 8].copy_from_slice(&0x1010u64.to_le_bytes());
@@ -1549,6 +1561,15 @@ mod tests {
         let shutdown = core::mem::offset_of!(FeatureApiV1, shutdown);
         bytes[shutdown..shutdown + 8].copy_from_slice(&0x1010u64.to_le_bytes());
         assert!(super::feature_api_bytes_valid(&bytes));
+        // ABI v2's per-frame entry is mandatory: a v1 image that does not carry
+        // it must be rejected here, not fault on the first drawn frame.
+        let frame = core::mem::offset_of!(FeatureApiV1, frame);
+        bytes[frame..frame + 8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(
+            !super::feature_api_bytes_valid(&bytes),
+            "null frame entry was accepted"
+        );
+        bytes[frame..frame + 8].copy_from_slice(&0x1010u64.to_le_bytes());
         bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
         assert!(!super::feature_api_bytes_valid(&bytes));
     }
@@ -1600,8 +1621,8 @@ mod tests {
     #[test]
     fn erased_headers_remain_readable_for_crt_startup() {
         let protection = super::erased_headers_protection();
-        assert_eq!(protection, crate::ffi::PAGE_READWRITE);
-        assert_ne!(protection & 0xf0, crate::ffi::PAGE_EXECUTE_READWRITE);
+        assert_eq!(protection, hromatite_core::ffi::PAGE_READWRITE);
+        assert_ne!(protection & 0xf0, hromatite_core::ffi::PAGE_EXECUTE_READWRITE);
     }
 
     #[test]

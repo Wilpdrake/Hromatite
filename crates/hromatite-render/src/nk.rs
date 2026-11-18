@@ -6,7 +6,7 @@
 //! [`Input`] from Unity/Windows) is the resident's job.
 //!
 //! ```no_run
-//! use hromatite_nuklear::{Input, Nk};
+//! use hromatite_render::nk::{Input, Nk};
 //!
 //! let mut nk = Nk::new().expect("nuklear context");
 //! nk.ui_mut().esp = true;
@@ -32,16 +32,12 @@
 
 #![deny(unsafe_code)]
 
-#[allow(unsafe_code)]
-#[allow(dead_code)] // the shim is a boundary: it covers the whole widget set the
-                   // panels may need, not only what today's layout happens to call
-mod sys;
-
+use crate::sys;
 use core::ffi::{c_char, c_void};
 use core::marker::PhantomData;
 use std::sync::Mutex;
 
-pub use sys::FontTexture;
+pub use crate::sys::FontTexture;
 
 /// nuklear's TTF decompressor keeps its output cursor in process-wide `static`
 /// variables (`nk__dout`, `nk__barrier*` in `nuklear.h`), so baking a font atlas

@@ -1,0 +1,19 @@
+[package]
+name = "hromatite-injector"
+version = "0.1.0"
+edition = "2024"
+description = "Hromatite.exe: cross-process manual mapper for the resident payload"
+
+# Hard boundary: the injector is a *host-side* CLI that runs inside the Proton
+# prefix. It must not link the resident runtime, the renderer, il2cpp or the EAC
+# model - only the Win32 OS layer (with cross-process access) it needs to map an
+# image into the game.
+[dependencies]
+hromatite-win = { path = "../hromatite-win", features = ["remote"] }
+
+[[bin]]
+name = "Hromatite"
+path = "src/main.rs"
+
+[lints]
+workspace = true

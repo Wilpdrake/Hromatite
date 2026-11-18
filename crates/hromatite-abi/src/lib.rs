@@ -108,7 +108,17 @@ pub fn host_header_valid(host: Option<&HostApiV1>) -> bool {
 
 /// This check is meaningful once `api` is known to point at a readable header.
 pub fn feature_header_valid(api: &FeatureApiV1) -> bool {
-    api.abi_version == ABI_VERSION && api.struct_size as usize >= core::mem::size_of::<FeatureApiV1>()
+    feature_header_fields_valid(api.struct_size, api.abi_version)
+}
+
+/// Byte-level form of [`feature_header_valid`].
+///
+/// Feature images are validated from raw bytes before a typed reference can
+/// exist (a null callback would make that reference invalid), so the header
+/// check has to be callable on the two fields alone. Keeping one predicate here
+/// is what stops the loader and the producer from drifting apart again.
+pub fn feature_header_fields_valid(struct_size: u32, abi_version: u32) -> bool {
+    abi_version == ABI_VERSION && struct_size as usize >= core::mem::size_of::<FeatureApiV1>()
 }
 
 #[cfg(test)]

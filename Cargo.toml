@@ -1,3 +1,13 @@
+# Virtual workspace: every buildable unit is a crate under `crates/`.
+#
+# The root used to be the injector package itself, which is what made
+# `Hromatite.exe` link the renderer, il2cpp and the resident runtime. The entry
+# points are now separate crates with hard dependency boundaries:
+#
+#   hromatite-injector   Hromatite.exe       -> hromatite-win only
+#   hromatite-dll        hromatite.dll       -> hromatite-runtime only
+#   hromatite-runtime    resident library    -> win, hook, render, core, eac
+#   hromatite-features   hromatite_features  -> abi, commands, protocol-only eac
 [workspace]
 members = [
     "crates/hromatite-abi",
@@ -7,7 +17,9 @@ members = [
     "crates/hromatite-eac",
     "crates/hromatite-features",
     "crates/hromatite-hook",
-    "crates/hromatite-nuklear",
+    "crates/hromatite-injector",
+    "crates/hromatite-render",
+    "crates/hromatite-runtime",
     "crates/hromatite-win",
     "crates/test-target",
 ]
@@ -19,17 +31,6 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
-
-[lints]
-workspace = true
-
-[package]
-name = "Hromatite"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-hromatite-core = { path = "crates/hromatite-core" }
 
 [profile.release]
 opt-level = 2

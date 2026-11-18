@@ -75,13 +75,6 @@ pub fn xor_page(page: u64, buf: &mut [u8]) {
     }
 }
 
-/// XOR `len` bytes starting at `page` — the tail of the last page included.
-pub fn xor_range(start_page: u64, buf: &mut [u8]) {
-    for (page, chunk) in (start_page..).zip(buf.chunks_mut(PAGE)) {
-        xor_page(page, chunk);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,17 +143,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn xor_range_walks_pages() {
-        let mut buf = vec![0u8; PAGE + 16];
-        xor_range(2, &mut buf);
-        let mut first = [0u8; PAGE];
-        xor_page(2, &mut first);
-        assert_eq!(&buf[..PAGE], &first[..]);
-        let mut tail = [0u8; 16];
-        xor_page(3, &mut tail);
-        assert_eq!(&buf[PAGE..], &tail[..]);
     }
 }

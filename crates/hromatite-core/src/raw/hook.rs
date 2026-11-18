@@ -5,7 +5,6 @@
 //! thread is created. Managed method bodies always run after best-effort
 //! guarded instrumentation.
 
-use crate::console;
 use crate::ffi;
 use crate::log;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -24,13 +23,31 @@ pub use hromatite_hook::tramp::{adjusted_disp32, branch_into_prologue, rel32_ok}
 // Tick source
 // ---------------------------------------------------------------------------
 
+/// Everything the resident runtime contributes to one managed tick.
+///
+/// `hromatite-core` owns the detours; the command channel, the feature router
+/// and the console live in `hromatite-runtime`, which depends on this crate.
+/// Publishing function pointers here - instead of the detour calling the
+/// runtime - is what keeps the crate graph acyclic.
+pub struct TickTarget {
+    /// First tick only: create the command reader and log the console path.
+    pub prepare: fn(),
+    /// Every frame, unthrottled: the feature image's per-frame entry.
+    pub frame: fn(),
+    /// Throttle for the full work pass (`HROMATITE_TICK_MS`).
+    pub interval_ms: fn() -> u64,
+    /// Throttled work: GC reports, hot reload, command dispatch.
+    pub work: fn(),
+    /// True only while a reload transition needs the original method first.
+    pub original_first: fn() -> bool,
+}
+
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_MS: AtomicU64 = AtomicU64::new(0);
 static START_MS: AtomicU64 = AtomicU64::new(0);
-static INTERVAL_MS: AtomicU64 = AtomicU64::new(250);
 static BUSY: AtomicBool = AtomicBool::new(false);
 static FRAME_BUSY: AtomicBool = AtomicBool::new(false);
-static READER: Mutex<Option<console::Reader>> = Mutex::new(None);
+static TICK_TARGET: AtomicUsize = AtomicUsize::new(0);
 static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
 fn now_ms() -> u64 {
@@ -38,19 +55,36 @@ fn now_ms() -> u64 {
     unsafe { ffi::GetTickCount64() }
 }
 
-/// Throttle command-file IO on Unity's managed thread. Atomic claiming and the
-/// BUSY flag keep re-entrant calls from overlapping a poll already in progress.
+/// Publish the resident's tick implementation. Called once at startup, before
+/// any detour can fire; a later call replaces it.
+pub fn set_tick_target(target: &'static TickTarget) {
+    TICK_TARGET.store(target as *const TickTarget as usize, Ordering::Release);
+}
+
+fn tick_target() -> Option<&'static TickTarget> {
+    let raw = TICK_TARGET.load(Ordering::Acquire) as *const TickTarget;
+    // SAFETY: only `set_tick_target` writes this slot, and it accepts nothing
+    // but a `&'static TickTarget`; the pointee therefore outlives the process.
+    unsafe { raw.as_ref() }
+}
+
+/// Throttle runtime work on Unity's managed thread. Atomic claiming and the
+/// BUSY flag keep re-entrant calls from overlapping a pass already in progress.
+/// Until [`set_tick_target`] has run the tick only counts frames.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
-    // The per-frame feature entry is not throttled: `Graphics.DrawMesh` applies
-    // to exactly one frame, so a 4 Hz path would flash the in-game overlay
-    // instead of drawing it. It is bounded by contract (no file or command I/O).
+    let Some(target) = tick_target() else {
+        return;
+    };
+    // The per-frame entry is not throttled: `Graphics.DrawMesh` applies to
+    // exactly one frame, so a 4 Hz path would flash the in-game overlay instead
+    // of drawing it. It is bounded by contract (no file or command I/O).
     if !FRAME_BUSY.swap(true, Ordering::AcqRel) {
-        let _ = log::guard("hook::frame", crate::raw::hot::frame);
+        let _ = log::guard("hook::frame", target.frame);
         FRAME_BUSY.store(false, Ordering::Release);
     }
     let now = now_ms();
-    let iv = crate::raw::hot::tick_interval_ms().max(1);
+    let iv = (target.interval_ms)().max(1);
     let last = LAST_MS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) < iv {
         return;
@@ -65,80 +99,14 @@ pub fn tick() {
         return;
     }
     // Never unwind through the game's managed frame.
-    let _ = log::guard("hook::tick", work);
+    let _ = log::guard("hook::tick", target.work);
     BUSY.store(false, Ordering::Release);
 }
 
-fn work() {
-    // Inline repairs publish lock-free counters in GetThreadContext; formatting
-    // and file IO happen only after the collector's stop-the-world detour.
-    if let Some((count, last_tid)) = take_inline_repairs() {
-        log::log_tag(
-            "gct",
-            &format!("inline guard: {count} stale record(s) reaped; last id={last_tid:#x}"),
-        );
-    }
-    for line in crate::raw::gcguard::report_lines() {
-        log::log_tag("gct", &line);
-    }
-    for line in crate::gcthreads::drain_worker_events() {
-        log::log_tag("gct", &line);
-    }
-
-    // Versioned feature work uses this same already-established game tick. It
-    // never creates a worker and never replaces the resident GC guard.
-    crate::raw::hot::tick();
-
-    let _ = log::guard("hook::work", || {
-        let mut reader = {
-            let mut g = match READER.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            g.take().unwrap_or_default()
-        };
-        // Never hold READER's mutex across a longjmp boundary.
-        let cmds = log::guard("reader.poll", || reader.poll()).unwrap_or_default();
-        {
-            let mut g = match READER.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            *g = Some(reader);
-        }
-        for line in cmds {
-            log::log_tag("con", &format!("> {line}"));
-            if let Some(out) = crate::raw::hot::command(&line) {
-                for line in out {
-                    log::log_tag("con", &line);
-                }
-                continue;
-            }
-            if !crate::raw::hot::resident_command(&line) && crate::raw::hot::dispatch(&line) {
-                continue;
-            }
-            let answered = log::guard("console::dispatch", || console::dispatch(&line));
-            let (out, action) = match answered {
-                Some(v) => v,
-                None => (
-                    vec!["command panicked (see PANIC line above)".to_string()],
-                    console::Action::None,
-                ),
-            };
-            for l in out {
-                log::log_tag("con", &l);
-            }
-            match action {
-                console::Action::Seal | console::Action::Quit => {
-                    log::log_tag(
-                        "con",
-                        "seal/quit is unavailable with the managed in-image runtime",
-                    );
-                }
-                console::Action::None => {}
-            }
-        }
-    });
+/// True only for reload transitions, where native work must not hold the game's
+/// next callback behind mapping, init, or retirement.
+pub fn original_first_required() -> bool {
+    tick_target().map(|t| (t.original_first)()).unwrap_or(false)
 }
 
 // ---- detours --------------------------------------------------------------
@@ -171,7 +139,9 @@ fn note_inline_repair(id: u32) {
     INLINE_REPAIRS.fetch_add(1, Ordering::Release);
 }
 
-fn take_inline_repairs() -> Option<(u64, u32)> {
+/// Drain the lock-free inline-repair counters published by the
+/// `GetThreadContext` guard; the caller formats and logs them.
+pub fn take_inline_repairs() -> Option<(u64, u32)> {
     let count = INLINE_REPAIRS.swap(0, Ordering::AcqRel);
     (count != 0).then(|| (count, INLINE_LAST_TID.load(Ordering::Acquire)))
 }
@@ -780,7 +750,7 @@ pub unsafe extern "system" fn late_update_detour(
     let f: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) =
         unsafe { core::mem::transmute(original) };
     tick_then_original(
-        crate::raw::hot::original_first_required(),
+        original_first_required(),
         || {
             // A payload fault must not skip the game's method. The guard is
             // inside the pre-original half, so the original call remains the
@@ -907,18 +877,12 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// First managed tick of this installation: arm the runtime's one-time setup
+/// (command reader, console path). Safe to call again - the runtime is idempotent.
 pub(crate) fn prepare_tick() {
-    if let Some(interval) = std::env::var("HROMATITE_TICK_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        INTERVAL_MS.store(interval.max(1), Ordering::Relaxed);
-    }
     let _ = START_MS.compare_exchange(0, now_ms(), Ordering::AcqRel, Ordering::Relaxed);
-    if let Ok(mut g) = READER.lock()
-        && g.is_none()
-    {
-        *g = Some(console::Reader::new());
+    if let Some(target) = tick_target() {
+        (target.prepare)();
     }
 }
 
@@ -956,10 +920,6 @@ pub fn install_late_update(
     let prep = prepare(candidate.entry)
         .ok_or_else(|| format!("cannot prepare a trampoline at {:#x}", candidate.entry))?;
     prepare_tick();
-    log::log_tag(
-        "late",
-        &format!("console file {}", console::cmd_path().display()),
-    );
     reset_late_observation();
     LATE_CLASS.store(candidate.class, Ordering::Relaxed);
     LATE_INFO.store(candidate.info, Ordering::Relaxed);
@@ -1224,7 +1184,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
             };
             Some(vec![format!(
                 "tick {n}, uptime {up}ms ({rate:.1}/s), interval {}ms, hooks={}, busy={}",
-                INTERVAL_MS.load(Ordering::Relaxed),
+                tick_target().map(|t| (t.interval_ms)()).unwrap_or(0),
                 match HOOKS.lock() {
                     Ok(g) => g.len(),
                     Err(p) => p.into_inner().len(),

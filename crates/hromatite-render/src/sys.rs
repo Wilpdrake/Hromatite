@@ -242,7 +242,7 @@ impl Drop for AlignedBox {
 
 /// A borrowed view of the baked font atlas.
 ///
-/// Texture id 1 in a [`crate::DrawCommand`] refers to these pixels.
+/// Texture id 1 in a [`crate::nk::DrawCommand`] refers to these pixels.
 pub struct FontTexture<'a> {
     ptr: *const u8,
     width: u32,

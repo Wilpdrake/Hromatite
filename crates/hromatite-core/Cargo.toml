@@ -13,10 +13,9 @@ hromatite-abi = { path = "../hromatite-abi" }
 # text and the host palette can never disagree.
 hromatite-commands = { path = "../hromatite-commands" }
 hromatite-hook = { path = "../hromatite-hook" }
-# The D3D11 backend turns one nuklear `Frame` into `DrawIndexed` calls. The crate
-# is dependency-free (its only build dependency is the C shim compiler), so the
-# resident linking it costs nothing at runtime.
-hromatite-nuklear = { path = "../hromatite-nuklear" }
+# The in-game renderer (nuklear + kiero + D3D11). Core only re-exports its
+# install/status surface until the runtime owns that wiring.
+hromatite-render = { path = "../hromatite-render" }
 hromatite-win = { path = "../hromatite-win", features = ["remote"] }
 
 [lints]

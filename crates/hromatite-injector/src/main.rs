@@ -8,9 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use hromatite_core::{
-    GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER, hot_runtime, log, manualmap, procs, remote::Remote,
-};
+use hromatite_win::{GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER, log, procs, remote::Remote};
+
+mod crypto;
+mod manualmap;
 
 fn usage() {
     println!(
@@ -19,8 +20,9 @@ fn usage() {
          \x20 bridge                 find {GAME_EXE} and report module bases (M0b)\n\
          \x20 inject --dll <path>     manual-map a DLL into the game (M1)\n\
          \x20 procs                  list wine processes\n\
-         \x20 hot-smoke <rounds> <dll-a> <dll-b> [...]\n\
-         \x20                        real local-map/canary/retire A/B loop (no Unity)"
+         \n\
+         the hot-reload smoke loop lives in the resident crate's `hot-smoke`\n\
+         binary: it needs the runtime's local-map/host layer, not the injector"
     );
 }
 
@@ -191,27 +193,6 @@ fn main() {
             Some(d) => inject(&d, &target, &opts, &mode, forced_pid),
             None => {
                 log::log_echo("inject needs --dll <path>");
-                1
-            }
-        },
-        "hot-smoke" => match args.get(1).and_then(|v| v.parse::<usize>().ok()) {
-            Some(rounds) if args.len() >= 4 => {
-                let paths = args[2..].to_vec();
-                match hot_runtime::smoke(&paths, rounds) {
-                    Ok(lines) => {
-                        for line in lines {
-                            log::log_echo(&line);
-                        }
-                        0
-                    }
-                    Err(error) => {
-                        log::log_echo(&format!("hot-smoke: {error}"));
-                        2
-                    }
-                }
-            }
-            _ => {
-                log::log_echo("usage: hot-smoke <rounds> <dll-a> <dll-b> [...]");
                 1
             }
         },

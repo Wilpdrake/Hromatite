@@ -10,10 +10,10 @@
 
 #![forbid(unsafe_code)]
 
-use crate::log;
-use crate::pe::PeImage;
-use crate::procs;
-use crate::remote::Remote;
+use hromatite_win::log;
+use hromatite_win::pe::PeImage;
+use hromatite_win::procs;
+use hromatite_win::remote::Remote;
 
 #[derive(Default)]
 pub struct Options {
@@ -51,7 +51,7 @@ fn seal_image(
             off += n;
             continue;
         }
-        if !r.protect(addr, n, crate::ffi::PAGE_READWRITE) {
+        if !r.protect(addr, n, hromatite_win::ffi::PAGE_READWRITE) {
             failed += 1;
             off += n;
             continue;
@@ -159,8 +159,8 @@ fn remote_load(r: &Remote, dll: &str) -> Option<usize> {
             return None;
         }
     };
-    let bytes = crate::raw::sys::wide_bytes(dll);
-    let arg = r.alloc(bytes.len(), crate::ffi::PAGE_READWRITE)?;
+    let bytes = hromatite_win::sys::wide_bytes(dll);
+    let arg = r.alloc(bytes.len(), hromatite_win::ffi::PAGE_READWRITE)?;
     if !r.write(arg, &bytes) {
         log::log("remote_load: cannot write dll path into target");
         return None;
@@ -355,7 +355,7 @@ fn stomp_alloc(r: &Remote, module: &str, size: usize) -> Option<usize> {
     if avail < size {
         return None;
     }
-    r.alloc_at(mbase + start, size, crate::ffi::PAGE_READWRITE)
+    r.alloc_at(mbase + start, size, hromatite_win::ffi::PAGE_READWRITE)
 }
 
 /// Load the DLL through the target's loader: file-backed sections (an img
@@ -370,9 +370,9 @@ pub fn inject_loadlib(pid: u32, dll_win_path: &str) -> Result<usize, String> {
         .export(k32, "LoadLibraryW")
         .ok_or("kernel32!LoadLibraryW unresolved")?;
 
-    let bytes = crate::raw::sys::wide_bytes(dll_win_path);
+    let bytes = hromatite_win::sys::wide_bytes(dll_win_path);
     let arg = r
-        .alloc(bytes.len(), crate::ffi::PAGE_READWRITE)
+        .alloc(bytes.len(), hromatite_win::ffi::PAGE_READWRITE)
         .ok_or("alloc path failed")?;
     if !r.write(arg, &bytes) {
         return Err("write path failed".into());
@@ -403,12 +403,12 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
             }
             None => {
                 log::log("stomp: not enough slack, falling back to a fresh allocation");
-                r.alloc(size, crate::ffi::PAGE_READWRITE)
+                r.alloc(size, hromatite_win::ffi::PAGE_READWRITE)
                     .ok_or("VirtualAllocEx failed")?
             }
         },
         None => r
-            .alloc(size, crate::ffi::PAGE_READWRITE)
+            .alloc(size, hromatite_win::ffi::PAGE_READWRITE)
             .ok_or("VirtualAllocEx failed")?,
     };
     let delta = base as i64 - img.image_base as i64;
@@ -453,9 +453,9 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         }
         let prot = if s.is_executable() {
             rx += 1;
-            crate::ffi::PAGE_EXECUTE_READ
+            hromatite_win::ffi::PAGE_EXECUTE_READ
         } else {
-            crate::ffi::PAGE_READWRITE
+            hromatite_win::ffi::PAGE_READWRITE
         };
         if !r.protect(base + s.va as usize, n, prot) {
             log::log(&format!(
@@ -516,7 +516,7 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     );
     let (code_lo, code_hi) = if code.0 == usize::MAX { (0, 0) } else { code };
     let params = r
-        .alloc(48, crate::ffi::PAGE_READWRITE)
+        .alloc(48, hromatite_win::ffi::PAGE_READWRITE)
         .ok_or("param alloc failed")?;
     let mut pbuf = [0u8; 48];
     pbuf[..8].copy_from_slice(&(base as u64).to_le_bytes());
@@ -530,12 +530,12 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     }
     let stub = dll_stub(base as u64, &targets, params as u64);
     let stub_mem = r
-        .alloc(stub.len(), crate::ffi::PAGE_READWRITE)
+        .alloc(stub.len(), hromatite_win::ffi::PAGE_READWRITE)
         .ok_or("stub alloc failed")?;
     if !r.write(stub_mem, &stub) {
         return Err("stub write failed".into());
     }
-    r.protect(stub_mem, stub.len(), crate::ffi::PAGE_EXECUTE_READ);
+    r.protect(stub_mem, stub.len(), hromatite_win::ffi::PAGE_EXECUTE_READ);
     // Sealing rewrites every page of the image, so the payload must be *done*:
     // wait far longer than the default when a seal is going to follow.
     // 30 min: interactive mode (HROMATITE_LIVE) keeps the entry point alive while

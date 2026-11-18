@@ -32,8 +32,8 @@
 // on the host these items are reached only by this module's tests.
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use crate::log;
-use crate::raw::vmt::{Vmt, VmtHook};
+use hromatite_win::log;
+use hromatite_hook::vmt::{Vmt, VmtHook};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -160,14 +160,14 @@ fn guarded_frame(callback: &mut RenderFn) {
 /// Undo the reserve-path inline hook. Off Windows the slot is always empty (the
 /// installer refuses), so dropping it is the whole job.
 #[cfg(windows)]
-fn unhook_module(hook: &mut Option<crate::raw::hook::Hook>) {
+fn unhook_module(hook: &mut Option<hromatite_hook::inline::Hook>) {
     if let Some(mut installed) = hook.take() {
         let _ = installed.unhook();
     }
 }
 
 #[cfg(not(windows))]
-fn unhook_module(hook: &mut Option<crate::raw::hook::Hook>) {
+fn unhook_module(hook: &mut Option<hromatite_hook::inline::Hook>) {
     *hook = None;
 }
 
@@ -235,7 +235,7 @@ pub struct Kiero {
     swapchain: usize,
     present: Option<VmtHook<'static>>,
     /// Reserve path: an inline hook on a module export.
-    module_hook: Option<crate::raw::hook::Hook>,
+    module_hook: Option<hromatite_hook::inline::Hook>,
 }
 
 impl Kiero {
@@ -263,7 +263,7 @@ impl Kiero {
                 "init: no graphics stack on this host (the live layer is windows-only)",
             );
             self.backend = RenderType::None;
-            return false;
+            false
         }
         #[cfg(windows)]
         {
@@ -273,16 +273,16 @@ impl Kiero {
                     true
                 }
                 RenderType::D3D11 => {
-                    let Some((base, size)) = crate::procs::own_module("dxgi.dll") else {
+                    let Some((base, size)) = hromatite_win::procs::own_module("dxgi.dll") else {
                         log::log_tag("kiero", "init: dxgi.dll is not loaded");
                         self.backend = RenderType::None;
                         return false;
                     };
                     // The factory entry point proves the module is a real DXGI
                     // image and gives the reserve path a callable target.
-                    let factory = crate::raw::sys::export_address("dxgi.dll", "CreateDXGIFactory1")
+                    let factory = hromatite_win::sys::export_address("dxgi.dll", "CreateDXGIFactory1")
                         .or_else(|| {
-                            crate::raw::sys::export_address("dxgi.dll", "CreateDXGIFactory")
+                            hromatite_win::sys::export_address("dxgi.dll", "CreateDXGIFactory")
                         });
                     if factory.is_none() {
                         log::log_tag("kiero", "init: dxgi.dll exports no DXGI factory");
@@ -321,7 +321,7 @@ impl Kiero {
                 );
                 return false;
             };
-            if slot == 0 || !crate::safe::readable_at(slot) {
+            if slot == 0 || !hromatite_win::memory::readable_at(slot) {
                 log::log_tag(
                     "kiero",
                     &format!("probe: {swapchain:#x} slot {index} -> {slot:#x} is not code"),
@@ -345,7 +345,7 @@ impl Kiero {
                 "kiero",
                 "hook_present_at: the live layer is windows-only on this host",
             );
-            return false;
+            false
         }
         #[cfg(windows)]
         {
@@ -401,20 +401,20 @@ impl Kiero {
                 "kiero",
                 "hook_module_export: the live layer is windows-only on this host",
             );
-            return false;
+            false
         }
         #[cfg(windows)]
         {
             if self.module_hook.is_some() {
                 return true;
             }
-            let Some(target) = crate::raw::sys::export_address(module, name) else {
+            let Some(target) = hromatite_win::sys::export_address(module, name) else {
                 log::log_tag("kiero", &format!("hook_module_export: {module}!{name} not found"));
                 return false;
             };
             let detour = present_detour as *const () as usize;
             let installed = log::guard("kiero::hook_module_export", || {
-                crate::raw::hook::hook_inline(target, detour)
+                hromatite_hook::inline::hook_inline(target, detour)
             })
             .flatten();
             let Some(hook) = installed else {
@@ -588,8 +588,8 @@ pub fn inside_frame() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi;
-    use crate::raw::vmt::{Live, TableMem};
+    use hromatite_win::ffi;
+    use hromatite_hook::vmt::{Live, TableMem};
     use std::time::Duration;
 
     /// Serialises the tests that touch the process-wide render slot; the

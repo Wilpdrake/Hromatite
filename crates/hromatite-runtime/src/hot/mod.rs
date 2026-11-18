@@ -1,6 +1,11 @@
-//! Pure generation and hot-configuration contracts, testable on the host.
+//! Hot-reload: the pure generation state machine plus the resident router.
+//!
+//! [`HotReload`] and its configuration are pure and host-testable (no `unsafe`,
+//! no OS calls). [`router`] is the Windows side that maps feature images, runs
+//! their canaries and retires generations; it carries its `unsafe` in the
+//! image-mapping module, not here.
 
-#![forbid(unsafe_code)]
+pub mod router;
 
 /// Host-owned settings. Feature flags are sent over `configure` using the
 /// lowercase names returned by [`HotConfig::feature_settings`].

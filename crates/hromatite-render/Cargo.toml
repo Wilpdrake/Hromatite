@@ -1,0 +1,23 @@
+[package]
+name = "hromatite-render"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "In-game rendering layer: vendored nuklear, kiero-style Present hook, D3D11 backend"
+
+# The crate owns every graphics-facing symbol (COM, DXGI, D3D11, User32, the
+# nuklear C shim). Nothing outside it links a graphics library, so the domain
+# crates stay testable on the host without a GPU or a window.
+[dependencies]
+hromatite-hook = { path = "../hromatite-hook" }
+hromatite-win = { path = "../hromatite-win" }
+
+[build-dependencies]
+cc = "1"
+
+[lib]
+name = "hromatite_render"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

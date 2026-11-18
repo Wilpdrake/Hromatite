@@ -43,6 +43,8 @@ use core::mem::size_of;
 
 use hromatite_abi::build::{Il2cppAnchors, Layout};
 
+// `procs` is only touched on the target build; the host build has no module.
+#[cfg(target_os = "windows")]
 use crate::procs;
 use crate::safe;
 

@@ -1,0 +1,29 @@
+[package]
+name = "hromatite-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Resident Hromatite runtime: startup orchestration, tick, hot-reload router, console"
+
+# The resident is the only crate that sees the whole payload: it wires the
+# IL2CPP domain, the renderer, the EAC model and the command channel together.
+# `hromatite-dll` links this crate and nothing else.
+[dependencies]
+hromatite-abi = { path = "../hromatite-abi" }
+hromatite-commands = { path = "../hromatite-commands" }
+hromatite-core = { path = "../hromatite-core" }
+hromatite-eac = { path = "../hromatite-eac" }
+hromatite-hook = { path = "../hromatite-hook" }
+hromatite-render = { path = "../hromatite-render" }
+hromatite-win = { path = "../hromatite-win" }
+
+[lib]
+name = "hromatite_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hot-smoke"
+path = "src/bin/hot_smoke.rs"
+required-features = []
+
+[lints]
+workspace = true

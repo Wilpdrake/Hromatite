@@ -229,8 +229,8 @@ mod imp {
         parse_feature_manifest, parse_reload_request, parse_versioned_name, replace_config,
     };
     use crate::hot::{Fault, HotConfig, HotReload, Phase, Tick};
-    use crate::raw::localmap::FeatureImage;
-    use crate::symbols;
+    use crate::localmap::FeatureImage;
+    use hromatite_core::symbols;
     use hromatite_abi::{HostApiV1, STATUS_OK};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -241,10 +241,10 @@ mod imp {
         std::sync::atomic::AtomicBool::new(false);
 
     fn loaded_game_assembly_hash() -> Result<String, String> {
-        let wide_name = crate::ffi::wide(crate::GAME_ASSEMBLY);
+        let wide_name = hromatite_core::ffi::wide(hromatite_core::GAME_ASSEMBLY);
         // SAFETY: `wide_name` is NUL terminated and lives throughout both calls;
         // GetModuleHandleW is a borrowed process-owned module handle.
-        let module = unsafe { crate::ffi::GetModuleHandleW(wide_name.as_ptr()) };
+        let module = unsafe { hromatite_core::ffi::GetModuleHandleW(wide_name.as_ptr()) };
         if module.is_null() {
             return Err("GameAssembly.dll is not loaded".into());
         }
@@ -252,7 +252,7 @@ mod imp {
         // SAFETY: path is a correctly sized writable UTF-16 output buffer;
         // Wine/Windows reports the exact number of units excluding NUL.
         let length =
-            unsafe { crate::ffi::GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) }
+            unsafe { hromatite_core::ffi::GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) }
                 as usize;
         if length == 0 {
             return Err("GetModuleFileNameW(GameAssembly) returned an empty path".into());
@@ -260,8 +260,8 @@ mod imp {
         if length >= path.len() {
             return Err("GetModuleFileNameW(GameAssembly) path is truncated".into());
         }
-        let path = crate::ffi::wide_to_string(&path[..length]);
-        crate::sha256::hex_digest_file(&path)
+        let path = hromatite_core::ffi::wide_to_string(&path[..length]);
+        hromatite_core::sha256::hex_digest_file(&path)
             .map_err(|error| format!("hash loaded GameAssembly at {path}: {error}"))
     }
 
@@ -336,7 +336,7 @@ mod imp {
 
         fn report(&mut self) {
             if self.dirty {
-                crate::log::log_tag("hot", &self.status());
+                hromatite_core::log::log_tag("hot", &self.status());
                 self.dirty = false;
             }
         }
@@ -346,14 +346,14 @@ mod imp {
                 Ok(version) => {
                     self.failed = self.pending.take().and_then(|pending| pending.image);
                     self.last_error = Some(reason.clone());
-                    crate::log::log_tag(
+                    hromatite_core::log::log_tag(
                         "hot",
                         &format!("generation {version} not activated: {reason}"),
                     );
                 }
                 Err(problem) => {
                     self.last_error = Some(format!("state error {problem:?}: {reason}"));
-                    crate::log::log_tag("hot", self.last_error.as_deref().unwrap_or("state error"));
+                    hromatite_core::log::log_tag("hot", self.last_error.as_deref().unwrap_or("state error"));
                 }
             }
             self.dirty = true;
@@ -408,7 +408,7 @@ mod imp {
                 Ok(bytes) => bytes,
                 Err(reason) => return self.fail_pending(reason),
             };
-            let actual_sha = crate::sha256::hex_digest(&bytes);
+            let actual_sha = hromatite_core::sha256::hex_digest(&bytes);
             if !actual_sha.starts_with(&artifact.sha256) {
                 return self.fail_pending(format!(
                     "SHA mismatch: expected {}, got {actual_sha}",
@@ -427,7 +427,7 @@ mod imp {
                 Ok(()) => {}
                 Err(problem) => return self.fail_pending(format!("begin canary: {problem:?}")),
             }
-            let loaded = crate::log::guard("hot::FeatureImage::load", || {
+            let loaded = hromatite_core::log::guard("hot::FeatureImage::load", || {
                 FeatureImage::load_verified(&path, &actual_sha)
             });
             let image = match loaded {
@@ -478,7 +478,7 @@ mod imp {
             }
             // SAFETY: localmap validated this table inside the still-owned image;
             // host storage intentionally lives for the whole process.
-            let initialized = crate::log::guard("hot::feature::init", || unsafe {
+            let initialized = hromatite_core::log::guard("hot::feature::init", || unsafe {
                 ((*api).init)(generation.host, version)
             });
             let init_status = initialized.unwrap_or(hromatite_abi::STATUS_ERROR);
@@ -491,7 +491,7 @@ mod imp {
                 for setting in self.config.feature_settings() {
                     let enabled = if setting.enabled { "1" } else { "0" };
                     // SAFETY: the byte slices remain live for this synchronous callback.
-                    let status = crate::log::guard("hot::feature::configure", || unsafe {
+                    let status = hromatite_core::log::guard("hot::feature::configure", || unsafe {
                         ((*api).configure)(
                             setting.key.as_ptr() as *const i8,
                             setting.key.len(),
@@ -511,7 +511,7 @@ mod imp {
                 let command = b"feature";
                 // SAFETY: the command is valid borrowed UTF-8 and the loaded
                 // generation stays owned by `pending` throughout this call.
-                canary_status = crate::log::guard("hot::feature::canary", || unsafe {
+                canary_status = hromatite_core::log::guard("hot::feature::canary", || unsafe {
                     ((*api).dispatch)(command.as_ptr() as *const i8, command.len())
                 })
                 .unwrap_or(hromatite_abi::STATUS_ERROR);
@@ -524,7 +524,7 @@ mod imp {
                     "generation {version} init/canary failed with status {canary_status} at {base:#x}+{size:#x}"
                 ));
             }
-            crate::log::log_tag("hot", &format!("generation {version} canary OK"));
+            hromatite_core::log::log_tag("hot", &format!("generation {version} canary OK"));
             if self.model.previous_version().is_some() {
                 match self.model.retire_previous() {
                     Ok(_) => {
@@ -535,7 +535,7 @@ mod imp {
                         }
                     }
                     Err(problem) => {
-                        crate::log::log_tag(
+                        hromatite_core::log::log_tag(
                             "hot",
                             &format!("previous generation is not drained: {problem:?}"),
                         );
@@ -549,7 +549,7 @@ mod imp {
                     self.previous = self.active.take();
                     self.active = generation;
                     self.dirty = true;
-                    crate::log::log_tag(
+                    hromatite_core::log::log_tag(
                         "hot",
                         &format!("generation {version} is active; previous available for rollback"),
                     );
@@ -635,7 +635,7 @@ mod imp {
                 .as_ref()
                 .map(|generation| generation.image.api());
             let result = api.map(|api| {
-                crate::log::guard("hot::feature::dispatch", || {
+                hromatite_core::log::guard("hot::feature::dispatch", || {
                     // SAFETY: active image is retained until after model.leave, and
                     // command bytes are borrowed only for this synchronous dispatch.
                     unsafe { ((*api).dispatch)(command.as_ptr() as *const i8, command.len()) }
@@ -661,7 +661,7 @@ mod imp {
                 .as_ref()
                 .map(|generation| generation.image.api());
             let result = api.map(|api| {
-                crate::log::guard("hot::feature::tick", || {
+                hromatite_core::log::guard("hot::feature::tick", || {
                     // SAFETY: active generation cannot retire during this guarded tick.
                     unsafe { ((*api).tick)() }
                 })
@@ -687,7 +687,7 @@ mod imp {
                 .as_ref()
                 .map(|generation| generation.image.api());
             let result = api.map(|api| {
-                crate::log::guard("hot::feature::frame", || {
+                hromatite_core::log::guard("hot::feature::frame", || {
                     // SAFETY: active generation cannot retire during this guarded call.
                     unsafe { ((*api).frame)() }
                 })
@@ -707,7 +707,7 @@ mod imp {
                 let api = generation.image.api();
                 for setting in config.feature_settings() {
                     let value = if setting.enabled { "1" } else { "0" };
-                    let status = crate::log::guard("hot::configure:active", || {
+                    let status = hromatite_core::log::guard("hot::configure:active", || {
                         // SAFETY: both generation values stay mapped throughout this call.
                         unsafe {
                             ((*api).configure)(
@@ -745,7 +745,7 @@ mod imp {
 
     fn now_ms() -> u64 {
         // SAFETY: parameterless Win32 millisecond counter.
-        unsafe { crate::ffi::GetTickCount64() }
+        unsafe { hromatite_core::ffi::GetTickCount64() }
     }
 
     fn phase_name(phase: Phase) -> &'static str {
@@ -767,7 +767,7 @@ mod imp {
         if existing != 0 {
             return Some(existing as *const HostApiV1);
         }
-        let host = Box::new(crate::raw::hostapi::current_host_api()?);
+        let host = Box::new(crate::hostapi::current_host_api()?);
         let pointer = Box::into_raw(host);
         match HOST_POINTER.compare_exchange(
             0,
@@ -875,11 +875,11 @@ mod imp {
         match actual {
             Ok(actual) if actual == symbols::GAMEASSEMBLY_SHA256 => {
                 LIVE_BUILD_VERIFIED.store(true, Ordering::Release);
-                crate::log::log_tag("hot", "live GameAssembly SHA-256 verified");
+                hromatite_core::log::log_tag("hot", "live GameAssembly SHA-256 verified");
                 true
             }
             Ok(actual) => {
-                crate::log::log_tag(
+                hromatite_core::log::log_tag(
                     "hot",
                     &format!(
                         "loaded GameAssembly SHA mismatch: loaded {actual}, resident {}",
@@ -889,7 +889,7 @@ mod imp {
                 false
             }
             Err(error) => {
-                crate::log::log_tag(
+                hromatite_core::log::log_tag(
                     "hot",
                     &format!("loaded GameAssembly not validated: {error}"),
                 );
@@ -963,12 +963,12 @@ mod imp {
         let api = generation.image.api();
         // SAFETY: the model has rejected all new entries and in_flight==0.
         let shutdown =
-            crate::log::guard("hot::feature::shutdown", || unsafe { ((*api).shutdown)() });
+            hromatite_core::log::guard("hot::feature::shutdown", || unsafe { ((*api).shutdown)() });
         if shutdown.is_none() {
             return Err("feature shutdown faulted".into());
         }
         // SAFETY: shutdown returned and migration no longer dispatches to this image.
-        crate::log::guard("hot::feature::retire", || unsafe {
+        hromatite_core::log::guard("hot::feature::retire", || unsafe {
             generation.image.retire()
         })
         .unwrap_or_else(|| Err("feature image detach faulted".into()))
@@ -988,7 +988,7 @@ mod imp {
                     path: PathBuf::from(&path),
                 };
                 if let Err(error) = runtime.schedule(artifact) {
-                    crate::log::log_tag("hot", &error);
+                    hromatite_core::log::log_tag("hot", &error);
                 }
             }
         }
@@ -1024,7 +1024,7 @@ mod imp {
                 };
                 if selection == ReloadSelection::Status {
                     let status = runtime.status();
-                    crate::log::log_tag("hot", &status);
+                    hromatite_core::log::log_tag("hot", &status);
                     return Some(vec![status]);
                 }
                 let requested = match selection {
@@ -1125,7 +1125,7 @@ mod imp {
         if paths.len() < 2 || rounds == 0 || rounds > 64 {
             return Err("hot-smoke requires at least two DLL paths and 1..64 rounds".into());
         }
-        let host = crate::raw::hostapi::smoke_host_api();
+        let host = crate::hostapi::smoke_host_api();
         let mut previous: Option<ImageGeneration> = None;
         let mut output = Vec::new();
         for generation in 0..rounds {
@@ -1271,7 +1271,7 @@ pub fn command(line: &str) -> Option<Vec<String>> {
 mod tests {
     #[test]
     fn manifest_drives_latest_and_preserves_the_artifact_identity() {
-        let expected = crate::symbols::GAMEASSEMBLY_SHA256.to_string();
+        let expected = hromatite_core::symbols::GAMEASSEMBLY_SHA256.to_string();
         let sha = "a".repeat(64);
         let valid = format!(
             "GENERATION=4\nSHA256={sha}\nFILE=/tmp/features-4-aaaaaaaaaaaa.dll\nGAME_SHA256={expected}\nABI=1\n"

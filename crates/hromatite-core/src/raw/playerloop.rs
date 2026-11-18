@@ -15,7 +15,7 @@ pub struct Entry {
     pub loop_condition_function: usize,
 }
 
-use crate::{console, log};
+use crate::log;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -279,7 +279,7 @@ pub unsafe extern "system" fn player_loop_detour() {
     // SAFETY: original is the trampoline for the same no-argument native
     // PlayerLoop updateFunction that was returned by Unity.
     let f: unsafe extern "system" fn() = unsafe { core::mem::transmute(original) };
-    let original_first = crate::raw::hot::original_first_required();
+    let original_first = crate::hook::original_first_required();
     if original_first {
         // SAFETY: the trampoline for the selected native updateFunction has already
         // been validated; the reload transition must not delay this real game call.
@@ -424,10 +424,6 @@ fn try_install(selector: &str) -> Result<Entry, ProbeError> {
         ))
     })?;
     crate::hook::prepare_tick();
-    log::log_tag(
-        "playerloop",
-        &format!("console file {}", console::cmd_path().display()),
-    );
     PLAYER_HITS.store(0, Ordering::Relaxed);
     PLAYER_TID.store(0, Ordering::Relaxed);
     PLAYER_START_MS.store(now_ms(), Ordering::Relaxed);

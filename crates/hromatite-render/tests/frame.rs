@@ -3,9 +3,9 @@
 //! They run the real C shim: a frame is built, converted and copied out exactly
 //! the way the resident will do it. No GPU, no hook, no game.
 
-use hromatite_nuklear::{Input, Keys, Nk, Ui};
+use hromatite_render::nk::{Input, Keys, Nk, Ui};
 
-fn frame_with(nk: &mut Nk, x: f32, y: f32, left_down: bool) -> hromatite_nuklear::Frame {
+fn frame_with(nk: &mut Nk, x: f32, y: f32, left_down: bool) -> hromatite_render::nk::Frame {
     let input = Input {
         mouse_x: x,
         mouse_y: y,
@@ -122,7 +122,7 @@ fn distance_is_clamped_to_range() {
     nk.ui_mut().distance = 1.0e6;
     let _ = nk.frame(&Input::default());
     assert!(
-        nk.ui().distance <= hromatite_nuklear::MAX_DISTANCE,
+        nk.ui().distance <= hromatite_render::nk::MAX_DISTANCE,
         "distance must never exceed MAX_DISTANCE, got {}",
         nk.ui().distance
     );
@@ -130,7 +130,7 @@ fn distance_is_clamped_to_range() {
     nk.ui_mut().distance = -1.0e6;
     let _ = nk.frame(&Input::default());
     assert!(
-        nk.ui().distance >= hromatite_nuklear::MIN_DISTANCE,
+        nk.ui().distance >= hromatite_render::nk::MIN_DISTANCE,
         "distance must never go below MIN_DISTANCE, got {}",
         nk.ui().distance
     );
@@ -162,7 +162,7 @@ fn non_ascii_player_names_are_sanitized() {
 
     // And the frame itself must survive a directly-assigned non-ASCII name.
     let ui = nk.ui_mut();
-    ui.players.push(hromatite_nuklear::Player {
+    ui.players.push(hromatite_render::nk::Player {
         name: String::from("Прямое имя"),
         distance: 3.0,
     });

@@ -33,7 +33,6 @@
 //! n × (<addr: u64 LE> + <rec_len bytes>)
 //! ```
 
-#![cfg_attr(not(windows), allow(dead_code))]
 
 use core::sync::atomic::{AtomicU8, Ordering};
 

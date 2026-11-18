@@ -13,7 +13,7 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use hromatite_nuklear::Frame;
+use crate::nk::Frame;
 
 /// `sizeof(struct nk_d3d11_vertex)`: `pos[2] f32, uv[2] f32, col[4] u8`.
 pub const VERTEX_SIZE: usize = 20;
@@ -290,12 +290,12 @@ pub use imp::{find_swapchain, swapchain_desc, Backend, SavedState};
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use crate::{log, veh};
+    use hromatite_win::{log, veh};
 
     /// Read `vtable[index]` for a COM object.
     fn slot(object: usize, index: u32) -> Option<usize> {
-        let table = crate::safe::read_u64(object)? as usize;
-        crate::safe::read_u64(table + (index as usize) * 8)
+        let table = hromatite_win::memory::read_u64(object)? as usize;
+        hromatite_win::memory::read_u64(table + (index as usize) * 8)
             .filter(|value| *value >= 0x10000)
             .map(|value| value as usize)
     }
@@ -387,9 +387,9 @@ mod imp {
     /// land inside the module. Candidates are then validated by a real
     /// `GetDesc` call, which is the definitive test.
     pub fn find_swapchain() -> Option<usize> {
-        let (base, size) = crate::procs::own_module("dxgi.dll")?;
+        let (base, size) = hromatite_win::procs::own_module("dxgi.dll")?;
         let end = base.checked_add(size)?;
-        let regions = crate::procs::regions(8192);
+        let regions = hromatite_win::procs::regions(8192);
         // Executable ranges of dxgi.dll: a swapchain slot must point there.
         let exec: Vec<(usize, usize)> = regions
             .iter()
@@ -429,7 +429,7 @@ mod imp {
             let mut offset = 0usize;
             while offset < region.size && scanned < BUDGET {
                 let want = (region.size - offset).min(0x10000);
-                let Some(chunk) = crate::safe::read_bytes(region.base + offset, want) else {
+                let Some(chunk) = hromatite_win::memory::read_bytes(region.base + offset, want) else {
                     offset += want;
                     scanned += want;
                     continue;
@@ -481,7 +481,7 @@ mod imp {
     ) -> Option<usize> {
         let mut slots = [0u64; SWAPCHAIN_SLOTS as usize];
         for (index, slot) in slots.iter_mut().enumerate() {
-            let value = crate::safe::read_u64(table + index * 8)? as usize;
+            let value = hromatite_win::memory::read_u64(table + index * 8)? as usize;
             if value < 0x10000 || !in_exec(value) {
                 return None;
             }
@@ -745,7 +745,7 @@ mod imp {
                     let Some(function) = slot(device, index) else {
                         continue;
                     };
-                    let bytes = crate::safe::read_upto(function, 12);
+                    let bytes = hromatite_win::memory::read_upto(function, 12);
                     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                     log::log_tag(
                         "d3d11",
@@ -1639,7 +1639,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hromatite_nuklear::{DrawCommand, FrameStats, Vertex};
+    use crate::nk::{DrawCommand, FrameStats, Vertex};
 
     #[test]
     fn projection_maps_screen_corners() {

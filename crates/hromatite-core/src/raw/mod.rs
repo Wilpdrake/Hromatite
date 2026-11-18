@@ -9,22 +9,13 @@
 //! callers therefore retain the existing VEH guard around scans. `Option` and
 //! `Result` remain the only contract for rejected addresses and OS failures.
 
-pub use hromatite_hook::vmt;
 #[allow(unused_imports)]
 pub use hromatite_win::{ffi, memory, memscan, sys};
 
-pub mod console;
-pub mod d3d11;
-pub(crate) mod d3d11_shaders;
 pub mod discover;
 pub mod gcguard;
 pub mod hook;
-pub mod hostapi;
-pub mod hot;
 pub mod il2cpp;
-// Kiero-style presentation hook: a VMT swap of IDXGISwapChain::Present.
-pub mod kiero;
-pub mod localmap;
 // EAC_M3_DUMP diagnostic (raw byte dumps of the class table for
 // `~/EAC-RE/tools/m3dump_analyze.py`). Kept from `eac-cut`; the env-gated call
 // site is not wired on master, so nothing references it yet.
@@ -32,4 +23,4 @@ pub mod localmap;
 pub mod m3dump;
 pub mod photon;
 pub mod playerloop;
-pub mod ui;
+

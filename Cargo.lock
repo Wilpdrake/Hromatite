@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "Hromatite"
-version = "0.1.0"
-dependencies = [
- "hromatite-core",
-]
-
-[[package]]
 name = "cc"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -40,7 +33,7 @@ dependencies = [
  "hromatite-abi",
  "hromatite-commands",
  "hromatite-hook",
- "hromatite-nuklear",
+ "hromatite-render",
  "hromatite-win",
 ]
 
@@ -48,8 +41,7 @@ dependencies = [
 name = "hromatite-dll"
 version = "0.1.0"
 dependencies = [
- "hromatite-core",
- "hromatite-eac",
+ "hromatite-runtime",
 ]
 
 [[package]]
@@ -78,10 +70,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "hromatite-nuklear"
+name = "hromatite-injector"
+version = "0.1.0"
+dependencies = [
+ "hromatite-win",
+]
+
+[[package]]
+name = "hromatite-render"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "hromatite-hook",
+ "hromatite-win",
+]
+
+[[package]]
+name = "hromatite-runtime"
+version = "0.1.0"
+dependencies = [
+ "hromatite-abi",
+ "hromatite-commands",
+ "hromatite-core",
+ "hromatite-eac",
+ "hromatite-hook",
+ "hromatite-render",
+ "hromatite-win",
 ]
 
 [[package]]

@@ -34,8 +34,8 @@ fn hex_nibble(value: u8) -> Option<u8> {
 /// `buildinfo` validates the compiled descriptor against the image first (no
 /// hashing on the normal path) and falls back to hashing only when it moved.
 pub(crate) fn game_sha_bytes() -> [u8; 32] {
-    if let Some(hex) = crate::buildinfo::loaded_sha_hex()
-        && let Some(bytes) = crate::buildinfo::decode_sha_hex(hex)
+    if let Some(hex) = hromatite_core::buildinfo::loaded_sha_hex()
+        && let Some(bytes) = hromatite_core::buildinfo::decode_sha_hex(hex)
     {
         return bytes;
     }
@@ -44,7 +44,7 @@ pub(crate) fn game_sha_bytes() -> [u8; 32] {
 
 fn compiled_sha_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
-    let text = crate::symbols::GAMEASSEMBLY_SHA256.as_bytes();
+    let text = hromatite_core::symbols::GAMEASSEMBLY_SHA256.as_bytes();
     for (index, slot) in out.iter_mut().enumerate() {
         let Some(high) = text.get(index * 2).and_then(|value| hex_nibble(*value)) else {
             return [0u8; 32];
@@ -76,14 +76,14 @@ extern "system" fn host_log(
 ) {
     let tag = borrowed_lossy(tag, tag_len, MAX_TAG_BYTES);
     let message = borrowed_lossy(message, message_len, MAX_LOG_BYTES);
-    crate::log::log_tag(&tag, &message);
+    hromatite_core::log::log_tag(&tag, &message);
 }
 
 extern "system" fn host_read(address: u64, out: *mut u8, out_len: usize) -> usize {
     if out.is_null() || out_len == 0 || out_len > MAX_IO_BYTES {
         return 0;
     }
-    let bytes = crate::safe::read_upto(address as usize, out_len);
+    let bytes = hromatite_core::safe::read_upto(address as usize, out_len);
     if bytes.is_empty() {
         return 0;
     }
@@ -100,7 +100,7 @@ extern "system" fn host_write(address: u64, data: *const u8, data_len: usize) ->
     // SAFETY: the feature ABI supplies a readable buffer of data_len bytes; the
     // OS-mediated write below does not retain it after this callback returns.
     let bytes = unsafe { core::slice::from_raw_parts(data, data_len) };
-    if crate::safe::write_bytes(address as usize, bytes) {
+    if hromatite_core::safe::write_bytes(address as usize, bytes) {
         data_len
     } else {
         0
@@ -119,7 +119,7 @@ extern "system" fn host_guarded_call(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (args, result);
-        return STATUS_ERROR;
+        STATUS_ERROR
     }
     #[cfg(target_os = "windows")]
     {
@@ -134,23 +134,23 @@ extern "system" fn host_guarded_call(
         // same checked VEH boundary used by the established console commands.
         let call = unsafe {
             match arg_count {
-                0 => crate::veh::call0(address as usize),
-                1 => crate::veh::call1(address as usize, values[0] as usize),
-                2 => crate::veh::call2(address as usize, values[0] as usize, values[1] as usize),
-                3 => crate::veh::call3(
+                0 => hromatite_core::veh::call0(address as usize),
+                1 => hromatite_core::veh::call1(address as usize, values[0] as usize),
+                2 => hromatite_core::veh::call2(address as usize, values[0] as usize, values[1] as usize),
+                3 => hromatite_core::veh::call3(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
                     values[2] as usize,
                 ),
-                4 => crate::veh::call4(
+                4 => hromatite_core::veh::call4(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
                     values[2] as usize,
                     values[3] as usize,
                 ),
-                5 => crate::veh::call5(
+                5 => hromatite_core::veh::call5(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -158,7 +158,7 @@ extern "system" fn host_guarded_call(
                     values[3] as usize,
                     values[4] as usize,
                 ),
-                6 => crate::veh::call6(
+                6 => hromatite_core::veh::call6(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -167,7 +167,7 @@ extern "system" fn host_guarded_call(
                     values[4] as usize,
                     values[5] as usize,
                 ),
-                7 => crate::veh::call7(
+                7 => hromatite_core::veh::call7(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -177,7 +177,7 @@ extern "system" fn host_guarded_call(
                     values[5] as usize,
                     values[6] as usize,
                 ),
-                8 => crate::veh::call8(
+                8 => hromatite_core::veh::call8(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -188,7 +188,7 @@ extern "system" fn host_guarded_call(
                     values[6] as usize,
                     values[7] as usize,
                 ),
-                9 => crate::veh::call9(
+                9 => hromatite_core::veh::call9(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -200,7 +200,7 @@ extern "system" fn host_guarded_call(
                     values[7] as usize,
                     values[8] as usize,
                 ),
-                10 => crate::veh::call10(
+                10 => hromatite_core::veh::call10(
                     address as usize,
                     values[0] as usize,
                     values[1] as usize,
@@ -233,8 +233,8 @@ extern "system" fn host_guarded_call(
 /// Build a stable-by-value table for a newly loaded generation. The caller puts
 /// it in leaked host-owned storage before passing the pointer across the ABI.
 pub(crate) fn current_host_api() -> Option<HostApiV1> {
-    let (ga, ga_size) = crate::procs::own_module(crate::GAME_ASSEMBLY)?;
-    let (up, up_size) = crate::procs::own_module(crate::UNITY_PLAYER)?;
+    let (ga, ga_size) = hromatite_core::procs::own_module(hromatite_core::GAME_ASSEMBLY)?;
+    let (up, up_size) = hromatite_core::procs::own_module(hromatite_core::UNITY_PLAYER)?;
     Some(HostApiV1 {
         struct_size: core::mem::size_of::<HostApiV1>() as u32,
         abi_version: hromatite_abi::ABI_VERSION,
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn game_hash_is_decoded_not_empty() {
         let hash = super::game_sha_bytes();
-        let expected = crate::symbols::GAMEASSEMBLY_SHA256;
+        let expected = hromatite_core::symbols::GAMEASSEMBLY_SHA256;
         assert_eq!(hex(&hash), expected);
         // First four bytes must decode from the same string (build agnostic).
         assert_eq!(hex(&hash[..4]).len(), 8);

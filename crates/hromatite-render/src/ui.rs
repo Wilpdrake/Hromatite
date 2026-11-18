@@ -1,7 +1,7 @@
 //! In-game UI: nuklear panels drawn into the game's own frame.
 //!
 //! The resident owns this, not the hot-reloadable feature image, because the
-//! D3D11 immediate context belongs to the render thread: [`crate::raw::kiero`]
+//! D3D11 immediate context belongs to the render thread: [`crate::kiero`]
 //! hooks `IDXGISwapChain::Present` on that thread and the frame is built and
 //! drawn there. Everything non-`Send` (the nuklear context, the D3D11 objects)
 //! therefore lives in a thread-local the per-frame closure reaches into.
@@ -11,7 +11,7 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use crate::log;
+use hromatite_win::log;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -101,12 +101,12 @@ pub fn install() -> bool {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use crate::ffi::{
+    use hromatite_win::ffi::{
         GetAsyncKeyState, GetClientRect, GetCursorPos, GetForegroundWindow, ScreenToClient,
     };
-    use crate::raw::d3d11::{swapchain_desc, Backend};
+    use crate::d3d11::{swapchain_desc, Backend};
     use core::cell::RefCell;
-    use hromatite_nuklear::{Input, Keys, Nk};
+    use crate::nk::{Input, Keys, Nk};
 
     const VK_LBUTTON: i32 = 0x01;
     const VK_BACK: i32 = 0x08;
@@ -138,19 +138,19 @@ mod imp {
     }
 
     pub fn install() -> bool {
-        let Some(swapchain) = crate::raw::d3d11::find_swapchain() else {
+        let Some(swapchain) = crate::d3d11::find_swapchain() else {
             log::log_tag("ui", "install: no IDXGISwapChain found; UI stays off");
             return false;
         };
         SWAPCHAIN.store(swapchain, Ordering::Release);
-        if !crate::raw::kiero::hook_present_at(swapchain) {
+        if !crate::kiero::hook_present_at(swapchain) {
             log::log_tag("ui", "install: could not hook Present; UI stays off");
             return false;
         }
         HOOKED.store(true, Ordering::Release);
         // Reachable from the Present detour; the closure itself is `Send`, the
         // non-`Send` state lives in the thread-local above.
-        crate::raw::kiero::render_each(present_frame);
+        crate::kiero::render_each(present_frame);
         log::log_tag(
             "ui",
             &format!("install: Present hooked at swapchain {swapchain:#x}; nuklear UI active"),
