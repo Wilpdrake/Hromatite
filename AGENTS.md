@@ -4722,3 +4722,19 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   swapchain игры (скан кучи за объектом с vtable, указывающей в код `dxgi.dll`) — в плане
   как часть родителя, не сделан.
 - **`feat/nuklear`** (worktree `Hromatite-nuklear`) ещё работает на момент записи.
+
+### 2026-11-18 — Дерево слияния трёх веток проверено целиком (всё зелёное)
+
+- Коммит этого шага: документо-запись. Ветки по-прежнему **не влиты** в master.
+- Проверка в отдельном worktree `~/.hermes/profiles/blank/cache/scratch/mergetest`
+  (master + `feat/kiero` + `feat/safetyhook` + `feat/nuklear`, слияния прошли без конфликтов):
+  * `cargo test --workspace --target x86_64-unknown-linux-gnu --offline` — всё зелёное:
+    core **215**, nuklear 3+10, features 24, eac 118+1+3, commands 4, abi 8;
+  * `cargo build --workspace --release --target x86_64-pc-windows-gnu --offline` — OK
+    (`hromatite.dll` 2 526 454 Б, `hromatite_features.dll` 2 767 830 Б);
+  * `cargo clippy --workspace --all-targets --release --target x86_64-pc-windows-gnu
+    -- -D warnings` — чисто;
+  * `python3 tools/test_buildgen.py` — **13/13 OK**.
+- Итог: три ветки совместимы, интеграционных конфликтов и регрессий нет. Осталось решение
+  пользователя: (а) сливать ли в master; (б) патчить ли vtable `dxgi.dll` на месте
+  (как сделано в `feat/kiero`) или переделывать на копию таблицы на объект.
