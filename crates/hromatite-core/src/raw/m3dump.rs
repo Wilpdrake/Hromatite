@@ -198,6 +198,7 @@ mod win {
             increasing: 0,
             filled: 0,
         };
+        let name_offset = m3::layout().map(|layout| layout.class_name as usize);
         let mut previous = 0usize;
         for index in 0..span {
             let Some(entry) = safe::read_usize(table + index * 8) else {
@@ -209,7 +210,10 @@ mod win {
             previous = entry;
             if entry >= 0x1_0000 && safe::readable_at(entry) {
                 candidate.filled += 1;
-                if let Some(name) = safe::read_usize(entry + m3::CLASS_NAME_OFF)
+                // The `name` slot is per build: without a descriptor there is
+                // nothing to probe for, so the candidate is only scored on shape.
+                if let Some(name_offset) = name_offset
+                    && let Some(name) = safe::read_usize(entry + name_offset)
                     && name >= 0x1_0000
                     && safe::ascii_at(name, 128).is_some_and(|text| !text.is_empty())
                 {
@@ -232,13 +236,18 @@ mod win {
     pub(super) fn candidates(base: usize, size: usize) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = Vec::new();
 
-        let legacy = base.saturating_add(m3::CLASS_TABLE_RVA as usize);
-        if let Some(slot) = safe::read_usize(legacy)
-            && slot >= 0x1_0000
+        // `s_TypeInfoDefinitionTable` slot of the loaded build, when known.
+        if let Some(rva) = m3::anchors().map(|anchors| anchors.class_table as usize)
+            && rva != 0
         {
-            push(&mut out, score(slot, SCORE_SPAN));
+            let legacy = base.saturating_add(rva);
+            if let Some(slot) = safe::read_usize(legacy)
+                && slot >= 0x1_0000
+            {
+                push(&mut out, score(slot, SCORE_SPAN));
+            }
+            push(&mut out, score(legacy, SCORE_SPAN));
         }
-        push(&mut out, score(legacy, SCORE_SPAN));
         if let Some(table) = m3::class_table() {
             push(&mut out, score(table, SCORE_SPAN));
         }
@@ -426,8 +435,10 @@ mod win {
                         let names: Vec<String> = (0..3)
                             .filter_map(|i| {
                                 let pointer = safe::read_usize(value + i * 8)?;
-                                // `Il2CppClass.methods` → `MethodInfo.name`.
-                                string_at(pointer.checked_add(m3::METHOD_NAME_OFF)?)
+                                // `Il2CppClass.methods` → `MethodInfo.name`; the
+                                // slot comes from the build descriptor.
+                                let name_offset = m3::layout()?.method_name as usize;
+                                string_at(pointer.checked_add(name_offset)?)
                                     .filter(|name| name.len() >= 3 && identifier_like(name))
                             })
                             .collect();

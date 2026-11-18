@@ -1,0 +1,2543 @@
+{
+ "schema": "hromatite/il2cpp-export-names/1",
+ "source": "Ghidra 12.1.2 project /11.17/GameAssembly.dll; names transferred from the previous build's map by call-graph isomorphism + relocation-masked body matching",
+ "gameassembly_sha256": "245768f252146ef463b539e6c613b4955b7e829a4afd4dc0a2a2939aef3baadb",
+ "previous_build": "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b",
+ "unity_version": "6000.0.67f1",
+ "image_base": "0x180000000",
+ "export_count": 251,
+ "distinct_addresses": 226,
+ "named_addresses": 222,
+ "renamed": 207,
+ "validation": {
+  "method": "1) 46+ tiny exports matched by exact relocation-masked body; 2) monotone DP over the remaining exports scored by masked body similarity; 3) every pair re-checked by call-graph isomorphism (mapped callee set of the old function == callee set of the new one).",
+  "call_graph_agreement": "223 of 224 pairs; the single exception (il2cpp_gc_set_mode) is proven by its own body: mode switch calling gc_enable(0xc2ab40)/gc_disable(0xc2ab90) and storing the mode global.",
+  "surviving_export_names": "3 addresses kept un-obfuscated names (il2cpp_free, il2cpp_gchandle_get_target, il2cpp_native_stack_trace) and the transfer predicted exactly those 3 (3/3).",
+  "layout_changes_in_this_build": [
+   "Il2CppClass.parent moved +0x10 -> +0xa0 (three parent-chain walkers agree)",
+   "Il2CppClass.fields +0x80 -> +0x88, FieldInfo stride 0x28 -> 0x20 {name@0, offset@8, type@0x10, token@0x18}",
+   "Il2CppClass.properties +0x90 -> +0x80, PropertyInfo stride 0x30, name@+0x10",
+   "Il2CppClass.methods +0x50 -> +0x58 (method_count @+0x120), interfaces @+0x90 (count @+0x12c)",
+   "MethodInfo.name +0x18 -> +0x20; token @+0x48, flags @+0x4c, param_count @+0x52 unchanged"
+  ],
+  "not_named": [
+   "0xbedb0",
+   "0xa9890",
+   "0x223a10",
+   "0x291f0"
+  ]
+ },
+ "entries": [
+  {
+   "addr": "0x180003540",
+   "rva": "0x3540",
+   "exports": [
+    "Ic_EDrqUlfu",
+    "dKbBoVXMbGH",
+    "uNtQszkiYol"
+   ],
+   "real_name": "il2cpp_object_get_class",
+   "confidence": "transfer:shape/alias-group",
+   "evidence": "structural transfer from 13632 (il2cpp_object_get_class): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180003570",
+   "rva": "0x3570",
+   "exports": [
+    "pnsYUtEuROP"
+   ],
+   "real_name": "il2cpp_class_get_static_field_data",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 13680 (il2cpp_class_get_static_field_data): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180003dc0",
+   "rva": "0x3dc0",
+   "exports": [
+    "JaJTdfxigcy",
+    "KJozPUyLyNb",
+    "QLJiMTROIGu",
+    "WTRYazoTOJl",
+    "aBBbIKrUhtV",
+    "dWRWgDUHPQb",
+    "fxfxBSbKIxS",
+    "pBiSRokHQkM"
+   ],
+   "real_name": "JaJTdfxigcy",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180019ea0",
+   "rva": "0x19ea0",
+   "exports": [
+    "xuZfvAudoga"
+   ],
+   "real_name": "il2cpp_array_length",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 106144 (il2cpp_array_length): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800291f0",
+   "rva": "0x291f0",
+   "exports": [
+    "FhFrjYQlnVI",
+    "rcYBxApbcPu"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov eax,[rcx+0x28]; ret (dword). Old build read qword +0x28; layout changed, transfer rejected.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180029200",
+   "rva": "0x29200",
+   "exports": [
+    "CKYCJLH_zrq",
+    "ElpceaUVydO",
+    "OVtDvqNeiUd",
+    "VsxW_OYdHnR",
+    "jKqWWKdLqzM",
+    "mBAApDnqgLH",
+    "tZOpEAGFRtk"
+   ],
+   "real_name": "il2cpp_class_get_namespace",
+   "confidence": "transfer:shape/alias-group",
+   "evidence": "structural transfer from 168448 (il2cpp_class_get_namespace): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180029240",
+   "rva": "0x29240",
+   "exports": [
+    "RfoshspXkim",
+    "_bBaJeBPOTR"
+   ],
+   "real_name": "il2cpp_method_get_name",
+   "confidence": "transfer:layout-shifted",
+   "evidence": "MethodInfo.name is +0x20 in this build (class_get_method_from_name strcmps [mi+0x20]); FieldInfo is now {name@0, offset@8, type@0x10} stride 0x20, so no field member sits at +0x20",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18008a720",
+   "rva": "0x8a720",
+   "exports": [
+    "ZIGkOEXDRIH"
+   ],
+   "real_name": "il2cpp_string_length",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 567008 (il2cpp_string_length): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18008ace0",
+   "rva": "0x8ace0",
+   "exports": [
+    "MmSpcUnvpiT",
+    "ViROpqnSqLU",
+    "XTPQdFmATHC",
+    "wLAfFeIwFAw"
+   ],
+   "real_name": "il2cpp_field_get_type",
+   "confidence": "transfer:layout-shifted",
+   "evidence": "FieldInfo in this build is {name@0, offset@8, type@0x10, token@0x18} stride 0x20; il2cpp_field_get_value @0xbbe020 reads the type pointer at [field+0x10] and the flags at [type+0x8], so this +0x10 getter is il2cpp_field_get_type (4 export names fold here). Old build's +0x10 fold was class_get_parent+field_get_name; parent moved to +0xa0.",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800a9890",
+   "rva": "0xa9890",
+   "exports": [
+    "pZKeRUysOcO"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov eax,[rcx+0x24]; ret. Old build 0xa3950 read dword +0x20 -> offset shifted; unnamed (no proof).",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800bedb0",
+   "rva": "0xbedb0",
+   "exports": [
+    "sDsLuohUtMT",
+    "xIqUhMtGGKe"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov rax,[rcx+0x48]; ret (2 export names fold here). Old build 0xaf7a0 read dword +0x1c -> API changed; unnamed (no proof).",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x1800bf6d0",
+   "rva": "0xbf6d0",
+   "exports": [
+    "SgxZGWHVeWV"
+   ],
+   "real_name": "il2cpp_method_get_token",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 783904 (il2cpp_method_get_token): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800c3580",
+   "rva": "0xc3580",
+   "exports": [
+    "eAJcgmnkkcq"
+   ],
+   "real_name": "il2cpp_image_get_filename",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 804784 (il2cpp_image_get_filename): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1800c35b0",
+   "rva": "0xc35b0",
+   "exports": [
+    "eQ_udtGRAV_"
+   ],
+   "real_name": "il2cpp_class_get_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 805392 (il2cpp_class_get_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18012c750",
+   "rva": "0x12c750",
+   "exports": [
+    "NNLAeRmGNQU"
+   ],
+   "real_name": "il2cpp_class_get_parent",
+   "confidence": "transfer:layout-shifted",
+   "evidence": "klass+0xa0 is walked as parent by class_get_property_from_name, class_get_field_from_name and class_get_method_from_name; the old build read parent at +0x10",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x18015d580",
+   "rva": "0x15d580",
+   "exports": [
+    "JrescIyCPri"
+   ],
+   "real_name": "il2cpp_class_get_userdata_offset",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 1429024 (il2cpp_class_get_userdata_offset): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180162620",
+   "rva": "0x162620",
+   "exports": [
+    "AHgVbbqKKhB"
+   ],
+   "real_name": "AHgVbbqKKhB",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180191fc0",
+   "rva": "0x191fc0",
+   "exports": [
+    "WRkXopXdVXK",
+    "fOOZwLEcXDn",
+    "mNuRKgiSKRJ"
+   ],
+   "real_name": "il2cpp_object_header_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 1644656 (il2cpp_object_header_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180223a10",
+   "rva": "0x223a10",
+   "exports": [
+    "xyyDIMsQIqo"
+   ],
+   "real_name": null,
+   "confidence": "unknown",
+   "evidence": "mov eax,[rcx]; ret. New address, absent in the old build; stub idx 150 is an ordering hint only.",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180234bd0",
+   "rva": "0x234bd0",
+   "exports": [
+    "NsGryMJjlqe"
+   ],
+   "real_name": "il2cpp_gc_has_strict_wbarriers",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 2346304 (il2cpp_gc_has_strict_wbarriers): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x1804cc880",
+   "rva": "0x4cc880",
+   "exports": [
+    "SlckClpXoIK"
+   ],
+   "real_name": "il2cpp_image_get_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 5029232 (il2cpp_image_get_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a54560",
+   "rva": "0xa54560",
+   "exports": [
+    "VqvssDaysEJ"
+   ],
+   "real_name": "il2cpp_string_chars",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 10826480 (il2cpp_string_chars): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a5ff70",
+   "rva": "0xa5ff70",
+   "exports": [
+    "IRYlxTSc_aA"
+   ],
+   "real_name": "il2cpp_object_unbox",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 10874112 (il2cpp_object_unbox): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180a61e80",
+   "rva": "0xa61e80",
+   "exports": [
+    "WBTKJxVZqPU"
+   ],
+   "real_name": "il2cpp_class_get_type",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 10882064 (il2cpp_class_get_type): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbc520",
+   "rva": "0xbbc520",
+   "exports": [
+    "oduLwDLXzyF"
+   ],
+   "real_name": "il2cpp_value_box",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12298048 (il2cpp_value_box): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbc720",
+   "rva": "0xbbc720",
+   "exports": [
+    "wqGVJJMvyCK"
+   ],
+   "real_name": "il2cpp_get_exception_argument_null",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12298560 (il2cpp_get_exception_argument_null): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbcf70",
+   "rva": "0xbbcf70",
+   "exports": [
+    "HwGnhyBPQKV"
+   ],
+   "real_name": "il2cpp_class_is_assignable_from",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12300688 (il2cpp_class_is_assignable_from): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bbe360",
+   "rva": "0xbbe360",
+   "exports": [
+    "tFbWcwYfZmj"
+   ],
+   "real_name": "il2cpp_field_set_value",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12305792 (il2cpp_field_set_value): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180bc6c50",
+   "rva": "0xbc6c50",
+   "exports": [
+    "DllGetActivationFactory"
+   ],
+   "real_name": "DllGetActivationFactory",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bc7050",
+   "rva": "0xbc7050",
+   "exports": [
+    "DllCanUnloadNow"
+   ],
+   "real_name": "DllCanUnloadNow",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bdfed0",
+   "rva": "0xbdfed0",
+   "exports": [
+    "il2cpp_free"
+   ],
+   "real_name": "il2cpp_free",
+   "confidence": "export name survived obfuscation",
+   "evidence": "the export name itself is the real il2cpp name; the structural transfer predicted the same",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0ab0",
+   "rva": "0xbf0ab0",
+   "exports": [
+    "CreateZStream"
+   ],
+   "real_name": "CreateZStream",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0bb0",
+   "rva": "0xbf0bb0",
+   "exports": [
+    "CloseZStream"
+   ],
+   "real_name": "CloseZStream",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0cb0",
+   "rva": "0xbf0cb0",
+   "exports": [
+    "Flush"
+   ],
+   "real_name": "Flush",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0d00",
+   "rva": "0xbf0d00",
+   "exports": [
+    "ReadZStream"
+   ],
+   "real_name": "ReadZStream",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0df0",
+   "rva": "0xbf0df0",
+   "exports": [
+    "WriteZStream"
+   ],
+   "real_name": "WriteZStream",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0ea0",
+   "rva": "0xbf0ea0",
+   "exports": [
+    "CreateNLSocket"
+   ],
+   "real_name": "CreateNLSocket",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0ec0",
+   "rva": "0xbf0ec0",
+   "exports": [
+    "ReadEvents"
+   ],
+   "real_name": "ReadEvents",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180bf0ee0",
+   "rva": "0xbf0ee0",
+   "exports": [
+    "CloseNLSocket"
+   ],
+   "real_name": "CloseNLSocket",
+   "confidence": "export name is already the real name",
+   "evidence": "non-il2cpp or unrenamed export (Dll*, zlib/NL-socket) \u2014 no rename needed",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c0f490",
+   "rva": "0xc0f490",
+   "exports": [
+    "DRmnKfgeyDh"
+   ],
+   "real_name": "il2cpp_array_get_byte_length",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12638000 (il2cpp_array_get_byte_length): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c18770",
+   "rva": "0xc18770",
+   "exports": [
+    "jplAeYs_aUf"
+   ],
+   "real_name": "il2cpp_class_has_parent",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12675616 (il2cpp_class_has_parent): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c239d0",
+   "rva": "0xc239d0",
+   "exports": [
+    "qUVGvhRKXLj"
+   ],
+   "real_name": "il2cpp_alloc",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12721248 (il2cpp_alloc): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29700",
+   "rva": "0xc29700",
+   "exports": [
+    "wiofthzFQhi"
+   ],
+   "real_name": "il2cpp_init",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12745104 (il2cpp_init): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29730",
+   "rva": "0xc29730",
+   "exports": [
+    "EWXYFMzKo_z"
+   ],
+   "real_name": "il2cpp_init_utf16",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12745152 (il2cpp_init_utf16): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29830",
+   "rva": "0xc29830",
+   "exports": [
+    "aVOyBIsKvEV"
+   ],
+   "real_name": "il2cpp_shutdown",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12745408 (il2cpp_shutdown): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29840",
+   "rva": "0xc29840",
+   "exports": [
+    "YYwZzyeoPtw"
+   ],
+   "real_name": "il2cpp_set_config_dir",
+   "confidence": "transfer:order",
+   "evidence": "structural transfer from 12745424 (il2cpp_set_config_dir): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29870",
+   "rva": "0xc29870",
+   "exports": [
+    "elgiqVMupFW"
+   ],
+   "real_name": "il2cpp_set_data_dir",
+   "confidence": "transfer:order",
+   "evidence": "structural transfer from 12745472 (il2cpp_set_data_dir): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298a0",
+   "rva": "0xc298a0",
+   "exports": [
+    "FgFB_doyyME"
+   ],
+   "real_name": "il2cpp_set_temp_dir",
+   "confidence": "transfer:order",
+   "evidence": "structural transfer from 12745520 (il2cpp_set_temp_dir): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298d0",
+   "rva": "0xc298d0",
+   "exports": [
+    "VmnMbwfutz_"
+   ],
+   "real_name": "il2cpp_set_commandline_arguments",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12745568 (il2cpp_set_commandline_arguments): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c298e0",
+   "rva": "0xc298e0",
+   "exports": [
+    "tKMlqQrCbdK"
+   ],
+   "real_name": "il2cpp_set_commandline_arguments_utf16",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12745584 (il2cpp_set_commandline_arguments_utf16): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29aa0",
+   "rva": "0xc29aa0",
+   "exports": [
+    "Sf_mjoYDAQD"
+   ],
+   "real_name": "il2cpp_set_config_utf16",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746032 (il2cpp_set_config_utf16): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29b80",
+   "rva": "0xc29b80",
+   "exports": [
+    "feBHYaqzlhX"
+   ],
+   "real_name": "il2cpp_set_config",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746256 (il2cpp_set_config): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c20",
+   "rva": "0xc29c20",
+   "exports": [
+    "LTiwyIMxJrB"
+   ],
+   "real_name": "il2cpp_set_memory_callbacks",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746416 (il2cpp_set_memory_callbacks): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c50",
+   "rva": "0xc29c50",
+   "exports": [
+    "DWQfOjuSYkN"
+   ],
+   "real_name": "pool_chunk_size_set",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12746464 (pool_chunk_size_set): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c60",
+   "rva": "0xc29c60",
+   "exports": [
+    "NqYpPMdPkrr"
+   ],
+   "real_name": "pool_chunk_size_get",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12746480 (pool_chunk_size_get): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c70",
+   "rva": "0xc29c70",
+   "exports": [
+    "AtRofkHxBor"
+   ],
+   "real_name": "il2cpp_get_corlib",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12746496 (il2cpp_get_corlib): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c80",
+   "rva": "0xc29c80",
+   "exports": [
+    "KpvDSIwaBLx"
+   ],
+   "real_name": "il2cpp_add_internal_call",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746512 (il2cpp_add_internal_call): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29c90",
+   "rva": "0xc29c90",
+   "exports": [
+    "RWBGiyiCccE"
+   ],
+   "real_name": "il2cpp_resolve_icall",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746528 (il2cpp_resolve_icall): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29ca0",
+   "rva": "0xc29ca0",
+   "exports": [
+    "ERgdPSnZoUz"
+   ],
+   "real_name": "il2cpp_array_class_get",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746544 (il2cpp_array_class_get): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29cb0",
+   "rva": "0xc29cb0",
+   "exports": [
+    "GPxwQvLkoeN"
+   ],
+   "real_name": "il2cpp_array_new",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746560 (il2cpp_array_new): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29ce0",
+   "rva": "0xc29ce0",
+   "exports": [
+    "BlJJmRzYhas"
+   ],
+   "real_name": "il2cpp_array_new_specific",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746608 (il2cpp_array_new_specific): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29cf0",
+   "rva": "0xc29cf0",
+   "exports": [
+    "GHLnWhcGRXE"
+   ],
+   "real_name": "il2cpp_array_new_full",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746624 (il2cpp_array_new_full): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d00",
+   "rva": "0xc29d00",
+   "exports": [
+    "IWKWvxooitO"
+   ],
+   "real_name": "il2cpp_bounded_array_class_get",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746640 (il2cpp_bounded_array_class_get): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d10",
+   "rva": "0xc29d10",
+   "exports": [
+    "kMYODcVLBcx"
+   ],
+   "real_name": "il2cpp_array_element_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746656 (il2cpp_array_element_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d20",
+   "rva": "0xc29d20",
+   "exports": [
+    "WXZPNvmvErI"
+   ],
+   "real_name": "il2cpp_class_enum_basetype",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746672 (il2cpp_class_enum_basetype): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d40",
+   "rva": "0xc29d40",
+   "exports": [
+    "WdhaIcUOfbb"
+   ],
+   "real_name": "il2cpp_class_from_system_type",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746704 (il2cpp_class_from_system_type): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d70",
+   "rva": "0xc29d70",
+   "exports": [
+    "XQrXXvZiTdz"
+   ],
+   "real_name": "il2cpp_class_is_inited",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746752 (il2cpp_class_is_inited): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d80",
+   "rva": "0xc29d80",
+   "exports": [
+    "klbiNGqwBzs"
+   ],
+   "real_name": "il2cpp_class_is_generic",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746768 (il2cpp_class_is_generic): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29d90",
+   "rva": "0xc29d90",
+   "exports": [
+    "DEsHKVK_rja"
+   ],
+   "real_name": "il2cpp_class_is_inflated",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746784 (il2cpp_class_is_inflated): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29da0",
+   "rva": "0xc29da0",
+   "exports": [
+    "MuiOTlxnVxe"
+   ],
+   "real_name": "il2cpp_class_is_subclass_of",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746800 (il2cpp_class_is_subclass_of): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29db0",
+   "rva": "0xc29db0",
+   "exports": [
+    "SzPCBXBLpZG",
+    "iPYgzfQYXav"
+   ],
+   "real_name": "il2cpp_class_from_il2cpp_type",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746816 (il2cpp_class_from_il2cpp_type): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29dc0",
+   "rva": "0xc29dc0",
+   "exports": [
+    "btyTDeZycO_"
+   ],
+   "real_name": "il2cpp_class_from_name",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12746832 (il2cpp_class_from_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29dd0",
+   "rva": "0xc29dd0",
+   "exports": [
+    "AxiEihG_gyX"
+   ],
+   "real_name": "il2cpp_class_get_events",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12746848 (il2cpp_class_get_events): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29de0",
+   "rva": "0xc29de0",
+   "exports": [
+    "PzyfpaXicSG"
+   ],
+   "real_name": "il2cpp_class_get_fields",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12746864 (il2cpp_class_get_fields): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29e60",
+   "rva": "0xc29e60",
+   "exports": [
+    "EcglvjJPyjZ"
+   ],
+   "real_name": "il2cpp_class_get_nested_types",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747008 (il2cpp_class_get_nested_types): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29e70",
+   "rva": "0xc29e70",
+   "exports": [
+    "PyAhYeDtrn_"
+   ],
+   "real_name": "il2cpp_class_get_interfaces",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747024 (il2cpp_class_get_interfaces): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29f00",
+   "rva": "0xc29f00",
+   "exports": [
+    "heRvEcEgwd_"
+   ],
+   "real_name": "il2cpp_class_get_properties",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747152 (il2cpp_class_get_properties): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c29f10",
+   "rva": "0xc29f10",
+   "exports": [
+    "lyIFmMPKBTS"
+   ],
+   "real_name": "il2cpp_class_get_property_from_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747168 (il2cpp_class_get_property_from_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a040",
+   "rva": "0xc2a040",
+   "exports": [
+    "E_UIULMvlKa"
+   ],
+   "real_name": "il2cpp_class_get_field_from_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747472 (il2cpp_class_get_field_from_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a050",
+   "rva": "0xc2a050",
+   "exports": [
+    "GkugSFk_FwN"
+   ],
+   "real_name": "il2cpp_class_get_methods",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747488 (il2cpp_class_get_methods): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a0d0",
+   "rva": "0xc2a0d0",
+   "exports": [
+    "QEMlqSZTlWY"
+   ],
+   "real_name": "il2cpp_class_get_method_from_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747616 (il2cpp_class_get_method_from_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a0e0",
+   "rva": "0xc2a0e0",
+   "exports": [
+    "SdjHa_ohsLI"
+   ],
+   "real_name": "il2cpp_class_instance_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747632 (il2cpp_class_instance_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a0f0",
+   "rva": "0xc2a0f0",
+   "exports": [
+    "modCAhNYFmy"
+   ],
+   "real_name": "il2cpp_class_num_fields",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747648 (il2cpp_class_num_fields): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a100",
+   "rva": "0xc2a100",
+   "exports": [
+    "eYpDhkJ_P_z"
+   ],
+   "real_name": "il2cpp_class_is_blittable",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747664 (il2cpp_class_is_blittable): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a110",
+   "rva": "0xc2a110",
+   "exports": [
+    "T_BZuvgbjTf"
+   ],
+   "real_name": "il2cpp_class_value_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747680 (il2cpp_class_value_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a120",
+   "rva": "0xc2a120",
+   "exports": [
+    "apUxrzFuTjO"
+   ],
+   "real_name": "il2cpp_class_get_flags",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747696 (il2cpp_class_get_flags): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a130",
+   "rva": "0xc2a130",
+   "exports": [
+    "YqwVnrHEzJf"
+   ],
+   "real_name": "il2cpp_class_is_abstract",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747712 (il2cpp_class_is_abstract): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a140",
+   "rva": "0xc2a140",
+   "exports": [
+    "BMJg_QlZmRV"
+   ],
+   "real_name": "il2cpp_class_is_interface",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747728 (il2cpp_class_is_interface): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a160",
+   "rva": "0xc2a160",
+   "exports": [
+    "tLOXcmSiwNE"
+   ],
+   "real_name": "il2cpp_class_array_element_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747760 (il2cpp_class_array_element_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a170",
+   "rva": "0xc2a170",
+   "exports": [
+    "UQNqZOEOCQy"
+   ],
+   "real_name": "il2cpp_class_get_type_token",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12747776 (il2cpp_class_get_type_token): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a180",
+   "rva": "0xc2a180",
+   "exports": [
+    "sSvf_NtCZOs"
+   ],
+   "real_name": "il2cpp_class_has_attribute",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747792 (il2cpp_class_has_attribute): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a220",
+   "rva": "0xc2a220",
+   "exports": [
+    "IOatyXWzGdr"
+   ],
+   "real_name": "il2cpp_class_has_references",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12747952 (il2cpp_class_has_references): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a260",
+   "rva": "0xc2a260",
+   "exports": [
+    "BeziVVkkOlb"
+   ],
+   "real_name": "il2cpp_class_is_enum",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748016 (il2cpp_class_is_enum): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a270",
+   "rva": "0xc2a270",
+   "exports": [
+    "VmwUZxZuLJx"
+   ],
+   "real_name": "il2cpp_class_get_assemblyname",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748032 (il2cpp_class_get_assemblyname): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a280",
+   "rva": "0xc2a280",
+   "exports": [
+    "DVzxuPeqxyE"
+   ],
+   "real_name": "il2cpp_class_get_rank",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748048 (il2cpp_class_get_rank): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a290",
+   "rva": "0xc2a290",
+   "exports": [
+    "hZQZnlhvgpW"
+   ],
+   "real_name": "il2cpp_class_get_data_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748064 (il2cpp_class_get_data_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a2a0",
+   "rva": "0xc2a2a0",
+   "exports": [
+    "tNANpu_fWEb"
+   ],
+   "real_name": "il2cpp_stats_dump_to_file",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748080 (il2cpp_stats_dump_to_file): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a5c0",
+   "rva": "0xc2a5c0",
+   "exports": [
+    "byZfLQ_yQyc"
+   ],
+   "real_name": "il2cpp_stats_get_value",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12748880 (il2cpp_stats_get_value): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a650",
+   "rva": "0xc2a650",
+   "exports": [
+    "coWsVJyCVtp"
+   ],
+   "real_name": "il2cpp_domain_get",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749024 (il2cpp_domain_get): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a660",
+   "rva": "0xc2a660",
+   "exports": [
+    "eLTolOvKOSm"
+   ],
+   "real_name": "il2cpp_domain_assembly_open",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749040 (il2cpp_domain_assembly_open): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a670",
+   "rva": "0xc2a670",
+   "exports": [
+    "Lvcy_fdLOaS"
+   ],
+   "real_name": "il2cpp_domain_get_assemblies",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749056 (il2cpp_domain_get_assemblies): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a690",
+   "rva": "0xc2a690",
+   "exports": [
+    "WeSZDzguSJx"
+   ],
+   "real_name": "il2cpp_raise_exception",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749088 (il2cpp_raise_exception): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a6a0",
+   "rva": "0xc2a6a0",
+   "exports": [
+    "csZIPl_TGkI"
+   ],
+   "real_name": "il2cpp_exception_from_name_msg",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749104 (il2cpp_exception_from_name_msg): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a6b0",
+   "rva": "0xc2a6b0",
+   "exports": [
+    "IIdhxbhDaHy"
+   ],
+   "real_name": "il2cpp_format_exception",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749120 (il2cpp_format_exception): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a750",
+   "rva": "0xc2a750",
+   "exports": [
+    "dfEWieHjVJf"
+   ],
+   "real_name": "il2cpp_format_stack_trace",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749280 (il2cpp_format_stack_trace): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a870",
+   "rva": "0xc2a870",
+   "exports": [
+    "NfwnSVqFgPp"
+   ],
+   "real_name": "il2cpp_unhandled_exception",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12749568 (il2cpp_unhandled_exception): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a880",
+   "rva": "0xc2a880",
+   "exports": [
+    "il2cpp_native_stack_trace"
+   ],
+   "real_name": "il2cpp_native_stack_trace",
+   "confidence": "export name survived obfuscation",
+   "evidence": "the export name itself is the real il2cpp name; the structural transfer predicted the same",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c2a970",
+   "rva": "0xc2a970",
+   "exports": [
+    "bqfLllwEELo"
+   ],
+   "real_name": "il2cpp_field_get_flags",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749824 (il2cpp_field_get_flags): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a980",
+   "rva": "0xc2a980",
+   "exports": [
+    "TAaevUeawLU"
+   ],
+   "real_name": "il2cpp_field_get_object",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749840 (il2cpp_field_get_object): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a990",
+   "rva": "0xc2a990",
+   "exports": [
+    "iVIbCgnTHxn"
+   ],
+   "real_name": "il2cpp_field_get_offset",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749856 (il2cpp_field_get_offset): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a9a0",
+   "rva": "0xc2a9a0",
+   "exports": [
+    "HRDYCXEhpIN"
+   ],
+   "real_name": "il2cpp_field_get_value",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749872 (il2cpp_field_get_value): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a9b0",
+   "rva": "0xc2a9b0",
+   "exports": [
+    "CMfgBCrMTyD"
+   ],
+   "real_name": "il2cpp_field_get_value_object",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749888 (il2cpp_field_get_value_object): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2a9c0",
+   "rva": "0xc2a9c0",
+   "exports": [
+    "NtGGZKqinas"
+   ],
+   "real_name": "il2cpp_field_has_attribute",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12749904 (il2cpp_field_has_attribute): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aa60",
+   "rva": "0xc2aa60",
+   "exports": [
+    "VTizYFlFXWx"
+   ],
+   "real_name": "il2cpp_field_set_value_object",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750064 (il2cpp_field_set_value_object): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aac0",
+   "rva": "0xc2aac0",
+   "exports": [
+    "ckXkXZgZamn"
+   ],
+   "real_name": "il2cpp_field_static_get_value",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750160 (il2cpp_field_static_get_value): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aad0",
+   "rva": "0xc2aad0",
+   "exports": [
+    "pIUbnvkQiyo"
+   ],
+   "real_name": "il2cpp_field_static_set_value",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750176 (il2cpp_field_static_set_value): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aae0",
+   "rva": "0xc2aae0",
+   "exports": [
+    "CGAabLwDHlo"
+   ],
+   "real_name": "il2cpp_field_is_literal",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750192 (il2cpp_field_is_literal): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aaf0",
+   "rva": "0xc2aaf0",
+   "exports": [
+    "wHwUmmfWxOQ"
+   ],
+   "real_name": "il2cpp_gc_collect",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750208 (il2cpp_gc_collect): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ab10",
+   "rva": "0xc2ab10",
+   "exports": [
+    "gbgblpJuFcl"
+   ],
+   "real_name": "il2cpp_gc_collect_a_little",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750240 (il2cpp_gc_collect_a_little): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ab20",
+   "rva": "0xc2ab20",
+   "exports": [
+    "sEYVrsQTVSx"
+   ],
+   "real_name": "il2cpp_gc_start_incremental_collection",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750256 (il2cpp_gc_start_incremental_collection): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ab40",
+   "rva": "0xc2ab40",
+   "exports": [
+    "YZgocajknzl"
+   ],
+   "real_name": "il2cpp_gc_enable",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750288 (il2cpp_gc_enable): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ab90",
+   "rva": "0xc2ab90",
+   "exports": [
+    "ydGvW_toZwN"
+   ],
+   "real_name": "il2cpp_gc_disable",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750368 (il2cpp_gc_disable): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2abe0",
+   "rva": "0xc2abe0",
+   "exports": [
+    "PmsHdVtTuHk"
+   ],
+   "real_name": "il2cpp_gc_is_disabled",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750448 (il2cpp_gc_is_disabled): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2abf0",
+   "rva": "0xc2abf0",
+   "exports": [
+    "XSoMH_ZvRnu"
+   ],
+   "real_name": "il2cpp_gc_set_mode",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750464 (il2cpp_gc_set_mode): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2acb0",
+   "rva": "0xc2acb0",
+   "exports": [
+    "FzTSzVlyvfV"
+   ],
+   "real_name": "il2cpp_gc_is_incremental",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750656 (il2cpp_gc_is_incremental): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2acc0",
+   "rva": "0xc2acc0",
+   "exports": [
+    "Fh_bWpJMrdz"
+   ],
+   "real_name": "il2cpp_gc_get_max_time_slice_ns",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750672 (il2cpp_gc_get_max_time_slice_ns): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2acd0",
+   "rva": "0xc2acd0",
+   "exports": [
+    "xnzpWzPGwHg"
+   ],
+   "real_name": "il2cpp_gc_set_max_time_slice_ns",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750688 (il2cpp_gc_set_max_time_slice_ns): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ace0",
+   "rva": "0xc2ace0",
+   "exports": [
+    "wriQvABKN_C"
+   ],
+   "real_name": "il2cpp_gc_get_used_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750704 (il2cpp_gc_get_used_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2acf0",
+   "rva": "0xc2acf0",
+   "exports": [
+    "ShQweBugZeL"
+   ],
+   "real_name": "il2cpp_gc_get_heap_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750720 (il2cpp_gc_get_heap_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ad00",
+   "rva": "0xc2ad00",
+   "exports": [
+    "oWYwng_urym"
+   ],
+   "real_name": "il2cpp_gc_foreach_heap",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750736 (il2cpp_gc_foreach_heap): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ad40",
+   "rva": "0xc2ad40",
+   "exports": [
+    "SLyEhsysrNy"
+   ],
+   "real_name": "il2cpp_stop_gc_world",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750800 (il2cpp_stop_gc_world): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ad70",
+   "rva": "0xc2ad70",
+   "exports": [
+    "njGMRCUCFhC"
+   ],
+   "real_name": "il2cpp_start_gc_world",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750848 (il2cpp_start_gc_world): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ada0",
+   "rva": "0xc2ada0",
+   "exports": [
+    "zlFPimNIWRO"
+   ],
+   "real_name": "il2cpp_gc_alloc_fixed",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12750896 (il2cpp_gc_alloc_fixed): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2adb0",
+   "rva": "0xc2adb0",
+   "exports": [
+    "hBYvCPkjtUo"
+   ],
+   "real_name": "il2cpp_gc_free_fixed",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750912 (il2cpp_gc_free_fixed): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2adc0",
+   "rva": "0xc2adc0",
+   "exports": [
+    "qKmSQlRRDBA"
+   ],
+   "real_name": "il2cpp_gchandle_new",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750928 (il2cpp_gchandle_new): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ade0",
+   "rva": "0xc2ade0",
+   "exports": [
+    "iRBehDenhQu"
+   ],
+   "real_name": "il2cpp_gchandle_new_weakref",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12750960 (il2cpp_gchandle_new_weakref): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ae10",
+   "rva": "0xc2ae10",
+   "exports": [
+    "il2cpp_gchandle_get_target"
+   ],
+   "real_name": "il2cpp_gchandle_get_target",
+   "confidence": "export name survived obfuscation",
+   "evidence": "the export name itself is the real il2cpp name; the structural transfer predicted the same",
+   "renamed_in_ghidra": false
+  },
+  {
+   "addr": "0x180c2ae20",
+   "rva": "0xc2ae20",
+   "exports": [
+    "NJrwINMbXdf"
+   ],
+   "real_name": "il2cpp_gchandle_foreach_get_target",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751024 (il2cpp_gchandle_foreach_get_target): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2ae50",
+   "rva": "0xc2ae50",
+   "exports": [
+    "BlRvOFYBfeH"
+   ],
+   "real_name": "il2cpp_gc_wbarrier_set_field",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751072 (il2cpp_gc_wbarrier_set_field): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aeb0",
+   "rva": "0xc2aeb0",
+   "exports": [
+    "RvvlAUNvLgC"
+   ],
+   "real_name": "il2cpp_gchandle_free",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751168 (il2cpp_gchandle_free): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aec0",
+   "rva": "0xc2aec0",
+   "exports": [
+    "efjbygKSppq"
+   ],
+   "real_name": "il2cpp_array_object_header_size",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751184 (il2cpp_array_object_header_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aed0",
+   "rva": "0xc2aed0",
+   "exports": [
+    "UUzzjjRYfIf"
+   ],
+   "real_name": "il2cpp_offset_of_array_length_in_array_object_header",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751200 (il2cpp_offset_of_array_length_in_array_object_header): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aee0",
+   "rva": "0xc2aee0",
+   "exports": [
+    "vAoPDwyTaHI"
+   ],
+   "real_name": "il2cpp_unity_liveness_allocate_struct",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751216 (il2cpp_unity_liveness_allocate_struct): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2af90",
+   "rva": "0xc2af90",
+   "exports": [
+    "KCjgQInqBVl"
+   ],
+   "real_name": "il2cpp_unity_liveness_calculation_from_root",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751392 (il2cpp_unity_liveness_calculation_from_root): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2aff0",
+   "rva": "0xc2aff0",
+   "exports": [
+    "gaQbnAVpJ_A"
+   ],
+   "real_name": "il2cpp_unity_liveness_calculation_from_statics",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751488 (il2cpp_unity_liveness_calculation_from_statics): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b000",
+   "rva": "0xc2b000",
+   "exports": [
+    "KdXFixsABUj"
+   ],
+   "real_name": "il2cpp_unity_liveness_finalize",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751504 (il2cpp_unity_liveness_finalize): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b0c0",
+   "rva": "0xc2b0c0",
+   "exports": [
+    "TKMfNUEVswf"
+   ],
+   "real_name": "il2cpp_unity_liveness_free_struct",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751696 (il2cpp_unity_liveness_free_struct): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b100",
+   "rva": "0xc2b100",
+   "exports": [
+    "Q_yPaBxQaGy"
+   ],
+   "real_name": "il2cpp_method_get_object",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751760 (il2cpp_method_get_object): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b110",
+   "rva": "0xc2b110",
+   "exports": [
+    "eDyORgSQr_m"
+   ],
+   "real_name": "il2cpp_method_is_generic",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751776 (il2cpp_method_is_generic): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b120",
+   "rva": "0xc2b120",
+   "exports": [
+    "qBSZhkDpeyg"
+   ],
+   "real_name": "il2cpp_method_is_inflated",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12751792 (il2cpp_method_is_inflated): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b130",
+   "rva": "0xc2b130",
+   "exports": [
+    "yxhiMbvlzOl"
+   ],
+   "real_name": "il2cpp_method_is_instance",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751808 (il2cpp_method_is_instance): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b140",
+   "rva": "0xc2b140",
+   "exports": [
+    "frBWHVWgIAf"
+   ],
+   "real_name": "il2cpp_method_get_param_count",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751824 (il2cpp_method_get_param_count): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b150",
+   "rva": "0xc2b150",
+   "exports": [
+    "YiQrpWYqUEZ"
+   ],
+   "real_name": "il2cpp_method_get_param",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12751840 (il2cpp_method_get_param): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b170",
+   "rva": "0xc2b170",
+   "exports": [
+    "_Wbupo_MigA"
+   ],
+   "real_name": "unity_member_name_chunked",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12751872 (unity_member_name_chunked): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b210",
+   "rva": "0xc2b210",
+   "exports": [
+    "vsAFPZuFIaa"
+   ],
+   "real_name": "il2cpp_method_get_flags",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12752032 (il2cpp_method_get_flags): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b220",
+   "rva": "0xc2b220",
+   "exports": [
+    "yAYpbjHJxon"
+   ],
+   "real_name": "il2cpp_method_get_param_name",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12752048 (il2cpp_method_get_param_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b270",
+   "rva": "0xc2b270",
+   "exports": [
+    "dJjrNyKsOls"
+   ],
+   "real_name": "il2cpp_profiler_install",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752128 (il2cpp_profiler_install): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b3a0",
+   "rva": "0xc2b3a0",
+   "exports": [
+    "WYaGHztIHig"
+   ],
+   "real_name": "il2cpp_profiler_set_events",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752432 (il2cpp_profiler_set_events): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b3f0",
+   "rva": "0xc2b3f0",
+   "exports": [
+    "OeWWKDYZAjc"
+   ],
+   "real_name": "il2cpp_profiler_install_enter_leave",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12752512 (il2cpp_profiler_install_enter_leave): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b420",
+   "rva": "0xc2b420",
+   "exports": [
+    "EkLMNvJVMFv"
+   ],
+   "real_name": "il2cpp_profiler_install_allocation",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752560 (il2cpp_profiler_install_allocation): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b440",
+   "rva": "0xc2b440",
+   "exports": [
+    "enlutTghOaM"
+   ],
+   "real_name": "il2cpp_profiler_install_gc",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12752592 (il2cpp_profiler_install_gc): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b470",
+   "rva": "0xc2b470",
+   "exports": [
+    "ZyhKAWkFwMT"
+   ],
+   "real_name": "il2cpp_profiler_install_fileio",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752640 (il2cpp_profiler_install_fileio): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b490",
+   "rva": "0xc2b490",
+   "exports": [
+    "wgfJjtKbbkG"
+   ],
+   "real_name": "il2cpp_profiler_install_thread",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752672 (il2cpp_profiler_install_thread): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b4c0",
+   "rva": "0xc2b4c0",
+   "exports": [
+    "AIKZsOFEPBT"
+   ],
+   "real_name": "il2cpp_object_get_size",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752720 (il2cpp_object_get_size): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b520",
+   "rva": "0xc2b520",
+   "exports": [
+    "encJheCQdFu"
+   ],
+   "real_name": "il2cpp_object_get_virtual_method",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752816 (il2cpp_object_get_virtual_method): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b530",
+   "rva": "0xc2b530",
+   "exports": [
+    "ctboJVoLThz"
+   ],
+   "real_name": "il2cpp_object_new",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752832 (il2cpp_object_new): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b550",
+   "rva": "0xc2b550",
+   "exports": [
+    "H_jNOpYzMzG"
+   ],
+   "real_name": "il2cpp_monitor_enter",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752864 (il2cpp_monitor_enter): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b560",
+   "rva": "0xc2b560",
+   "exports": [
+    "CtRQswDxaHg"
+   ],
+   "real_name": "il2cpp_monitor_try_enter",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752880 (il2cpp_monitor_try_enter): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b570",
+   "rva": "0xc2b570",
+   "exports": [
+    "JkBdGNTyRCh"
+   ],
+   "real_name": "il2cpp_monitor_exit",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752896 (il2cpp_monitor_exit): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b580",
+   "rva": "0xc2b580",
+   "exports": [
+    "zNDgFMafSdD"
+   ],
+   "real_name": "il2cpp_monitor_pulse",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752912 (il2cpp_monitor_pulse): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b590",
+   "rva": "0xc2b590",
+   "exports": [
+    "lFHrmcMlsyY"
+   ],
+   "real_name": "il2cpp_monitor_pulse_all",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12752928 (il2cpp_monitor_pulse_all): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b5e0",
+   "rva": "0xc2b5e0",
+   "exports": [
+    "QqGBChtjICI"
+   ],
+   "real_name": "il2cpp_monitor_wait",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753008 (il2cpp_monitor_wait): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b5f0",
+   "rva": "0xc2b5f0",
+   "exports": [
+    "UwXDRaPbPaX"
+   ],
+   "real_name": "il2cpp_monitor_try_wait",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753024 (il2cpp_monitor_try_wait): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b600",
+   "rva": "0xc2b600",
+   "exports": [
+    "jPDXmjActOY"
+   ],
+   "real_name": "il2cpp_runtime_invoke_convert_args",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753040 (il2cpp_runtime_invoke_convert_args): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b610",
+   "rva": "0xc2b610",
+   "exports": [
+    "qMbjpGRZvQp"
+   ],
+   "real_name": "il2cpp_runtime_invoke",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753056 (il2cpp_runtime_invoke): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b620",
+   "rva": "0xc2b620",
+   "exports": [
+    "AYXoIdzhJch"
+   ],
+   "real_name": "il2cpp_runtime_class_init",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753072 (il2cpp_runtime_class_init): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b630",
+   "rva": "0xc2b630",
+   "exports": [
+    "nJVqenAoYGY"
+   ],
+   "real_name": "il2cpp_runtime_object_init",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753088 (il2cpp_runtime_object_init): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b640",
+   "rva": "0xc2b640",
+   "exports": [
+    "BvTHcWjoDfD"
+   ],
+   "real_name": "il2cpp_runtime_object_init_exception",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753104 (il2cpp_runtime_object_init_exception): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b650",
+   "rva": "0xc2b650",
+   "exports": [
+    "MizASLLdZoO",
+    "YJPvvIdRptL"
+   ],
+   "real_name": "il2cpp_string_new",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753120 (il2cpp_string_new): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b670",
+   "rva": "0xc2b670",
+   "exports": [
+    "HwnvkaNaBVc"
+   ],
+   "real_name": "il2cpp_string_new_utf16",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753152 (il2cpp_string_new_utf16): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b6c0",
+   "rva": "0xc2b6c0",
+   "exports": [
+    "Bqbgogndlcf"
+   ],
+   "real_name": "il2cpp_string_new_len",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753232 (il2cpp_string_new_len): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b6d0",
+   "rva": "0xc2b6d0",
+   "exports": [
+    "DTnmKttSVkm"
+   ],
+   "real_name": "il2cpp_string_intern",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753248 (il2cpp_string_intern): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b6e0",
+   "rva": "0xc2b6e0",
+   "exports": [
+    "bpGipNQUAAd"
+   ],
+   "real_name": "il2cpp_string_is_interned",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753264 (il2cpp_string_is_interned): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b7d0",
+   "rva": "0xc2b7d0",
+   "exports": [
+    "Khnrdefzshe"
+   ],
+   "real_name": "il2cpp_thread_current",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12753504 (il2cpp_thread_current): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b800",
+   "rva": "0xc2b800",
+   "exports": [
+    "xAYtuhywedN"
+   ],
+   "real_name": "il2cpp_thread_attach",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753552 (il2cpp_thread_attach): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b810",
+   "rva": "0xc2b810",
+   "exports": [
+    "lrU_EvJjorB"
+   ],
+   "real_name": "il2cpp_thread_detach",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753568 (il2cpp_thread_detach): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b830",
+   "rva": "0xc2b830",
+   "exports": [
+    "hAWSCRYekvn"
+   ],
+   "real_name": "il2cpp_is_vm_thread",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753600 (il2cpp_is_vm_thread): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b840",
+   "rva": "0xc2b840",
+   "exports": [
+    "esAUikLwLiC"
+   ],
+   "real_name": "il2cpp_current_thread_walk_frame_stack",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753616 (il2cpp_current_thread_walk_frame_stack): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b8a0",
+   "rva": "0xc2b8a0",
+   "exports": [
+    "tDklyqdhMwL"
+   ],
+   "real_name": "il2cpp_thread_walk_frame_stack",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12753712 (il2cpp_thread_walk_frame_stack): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b9e0",
+   "rva": "0xc2b9e0",
+   "exports": [
+    "wQUPWTRFAqT"
+   ],
+   "real_name": "il2cpp_current_thread_get_top_frame",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12754032 (il2cpp_current_thread_get_top_frame): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2b9f0",
+   "rva": "0xc2b9f0",
+   "exports": [
+    "OlVg_kmfoSI"
+   ],
+   "real_name": "il2cpp_thread_get_top_frame",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12754048 (il2cpp_thread_get_top_frame): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bb20",
+   "rva": "0xc2bb20",
+   "exports": [
+    "AkgyHqUyTVi"
+   ],
+   "real_name": "il2cpp_current_thread_get_frame_at",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12754352 (il2cpp_current_thread_get_frame_at): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bb30",
+   "rva": "0xc2bb30",
+   "exports": [
+    "xYhKraeKpeH"
+   ],
+   "real_name": "il2cpp_thread_get_frame_at",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12754368 (il2cpp_thread_get_frame_at): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bc70",
+   "rva": "0xc2bc70",
+   "exports": [
+    "jHfkrhVgjwN"
+   ],
+   "real_name": "il2cpp_current_thread_get_stack_depth",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12754688 (il2cpp_current_thread_get_stack_depth): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bc90",
+   "rva": "0xc2bc90",
+   "exports": [
+    "XpmDtwhpLLJ"
+   ],
+   "real_name": "il2cpp_thread_get_stack_depth",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12754720 (il2cpp_thread_get_stack_depth): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bdb0",
+   "rva": "0xc2bdb0",
+   "exports": [
+    "s_asJdghMco"
+   ],
+   "real_name": "il2cpp_override_stack_backtrace",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12755008 (il2cpp_override_stack_backtrace): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bdc0",
+   "rva": "0xc2bdc0",
+   "exports": [
+    "pSYlXOmuFai"
+   ],
+   "real_name": "il2cpp_type_get_object",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755024 (il2cpp_type_get_object): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bdd0",
+   "rva": "0xc2bdd0",
+   "exports": [
+    "qwywpRfSJsX"
+   ],
+   "real_name": "il2cpp_type_get_type",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12755040 (il2cpp_type_get_type): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bde0",
+   "rva": "0xc2bde0",
+   "exports": [
+    "JyyjYooDppe"
+   ],
+   "real_name": "il2cpp_type_get_class_or_element_class",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755056 (il2cpp_type_get_class_or_element_class): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2be10",
+   "rva": "0xc2be10",
+   "exports": [
+    "KcGWbPUQ_he"
+   ],
+   "real_name": "il2cpp_type_get_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755104 (il2cpp_type_get_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bec0",
+   "rva": "0xc2bec0",
+   "exports": [
+    "gEPPIdReRFT"
+   ],
+   "real_name": "il2cpp_type_get_assembly_qualified_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755280 (il2cpp_type_get_assembly_qualified_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2bf70",
+   "rva": "0xc2bf70",
+   "exports": [
+    "wPGXYAhjNuS"
+   ],
+   "real_name": "il2cpp_type_get_reflection_name",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755456 (il2cpp_type_get_reflection_name): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c020",
+   "rva": "0xc2c020",
+   "exports": [
+    "zTXhtUZhkrN"
+   ],
+   "real_name": "il2cpp_type_is_byref",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12755632 (il2cpp_type_is_byref): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c030",
+   "rva": "0xc2c030",
+   "exports": [
+    "RvIrvgDgvvW"
+   ],
+   "real_name": "il2cpp_type_get_attrs",
+   "confidence": "transfer:proof",
+   "evidence": "structural transfer from 12755648 (il2cpp_type_get_attrs): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c040",
+   "rva": "0xc2c040",
+   "exports": [
+    "ROxvQTNcpWg"
+   ],
+   "real_name": "il2cpp_type_equals",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755664 (il2cpp_type_equals): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c060",
+   "rva": "0xc2c060",
+   "exports": [
+    "OtcWMAVwUYj"
+   ],
+   "real_name": "il2cpp_type_is_static",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755696 (il2cpp_type_is_static): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c070",
+   "rva": "0xc2c070",
+   "exports": [
+    "JiPazlTXfyX"
+   ],
+   "real_name": "il2cpp_type_is_pointer_type",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755712 (il2cpp_type_is_pointer_type): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c080",
+   "rva": "0xc2c080",
+   "exports": [
+    "CDNWvXCkYIn"
+   ],
+   "real_name": "il2cpp_image_get_entry_point",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12755728 (il2cpp_image_get_entry_point): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c0a0",
+   "rva": "0xc2c0a0",
+   "exports": [
+    "dGFWQEvDuHA"
+   ],
+   "real_name": "il2cpp_image_get_class",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755760 (il2cpp_image_get_class): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c0e0",
+   "rva": "0xc2c0e0",
+   "exports": [
+    "AejIJaYfLVt"
+   ],
+   "real_name": "il2cpp_capture_memory_snapshot",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755824 (il2cpp_capture_memory_snapshot): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c0f0",
+   "rva": "0xc2c0f0",
+   "exports": [
+    "qntzYTUayFw"
+   ],
+   "real_name": "il2cpp_free_captured_memory_snapshot",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12755840 (il2cpp_free_captured_memory_snapshot): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c1c0",
+   "rva": "0xc2c1c0",
+   "exports": [
+    "rmFJRAZh_IU"
+   ],
+   "real_name": "il2cpp_set_find_plugin_callback",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12756048 (il2cpp_set_find_plugin_callback): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c1d0",
+   "rva": "0xc2c1d0",
+   "exports": [
+    "jsJEhHPCfMH"
+   ],
+   "real_name": "il2cpp_register_log_callback",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12756064 (il2cpp_register_log_callback): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c1e0",
+   "rva": "0xc2c1e0",
+   "exports": [
+    "ufbGeuGkOy_"
+   ],
+   "real_name": "il2cpp_is_debugger_attached",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12756080 (il2cpp_is_debugger_attached): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c200",
+   "rva": "0xc2c200",
+   "exports": [
+    "sGcOZanUuqk"
+   ],
+   "real_name": "unity_method_code_range_foreach_chunked",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12756112 (unity_method_code_range_foreach_chunked): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c3e0",
+   "rva": "0xc2c3e0",
+   "exports": [
+    "S_eQRmMVRbo"
+   ],
+   "real_name": "gc_heap_section_range_contains",
+   "confidence": "transfer:inferred",
+   "evidence": "structural transfer from 12756592 (gc_heap_section_range_contains): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c420",
+   "rva": "0xc2c420",
+   "exports": [
+    "YtieUSlSXNL"
+   ],
+   "real_name": "unity_set_global_ptr_e66c828",
+   "confidence": "transfer:unknown",
+   "evidence": "structural transfer from 12756656 (unity_set_global_ptr_e66c828): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c430",
+   "rva": "0xc2c430",
+   "exports": [
+    "joDurDOtrYU"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_class",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12756672 (il2cpp_custom_attrs_from_class): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c4a0",
+   "rva": "0xc2c4a0",
+   "exports": [
+    "vLIElcaTcdo"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_method",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12756784 (il2cpp_custom_attrs_from_method): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c510",
+   "rva": "0xc2c510",
+   "exports": [
+    "WOpghSrTVnu"
+   ],
+   "real_name": "il2cpp_custom_attrs_from_field",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12756896 (il2cpp_custom_attrs_from_field): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c580",
+   "rva": "0xc2c580",
+   "exports": [
+    "sTxdeYnHqEo"
+   ],
+   "real_name": "il2cpp_custom_attrs_has_attr",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12757008 (il2cpp_custom_attrs_has_attr): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c620",
+   "rva": "0xc2c620",
+   "exports": [
+    "vCJuVkogLcJ"
+   ],
+   "real_name": "il2cpp_custom_attrs_get_attr",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12757168 (il2cpp_custom_attrs_get_attr): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c630",
+   "rva": "0xc2c630",
+   "exports": [
+    "cirwLHQQqKK"
+   ],
+   "real_name": "il2cpp_custom_attrs_construct",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12757184 (il2cpp_custom_attrs_construct): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c6d0",
+   "rva": "0xc2c6d0",
+   "exports": [
+    "AZxjSvviZrW"
+   ],
+   "real_name": "il2cpp_type_get_name_chunked",
+   "confidence": "transfer:proven",
+   "evidence": "structural transfer from 12757344 (il2cpp_type_get_name_chunked): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c6f0",
+   "rva": "0xc2c6f0",
+   "exports": [
+    "_CGvKiZUBnb"
+   ],
+   "real_name": "il2cpp_class_set_userdata",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12757376 (il2cpp_class_set_userdata): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  },
+  {
+   "addr": "0x180c2c700",
+   "rva": "0xc2c700",
+   "exports": [
+    "znRPliwfuJY"
+   ],
+   "real_name": "il2cpp_class_for_each",
+   "confidence": "transfer:strong",
+   "evidence": "structural transfer from 12757392 (il2cpp_class_for_each): call-graph isomorphism + relocation-masked body match",
+   "renamed_in_ghidra": true
+  }
+ ]
+}

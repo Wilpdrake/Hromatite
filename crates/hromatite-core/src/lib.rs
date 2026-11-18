@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod crc;
+pub mod buildinfo;
 pub mod crypto;
 pub mod gamebuild;
 pub mod gcthreads;

@@ -18,10 +18,40 @@ pub struct Entry {
 use crate::{console, log};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const GET_CURRENT_PLAYER_LOOP_RVA: usize = 0x086c_da10;
-const CLASS_FROM_TYPE_RVA: usize = 0x00c2_8040;
-const BUILD_SHA256: &str = lateupdate::AUTO_BUILD_SHA256;
-use crate::lateupdate;
+/// The addresses this module calls. Both come from the build descriptor (or
+/// `raw::discover` for an unknown build), never from a literal: the previous
+/// version gated the whole module on `lateupdate::AUTO_BUILD_SHA256`, so a game
+/// update silently turned PlayerLoop off even though the getter had merely
+/// moved.
+#[derive(Clone, Copy, Debug)]
+struct Api {
+    /// `PlayerLoop.GetCurrentPlayerLoop(PlayerLoopSystem* out, MethodInfo*)`.
+    getter: usize,
+    /// `il2cpp_class_from_il2cpp_type`; `0` when the build does not carry it,
+    /// in which case the `Il2CppType.data` pointer is used directly.
+    class_from_type: usize,
+}
+
+fn api() -> Result<Api, String> {
+    let (base, size) =
+        crate::procs::own_module(crate::GAME_ASSEMBLY).ok_or("GameAssembly.dll is not loaded")?;
+    let runtime = crate::buildinfo::runtime_anchors(base, size)
+        .ok_or("no PlayerLoop anchor for this GameAssembly build")?;
+    if runtime.get_current_player_loop == 0 {
+        return Err("the build descriptor has no GetCurrentPlayerLoop anchor".into());
+    }
+    let getter = base
+        .checked_add(runtime.get_current_player_loop as usize)
+        .filter(|address| *address >= base && *address < base.saturating_add(size))
+        .ok_or("GetCurrentPlayerLoop is outside GameAssembly.dll")?;
+    let class_from_type = match crate::buildinfo::il2cpp_anchors(base, size) {
+        Some(anchors) if anchors.class_from_type != 0 => {
+            base.wrapping_add(anchors.class_from_type as usize)
+        }
+        _ => 0,
+    };
+    Ok(Api { getter, class_from_type })
+}
 
 static PLAYER_ORIG: AtomicUsize = AtomicUsize::new(0);
 static PLAYER_ENTRY: AtomicUsize = AtomicUsize::new(0);
@@ -39,41 +69,58 @@ fn now_ms() -> u64 {
     unsafe { crate::ffi::GetTickCount64() }
 }
 
-fn type_name(reflection: usize) -> String {
-    let Some((ga, _)) = crate::procs::own_module(crate::GAME_ASSEMBLY) else {
+fn type_name(api: &Api, reflection: usize) -> String {
+    // A managed `System.Type` keeps its `Il2CppType*` at +0x10.
+    let Some(desc) = crate::safe::read_usize(reflection.wrapping_add(0x10)) else {
         return String::new();
     };
-    let desc = crate::safe::read_usize(reflection.wrapping_add(0x10)).unwrap_or(0);
     if desc < 0x10000 {
         return String::new();
     }
-    // SAFETY: class_from_type consumes the Il2CppType stored in a managed
-    // Il2CppReflectionType at +0x10 and returns an Il2CppClass pointer.
-    let klass =
-        unsafe { crate::veh::call2(ga.wrapping_add(CLASS_FROM_TYPE_RVA), desc, 0) }.unwrap_or(0);
-    if klass < 0x10000 {
-        String::new()
+    let resolved = if api.class_from_type >= 0x10000 {
+        // SAFETY: class_from_type consumes the Il2CppType stored in a managed
+        // Il2CppReflectionType at +0x10 and returns an Il2CppClass pointer.
+        unsafe { crate::veh::call2(api.class_from_type, desc, 0) }.unwrap_or(0)
     } else {
-        crate::m3::class_full_name(klass)
+        0
+    };
+    // `Il2CppType.data` is the `Il2CppClass*` for class and value types, so the
+    // name can be read without calling anything when no anchor is known.
+    let klass = if resolved >= 0x10000 {
+        resolved
+    } else {
+        crate::safe::read_usize(desc).unwrap_or(0)
+    };
+    if klass < 0x10000 {
+        return String::new();
     }
+    let name = crate::m3::class_full_name(klass);
+    // A wrong layout offset yields garbage here; the callers only need a label,
+    // so anything that is not identifier-shaped is dropped instead of logged.
+    if plausible_type_name(&name) {
+        name
+    } else {
+        String::new()
+    }
+}
+
+fn plausible_type_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'`' | b'<'
+                | b'>' | b'[' | b']' | b',' | b'/' | b'*'))
 }
 
 /// Read the public managed representation of the current native loop. No
 /// SetPlayerLoop/SetPlayerLoopInternal call is made anywhere in this module.
 pub fn snapshot() -> Result<Vec<Entry>, String> {
-    if crate::symbols::GAMEASSEMBLY_SHA256 != BUILD_SHA256 {
-        return Err("PlayerLoop RVAs belong to another GameAssembly build".into());
-    }
-    let (ga, gasize) =
-        crate::procs::own_module(crate::GAME_ASSEMBLY).ok_or("GameAssembly.dll is not loaded")?;
-    let getter = ga.wrapping_add(GET_CURRENT_PLAYER_LOOP_RVA);
-    if getter < ga || getter >= ga.saturating_add(gasize) {
-        return Err("GetCurrentPlayerLoop is outside GameAssembly.dll".into());
-    }
+    let api = api()?;
     let mut root = [0usize; 5];
     // SAFETY: GetCurrentPlayerLoop returns PlayerLoopSystem (0x28 bytes) via a
     // hidden output pointer in rcx. root is exactly that writable stack buffer.
-    let answer = unsafe { crate::veh::call2(getter, root.as_mut_ptr() as usize, 0) }
+    let answer = unsafe { crate::veh::call2(api.getter, root.as_mut_ptr() as usize, 0) }
         .map_err(|error| format!("GetCurrentPlayerLoop faulted: {error}"))?;
     if answer == 0 {
         return Err("GetCurrentPlayerLoop returned NULL".into());
@@ -81,12 +128,13 @@ pub fn snapshot() -> Result<Vec<Entry>, String> {
     let children = root[1];
     let mut entries = Vec::new();
     if children != 0 {
-        read_children(children, "", 0, &mut entries)?;
+        read_children(&api, children, "", 0, &mut entries)?;
     }
     Ok(entries)
 }
 
 fn read_children(
+    api: &Api,
     children: usize,
     prefix: &str,
     depth: usize,
@@ -109,7 +157,7 @@ fn read_children(
             *word = crate::safe::read_usize(at.wrapping_add(slot * 8))
                 .ok_or_else(|| format!("PlayerLoop child {index} qword {slot} is unreadable"))?;
         }
-        let name = type_name(words[0]);
+        let name = type_name(api, words[0]);
         let segment = if name.is_empty() {
             format!("#{index}")
         } else {
@@ -126,7 +174,7 @@ fn read_children(
         entry.path = path.clone();
         entries.push(entry);
         if nested != 0 {
-            read_children(nested, &path, depth + 1, entries)?;
+            read_children(api, nested, &path, depth + 1, entries)?;
         }
     }
     Ok(())

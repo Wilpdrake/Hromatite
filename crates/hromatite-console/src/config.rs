@@ -5,23 +5,44 @@ use std::path::PathBuf;
 pub const HELP: &str = "hromatite-console — host TUI over Hromatite's existing file channel
 
 USAGE:
-  hromatite-console [--prefix DIR] [--log FILE] [--demo] [--snapshot] [--size WxH]
+  hromatite-console [--prefix DIR] [--log FILE] [--view NAME] [--demo]
+                    [--snapshot] [--size WxH]
 
   --prefix DIR   Proton prefix (default: $HROMATITE_PREFIX or Steam app 438100)
-  --log FILE     Override the input log path
+  --log FILE     Override the payload log path (also becomes the first view)
+  --view NAME    Open this log view first: payload, game, eac, hooks, gc,
+                 stdout, launch (or an index); default is payload
   --demo         Clearly marked synthetic fixture; never reads/writes live files
   --snapshot     Print one escape-free frame and exit (default 100x24)
   --size WxH     Snapshot dimensions, for example 120x32
+
+LOGS:
+  Every followed log is tailed at once and keeps its own history, scroll offset
+  and follow state; F9/F10 (or log next|prev|<name>) switch between them.
+  Sources are read-only files that the game, Proton, EAC and the payload write:
+    payload  hromatite.log        command channel, tick, telemetry
+    game     AppData/LocalLow/VRChat/VRChat/output_log_*.txt (newest)
+    eac      AppData/Roaming/EasyAntiCheat/*/*/anticheatlauncher.log
+    hooks    hromatite_eac_hooks.log (EAC frame log)
+    gc       VRChat.gc.log        Unity collector log
+    stdout   ~/.hromatite-logs/game-*.log (wrapper capture, newest)
+    launch   ~/.hromatite-launch.log
+  Wildcards re-resolve while running, so a game restart moves the view to the
+  new session's file and replays its tail.
 
 KEYS:
   help or ? local field manual (no payload answer required)
   Enter send/confirm    Up/Down history    Tab complete    Ctrl-R or / filter
   F1 field manual       F2 follow          F3 errors+GC    F4 or : palette
   F5 refresh once       F6 auto telemetry  F7 reload       F8 clear view
-  PgUp/PgDn scroll
+  F9 next log           F10 previous log
+  PgUp/PgDn page        mouse wheel scrolls 3 rows
   Esc back/cancel       Ctrl-C exit
-  Palette searches names, syntax and descriptions. RISK commands require a
-  second Enter; editing or Esc cancels the pending confirmation.
+  The palette is generated from the payload's own command table (palette, Tab
+  completion and the RISK gate share it), so it never lists a stale command.
+  Palette searches names, aliases, syntax and descriptions. RISK commands
+  require a second Enter; editing or Esc cancels the pending confirmation.
+  log / logs are host-side view commands and are never sent to the payload.
 ";
 
 #[derive(Debug)]
@@ -32,6 +53,7 @@ pub struct Config {
     pub demo: bool,
     pub snapshot: bool,
     pub help: bool,
+    pub view: Option<String>,
     pub width: u16,
     pub height: u16,
 }
@@ -48,6 +70,7 @@ impl Config {
         let mut demo = false;
         let mut snapshot = false;
         let mut help = false;
+        let mut view = None;
         let mut width = 100;
         let mut height = 24;
         let mut args = args
@@ -60,6 +83,7 @@ impl Config {
             match value.as_str() {
                 "--prefix" => prefix = PathBuf::from(required(&mut args, "--prefix")?),
                 "--log" => log_path = Some(PathBuf::from(required(&mut args, "--log")?)),
+                "--view" => view = Some(required(&mut args, "--view")?),
                 "--demo" => demo = true,
                 "--snapshot" => snapshot = true,
                 "-h" | "--help" => help = true,
@@ -78,6 +102,7 @@ impl Config {
             demo,
             snapshot,
             help,
+            view,
             width,
             height,
         })

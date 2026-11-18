@@ -1341,6 +1341,62 @@ fn resolve_chain(class: usize) -> Vec<(usize, Vec<crate::m3::Method>)> {
         .collect()
 }
 
+/// Substring search over the materialised class table.
+///
+/// This used to be `m3::find_contains`; the class table is the only source a
+/// resolver may use — the layout is per build and there is nothing to guess.
+#[cfg(windows)]
+fn find_contains(needle: &str, max: usize, limit: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (index, class) in crate::m3::classes(max) {
+        let Some(name) = crate::m3::class_name(class) else {
+            continue;
+        };
+        if name.is_empty() || !name.contains(needle) {
+            continue;
+        }
+        out.push((index, crate::m3::class_full_name(class)));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// `il2cpp_class_from_name(image, ns, name)` on the image of one assembly.
+///
+/// Every address comes from the build descriptor ([`crate::m3`]); the call is
+/// gated on the class table being populated, because issuing an il2cpp export
+/// before `il2cpp_init` finishes faults inside `il2cpp_alloc` (measured
+/// 2026-11-17: one AV per image, 99 in total).
+#[cfg(windows)]
+fn class_by_name_via_api(ns: &str, name: &str, assembly: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let call = crate::m3::class_from_name_addr()?;
+    // `None` = metadata is not initialised yet or the build is unknown: refuse
+    // instead of guessing an image.
+    if crate::m3::class_table().is_none() {
+        log::log_tag(
+            TAG,
+            &format!("class_from_name {ns}.{name}: no class table yet; deferred"),
+        );
+        return None;
+    }
+    let corlib = crate::raw::il2cpp::find_domain()?;
+    let image = crate::m3::image_of(corlib, assembly)?;
+    let ns_c = crate::raw::memscan::stash_cstr(ns)?;
+    let name_c = crate::raw::memscan::stash_cstr(name)?;
+    let class = crate::raw::memscan::call3(call, image, ns_c, name_c)?;
+    if class < 0x10000 {
+        return None;
+    }
+    let got = crate::m3::class_name(class)?;
+    let got_ns = crate::m3::class_namespace(class).unwrap_or_default();
+    (got == name && got_ns == ns).then_some(class)
+}
+
 /// Every class the resolver is willing to look at, in preference order.
 ///
 /// Three strategies, each tried only when the previous one found nothing:
@@ -1387,7 +1443,7 @@ fn peer_classes() -> Vec<(usize, usize)> {
     for (ns, name) in PEER_CANDIDATES {
         let api_hit = PEER_ASSEMBLIES
             .iter()
-            .find_map(|assembly| crate::m3::class_by_name_via_api(ns, name, assembly));
+            .find_map(|assembly| class_by_name_via_api(ns, name, assembly));
         if let Some(class) = api_hit {
             log::log_tag(
                 TAG,
@@ -1399,18 +1455,11 @@ fn peer_classes() -> Vec<(usize, usize)> {
                 out.push((usize::MAX, class));
             }
         }
-        if let Some(hit) = crate::m3::discover_class(ns, name) {
-            log::log_tag(
-                TAG,
-                &format!(
-                    "discovered {ns}.{name} -> {:#x} (name+{:#x}, methods+{:#x})",
-                    hit.class, hit.name_off, hit.methods_off
-                ),
-            );
-            if !out.iter().any(|(_, known)| *known == hit.class) {
-                out.push((hit.index, hit.class));
-            }
-        }
+        // The name/heap discovery pass (`m3::discover_class`) is gone: it
+        // guessed the record layout and, measured 2026-11-17, accepted the
+        // module header and ~300 non-image slots, so `class_from_name` on them
+        // faulted. Every offset is per build now — if the table and the API both
+        // miss, the resolver reports it instead of guessing.
     }
     if !out.is_empty() {
         return out;
@@ -1422,7 +1471,7 @@ fn peer_classes() -> Vec<(usize, usize)> {
     let table = crate::m3::classes(SCAN_LIMIT);
     let mut relaxed: Vec<(usize, usize)> = Vec::new();
     for needle in PEER_NEEDLES {
-        for (index, full) in crate::m3::find_contains(needle, SCAN_LIMIT, PEER_CONTAINS_LIMIT) {
+        for (index, full) in find_contains(needle, SCAN_LIMIT, PEER_CONTAINS_LIMIT) {
             let Some((_, class)) = table.iter().find(|(at, _)| *at == index) else {
                 continue;
             };
@@ -1624,7 +1673,7 @@ fn resolve_named(names: &[&str], preferred: Option<u8>) -> Option<Resolved> {
     }
     // Nothing matched: say what the class table actually holds, so a renamed type
     // (or a wrong table) is visible in one log line.
-    let like = crate::m3::find_contains("Photon", SCAN_LIMIT, 8);
+    let like = find_contains("Photon", SCAN_LIMIT, 8);
     log::log_tag(
         TAG,
         &format!(
@@ -1733,7 +1782,7 @@ fn build_report() -> String {
         .map(|(_, class)| crate::m3::class_full_name(*class))
         .collect();
     let stats = table_stats(&names);
-    let like = crate::m3::find_contains("Photon", SCAN_LIMIT, 16);
+    let like = find_contains("Photon", SCAN_LIMIT, 16);
     let send = resolve_send_operation().map(|resolved| {
         let class = crate::m3::class_full_name(resolved.class);
         let method = method_name(resolved.class, resolved.entry, SEND_METHODS);

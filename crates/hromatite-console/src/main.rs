@@ -3,10 +3,11 @@
 
 use hromatite_console::config::{Config, HELP};
 use hromatite_console::demo;
-use hromatite_console::fileio::{CommandWriter, LogTail};
+use hromatite_console::fileio::CommandWriter;
 use hromatite_console::input::KeyDecoder;
 use hromatite_console::model::{Action, ConsoleModel};
-use hromatite_console::render::{RenderContext, ansi_frame, render};
+use hromatite_console::render::{RenderContext, ansi_frame, body_rows, human_bytes, render};
+use hromatite_console::sources::{self, SourceTail};
 use hromatite_console::telemetry::AutoRefresh;
 use std::fs::Metadata;
 use std::io::{self, IsTerminal, Read, Write};
@@ -30,24 +31,61 @@ fn main() {
 
 fn run(config: Config) -> io::Result<()> {
     if config.demo {
+        let mut model = demo::model();
+        if let Some(view) = &config.view {
+            model.select_source(view);
+        }
         if config.snapshot {
-            snapshot(demo::model(), &config);
+            snapshot(&model, &config, &[]);
             return Ok(());
         }
-        return interactive(config, demo::model(), None);
+        return interactive(config, model, Vec::new());
     }
-    let mut tail = LogTail::open(&config.log_path, true)?;
+    let specs = sources::plan(&config);
+    let labels: Vec<&'static str> = specs.iter().map(|spec| spec.label).collect();
+    let mut tails: Vec<SourceTail> = specs
+        .into_iter()
+        .map(|spec| SourceTail::new(spec.pattern))
+        .collect();
     let mut model = ConsoleModel::new(false);
-    model.ingest(tail.poll()?);
+    model.configure_sources(&labels);
+    let mut failed = false;
+    for (index, tail) in tails.iter_mut().enumerate() {
+        match tail.poll() {
+            Ok(polled) => model.ingest_replay(index, polled.lines),
+            Err(error) => {
+                failed = true;
+                model.set_notice(format!("{}: {error}", labels[index]));
+            }
+        }
+    }
+    if !failed {
+        match &config.view {
+            Some(view) if model.select_source(view).is_some() => {}
+            Some(view) => model.set_notice(format!(
+                "no such log view: {view} — logs: {}",
+                model.source_labels().join(" ")
+            )),
+            None => model.set_notice(format!(
+                "following {} logs — F9/F10 switch, `logs` lists, F1 help",
+                model.source_count()
+            )),
+        }
+    }
     if config.snapshot {
-        snapshot(model, &config);
+        snapshot(&model, &config, &tails);
         return Ok(());
     }
-    interactive(config, model, Some(tail))
+    interactive(config, model, tails)
 }
 
-fn snapshot(model: ConsoleModel, config: &Config) {
-    let frame = render(&model, &context(config), config.width, config.height);
+fn snapshot(model: &ConsoleModel, config: &Config, tails: &[SourceTail]) {
+    let frame = render(
+        model,
+        &context(config, model, tails),
+        config.width,
+        config.height,
+    );
     let mut out = io::stdout().lock();
     for line in &frame.lines {
         let _ = writeln!(out, "{line}");
@@ -57,7 +95,7 @@ fn snapshot(model: ConsoleModel, config: &Config) {
 fn interactive(
     config: Config,
     mut model: ConsoleModel,
-    mut tail: Option<LogTail>,
+    mut tails: Vec<SourceTail>,
 ) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -71,21 +109,35 @@ fn interactive(
     let mut decoder = KeyDecoder::default();
     let mut input = [0u8; 256];
     let mut last_size = (0, 0);
+    let mut last_active = model.active_source();
     let mut stdout = io::stdout().lock();
     loop {
-        if let Some(source) = tail.as_mut() {
+        for (index, source) in tails.iter_mut().enumerate() {
             match source.poll() {
-                Ok(lines) => model.ingest(lines),
+                Ok(polled) => {
+                    if polled.retargeted {
+                        let label = model.source_labels()[index];
+                        model.set_notice(format!("{label}: new file {}", source.display()));
+                        model.ingest_replay(index, polled.lines);
+                    } else {
+                        model.ingest_from(index, polled.lines);
+                    }
+                }
                 Err(error) => model.set_notice(format!("log read: {error}")),
             }
         }
-        let render_context = context(&config);
+        if model.active_source() != last_active {
+            last_active = model.active_source();
+            let label = model.source_labels()[last_active];
+            model.set_notice(describe_view(label, &file_state(&tails[last_active])));
+        }
+        let render_context = context(&config, &model, &tails);
         let was_suspended = auto.suspended();
         let automatic = auto.poll(Instant::now(), render_context.log_age_secs);
         model.set_auto_suspended(auto.suspended());
         if was_suspended != auto.suspended() {
             model.set_notice(if auto.suspended() {
-                "auto telemetry paused: log is stale"
+                "auto telemetry paused: payload log is stale"
             } else {
                 "auto telemetry resumed"
             });
@@ -101,6 +153,7 @@ fn interactive(
             }
         }
         let (width, height) = terminal_size();
+        model.set_viewport(body_rows(height as usize));
         if (width, height) != last_size {
             write!(stdout, "\x1b[2J")?;
             last_size = (width, height);
@@ -153,26 +206,87 @@ fn interactive(
     }
 }
 
-fn context(config: &Config) -> RenderContext {
+#[derive(Clone)]
+struct FileState {
+    path: String,
+    bytes: Option<u64>,
+    age: Option<u64>,
+}
+
+fn file_state(source: &SourceTail) -> FileState {
+    let path = source.display();
+    match source
+        .resolved()
+        .and_then(|path| std::fs::metadata(path).ok())
+    {
+        Some(metadata) => FileState {
+            path,
+            bytes: Some(metadata.len()),
+            age: modified_age(&metadata),
+        },
+        None => FileState {
+            path,
+            bytes: None,
+            age: None,
+        },
+    }
+}
+
+fn describe_view(label: &str, state: &FileState) -> String {
+    let bytes = state
+        .bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "no file".into());
+    let age = state
+        .age
+        .map_or_else(|| "--".into(), |age| format!("{age}s ago"));
+    format!("view {label}: {} — {bytes}, {age}", state.path)
+}
+
+fn context(config: &Config, model: &ConsoleModel, tails: &[SourceTail]) -> RenderContext {
+    let view_label = model
+        .source_labels()
+        .get(model.active_source())
+        .copied()
+        .unwrap_or("payload");
     if config.demo {
+        let demo_bytes = |lines: &[&str]| -> Option<u64> {
+            Some(lines.iter().map(|line| line.len() as u64 + 1).sum())
+        };
+        let view_bytes = match view_label {
+            "game" => demo_bytes(demo::DEMO_GAME_LINES),
+            "eac" => demo_bytes(demo::DEMO_EAC_LINES),
+            _ => demo_bytes(demo::DEMO_LINES),
+        };
         return RenderContext {
             log_path: "<built-in demo fixture>".into(),
             command_path: "<disabled in demo>".into(),
-            log_bytes: Some(
-                demo::DEMO_LINES
-                    .iter()
-                    .map(|line| line.len() as u64 + 1)
-                    .sum(),
-            ),
+            log_bytes: demo_bytes(demo::DEMO_LINES),
             log_age_secs: Some(0),
+            view_path: format!("<built-in demo: {view_label}>"),
+            view_bytes,
+            view_age_secs: Some(0),
         };
     }
-    let metadata = std::fs::metadata(&config.log_path).ok();
+    // The payload log drives LINKED/STALE and the auto-telemetry gate; the view
+    // is whatever log the operator switched to.
+    let payload = tails.first().map(file_state).unwrap_or_else(|| FileState {
+        path: config.log_path.display().to_string(),
+        bytes: None,
+        age: None,
+    });
+    let view = tails
+        .get(model.active_source())
+        .map(file_state)
+        .unwrap_or_else(|| payload.clone());
     RenderContext {
-        log_path: config.log_path.display().to_string(),
+        log_path: payload.path,
         command_path: config.command_path.display().to_string(),
-        log_bytes: metadata.as_ref().map(Metadata::len),
-        log_age_secs: metadata.and_then(|metadata| modified_age(&metadata)),
+        log_bytes: payload.bytes,
+        log_age_secs: payload.age,
+        view_path: view.path,
+        view_bytes: view.bytes,
+        view_age_secs: view.age,
     }
 }
 
@@ -247,7 +361,10 @@ impl TerminalGuard {
             return Err(io::Error::last_os_error());
         }
         let mut stdout = io::stdout().lock();
-        write!(stdout, "\x1b[?1049h\x1b[?25h\x1b[2J")?;
+        // 1049 alternate screen, cursor on. 1000+1006 turn on mouse reporting in
+        // SGR form so the wheel can scroll the log; Shift+drag still selects text
+        // in terminals that reserve plain selection for the application.
+        write!(stdout, "\x1b[?1049h\x1b[?25h\x1b[?1000h\x1b[?1006h\x1b[2J")?;
         stdout.flush()?;
         Ok(Self { original })
     }
@@ -256,7 +373,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\x1b[0m\x1b[?25h\x1b[?1049l");
+        // Release mouse reporting before leaving the alternate screen, otherwise
+        // the operator's shell would keep receiving clicks as escape sequences.
+        let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l");
         let _ = stdout.flush();
         // SAFETY: original came from tcgetattr on this same fd and is still live.
         let _ = unsafe { tcsetattr(0, 0, &self.original) };

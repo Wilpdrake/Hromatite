@@ -18,10 +18,31 @@ pub const DEMO_LINES: &[&str] = &[
     "legacy unframed compatibility line",
 ];
 
+/// Unity player log, in the shape `output_log_*.txt` really uses.
+pub const DEMO_GAME_LINES: &[&str] = &[
+    "2026-11-18 07:08:11.113  Log        -  [Behaviour] OnPlayerJoined Nyx",
+    "2026-11-18 07:08:12.401  Log        -  [Behaviour] Entering Room: Demo Apartment",
+    "2026-11-18 07:08:14.882  Error      -  [Behaviour] Failed to load avatar bundle: demo",
+    "2026-11-18 07:08:15.004  Log        -  [Behaviour] Switching  to  OK",
+    "2026-11-18 07:08:19.771  Warning    -  [Behaviour] Audio device changed, reopening",
+];
+
+/// EAC launcher log, keeping its own bracketed prefixes.
+pub const DEMO_EAC_LINES: &[&str] = &[
+    "[EasyAntiCheat] Bootstrapper started",
+    "[EasyAntiCheat] System name: 'linux64'",
+    "[AntiCheatClient] Session Begin: Success (Mode 1)",
+    "[AntiCheatClient] Heartbeat sent 512 bytes",
+    "[AntiCheatClient] Session End: Success",
+];
+
 pub fn model() -> ConsoleModel {
     let mut model = ConsoleModel::new(true);
-    model.ingest(DEMO_LINES);
-    model.set_notice("DEMO fixture only — commands are not written anywhere");
+    model.configure_sources(&["payload", "game", "eac"]);
+    model.ingest_replay(0, DEMO_LINES);
+    model.ingest_replay(1, DEMO_GAME_LINES);
+    model.ingest_replay(2, DEMO_EAC_LINES);
+    model.set_notice("DEMO fixture only — F9/F10 switch the three logs; nothing is written");
     model
 }
 
@@ -34,5 +55,28 @@ mod tests {
         assert!(model.camera.is_some());
         assert!(model.player.as_deref().unwrap().contains("Nyx"));
         assert!(model.lines().any(|line| line.tag == "raw"));
+    }
+
+    #[test]
+    fn demo_offers_three_switching_views() {
+        let mut model = super::model();
+        assert_eq!(model.source_labels(), ["payload", "game", "eac"]);
+        assert_eq!(model.active_source(), 0);
+        assert_eq!(model.select_source("game"), Some("game"));
+        assert_eq!(model.active_source(), 1);
+        assert!(
+            model
+                .visible_lines()
+                .iter()
+                .any(|line| line.raw.contains("Entering Room")),
+            "the game view must show the game log"
+        );
+        assert_eq!(model.select_source("eac"), Some("eac"));
+        assert!(
+            model
+                .visible_lines()
+                .iter()
+                .any(|line| line.raw.contains("Session Begin"))
+        );
     }
 }

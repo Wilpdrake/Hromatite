@@ -26,7 +26,23 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
+/// SHA-256 of the build the features are talking to.
+///
+/// It must describe the *loaded* module, not the source tree: after a game
+/// update the compiled `symbols.rs` is stale, and a feature that keys its
+/// struct layout on the old SHA would read the new binary with the old offsets.
+/// `buildinfo` validates the compiled descriptor against the image first (no
+/// hashing on the normal path) and falls back to hashing only when it moved.
 pub(crate) fn game_sha_bytes() -> [u8; 32] {
+    if let Some(hex) = crate::buildinfo::loaded_sha_hex()
+        && let Some(bytes) = crate::buildinfo::decode_sha_hex(hex)
+    {
+        return bytes;
+    }
+    compiled_sha_bytes()
+}
+
+fn compiled_sha_bytes() -> [u8; 32] {
     let mut out = [0u8; 32];
     let text = crate::symbols::GAMEASSEMBLY_SHA256.as_bytes();
     for (index, slot) in out.iter_mut().enumerate() {
@@ -103,7 +119,7 @@ extern "system" fn host_guarded_call(
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (args, result);
-        STATUS_ERROR
+        return STATUS_ERROR;
     }
     #[cfg(target_os = "windows")]
     {
@@ -188,10 +204,11 @@ mod tests {
     #[test]
     fn game_hash_is_decoded_not_empty() {
         let hash = super::game_sha_bytes();
-        // First four bytes of `symbols::GAMEASSEMBLY_SHA256`; regenerated with
-        // the game build (`tools/symmap.py`).
-        assert_eq!(&hash[..4], &[0x24, 0x57, 0x68, 0xf2]);
-        assert_eq!(hex(&hash), crate::symbols::GAMEASSEMBLY_SHA256);
+        let expected = crate::symbols::GAMEASSEMBLY_SHA256;
+        assert_eq!(hex(&hash), expected);
+        // First four bytes must decode from the same string (build agnostic).
+        assert_eq!(hex(&hash[..4]).len(), 8);
+        assert!(expected.starts_with(&hex(&hash[..4])));
     }
 
     #[test]

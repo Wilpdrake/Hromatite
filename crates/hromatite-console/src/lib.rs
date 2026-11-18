@@ -9,6 +9,7 @@ pub mod input;
 pub mod model;
 pub mod parser;
 pub mod render;
+pub mod sources;
 pub mod telemetry;
 
 #[cfg(test)]

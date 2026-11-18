@@ -258,7 +258,7 @@ pub fn api() -> HostApiV1 {
         game_assembly_size: 0x0f44_0000,
         unity_player_base: 0x0000_0002_8000_0000,
         unity_player_size: 0x0215_3000,
-        game_assembly_sha256: [0x5a; 32],
+        game_assembly_sha256: hromatite_abi::build::newest_sha_bytes(),
         log,
         read,
         write,

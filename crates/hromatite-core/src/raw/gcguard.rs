@@ -1,65 +1,58 @@
-//! Boehm GC thread-lifetime recovery that never holds a lock across a
-//! collection.
+//! Boehm GC thread-lifetime recovery with ownership-preserving cleanup.
 //!
-//! `GC_remove_thread` normally does CloseHandle -> unlink -> free; two precise
-//! detours make it unlink -> CloseHandle -> free instead, so a record that the
-//! collector is about to visit still owns a *valid* thread handle (a closed
-//! handle makes `SuspendThread` fail with ERROR_ACCESS_DENIED before the
-//! `GetThreadContext` call-site is ever reached).
-//!
-//! The collector entry detour only marks the collection (`ENTRY_ACTIVE` +
-//! owner tid) and calls the original. It deliberately takes **no** lock: taking
-//! Boehm's thread-list section there and holding it across the stop-the-world
-//! pass inverts locks against `GC_unregister_my_thread` and wedges the world
-//! (measured 2026-11-18: login, world switch and menu freezes, 134/138 threads
-//! idle, main thread at 0% CPU, no dump).
-//!
-//! Records are removed only where the world is already stopped, so the table is
-//! stable without any lock of ours: the `GetThreadContext` call-site guard
-//! (`hook::install_gc_context_guard`) and the last-resort VEH for Boehm's own
-//! `SuspendThread/ResumeThread` aborts.
+//! GC_remove_thread normally does CloseHandle -> unlink -> free. Two precise
+//! detours make it unlink -> CloseHandle -> free instead. The entry collector
+//! also removes already-terminated records through that same original function,
+//! so it never leaks raw records or handles. The original no-argument suspend
+//! pass runs under Boehm's own thread-list lock, which is recursive by design.
 
-use crate::gamebuild;
-use crate::raw::hook::{Prep, masked_signature_matches, patch, prepare, register};
+use crate::raw::hook::{Prep, patch, prepare, register};
 use crate::{ffi, log, procs};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-// Boehm's thread-lifetime block on the 2026-11-17 build (`245768f2…`), measured
-// with Ghidra plus one live read of `GC_threads[]`:
-//
-//   FUN_180c43520 = GC_remove_thread   `LEA R14,[0x18e6bd8a0]`, CloseHandle at
-//                                      +0x40, unlink at +0x46, free at +0x68
-//   FUN_180c43790 = GC_suspend_all     `LEA RCX,[0x18e6bd860]` (EnterCriticalSection),
-//                                      `LEA R15,[0x18e6bd8a0]`, `LEA R12,[0x18e6be0a0]`
-//   GetThreadContext call-site +0xb2, retry limit 0xf4240, three INT3 sites.
-//
-// The previous build was `GC_threads` 0xe6bb180 / remove 0xc417b0 / suspend 0xc41a20.
-const GC_REMOVE_THREAD_RVA: usize = 0xc43520;
-const GC_SKIP_CLOSE_RVA: usize = 0xc43560;
-const GC_AFTER_UNLINK_RVA: usize = 0xc43588;
-const GC_UNLINKED_NEXT_RVA: usize = 0xc43566;
-const GC_SUSPEND_ENTRY_RVA: usize = 0xc43790;
-const GC_RESUME_ABORT_RVA: usize = 0xc4386b;
-const GC_SUSPEND_ABORT_RVA: usize = 0xc438d5;
-const GC_PROCESS_RECORD_RVA: usize = 0xc43800;
-const GC_ADVANCE_BUCKET_RVA: usize = 0xc439da;
-const GC_THREADS_RVA: usize = 0x0e6b_d8a0;
+// Absolute addresses for the build we actually attached to. Everything below is
+// filled once in `install()` from `hromatite_abi::build` (keyed by the module
+// hash) or, for an unknown build, from `raw::discover`. A zero value always
+// means "not resolved" and every user treats it as "do nothing".
+static REMOVE_THREAD_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SKIP_CLOSE_ADDR: AtomicUsize = AtomicUsize::new(0);
+static UNLINKED_NEXT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static AFTER_UNLINK_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SUSPEND_ENTRY_ADDR: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_RECORD_ADDR: AtomicUsize = AtomicUsize::new(0);
+static RESUME_ABORT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SUSPEND_ABORT_ADDR: AtomicUsize = AtomicUsize::new(0);
+static ADVANCE_BUCKET_ADDR: AtomicUsize = AtomicUsize::new(0);
 const WIN64_CONTEXT_RBX: usize = 0x90;
 const WIN64_CONTEXT_RIP: usize = 0xf8;
 
-/// `None` is a wildcard. These blocks are identified by their opcodes; the
-/// IAT `call [rip+disp32]` and the RIP-relative `lea` displacement belong to the
-/// build's import/data layout and change on every patch.
-const SKIP_CLOSE_SIGNATURE: &[Option<u8>] = &[Some(0xff), Some(0x15), None, None, None, None];
-const AFTER_UNLINK_SIGNATURE: &[Option<u8>] =
-    &[Some(0x48), Some(0x8d), Some(0x05), None, None, None, None];
-/// `GC_suspend_all` prologue: pushes RBX/RBP/RSI/RDI. No displacement, exact.
-const SUSPEND_ENTRY_SIGNATURE: [u8; 15] = [
-    0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
-];
+/// Byte counts the detours need at each site. The *contents* are build specific
+/// (relocated displacements), so only shapes are checked; the numeric sites
+/// themselves come from the build descriptor.
+const SKIP_CLOSE_LEN: usize = 6;
+const AFTER_UNLINK_LEN: usize = 7;
+const SUSPEND_ENTRY_LEN: usize = 15;
 
+/// `call qword ptr [rip+disp32]` — the CloseHandle call site.
+pub(crate) fn valid_skip_close(bytes: &[u8]) -> bool {
+    bytes.len() == SKIP_CLOSE_LEN && bytes[0] == 0xff && bytes[1] == 0x15
+}
+
+/// `lea rax,[rip+disp32]` — the sentinel check right after the unlink.
+pub(crate) fn valid_after_unlink(bytes: &[u8]) -> bool {
+    bytes.len() == AFTER_UNLINK_LEN && bytes[0..3] == [0x48, 0x8d, 0x05]
+}
+
+/// The collector entry is `mov [rsp+d8],rbx; mov [rsp+d8],reg; mov [rsp+d8],reg`.
 pub(crate) fn valid_gc_suspend_entry(bytes: &[u8]) -> bool {
-    bytes == SUSPEND_ENTRY_SIGNATURE
+    // Three consecutive 5-byte stores: `48 89 <modrm> 24 <disp8>`.
+    bytes.len() == SUSPEND_ENTRY_LEN
+        && bytes[0..2] == [0x48, 0x89]
+        && bytes[3] == 0x24
+        && bytes[5..7] == [0x48, 0x89]
+        && bytes[8] == 0x24
+        && bytes[10..12] == [0x48, 0x89]
+        && bytes[13] == 0x24
 }
 
 static ENTRY_ORIG: AtomicUsize = AtomicUsize::new(0);
@@ -73,12 +66,15 @@ static SKIP_PREP: AtomicUsize = AtomicUsize::new(0);
 static AFTER_PREP: AtomicUsize = AtomicUsize::new(0);
 static MODULE_BASE: AtomicUsize = AtomicUsize::new(0);
 static THREADS_BASE: AtomicUsize = AtomicUsize::new(0);
+static THREAD_LIST_CS: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 static DETACHING: AtomicBool = AtomicBool::new(false);
 static ENTRY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ENTRY_OWNER_TID: AtomicU32 = AtomicU32::new(0);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static REMOVED: AtomicU64 = AtomicU64::new(0);
 static RECOVERED: AtomicU64 = AtomicU64::new(0);
+static LAST_REMOVED: AtomicU32 = AtomicU32::new(0);
 static LAST_RECOVERED: AtomicU32 = AtomicU32::new(0);
 
 struct Flight;
@@ -133,15 +129,10 @@ pub fn before_unhook() -> bool {
 /// reinstall cannot silently promise a complete guard or drop pending decisions.
 pub fn after_unhook(hooks: &[(usize, bool)]) {
     let ga = MODULE_BASE.load(Ordering::Acquire);
-    let attached = |target: usize| {
-        ga != 0
-            && hooks
-                .iter()
-                .any(|(candidate, detached)| *candidate == target && !*detached)
-    };
-    ENTRY_ATTACHED.store(attached(ga + GC_SUSPEND_ENTRY_RVA), Ordering::Release);
-    SKIP_ATTACHED.store(attached(ga + GC_SKIP_CLOSE_RVA), Ordering::Release);
-    AFTER_ATTACHED.store(attached(ga + GC_AFTER_UNLINK_RVA), Ordering::Release);
+    let attached = |target: usize| ga != 0 && hooks.iter().any(|(candidate, detached)| *candidate == target && !*detached);
+    ENTRY_ATTACHED.store(attached(SUSPEND_ENTRY_ADDR.load(Ordering::Acquire)), Ordering::Release);
+    SKIP_ATTACHED.store(attached(SKIP_CLOSE_ADDR.load(Ordering::Acquire)), Ordering::Release);
+    AFTER_ATTACHED.store(attached(AFTER_UNLINK_ADDR.load(Ordering::Acquire)), Ordering::Release);
     // Latch detachment until install() completes every GC target again. A late
     // pre-emitted detour therefore cannot admit a new decision after detach.
     DETACHING.store(true, Ordering::Release);
@@ -237,7 +228,8 @@ impl DecisionBook {
     }
 }
 
-static CLOSE_DECISIONS: std::sync::Mutex<DecisionBook> = std::sync::Mutex::new(DecisionBook::new());
+static CLOSE_DECISIONS: std::sync::Mutex<DecisionBook> =
+    std::sync::Mutex::new(DecisionBook::new());
 
 fn begin_close(record: usize) -> CloseChoice {
     if DETACHING.load(Ordering::Acquire) || !READY.load(Ordering::Acquire) {
@@ -268,10 +260,14 @@ unsafe fn terminate_record_by_tid(id: u32) {
     }
     // SAFETY: id was read from a record currently linked under Boehm's list
     // lock. GC_remove_thread(tid) owns close+unlink+free for this exact build.
-    let f: unsafe extern "system" fn(u32) =
-        unsafe { core::mem::transmute(ga + GC_REMOVE_THREAD_RVA) };
-    // SAFETY: id was read from a linked record while the world is stopped (the
-    // collector's own pass or our VEH at its abort site), so the table is stable.
+    let remove = REMOVE_THREAD_ADDR.load(Ordering::Acquire);
+    if remove == 0 {
+        return;
+    }
+    // SAFETY: `remove` is the GC_remove_thread entry of the build we patched,
+    // whose signature is `void(DWORD tid)` on every supported build.
+    let f: unsafe extern "system" fn(u32) = unsafe { core::mem::transmute(remove) };
+    // SAFETY: id belongs to this exact linked record under the list lock.
     unsafe { f(id) };
 }
 
@@ -286,27 +282,56 @@ unsafe fn original_wait(handle: usize) -> u32 {
     }
 }
 
-/// Entry detour for the no-argument GC_suspend_all: a **marker only**.
-///
-/// It sets `ENTRY_ACTIVE`/`ENTRY_OWNER_TID` (so the removal path knows a
-/// collection is in progress and the last-resort VEH may act) and then runs the
-/// untouched original. It deliberately takes **no** lock and removes nothing.
-///
-/// Why: taking Boehm's thread-list critical section here and holding it across
-/// the original's stop-the-world pass creates a lock inversion — a worker
-/// suspended inside `GC_unregister_my_thread` (which takes the same section and
-/// waits for the collector) blocks the collector for good. Measured
-/// 2026-11-18: three freezes (login, world switch, menu) each left 134+ of 138
-/// threads idle with the main thread at 0% CPU and no dump; the same binary
-/// with this detour disabled loaded worlds normally for 40+ minutes.
-///
-/// Removing a record from here was also unsound: the world is still running at
-/// entry, so a concurrent table walk can observe a freed node. The two places
-/// that may repair the table both run with the world stopped — the
-/// `GetThreadContext` call-site guard and the `SuspendThread loop failed` VEH.
+unsafe fn sanitize_locked() {
+    let base = THREADS_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    for bucket in 0..256usize {
+        // SAFETY: base is the build-measured GC_threads table under its own lock.
+        let link = base.wrapping_add(bucket * core::mem::size_of::<usize>());
+        // SAFETY: link is a complete bucket pointer. Cross-bucket removal by tid
+        // is deliberate here: this iteration validates only linked memory.
+        let mut current = unsafe { core::ptr::read_unaligned(link as *const usize) };
+        for _ in 0..8 {
+            if current == 0 {
+                break;
+            }
+            // SAFETY: the list lock prevents concurrent mutation while scalar
+            // fields and the next link are read from this live record.
+            let (next, id, handle, stack, blocked) = unsafe {
+                (
+                    core::ptr::read_unaligned(current as *const usize),
+                    core::ptr::read_unaligned(current.wrapping_add(8) as *const u32),
+                    core::ptr::read_unaligned(current.wrapping_add(0x10) as *const usize),
+                    core::ptr::read_unaligned(current.wrapping_add(0x18) as *const usize),
+                    core::ptr::read_unaligned(current.wrapping_add(0x28) as *const usize),
+                )
+            };
+            if id != 0 && stack != 0 && blocked == 0 && handle != 0 && handle < usize::MAX - 1 {
+                // SAFETY: this exact object is queried only until it returns a
+                // signalled state. Invalid/unknown objects stay linked.
+                let wait = unsafe { original_wait(handle) };
+                if gc_record_action(wait) == GcRecordAction::Unlink {
+                    // SAFETY: GC_remove_thread performs all cleanup itself. Do not
+                    // continue walking this chain after it has freed a record.
+                    unsafe { terminate_record_by_tid(id) };
+                    LAST_REMOVED.store(id, Ordering::Relaxed);
+                    REMOVED.fetch_add(1, Ordering::Release);
+                    break;
+                }
+            }
+            current = next;
+        }
+    }
+}
+
+/// Entry detour for the no-argument GC_suspend_all. Sanitization and the
+/// original pass share the same outmost critical-section ownership.
 ///
 /// # Safety
-/// ENTRY_ORIG must be a trampoline for this exact build's GC_suspend_all.
+/// ENTRY_ORIG must be a trampoline for this exact build's GC_suspend_all, and
+/// THREAD_LIST_CS its measured Boehm thread-list critical section.
 unsafe extern "system" fn suspend_entry_detour() {
     let _flight = Flight::new();
     let original = ENTRY_ORIG.load(Ordering::Acquire);
@@ -314,23 +339,36 @@ unsafe extern "system" fn suspend_entry_detour() {
         return;
     }
     // SAFETY: original is a validated no-argument trampoline, with no altered
-    // argument state.
+    // argument state on the fast path.
     let f: unsafe extern "system" fn() = unsafe { core::mem::transmute(original) };
     if !READY.load(Ordering::Acquire) {
         // SAFETY: simply execute the uninstrumented original when not active.
         unsafe { f() };
         return;
     }
+    let cs = THREAD_LIST_CS.load(Ordering::Acquire);
+    if cs == 0 {
+        // SAFETY: optional instrumentation never suppresses Boehm itself.
+        unsafe { f() };
+        return;
+    }
+    // SAFETY: cs is a real CRITICAL_SECTION from GameAssembly; Windows permits
+    // recursive ownership on its collector thread. Lifecycle waits for Flight.
+    unsafe { ffi::EnterCriticalSection(cs as *mut core::ffi::c_void) };
     let was_active = ENTRY_ACTIVE.swap(true, Ordering::AcqRel);
     if !was_active {
         ENTRY_OWNER_TID.store(crate::gcthreads::own_tid(), Ordering::Release);
     }
-    // SAFETY: identical no-argument original trampoline, called unchanged.
+    // SAFETY: the recursive outmost lock serializes all record lifetime work.
+    unsafe { sanitize_locked() };
+    // SAFETY: identical no-argument original trampoline, now after sanitization.
     unsafe { f() };
     ENTRY_ACTIVE.store(was_active, Ordering::Release);
     if !was_active {
         ENTRY_OWNER_TID.store(0, Ordering::Release);
     }
+    // SAFETY: same lock and same owning thread as EnterCriticalSection.
+    unsafe { ffi::LeaveCriticalSection(cs as *mut core::ffi::c_void) };
 }
 
 /// Route skip-CloseHandle. With READY set, skip directly to the original next
@@ -341,9 +379,12 @@ unsafe extern "system" fn suspend_entry_detour() {
 /// original fallback trampoline when protection is not fully installed.
 unsafe fn skip_close_route(_handle: ffi::HANDLE, record: usize) -> usize {
     let _flight = Flight::new();
-    let ga = MODULE_BASE.load(Ordering::Acquire);
+    let unlinked_next = UNLINKED_NEXT_ADDR.load(Ordering::Acquire);
+    if unlinked_next == 0 {
+        return SKIP_ORIG.load(Ordering::Acquire);
+    }
     if begin_close(record) == CloseChoice::Skip {
-        return ga + GC_UNLINKED_NEXT_RVA;
+        return unlinked_next;
     }
     let original = SKIP_ORIG.load(Ordering::Acquire);
     if original != 0 {
@@ -352,10 +393,8 @@ unsafe fn skip_close_route(_handle: ffi::HANDLE, record: usize) -> usize {
     #[cfg(target_os = "windows")]
     // SAFETY: partial-install fallback must preserve the original close and
     // still continue at c417f6 rather than return to GC_remove_thread's caller.
-    unsafe {
-        ffi::CloseHandle(_handle)
-    };
-    ga + GC_UNLINKED_NEXT_RVA
+    unsafe { ffi::CloseHandle(_handle) };
+    unlinked_next
 }
 
 /// Naked continuation is mandatory: replacing a CALL with a JMP supplies no
@@ -385,8 +424,7 @@ unsafe extern "system" fn defer_close_detour() -> ! {
 ///
 /// # Safety
 /// The route runs only at c41818 in GC_remove_thread with the measured RBX
-/// record layout. Only the removal that owns this record reaches these sites, and
-/// the world is stopped whenever we repair the table, so no second remover races.
+/// record layout, while Boehm's thread-list lock excludes other removals.
 unsafe fn close_after_unlink_route(record: usize) -> usize {
     let _flight = Flight::new();
     // The decision was captured at THIS removal's first detour. Later activation
@@ -433,8 +471,7 @@ unsafe fn linked_by_pointer(base: usize, candidate: usize) -> Option<LinkedRecor
         return None;
     }
     for bucket in 0..256usize {
-        // SAFETY: base is the build-measured GC_threads table, read while the
-        // caller holds the world stopped.
+        // SAFETY: base is the build-measured GC_threads table under list lock.
         let link = base.wrapping_add(bucket * core::mem::size_of::<usize>());
         // SAFETY: link is a complete bucket pointer in that table.
         let mut current = unsafe { core::ptr::read_unaligned(link as *const usize) };
@@ -469,26 +506,26 @@ unsafe fn linked_by_pointer(base: usize, candidate: usize) -> Option<LinkedRecor
     None
 }
 
-fn next_after_abort(ga: usize, next: usize) -> (usize, usize) {
+fn next_after_abort(_ga: usize, next: usize) -> (usize, usize) {
     if next != 0 {
         // Skip the removed record's "mov rbx,[rbx]" entirely: the saved next
         // pointer is inserted into RBX before the ordinary per-record checks.
-        (next, ga + GC_PROCESS_RECORD_RVA)
+        (next, PROCESS_RECORD_ADDR.load(Ordering::Acquire))
     } else {
         // No list node remains: advance the bucket index, with no stale RBX read.
-        (0, ga + GC_ADVANCE_BUCKET_RVA)
+        (0, ADVANCE_BUCKET_ADDR.load(Ordering::Acquire))
     }
 }
 
-fn abort_address(ga: usize, code: u32, address: usize) -> bool {
-    ga != 0
-        && code == 0x8000_0003
-        && (address == ga + GC_RESUME_ABORT_RVA || address == ga + GC_SUSPEND_ABORT_RVA)
+fn abort_address(_ga: usize, code: u32, address: usize) -> bool {
+    code == 0x8000_0003
+        && address != 0
+        && (address == RESUME_ABORT_ADDR.load(Ordering::Acquire)
+            || address == SUSPEND_ABORT_ADDR.load(Ordering::Acquire))
 }
 
 /// Last-resort recovery of an exact Boehm fatal, while the owner thread still
-/// is at its own abort site with the world stopped. Cleanup is delegated to
-/// GC_remove_thread, then
+/// holds the record-list lock. Cleanup is delegated to GC_remove_thread, then
 /// execution resumes using the next pointer saved before that cleanup.
 ///
 /// # Safety
@@ -521,11 +558,9 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
         return false;
     }
     // SAFETY: RBX offset is the mingw-measured 0x90 field in that CONTEXT.
-    let candidate =
-        unsafe { core::ptr::read_unaligned(context.add(WIN64_CONTEXT_RBX).cast::<usize>()) };
+    let candidate = unsafe { core::ptr::read_unaligned(context.add(WIN64_CONTEXT_RBX).cast::<usize>()) };
     let base = THREADS_BASE.load(Ordering::Acquire);
-    // SAFETY: the collector is stopped at its own abort site, so pointer
-    // validation cannot race
+    // SAFETY: the active owner holds Boehm's lock, so pointer validation cannot
     // race a record removal/free. A stale RBX is not dereferenced on a miss.
     let Some(record) = (unsafe { linked_by_pointer(base, candidate) }) else {
         return false;
@@ -539,7 +574,7 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
         return false;
     }
     // SAFETY: next is captured while record is still allocated and the active
-    // world is stopped at this abort, not on some later unsynchronized read.
+    // owner holds Boehm's list lock, not on some later unsynchronized read.
     let next = unsafe { core::ptr::read_unaligned(record.record as *const usize) };
     // SAFETY: GC_remove_thread(tid) now uses the corrected unlink/close/free path.
     unsafe { terminate_record_by_tid(record.id) };
@@ -556,9 +591,13 @@ pub unsafe fn recover_boehm_abort(info: *mut ffi::EXCEPTION_POINTERS) -> bool {
 
 pub fn report_lines() -> Vec<String> {
     let mut lines = Vec::new();
-    // Table repairs are reported by the call-site guard itself
-    // (`inline guard: N stale record(s) reaped`); the entry detour no longer
-    // removes anything, so there is nothing to report here.
+    let removed = REMOVED.swap(0, Ordering::AcqRel);
+    if removed != 0 {
+        lines.push(format!(
+            "entry guard: {removed} terminated record(s) cleaned by GC_remove_thread; last id={:#x}",
+            LAST_REMOVED.load(Ordering::Acquire)
+        ));
+    }
     let recovered = RECOVERED.swap(0, Ordering::AcqRel);
     if recovered != 0 {
         lines.push(format!(
@@ -587,6 +626,31 @@ fn exact_bytes(target: usize, length: usize) -> Option<Vec<u8>> {
     crate::safe::read_bytes(target, length)
 }
 
+/// Shape of an initialised `RTL_CRITICAL_SECTION` (identical in Windows and
+/// wine): `DebugInfo` is `-1` or a pointer, `LockCount` is `-1` when free or
+/// `>= 0` when held, `RecursionCount` is small, and `OwningThread` is 0 or a
+/// plausible handle. Anything else is not a lock and must never be entered.
+fn critical_section_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 24 {
+        return false;
+    }
+    let debug_info = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default());
+    let lock_count = i32::from_le_bytes(bytes[8..12].try_into().unwrap_or_default());
+    let recursion = i32::from_le_bytes(bytes[12..16].try_into().unwrap_or_default());
+    let owner = u64::from_le_bytes(bytes[16..24].try_into().unwrap_or_default());
+    // `DebugInfo` is -1 or a user-space pointer; a value with the high bit set
+    // is a string word, not debug info.
+    let debug_ok = debug_info == u64::MAX || (0x10000..0x0000_8000_0000_0000).contains(&debug_info);
+    debug_ok
+        && (-1..=0x1_0000).contains(&lock_count)
+        && (0..=0x100).contains(&recursion)
+        && (owner == 0 || owner < 0x1_0000_0000)
+}
+
+fn looks_like_critical_section(address: usize) -> bool {
+    crate::safe::read_bytes(address, 24).is_some_and(|bytes| critical_section_shape(&bytes))
+}
+
 fn stored_prep(slot: &AtomicUsize, target: usize) -> Option<&'static Prep> {
     if slot.load(Ordering::Acquire) == 0 {
         let prep = Box::new(prepare(target)?);
@@ -613,21 +677,19 @@ fn install_attached(prep: &Prep, detour: usize, attached: &AtomicBool) -> bool {
 }
 
 /// Idempotent installation: validate destinations for this process, then patch
-/// close handling, close-after-unlink and finally the collector entry marker.
-/// Prepared pages and origins are never cleared or freed, including on a later
-/// failure; a retry reuses them rather than allocating replacement pages.
+/// close handling, close-after-unlink and finally the collector entry. Prepared
+/// pages and origins are never cleared or freed, including on a later failure;
+/// a retry reuses them rather than allocating replacement trampoline pages.
 pub fn install() -> bool {
     if READY.load(Ordering::Acquire) {
         return true;
     }
     reset_install();
-    // `HROMATITE_GCT_ENTRY=0` keeps Boehm completely stock. It exists only as the
+    // `HROMATITE_GCT_ENTRY=0` keeps Boehm completely stock and is only the
     // emergency switch for this guard: with it off, a worker that exits without
     // `GC_unregister_my_thread` leaks its record and the next collection aborts
-    // with `SuspendThread loop failed`. The default (unset) is the v2 guard: the
-    // entry detour marks the collection without taking any lock, the removal path
-    // keeps handles valid until after unlink, and the call-site guard repairs the
-    // table with the world stopped.
+    // with `SuspendThread loop failed`. Unset (the default) is the guard as
+    // described above; nothing else about the default path depends on the env.
     if std::env::var("HROMATITE_GCT_ENTRY")
         .map(|value| value == "0")
         .unwrap_or(false)
@@ -639,35 +701,34 @@ pub fn install() -> bool {
         );
         return false;
     }
-    if !gamebuild::is_supported() {
-        log::log_tag(
-            "gct",
-            "entry guard disabled: unsupported GameAssembly build",
-        );
-        return false;
-    }
-    let Some((ga, _)) = procs::own_module(crate::GAME_ASSEMBLY) else {
+    let Some((ga, gasize)) = procs::own_module(crate::GAME_ASSEMBLY) else {
         log::log_tag("gct", "entry guard disabled: GameAssembly is not loaded");
         return false;
     };
-    let entry = ga + GC_SUSPEND_ENTRY_RVA;
-    let skip = ga + GC_SKIP_CLOSE_RVA;
-    let after = ga + GC_AFTER_UNLINK_RVA;
+    let Some(anchors) = crate::buildinfo::gc_anchors(ga, gasize) else {
+        log::log_tag(
+            "gct",
+            "entry guard disabled: this GameAssembly build has no GC anchors",
+        );
+        return false;
+    };
+    let entry = ga + anchors.suspend_entry as usize;
+    let skip = ga + anchors.skip_close as usize;
+    let after = ga + anchors.after_unlink as usize;
     if (ENTRY_PREP.load(Ordering::Acquire) == 0
-        && exact_bytes(entry, SUSPEND_ENTRY_SIGNATURE.len())
+        && exact_bytes(entry, SUSPEND_ENTRY_LEN)
             .map(|head| valid_gc_suspend_entry(&head))
             != Some(true))
         || (SKIP_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(skip, SKIP_CLOSE_SIGNATURE.len())
-                .is_none_or(|head| !masked_signature_matches(&head, SKIP_CLOSE_SIGNATURE)))
+            && exact_bytes(skip, SKIP_CLOSE_LEN)
+                .map(|head| valid_skip_close(&head))
+                != Some(true))
         || (AFTER_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(after, AFTER_UNLINK_SIGNATURE.len())
-                .is_none_or(|head| !masked_signature_matches(&head, AFTER_UNLINK_SIGNATURE)))
+            && exact_bytes(after, AFTER_UNLINK_LEN)
+                .map(|head| valid_after_unlink(&head))
+                != Some(true))
     {
-        log::log_tag(
-            "gct",
-            "entry guard: one or more live signatures do not match",
-        );
+        log::log_tag("gct", "entry guard: one or more live signatures do not match");
         return false;
     }
     let Some(skip_prep) = stored_prep(&SKIP_PREP, skip) else {
@@ -679,30 +740,46 @@ pub fn install() -> bool {
     let Some(entry_prep) = stored_prep(&ENTRY_PREP, entry) else {
         return false;
     };
-    if skip_prep.prologue != SKIP_CLOSE_SIGNATURE.len()
-        || after_prep.prologue != AFTER_UNLINK_SIGNATURE.len()
-    {
+    if skip_prep.prologue != SKIP_CLOSE_LEN || after_prep.prologue != AFTER_UNLINK_LEN {
         return false;
     }
     MODULE_BASE.store(ga, Ordering::Release);
-    THREADS_BASE.store(ga + GC_THREADS_RVA, Ordering::Release);
+    REMOVE_THREAD_ADDR.store(ga + anchors.remove_thread as usize, Ordering::Release);
+    SKIP_CLOSE_ADDR.store(skip, Ordering::Release);
+    UNLINKED_NEXT_ADDR.store(ga + anchors.unlinked_next as usize, Ordering::Release);
+    AFTER_UNLINK_ADDR.store(after, Ordering::Release);
+    SUSPEND_ENTRY_ADDR.store(entry, Ordering::Release);
+    PROCESS_RECORD_ADDR.store(ga + anchors.process_record as usize, Ordering::Release);
+    RESUME_ABORT_ADDR.store(ga + anchors.resume_abort as usize, Ordering::Release);
+    SUSPEND_ABORT_ADDR.store(ga + anchors.suspend_abort as usize, Ordering::Release);
+    ADVANCE_BUCKET_ADDR.store(ga + anchors.advance_bucket as usize, Ordering::Release);
+    THREADS_BASE.store(ga + anchors.threads as usize, Ordering::Release);
+    // A wrong `thread_list_cs` used to *hang* the game: `EnterCriticalSection`
+    // on a non-lock spins forever, and the previous build's heuristic pointed at
+    // a plain string. Accept only the shape of an initialised critical section
+    // and otherwise run without sanitisation instead of freezing.
+    let cs_address = ga + anchors.thread_list_cs as usize;
+    let cs = if looks_like_critical_section(cs_address) {
+        cs_address
+    } else {
+        log::log_tag(
+            "gct",
+            &format!(
+                "thread-list lock {cs_address:#x} is not an initialised CRITICAL_SECTION; \
+                 sanitisation disabled"
+            ),
+        );
+        0
+    };
+    THREAD_LIST_CS.store(cs, Ordering::Release);
     SKIP_ORIG.store(skip_prep.trampoline, Ordering::Release);
     AFTER_ORIG.store(after_prep.trampoline, Ordering::Release);
     ENTRY_ORIG.store(entry_prep.trampoline, Ordering::Release);
 
-    if !install_attached(
-        skip_prep,
-        defer_close_detour as *const () as usize,
-        &SKIP_ATTACHED,
-    ) || !install_attached(
-        after_prep,
-        close_after_unlink_detour as *const () as usize,
-        &AFTER_ATTACHED,
-    ) || !install_attached(
-        entry_prep,
-        suspend_entry_detour as *const () as usize,
-        &ENTRY_ATTACHED,
-    ) {
+    if !install_attached(skip_prep, defer_close_detour as *const () as usize, &SKIP_ATTACHED)
+        || !install_attached(after_prep, close_after_unlink_detour as *const () as usize, &AFTER_ATTACHED)
+        || !install_attached(entry_prep, suspend_entry_detour as *const () as usize, &ENTRY_ATTACHED)
+    {
         reset_install();
         return false;
     }
@@ -710,9 +787,7 @@ pub fn install() -> bool {
     READY.store(true, Ordering::Release);
     log::log_tag(
         "gct",
-        &format!(
-            "GC guard installed at {entry:#x} (marker only, no lock held); CloseHandle moved after unlink"
-        ),
+        &format!("entry GC guard installed at {entry:#x}; CloseHandle moved after unlink"),
     );
     true
 }
@@ -721,6 +796,33 @@ pub fn install() -> bool {
 mod tests {
     use super::*;
     static LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The check that would have prevented the 245768f2 hang: an initialised,
+    /// unlocked `RTL_CRITICAL_SECTION` versus the bytes the old heuristic
+    /// pointed at (a plain "CP1252" string).
+    #[test]
+    fn only_initialised_critical_sections_are_accepted() {
+        let mut free = [0u8; 24];
+        free[0..8].copy_from_slice(&u64::MAX.to_le_bytes()); // DebugInfo = -1
+        free[8..12].copy_from_slice(&(-1i32).to_le_bytes()); // LockCount = -1
+        assert!(super::critical_section_shape(&free));
+
+        let mut held = free;
+        held[8..12].copy_from_slice(&3i32.to_le_bytes());
+        held[12..16].copy_from_slice(&1i32.to_le_bytes());
+        held[16..24].copy_from_slice(&0x1234u64.to_le_bytes());
+        assert!(super::critical_section_shape(&held), "a held lock is still a lock");
+
+        let mut not_a_lock = [0u8; 24];
+        // Exactly the bytes the heuristic pointed at in 245768f2: the string
+        // "CP1252" behind a small integer word — never a lock.
+        not_a_lock
+            .copy_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0x80, 0xfd, 0xff, 0, 0, 0, 0, 0, 0,
+                                b'C', b'P', b'1', b'2', b'5', b'2', 0, 0]);
+        assert!(!super::critical_section_shape(&not_a_lock));
+        assert!(!super::critical_section_shape(&not_a_lock[..12]));
+        assert!(!super::critical_section_shape(&[0u8; 24]), "all zero");
+    }
 
     #[repr(C)]
     struct Record {
@@ -783,11 +885,10 @@ mod tests {
     #[test]
     fn abort_resume_uses_saved_next_instead_of_freed_current_record() {
         let ga = 0x6fff_eaa1_0000;
-        assert_eq!(
-            next_after_abort(ga, 0x1234_5000),
-            (0x1234_5000, ga + GC_PROCESS_RECORD_RVA)
-        );
-        assert_eq!(next_after_abort(ga, 0), (0, ga + GC_ADVANCE_BUCKET_RVA));
+        PROCESS_RECORD_ADDR.store(ga + 0x70, Ordering::Relaxed);
+        ADVANCE_BUCKET_ADDR.store(ga + 0x24a, Ordering::Relaxed);
+        assert_eq!(next_after_abort(ga, 0x1234_5000), (0x1234_5000, ga + 0x70));
+        assert_eq!(next_after_abort(ga, 0), (0, ga + 0x24a));
         assert!(!can_recover_boehm_abort(false, 0x123, 0x123));
         assert!(!can_recover_boehm_abort(true, 0x123, 0x456));
         assert!(can_recover_boehm_abort(true, 0x123, 0x123));
@@ -817,10 +918,13 @@ mod tests {
         SKIP_ATTACHED.store(true, Ordering::Relaxed);
         AFTER_ATTACHED.store(true, Ordering::Relaxed);
         ENTRY_ATTACHED.store(true, Ordering::Relaxed);
+        SKIP_CLOSE_ADDR.store(ga + 0x40, Ordering::Relaxed);
+        AFTER_UNLINK_ADDR.store(ga + 0x68, Ordering::Relaxed);
+        SUSPEND_ENTRY_ADDR.store(ga + 0x270, Ordering::Relaxed);
         after_unhook(&[
-            (ga + GC_SKIP_CLOSE_RVA, false),
-            (ga + GC_AFTER_UNLINK_RVA, true),
-            (ga + GC_SUSPEND_ENTRY_RVA, true),
+            (ga + 0x40, false),
+            (ga + 0x68, true),
+            (ga + 0x270, true),
         ]);
         assert!(SKIP_ATTACHED.load(Ordering::Relaxed));
         assert!(!AFTER_ATTACHED.load(Ordering::Relaxed));

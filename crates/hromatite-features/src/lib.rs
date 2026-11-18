@@ -518,6 +518,11 @@ mod tests {
         assert!(lines[0].contains("\"ev\":\"session_begin\""));
         assert_eq!(lines[1].matches("\"ev\":\"heartbeat\"").count(), 1);
         assert!(lines[1].contains("\"frame_len\":144"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("\"source\":\"model\""),
+            "a synthesized beat must say so: {}",
+            lines[1]
+        );
         assert!(lines[2].contains("\"ev\":\"heartbeat\""));
         assert!(lines[3].contains("\"ev\":\"session_end\""));
         assert!(lines[3].contains("\"heartbeats\":2"), "{}", lines[3]);
@@ -587,6 +592,105 @@ mod tests {
             "{console}"
         );
         assert!(console.contains("eac.hooks: installed=false"), "{console}");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// One capture record: `u32 len, u32 dt_ms, bytes`.
+    fn record(dt_ms: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&dt_ms.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn wire_frame(flags: u16, session_id: u64, sequence: u64, body: &[u8]) -> Vec<u8> {
+        hromatite_eac::Frame {
+            header: hromatite_eac::Header {
+                version: hromatite_eac::codec::VERSION,
+                flags,
+                session_id,
+                sequence,
+                checksum: 0,
+            },
+            payload: body,
+        }
+        .encode(hromatite_eac::ChecksumKind::Crc32c)
+    }
+
+    fn wire_heartbeat(session_id: u64, sequence: u64) -> Vec<u8> {
+        let body = vec![0u8; hromatite_eac::codec::WIRE_BODY_LEN];
+        wire_frame(1, session_id, sequence, &body)
+    }
+
+    /// When the resident owns the outbound wrapper this image sees no frames at
+    /// all, so the only truth available is the capture file. The tap must mirror
+    /// it: real `SessionId`/`Sequence`, the transport's `dt`, the real 512-byte
+    /// size, a verified CRC — and it must silence the synthetic timer.
+    #[test]
+    fn the_capture_tap_mirrors_real_wire_heartbeats() {
+        let _serial = fake::serial();
+        start(32);
+        let dir = std::env::temp_dir().join(format!(
+            "hromatite-features-tap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("tap.jsonl");
+        let capture = dir.join("capture.bin");
+        std::fs::write(&capture, b"").expect("empty capture");
+
+        // `eac_auto=1` is the default: without a tap it would synthesize beats
+        // on its own timer, which is exactly what must not happen here.
+        assert_eq!(configure("eac_auto", "1"), STATUS_OK);
+        assert_eq!(send(&format!("eac.log {}", log.display())), STATUS_OK);
+        assert_eq!(send(&format!("eac.tap {}", capture.display())), STATUS_OK);
+
+        let mut bytes = Vec::new();
+        bytes.extend(record(0, &wire_frame(0x0013, 0x158b, 9, &[])));
+        bytes.extend(record(0, &wire_heartbeat(0x158b, 1)));
+        bytes.extend(record(2_007, &wire_heartbeat(0x158b, 2)));
+        std::fs::write(&capture, &bytes).expect("capture");
+        (api().tick)();
+        assert_eq!(send("eac.status"), STATUS_OK);
+
+        let text = std::fs::read_to_string(&log).expect("jsonl");
+        let beats: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("\"ev\":\"heartbeat\""))
+            .collect();
+        assert_eq!(beats.len(), 2, "records: {text}");
+        assert!(beats[0].contains("\"frame_len\":512"), "{}", beats[0]);
+        assert!(beats[0].contains("\"source\":\"wire\""), "{}", beats[0]);
+        assert!(
+            beats[0].contains("\"sid\":\"0x000000000000158b\""),
+            "{}",
+            beats[0]
+        );
+        assert!(beats[0].contains("\"seq\":1"), "{}", beats[0]);
+        assert!(beats[1].contains("\"seq\":2"), "{}", beats[1]);
+        assert!(beats[1].contains("\"dt_ms\":2007"), "{}", beats[1]);
+        assert!(
+            !text.contains("\"source\":\"model\""),
+            "the tap must suppress synthetic beats: {text}"
+        );
+
+        let console = fake::message_log();
+        assert!(console.contains("source=wire"), "{console}");
+        assert!(console.contains("observed=2"), "{console}");
+        assert!(console.contains("interval_ms=2007"), "{console}");
+        assert!(console.contains("crc_ok=3"), "{console}");
+        assert!(console.contains("crc_bad=0"), "{console}");
+
+        assert_eq!(send("eac.tap off"), STATUS_OK);
+        assert_eq!(send("eac.status"), STATUS_OK);
+        assert!(
+            fake::message_log().contains("source=model"),
+            "detaching must return the model"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

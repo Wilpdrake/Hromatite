@@ -7,6 +7,9 @@ description = "Host-side interactive TUI for the Hromatite file console"
 
 [dependencies]
 unicode-width = "0.2.3"
+# Same crate the payload builds its `help` from: the palette, completion and the
+# risk gate are generated, never hand-maintained.
+hromatite-commands = { path = "../hromatite-commands" }
 
 [lib]
 name = "hromatite_console"

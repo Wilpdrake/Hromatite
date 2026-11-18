@@ -1,6 +1,12 @@
+# Rust build artifacts — root workspace and every per-crate workspace
 /target
-crates/hromatite-overlay/target/
+crates/*/target/
+target-*/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors
 .idea/
 *.iml
-__pycache__/
-target-*/
