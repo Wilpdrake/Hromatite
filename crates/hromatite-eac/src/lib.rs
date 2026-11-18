@@ -33,7 +33,10 @@ pub mod clock;
 pub mod codec;
 pub mod digest;
 #[allow(unsafe_code)]
+pub mod eacimage;
+#[allow(unsafe_code)]
 pub mod eos;
+pub mod epoch;
 pub mod eventlog;
 #[allow(unsafe_code)]
 pub mod evp;
