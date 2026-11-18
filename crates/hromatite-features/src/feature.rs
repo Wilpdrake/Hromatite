@@ -232,6 +232,22 @@ impl Feature {
             // In-game ESP: the game's own renderer draws it, see `render.rs`.
             "draw" => match a1.to_ascii_lowercase().as_str() {
                 "" | "status" => self.respond(self.render.status(), STATUS_OK),
+                "probe" => {
+                    let lines = {
+                        let Some(mut metadata) = Metadata::new(&self.host, &mut self.metadata_cache)
+                        else {
+                            return self.respond(
+                                [format!(
+                                    "draw probe: no metadata layout for GameAssembly {}",
+                                    self.host.game_sha_hex()
+                                )],
+                                STATUS_NOT_READY,
+                            );
+                        };
+                        self.render.probe(&mut metadata)
+                    };
+                    self.respond(lines, STATUS_OK)
+                }
                 "on" | "1" => {
                     self.render.set(true);
                     self.respond(

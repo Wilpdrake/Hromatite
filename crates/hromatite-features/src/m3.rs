@@ -10,8 +10,6 @@ use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 pub const CLASS_MAX: usize = 120_000;
 
 /// `Il2CppTypeEnum` values this crate discriminates overloads by.
-const TYPE_VALUETYPE: u32 = 0x11;
-const TYPE_CLASS: u32 = 0x12;
 const TYPE_SZARRAY: u32 = 0x1d;
 
 #[derive(Debug, Default)]
@@ -289,18 +287,26 @@ impl<'a> Metadata<'a> {
             .map(|bits| (bits >> 16) & 0xff)
     }
 
-    /// `Il2CppClass*` a class/value-type record refers to (the type's `data`
-    /// union holds it for both kinds).
-    pub fn type_class(&self, ty: usize) -> Option<usize> {
-        if !matches!(self.type_kind(ty)?, TYPE_CLASS | TYPE_VALUETYPE) {
+    /// `Il2CppClass*` for a `const Il2CppType*`, via
+    /// `il2cpp_class_from_il2cpp_type`. The type's `data` union does not hold a
+    /// class pointer for CLASS/VALUETYPE (it holds a metadata index), so this
+    /// call is the only reliable way to turn a signature parameter into a class.
+    pub fn class_of_type(&self, ty: usize) -> Option<usize> {
+        if self.api.class_from_type == 0 || ty < 0x10000 {
             return None;
         }
-        self.host.read_usize(ty).filter(|class| *class >= 0x10000)
+        let (base, size) = self.host.game_assembly_range();
+        let function = base.checked_add(self.api.class_from_type as usize)?;
+        if function.checked_add(8)? > base.checked_add(size)? {
+            return None;
+        }
+        let class = self.host.call(function, &[ty]).ok()?;
+        (class >= 0x10000).then_some(class)
     }
 
-    /// `Il2CppClass*` of parameter `index` when it is a class or a value type.
+    /// `Il2CppClass*` of parameter `index`.
     pub fn parameter_class(&self, info: usize, index: u8) -> Option<usize> {
-        self.type_class(self.parameter_type(info, index)?)
+        self.class_of_type(self.parameter_type(info, index)?)
     }
 
     /// True when parameter `index` is a managed one-dimensional array (`T[]`).
@@ -308,15 +314,20 @@ impl<'a> Metadata<'a> {
         self.parameter_kind(info, index) == Some(TYPE_SZARRAY)
     }
 
-    /// Element class of parameter `index` when it is `T[]`.
+    /// Element class of parameter `index` when it is `T[]`: an `SZARRAY` type's
+    /// `data` points at an `Il2CppArrayType` whose first field is the element's
+    /// `Il2CppType`.
     pub fn parameter_array_element_class(&self, info: usize, index: u8) -> Option<usize> {
         let ty = self.parameter_type(info, index)?;
         if self.type_kind(ty)? != TYPE_SZARRAY {
             return None;
         }
-        // For SZARRAY the `data` union points at the element's `Il2CppType`.
-        let element = self.host.read_usize(ty).filter(|ty| *ty >= 0x10000)?;
-        self.type_class(element)
+        let array_type = self.host.read_usize(ty).filter(|value| *value >= 0x10000)?;
+        let element = self
+            .host
+            .read_usize(array_type)
+            .filter(|value| *value >= 0x10000)?;
+        self.class_of_type(element)
     }
 
     pub fn method_in_chain(&self, class: usize, name: &str) -> Option<(usize, usize)> {

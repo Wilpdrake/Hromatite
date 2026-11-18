@@ -377,6 +377,7 @@ mod tests {
         let info = 0x0000_0010_0000_0000u64;
         let params = info + 0x100;
         let vector3_array = info + 0x200;
+        let array_type = info + 0x280;
         let element = info + 0x300;
         let vector3 = 0x0000_0010_0000_4000u64;
         let int32 = 0x0000_0010_0000_5000u64;
@@ -384,13 +385,26 @@ mod tests {
         fake::put_u64(info + u64::from(layout.method_parameters), params);
         fake::put_u64(params, vector3_array);
         fake::put_u64(params + 8, int32);
-        // SZARRAY whose data points at the element type (a value type).
-        fake::put_u64(vector3_array, element);
+        // SZARRAY: `data` points at an Il2CppArrayType whose first field is the
+        // element type.
+        fake::put_u64(vector3_array, array_type);
         fake::put_u32(vector3_array + 8, 0x1d << 16);
-        fake::put_u64(element, vector3);
+        fake::put_u64(array_type, element);
         fake::put_u32(element + 8, 0x11 << 16);
-        // System.Int32 is a plain IVT (0x08), not a class.
+        // System.Int32 is a plain I4, not a class.
         fake::put_u32(int32 + 8, 0x08 << 16);
+
+        // `Il2CppType` does not carry a class pointer, so the only way to a class
+        // is `il2cpp_class_from_il2cpp_type`; the mock answers for Vector3 only.
+        let class_from_type = fake::api().game_assembly_base
+            + u64::from(hromatite_abi::build::newest().il2cpp.class_from_type);
+        fake::on_call(
+            class_from_type,
+            Box::new(move |args| match args.first().copied() {
+                Some(address) if address == element => (0, vector3),
+                _ => (0, 0),
+            }),
+        );
 
         assert!(
             metadata.parameter_is_array(info as usize, 0),

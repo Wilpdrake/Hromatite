@@ -78,6 +78,8 @@ pub struct Renderer {
     /// Consecutive faults; a run of them switches the renderer off instead of
     /// faulting the game once per frame.
     faults: u32,
+    /// Consecutive vertex-upload faults (the mesh never received geometry).
+    upload_faults: u32,
 }
 
 impl Default for Renderer {
@@ -90,6 +92,7 @@ impl Default for Renderer {
             segments: 0,
             players: 0,
             faults: 0,
+            upload_faults: 0,
         }
     }
 }
@@ -101,10 +104,17 @@ struct Api {
     material: usize,
     verts: usize,
     verts_data: usize,
+    mesh_class: usize,
     set_vertices: usize,
+    /// `Mesh.vertices` setter — the legacy upload path, used only when
+    /// `SetVertices(Vector3[])` throws inside Unity.
+    set_vertices_legacy: usize,
     draw_mesh: usize,
     matrix: [f32; 16],
     staging: Vec<f32>,
+    /// Element class and factory kept for the probe's own diagnostics.
+    vector3_class: usize,
+    array_new: usize,
     /// Floats currently holding geometry in the managed vertex array.
     written: usize,
     shader: String,
@@ -152,6 +162,75 @@ impl Renderer {
         out
     }
 
+    /// `draw probe` — report the managed objects and re-run one call, so a
+    /// fault inside Unity can be attributed instead of guessed.
+    pub fn probe(&self, metadata: &mut Metadata<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(api) = self.api.as_ref() else {
+            out.push("draw probe: managed objects not created yet (run `draw on`)".into());
+            return out;
+        };
+        let mesh_class = metadata.host.read_usize(api.mesh).unwrap_or(0);
+        let verts_class = metadata.host.read_usize(api.verts).unwrap_or(0);
+        let verts_len = metadata.host.read_usize(api.verts + 0x18).unwrap_or(0);
+        out.push(format!(
+            "draw probe: mesh {:#x} klass {:#x}, material {:#x} klass {:#x}",
+            api.mesh,
+            mesh_class,
+            api.material,
+            metadata.host.read_usize(api.material).unwrap_or(0)
+        ));
+        out.push(format!(
+            "draw probe: verts {:#x} klass {:#x} length {}",
+            api.verts, verts_class, verts_len
+        ));
+        out.push(format!(
+            "draw probe: SetVertices {:#x}, DrawMesh {:#x}, shader {:?}",
+            api.set_vertices, api.draw_mesh, api.shader
+        ));
+        // Is the mesh object itself healthy? A zero vertex count on a freshly
+        // constructed Mesh means the ctor did not run, not that the array is bad.
+        let mesh_methods = metadata.methods(api.mesh_class);
+        if let Some(get_count) = mesh_methods
+            .iter()
+            .find(|m| m.name == "get_vertexCount" && m.parameters_count == 0)
+            .map(|m| m.entry)
+            .filter(|entry| *entry != 0)
+        {
+            match metadata.host.call(get_count, &[api.mesh]) {
+                Ok(value) => out.push(format!("draw probe: mesh.vertexCount = {value}")),
+                Err(status) => out.push(format!("draw probe: get_vertexCount faulted, status {status}")),
+            }
+        }
+        // Same call with a one-element array: distinguishes "the array is wrong"
+        // from "the mesh is wrong".
+        if let Ok(small) = metadata.host.call(api.array_new, &[api.vector3_class, 1])
+            && small >= 0x10000
+        {
+            match metadata.host.call(api.set_vertices, &[api.mesh, small]) {
+                Ok(value) => out.push(format!("draw probe: SetVertices(len 1) returned {value:#x}")),
+                Err(status) => out.push(format!(
+                    "draw probe: SetVertices(len 1) faulted, host status {status}"
+                )),
+            }
+        }
+        match metadata
+            .host
+            .call(api.set_vertices, &[api.mesh, api.verts])
+        {
+            Ok(value) => out.push(format!("draw probe: SetVertices returned {value:#x}")),
+            Err(status) => out.push(format!("draw probe: SetVertices faulted, host status {status}")),
+        }
+        match metadata
+            .host
+            .call(api.draw_mesh, &[api.mesh, api.matrix.as_ptr() as usize, api.material, 0, 0, 0, 0, 0, 0, 0])
+        {
+            Ok(value) => out.push(format!("draw probe: DrawMesh returned {value:#x}")),
+            Err(status) => out.push(format!("draw probe: DrawMesh faulted, host status {status}")),
+        }
+        out
+    }
+
     /// Per-frame work on the established game thread. Draws every frame and
     /// rebuilds the vertex buffer occasionally.
     pub fn frame(&mut self, metadata: &mut Metadata<'_>, scene_cache: &mut telemetry::Cache) {
@@ -190,9 +269,32 @@ impl Renderer {
         self.frames = self.frames.saturating_add(1);
 
         if self.frames % REBUILD_EVERY == 1 {
-            let (segments, players) = rebuild(metadata, scene_cache, api);
-            self.segments = segments;
+            let (segments, players, upload_fault) = rebuild(metadata, scene_cache, api);
             self.players = players;
+            match upload_fault {
+                None => {
+                    self.segments = segments;
+                    self.upload_faults = 0;
+                }
+                Some(status) => {
+                    // Retry twice (the other upload path may work), then stop:
+                    // a fault per rebuild is an exception per rebuild inside Unity.
+                    self.segments = 0;
+                    self.upload_faults = self.upload_faults.saturating_add(1);
+                    if self.upload_faults == 1 {
+                        metadata.host.log(&format!(
+                            "draw: Mesh.SetVertices faulted (host status {status}); trying the legacy \
+                             vertices setter"
+                        ));
+                    }
+                    if self.upload_faults >= 3 {
+                        metadata
+                            .host
+                            .log("draw: vertex upload keeps faulting — renderer switched off");
+                        self.mode = Mode::Off;
+                    }
+                }
+            }
         }
 
         // SAFETY: the matrix is only read for the duration of the call, and it
@@ -239,7 +341,7 @@ fn rebuild(
     metadata: &mut Metadata<'_>,
     scene_cache: &mut telemetry::Cache,
     api: &mut Api,
-) -> (usize, usize) {
+) -> (usize, usize, Option<i32>) {
     api.staging.clear();
     let scene = telemetry::scene(metadata, scene_cache);
     let eye = scene.as_ref().and_then(|scene| scene.eye);
@@ -282,7 +384,7 @@ fn rebuild(
             api.written = 0;
             let _ = metadata.host.call(api.set_vertices, &[api.mesh, api.verts]);
         }
-        return (0, players);
+        return (0, players, None);
     }
 
     // Unused vertices collapse onto the origin, which rasterises to nothing.
@@ -293,7 +395,7 @@ fn rebuild(
     let bytes = f32_bytes(&api.staging[..filled]);
     if !metadata.host.write_bytes(api.verts_data, bytes) {
         metadata.host.log("draw: could not write the vertex array");
-        return (0, 0);
+        return (0, 0, None);
     }
     // When the box count drops, the vertices written last time are still in the
     // mesh; clear exactly that tail.
@@ -302,16 +404,27 @@ fn rebuild(
         metadata.host.write_bytes(api.verts_data + filled * 4, tail);
     }
     api.written = filled;
-    match metadata.host.call(api.set_vertices, &[api.mesh, api.verts]) {
-        Ok(_) => {}
-        Err(status) => {
-            metadata
-                .host
-                .log(&format!("draw: Mesh.SetVertices faulted (host status {status})"));
-            return (0, 0);
+    // `SetVertices(Vector3[])` has thrown inside Unity on this build; the legacy
+    // `Mesh.vertices` setter is a different code path and is tried once before
+    // the frame is declared broken.
+    let mut uploaded = false;
+    let mut last_status = 0;
+    for entry in [api.set_vertices, api.set_vertices_legacy] {
+        if entry == 0 {
+            continue;
+        }
+        match metadata.host.call(entry, &[api.mesh, api.verts]) {
+            Ok(_) => {
+                uploaded = true;
+                break;
+            }
+            Err(status) => last_status = status,
         }
     }
-    (filled / 12, players)
+    if !uploaded {
+        return (0, 0, Some(last_status));
+    }
+    (filled / 12, players, None)
 }
 
 /// Reinterpret an `f32` slice as bytes without copying: the staging buffer is
@@ -394,16 +507,48 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
         .map(|m| m.entry)
         .filter(|entry| *entry != 0)
         .ok_or_else(|| "UnityEngine.Mesh.SetVertices(Vector3[]) not found".to_string())?;
-    let set_triangles = mesh_methods
+    let set_vertices_legacy = mesh_methods
         .iter()
         .find(|m| {
-            m.name == "SetTriangles"
-                && m.parameters_count == 2
-                && metadata.parameter_array_element_class(m.info, 0) == Some(int32_class)
+            m.name == "set_vertices"
+                && m.parameters_count == 1
+                && metadata.parameter_is_array(m.info, 0)
         })
         .map(|m| m.entry)
         .filter(|entry| *entry != 0)
-        .ok_or_else(|| "UnityEngine.Mesh.SetTriangles(int[], int) not found".to_string())?;
+        .unwrap_or(0);
+    // `SetTriangles` follows the same collapsing rule as `DrawMesh`: the
+    // two-parameter C# shape may exist as `(int[], int)` or only as
+    // `(int[], int, bool calculateBounds)`. Both are called through the same
+    // entry, with the third argument set to "recalculate bounds".
+    let mut set_triangles = None;
+    let mut triangle_shapes = Vec::new();
+    for candidate in mesh_methods
+        .iter()
+        .filter(|m| m.name == "SetTriangles" && (2..=3).contains(&m.parameters_count))
+        .filter(|m| metadata.parameter_is_array(m.info, 0))
+    {
+        let element = metadata.parameter_array_element_class(candidate.info, 0);
+        triangle_shapes.push(format!(
+            "params={} element={element:?}",
+            candidate.parameters_count
+        ));
+        let better = match set_triangles {
+            None => true,
+            Some((_, count, element)) => {
+                (element == Some(int32_class) && candidate.parameters_count <= count)
+                    || (element != Some(int32_class) && candidate.parameters_count < count)
+            }
+        };
+        if better {
+            set_triangles = Some((candidate.entry, candidate.parameters_count, element));
+        }
+    }
+    let Some((set_triangles, set_triangles_arity, _)) = set_triangles else {
+        return Err(format!(
+            "UnityEngine.Mesh.SetTriangles(int[], int) not found (array overloads: {triangle_shapes:?})"
+        ));
+    };
     let set_bounds = mesh_methods
         .iter()
         .find(|m| m.name == "set_bounds" && m.parameters_count == 1)
@@ -522,7 +667,12 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
     if !host.write_bytes(triangles.wrapping_add(ARRAY_DATA), &bytes) {
         return Err("could not fill the index array".into());
     }
-    host.call(set_triangles, &[mesh, triangles, 0])
+    let triangle_arguments: Vec<usize> = if set_triangles_arity >= 3 {
+        vec![mesh, triangles, 0, 1]
+    } else {
+        vec![mesh, triangles, 0]
+    };
+    host.call(set_triangles, &triangle_arguments)
         .map_err(|status| format!("Mesh.SetTriangles faulted: {status}"))?;
 
     // One huge bounds box: the mesh is rebuilt every few frames and Unity would
@@ -546,7 +696,9 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
         material,
         verts,
         verts_data: verts.wrapping_add(ARRAY_DATA),
+        mesh_class,
         set_vertices,
+        set_vertices_legacy,
         draw_mesh,
         matrix: [
             1.0, 0.0, 0.0, 0.0, //
@@ -555,6 +707,8 @@ fn build_api(metadata: &mut Metadata<'_>) -> Result<Api, String> {
             0.0, 0.0, 0.0, 1.0,
         ],
         staging: Vec::with_capacity(MAX_VERTS * 3),
+        vector3_class,
+        array_new,
         written: 0,
         shader: shader_name,
         classes,
