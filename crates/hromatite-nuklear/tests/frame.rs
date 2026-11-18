@@ -5,16 +5,26 @@
 
 use hromatite_nuklear::{Input, Keys, Nk, Ui};
 
-fn click(nk: &mut Nk, x: f32, y: f32) {
+fn frame_with(nk: &mut Nk, x: f32, y: f32, left_down: bool) -> hromatite_nuklear::Frame {
     let input = Input {
         mouse_x: x,
         mouse_y: y,
-        left_pressed: true,
-        left_down: false,
+        left_pressed: left_down,
+        left_down,
         scroll: 0.0,
         keys: Keys::default(),
     };
-    let _ = nk.frame(&input);
+    nk.frame(&input)
+}
+
+/// A full click: release first, then press.
+///
+/// nuklear only records `clicked_pos` when the button state *changes*, so a
+/// scan that presses at a new point every frame without releasing in between
+/// would keep hitting the first point.
+fn click(nk: &mut Nk, x: f32, y: f32) {
+    frame_with(nk, x, y, false);
+    let _ = frame_with(nk, x, y, true);
 }
 
 /// Restore the state a fresh `Ui` would have, so a scan starts from a known point.
@@ -31,6 +41,9 @@ fn reset(ui: &mut Ui) {
 
 /// Scan a rectangle for a click point that makes `want` true.
 ///
+/// `reset` runs before every attempt, so a test can either restore a fresh `Ui`
+/// or deliberately keep the state left by the previous click.
+///
 /// The alternative would be hard-coding pixel coordinates, which breaks on the
 /// first layout tweak. Scanning keeps the test about behaviour ("a click on the
 /// close button closes the window") instead of about geometry.
@@ -40,6 +53,7 @@ fn find_click_in(
     x1: i32,
     y0: i32,
     y1: i32,
+    reset: impl Fn(&mut Ui),
     want: impl Fn(&Ui) -> bool,
 ) -> Option<(f32, f32)> {
     let mut y = y0;
@@ -75,7 +89,7 @@ fn frame_without_input_is_not_empty() {
 #[test]
 fn close_button_click_closes_the_window() {
     let mut nk = Nk::new().expect("context");
-    let hit = find_click_in(&mut nk, 200, 356, 20, 110, |ui| !ui.open)
+    let hit = find_click_in(&mut nk, 200, 356, 20, 110, reset, |ui| !ui.open)
         .expect("some point in the header must be the close button");
     assert!(!nk.ui().open, "click at {hit:?} must close the window");
 }
@@ -83,11 +97,11 @@ fn close_button_click_closes_the_window() {
 #[test]
 fn reopen_button_click_opens_the_window() {
     let mut nk = Nk::new().expect("context");
-    let hit = find_click_in(&mut nk, 200, 356, 20, 110, |ui| !ui.open)
+    let _hit = find_click_in(&mut nk, 200, 356, 20, 110, reset, |ui| !ui.open)
         .expect("close button");
     assert!(!nk.ui().open);
 
-    let reopen = find_click_in(&mut nk, 16, 160, 16, 70, |ui| ui.open)
+    let reopen = find_click_in(&mut nk, 16, 160, 16, 70, |_| {}, |ui| ui.open)
         .expect("the collapsed window must offer a reopen button");
     assert!(nk.ui().open, "click at {reopen:?} must reopen the window");
 }
@@ -96,7 +110,7 @@ fn reopen_button_click_opens_the_window() {
 fn esp_checkbox_click_flips_state() {
     let mut nk = Nk::new().expect("context");
     assert!(nk.ui().esp);
-    let hit = find_click_in(&mut nk, 16, 356, 20, 140, |ui| !ui.esp)
+    let hit = find_click_in(&mut nk, 16, 356, 20, 140, reset, |ui| !ui.esp)
         .expect("some point in the toggle row must be the ESP checkbox");
     assert!(!nk.ui().esp, "click at {hit:?} must toggle ESP off");
 }
@@ -147,8 +161,8 @@ fn non_ascii_player_names_are_sanitized() {
     );
 
     // And the frame itself must survive a directly-assigned non-ASCII name.
-    drop(ui);
-    nk.ui_mut().players.push(hromatite_nuklear::Player {
+    let ui = nk.ui_mut();
+    ui.players.push(hromatite_nuklear::Player {
         name: String::from("Прямое имя"),
         distance: 3.0,
     });
@@ -182,11 +196,29 @@ fn draw_indices_stay_inside_the_vertex_range() {
 fn font_atlas_is_baked() {
     let nk = Nk::new().expect("context");
     let atlas = nk.font_texture().expect("baked font atlas");
-    assert!(atlas.width > 0, "atlas width");
-    assert!(atlas.height > 0, "atlas height");
-    assert_eq!(atlas.data.len(), atlas.width as usize * atlas.height as usize * 4);
+    let (w, h) = (atlas.width(), atlas.height());
+    assert!(w > 0, "atlas width");
+    assert!(h > 0, "atlas height");
+    assert_eq!(atlas.data().len(), w as usize * h as usize * 4);
     assert!(
-        atlas.data.iter().any(|&b| b != 0),
+        atlas.data().iter().any(|&b| b != 0),
         "the baked atlas must not be blank"
     );
 }
+
+/// Regression test: nuklear's TTF decompressor keeps its cursor in process-wide
+/// `static`s, so two concurrent `Nk::new()` calls used to corrupt the font bake
+/// and abort on `nk_decompress`'s assertion.
+#[test]
+fn contexts_can_be_created_concurrently() {
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                let mut nk = Nk::new().expect("context");
+                let frame = nk.frame(&Input::default());
+                assert!(!frame.commands.is_empty());
+            });
+        }
+    });
+}
+
