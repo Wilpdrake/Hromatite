@@ -30,11 +30,13 @@ pub use raw::hook;
 pub use raw::hot as hot_runtime;
 pub use raw::iat;
 pub use raw::il2cpp;
+pub use raw::kiero;
 pub use raw::memory as safe;
 pub use raw::photon;
 pub use raw::playerloop;
 pub use raw::procs;
 pub use raw::remote;
+pub use raw::vmt;
 
 pub const GAME_EXE: &str = "VRChat.exe";
 pub const GAME_ASSEMBLY: &str = "GameAssembly.dll";
