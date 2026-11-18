@@ -356,6 +356,15 @@ pub const SPECS: &[Spec] = &[
         scope: Scope::Feature,
     },
     Spec {
+        name: "eac.tap",
+        aliases: &[],
+        usage: "eac.tap [off|from <path>|<path>]",
+        summary: "mirror the real heartbeat frames from the capture file",
+        note: "зеркало реальных кадров из capture-файла",
+        risk: Risk::ReadOnly,
+        scope: Scope::Feature,
+    },
+    Spec {
         name: "eac.log",
         aliases: &[],
         usage: "eac.log <path>",
