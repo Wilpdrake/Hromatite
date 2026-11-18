@@ -540,13 +540,31 @@ mod imp {
             if !succeeded(hr) || device == 0 {
                 return Err(format!("IDXGISwapChain::GetDevice failed: {hr:#x}"));
             }
+            log::log_tag("d3d11", &format!("GetDevice -> device {device:#x} (hr {hr:#x})"));
             let mut context = 0usize;
             let hr = method(
                 device,
                 DEVICE_GET_IMMEDIATE_CONTEXT,
                 &[(&mut context as *mut usize as u64)],
             );
+            log::log_tag(
+                "d3d11",
+                &format!("GetImmediateContext slot {DEVICE_GET_IMMEDIATE_CONTEXT} -> hr {hr:#x}, context {context:#x}"),
+            );
             if !succeeded(hr) || context == 0 {
+                // Dump the surrounding vtable entries with their first bytes: the
+                // next live run then settles the index without another rebuild.
+                for index in 34..=44u32 {
+                    let Some(function) = slot(device, index) else {
+                        continue;
+                    };
+                    let bytes = crate::safe::read_upto(function, 12);
+                    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    log::log_tag(
+                        "d3d11",
+                        &format!("  slot {index} @ {function:#x}: {}", hex.join(" ")),
+                    );
+                }
                 return Err(format!("ID3D11Device::GetImmediateContext failed: {hr:#x}"));
             }
 
