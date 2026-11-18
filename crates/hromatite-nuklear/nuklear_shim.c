@@ -108,8 +108,10 @@ void nk_shim_get_constants(struct nk_shim_constants *out)
     out->text_centered = NK_TEXT_CENTERED;
     out->text_right = NK_TEXT_RIGHT;
 
-    out->layout_static = NK_LAYOUT_STATIC;
-    out->layout_dynamic = NK_LAYOUT_DYNAMIC;
+    /* nk_layout_row_begin takes `enum nk_layout_format`, which is NOT the same
+     * enum as the NK_LAYOUT_* panel types. */
+    out->layout_static = NK_STATIC;
+    out->layout_dynamic = NK_DYNAMIC;
 }
 
 /* ------------------------------------------------------------------ */
@@ -433,48 +435,55 @@ int nk_shim_convert(void *ctx, void *cmds, void *verts, void *elems)
     return res == NK_CONVERT_SUCCESS ? 0 : -1;
 }
 
-size_t nk_shim_draw_command_count(void *cmds)
+size_t nk_shim_buffer_used(void *buf)
 {
-    struct nk_buffer *b = (struct nk_buffer *)cmds;
+    struct nk_buffer *b = (struct nk_buffer *)buf;
     if (!b) return 0;
-    return (size_t)(nk_buffer_total(b) / sizeof(struct nk_draw_command));
+    /* For a front buffer `allocated` is the number of bytes in use;
+     * `memory.size` is the capacity, which is what nk_buffer_total returns. */
+    return (size_t)b->allocated;
+}
+
+size_t nk_shim_draw_command_count(void *ctx)
+{
+    struct nk_context *c = (struct nk_context *)ctx;
+    return c ? (size_t)c->draw_list.cmd_count : 0;
 }
 
 size_t nk_shim_vertex_count(void *verts)
 {
-    struct nk_buffer *b = (struct nk_buffer *)verts;
-    if (!b) return 0;
-    return (size_t)(nk_buffer_total(b) / sizeof(nk_shim_vertex));
+    return nk_shim_buffer_used(verts) / sizeof(nk_shim_vertex);
 }
 
 size_t nk_shim_element_count(void *elems)
 {
-    struct nk_buffer *b = (struct nk_buffer *)elems;
-    if (!b) return 0;
-    return (size_t)(nk_buffer_total(b) / sizeof(nk_draw_index));
+    return nk_shim_buffer_used(elems) / sizeof(nk_draw_index);
 }
 
-size_t nk_shim_copy_draw_commands(void *font, void *cmds,
+size_t nk_shim_copy_draw_commands(void *font, void *ctx, void *cmds,
     nk_shim_draw_command *out, size_t max)
 {
     struct nk_shim_font *f = (struct nk_shim_font *)font;
+    struct nk_context *c = (struct nk_context *)ctx;
     struct nk_buffer *b = (struct nk_buffer *)cmds;
-    const struct nk_draw_command *src;
-    size_t count, i;
+    const struct nk_draw_command *cmd;
+    size_t i = 0;
 
-    if (!b || !out || max == 0) return 0;
-    count = (size_t)(nk_buffer_total(b) / sizeof(struct nk_draw_command));
-    if (count > max) count = max;
-    src = (const struct nk_draw_command *)nk_buffer_memory_const(b);
-    for (i = 0; i < count; ++i) {
-        out[i].clip_x = src[i].clip_rect.x;
-        out[i].clip_y = src[i].clip_rect.y;
-        out[i].clip_w = src[i].clip_rect.w;
-        out[i].clip_h = src[i].clip_rect.h;
-        out[i].elem_count = src[i].elem_count;
-        out[i].texture_id = (f && src[i].texture.ptr == f->tex.ptr) ? 1u : 0u;
+    if (!c || !b || !out || max == 0) return 0;
+    /* nuklear keeps draw commands in a back buffer (filled from the end), so
+     * the buffer's `allocated` counter says nothing about them. The public
+     * nk_draw_list_foreach iterator is the supported way to walk them. */
+    nk_draw_list_foreach(cmd, &c->draw_list, b) {
+        if (i >= max) break;
+        out[i].clip_x = cmd->clip_rect.x;
+        out[i].clip_y = cmd->clip_rect.y;
+        out[i].clip_w = cmd->clip_rect.w;
+        out[i].clip_h = cmd->clip_rect.h;
+        out[i].elem_count = cmd->elem_count;
+        out[i].texture_id = (f && cmd->texture.ptr == f->tex.ptr) ? 1u : 0u;
+        i++;
     }
-    return count;
+    return i;
 }
 
 size_t nk_shim_copy_vertices(void *verts, nk_shim_vertex *out, size_t max)
@@ -482,7 +491,7 @@ size_t nk_shim_copy_vertices(void *verts, nk_shim_vertex *out, size_t max)
     struct nk_buffer *b = (struct nk_buffer *)verts;
     size_t count, bytes;
     if (!b || !out || max == 0) return 0;
-    count = (size_t)(nk_buffer_total(b) / sizeof(nk_shim_vertex));
+    count = nk_shim_buffer_used(verts) / sizeof(nk_shim_vertex);
     if (count > max) count = max;
     bytes = count * sizeof(nk_shim_vertex);
     memcpy(out, nk_buffer_memory_const(b), bytes);
@@ -495,7 +504,7 @@ size_t nk_shim_copy_elements(void *elems, uint16_t *out, size_t max)
     const nk_draw_index *src;
     size_t count, i;
     if (!b || !out || max == 0) return 0;
-    count = (size_t)(nk_buffer_total(b) / sizeof(nk_draw_index));
+    count = nk_shim_buffer_used(elems) / sizeof(nk_draw_index);
     if (count > max) count = max;
     src = (const nk_draw_index *)nk_buffer_memory_const(b);
     for (i = 0; i < count; ++i)
