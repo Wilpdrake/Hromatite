@@ -101,3 +101,32 @@ x86_64-pc-windows-gnu --offline`; живой прогон — пользоват
   целей) — нужен fail-open и стенд.
 * `EAC_FORGE_STREAM`/Photon никогда не проверялись живьём; ожидания могут быть
   неверными, поэтому первый прогон — диагностический, не «приёмка».
+
+## 7. Живой прогон C (игру запускает пользователь; агент её не трогает)
+
+1. Сохранить `~/.hromatite-mode` (sha256) и вернуть байт-в-байт после прогона.
+2. Выставить на прогон (сборка этой ветки):
+   `HROMATITE_DLL=Z:\home\wilpdrake\RustroverProjects\Hromatite-replace\target\x86_64-pc-windows-gnu\release\hromatite.dll`,
+   `HROMATITE_FEATURE_DLL=…\release\hromatite_features.dll`, остальные ключи как сейчас
+   (`FRAME_HOOK=1`, `LATE_UPDATE=auto`, `PLAYER_LOOP=0`, `LIVE=0`, `SEAL=0`, `L2B=0`,
+   `GCT_FIX=1`, `EAC_EVENTHOOK=0`, `EACSHIM_DROP_AFTER_MS=0`) плюс
+   `EAC_REPLAY_SELF=1` и `EAC_FORGE_KEEP_SMALL=1`.
+3. Запуск обычный. В `hromatite.log` ожидаем: `eac: hooks installed 8/8` →
+   `[report] self: … message start(s) … waiting` (не чаще раза в 5 с) →
+   `[report] self stream sid=0x… frames=…` → `[report] start mode=report`.
+4. Критерий: **>300 с** от `[report] start` без `code 104` / «could not maintain a
+   verified connection» ⇒ содержимое replayable внутри сессии (трек A возможен).
+   Кик на 50–75 с ⇒ записи привязаны ко времени/процессу (остаётся трек B).
+5. Если 7 минут нет `self stream` — модуль не выдал второго `StartData`:
+   проверить, что мир загружен и в логе идут `[msg] out … len=512`.
+
+## 8. Что уже сделано в коде (ветка `eac-replace`)
+
+* `MessageHeader` переписан по измерениям: поля `+0x00..+0x18`, blob массивом
+  48 Б с `+0x1C`; `MSG_HEADER_LEN = 0x4E` (начало записей).
+* `TotalMode::Recorded` — по умолчанию (константа на action, не счётчик кадров).
+* `boundary_flags` больше не выставляет `EndData` (в 512-Б кадрах его нет).
+* `session_blob` (SplitMix-выдумка) удалён; blob пишется только наблюдаемый.
+* `EAC_REPLAY_SELF=1` сам взводит takeover (90 с / 20 кадров) и переигрывает
+  **целое** сообщение `StartData..StartData`, дожидаясь его появления.
+* Проверено: eac 82/82, clippy `-D warnings`, windows release.

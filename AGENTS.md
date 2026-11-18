@@ -3387,3 +3387,34 @@ il2cpp одними чтениями памяти (без единого выз�
   `head`/`len`. (2) `EAC_EVENT_SEND` из того же прогона (нужен шаблон event 66).
   (3) IAT-хук `AddNotify` (для EOSSDK-кадров при поздней инъекции) и `EAC_EVP` —
   как было. Merge в master — после согласования.
+
+### 2026-11-18 — EAC: разведка «полного отключения», исправлена модель сообщения, self-replay
+
+- Ветка `eac-replace` (worktree `~/RustroverProjects/Hromatite-replace`) от
+  `eac-emu` @ `6d6cadf`; коммиты `8c3a14c` (план), `d292081` (WIP-предпосылки
+  сборки), `fix(eac): model the message header…`, `feat(eac): EAC_REPLAY_SELF…`.
+- **Разведка (3 агента, только чтение).** EAC на Linux/Proton — один ELF-SO
+  12 015 192 Б, замапленный **в `VRChat.exe`**; бутстрап пишет `Wine module
+  mapping` → `loaded in-game` → `Terminating with: 0` (107 мс). Ядра нет
+  (0/288 в `/proc/modules`), win64-часть (перечисление модулей, Hash Catalogue)
+  не загружается. Без модуля: null client — кик **~3 с**; стаб бутстрапа —
+  `Error World`/offline и **0 вызовов AC API**. Значит «убрать EAC и прислать
+  свои кадры» упирается в допуск, а не в транспорт.
+- **Свежий разбор 2106 кадров / 17 сессий.** `+0x04` — константа 1 (**не**
+  счётчик); счётчик — `u32` по `+0x18`, +1 на сообщение (22→35 в control, 157
+  в live 2026-11-18); `total_len` — константа на action (1592/13, 2302/4), а не
+  длина сообщения; сообщения 35–209 кадров; `EndData` не встречается; blob 48 Б
+  наблюдается, а не выводится.
+- **Код.** `MessageHeader` переписан (поля, blob массивом, `MSG_HEADER_LEN=0x4E`),
+  `TotalMode::Recorded` по умолчанию, `boundary_flags` без `EndData`,
+  `session_blob` (SplitMix) удалён. `EAC_REPLAY_SELF=1` теперь сам взводит
+  takeover (90 с / 20 кадров, без файла отчёта) и переигрывает **целое**
+  сообщение `StartData..StartData`, дожидаясь его; ожидание логируется раз в 5 с.
+- **Проверено.** `cargo test -p hromatite-eac` — **82/82**; clippy `-D warnings`
+  по eac — чисто; `cargo build --workspace --release --target
+  x86_64-pc-windows-gnu` — OK (`hromatite.dll` 2 316 635 Б).
+- **Осталось (живой прогон, запускает пользователь).** `EAC_REPLAY_SELF=1` +
+  `EAC_FORGE_KEEP_SMALL=1`, критерий: `[report] self stream …` и **>300 с** без
+  `code 104` ⇒ содержимое replayable внутри сессии (трек A возможен); кик на
+  50–75 с ⇒ записи привязаны ко времени/процессу, остаётся трек B (ослепление
+  чтений EAC). Подробности и env — `docs/EAC-REPLACE-PLAN.md` §7.
