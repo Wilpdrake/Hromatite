@@ -42,6 +42,8 @@
 | L2 «двойная память» | ❌ спроектировано (§7.4), не написано |
 | Инцидент: EAC выкинул с «failed to verify installation integrity» (error 16) | ⚠️ причина не изолирована (см. §8.4) |
 | Падения `Fatal error in GC — SuspendThread loop failed` | ✅ причина найдена, лечится в рантайме: протухшая запись `GC_threads[]` у нормально завершившегося потока il2cpp — репер вычеркивает её за <1 с (см. §17, 2026-11-15) |
+| **Живая сборка сейчас `245768f2…`** (шаг образов `0x50`, `Il2CppClass.name +0x10`, steps `class_methods 0x58`, `class_fields 0x88`, `method_*` +8) | ✅ все per-build числа — в `hromatite-abi::build` (`KNOWN`), в коде литералов больше нет; строки TL;DR выше с `0x48`/`0xe66c870`/`0xc2a330` относятся к предыдущей сборке `648f61b1…` |
+| **EAC heartbeat** | ✅ **зеркало** реальных кадров: `eac.tap` читает capture резидента, JSONL пишет `source=wire`, 512 Б, реальные sid/seq, `dt` median 2008 мс, CRC 26/26 (живая приёмка 2026-11-18); ❌ синтез/подмена, который держит сессию (forge 39–75 с против 120.5 с «тишины») |
 
 ---
 
@@ -3445,3 +3447,79 @@ il2cpp одними чтениями памяти (без единого выз�
   запуск делает пользователь; критерий: `F9`/`F10` листают семь видов, `logs`
   печатает список, в игре ничего не меняется. Дефолты не изменились:
   `tools/hromatite-tui.sh` без аргументов по-прежнему открывает `payload`.
+
+### 2026-11-18 — Heartbeat приведён к проводу: CRC/кадр/каденция по факту, `eac.tap` зеркалит реальные кадры
+
+- Коммиты: **`ba03e35`** (модель+CRC+tap), **`76681ce`** (шаг image-таблицы),
+  **`1004394`** (все resident-аксессоры из дескриптора + `class_from_name`),
+  **`fb4e159`** (`Il2CppClass.name` +0x10 + обход всех образов),
+  **`267e90c`** (CRITICAL_SECTION вместо строки + гейт формы).
+- **Провод изучен и закреплён тестом.** CRC-32C **raw** (`init=0, xorout=0`)
+  по **всему кадру** с обнулённым полем контрольной суммы воспроизводит
+  **170/170** кадров `evidence/control_0009/capture.bin` (121×512 Б + 24-Б ack и
+  все прочие размеры); стандартный вариант `init=xorout=0xFFFFFFFF` — 0/121.
+  Тест включается `HROMATITE_EAC_CAPTURE=<capture.bin>` и **не коммитит байты
+  протокола**. Прежняя реализация ошибалась дважды: не тот вариант и не тот
+  регион (пропускала 4 нулевых байта поля).
+- **Модель больше не выдумывает.** `DEFAULT_INTERVAL_MS = 2007`,
+  `WIRE_HEARTBEAT_LEN = 512` (24+488), `Beat.frame_len/observed`,
+  `EacSession::record_observed` (реальные sid/seq/dt, эпоха открывается сама при
+  смене sid, каденция переучивается и гэп 26 с её не портит). Новый `tap`
+  (инкрементальный ридер capture-файла резидента: offset + неполный хвост +
+  ротация) и команда `eac.tap [off|from <path>|<path>]`. Пока tap подключён,
+  синтетические удары не пишутся; записи несут `source=wire`, а `eac.status`
+  печатает `source= wire_len= tap_crc=ok/total`, `observed=`, измеренный
+  `interval_ms`. `eac.hooks` больше не врёт нулём: строка `out=0 while in=N —
+  outbound counters live in the resident; read the frames with eac.tap`.
+- **Живая приёмка (10:29–10:32 MSK, pid 1116073, мир `wrld_ea474137…`).**
+  `[late] LateUpdate runtime ready … inline GC guard installed`,
+  `LateUpdate … hits=2528 (49.3/s), last tid=0x1c0`. В JSONL 57 записей:
+  **24 heartbeat, все `source=wire`, `frame_len=512`**, `dt` median **2008 мс**
+  (min 2000 / max 2047), `sid=0x5eac` (реальный), `seq` 9→33, `flags=0`;
+  плюс `report` (StartData: `frame_len=356, total_len=32894, action=1`) и 32
+  `ac_in`. `eac.status`: `sid=0x5eac … interval_ms=2010 dt_ms=2010 gaps=0
+  frame_len=512`, `source=wire … tap_crc=26/26`. `eac.tap`: `frames=26
+  crc_ok=26 crc_bad=0`. До правки те же поля были `interval_ms=5000`,
+  `frame_len=144`, выдуманный sid, `dt≈5210`.
+- **Три бага живой сборки `245768f2…`, найденные этим прогоном** (все — «числа
+  прошлой сборки»; из-за них payload вообще не стартовал, а один — вешал игру):
+  1. **шаг таблицы образов** `0x48` → **`0x50`** и имя файла `+0x40` → **`+0x18`**
+     (измерено на живом процессе: 69 записей от `Assembly-CSharp @0x3027c0a0`);
+     `m3::image_of` с литералом не находил `Assembly-CSharp` → `[late] class did
+     not become available` через 30 с;
+  2. **`Il2CppClass.name` `+0x98` → `+0x10`** (на записи `VRC.Udon.UdonManager
+     @0x31e92490`: `+0x10`='UdonManager', `+0x18`='VRC.Udon', `+0x98`=0) →
+     `class_full_name()` давал `"VRC.Udon."` и авто-цель не совпадала. Подтверждено
+     там же: methods `+0x58`, fields `+0x88` (ровно 66 записей по 0x20, счётчик
+     `+0x124`=66), `MethodInfo.name +0x20`, `return_type +0x28` (void у
+     `LateUpdate`), `flags 0x81`, params 0, parent `+0xa0`;
+  3. **`gc.thread_list_cs` = `0xe6bd800`**, а там лежит строка **«CP1252»**.
+     `EnterCriticalSection` по этому адресу крутится вечно: игра вставала через
+     ~20 с после старта (26 % CPU, main thread в futex), тогда как чистый запуск
+     доходит до UI за 24 с. Настоящий адрес — **`0xe6bd860`** (найден офлайном по
+     двум `call [EnterCriticalSection]`, чей `lea rcx` указывает рядом с таблицей
+     потоков; в живой памяти это инициализированная `RTL_CRITICAL_SECTION`:
+     `DebugInfo=-1, LockCount=-1`). Добавлен гейт формы: если по адресу не
+     CRITICAL_SECTION — санитизация отключается с логом, а не вешает игру.
+- **Побочное наблюдение:** wrapper повторно инжектит, пока не увидит строку
+  `LateUpdate runtime ready`; вторая копия образа не может провалидировать уже
+  пропатченные сайты и печатает `signatures do not match` + `startup aborted`.
+  Когда первая установка удаётся, повторов нет; лечится не раньше, чем payload
+  научится распознавать собственные патчи.
+- **Проверено:** `hromatite-core` **134** (включая форму CRITICAL_SECTION и оба
+  CRC-варианта), abi 8, eac 43+1, features 16, commands 4; clippy
+  `--workspace --all-targets --release` (windows-gnu) чисто; release-сборка OK;
+  `HROMATITE_EAC_CAPTURE=…/control_0009/capture.bin` → `verified 170/170`.
+  Новых `crash.dmp` нет, `VRChat.gc.log` в этом прогоне не создавался.
+- **Что НЕ достигнуто (граница честности).** Это **зеркало**, а не синтез:
+  сессию держит реальный клиент, мы лишь читаем его кадры (в игру ничего не
+  отправляется). Собственный heartbeat по-прежнему не держит сессию — forge
+  39–75 с, реплей чужого отчёта 53–65 с, реплей чужих кадров ~200 с против
+  120.5 с полной тишины и 283 с живой сессии; упирается в 16-байтные записи
+  тела (похоже на хеши памяти, ASLR-привязанные) — следующий блокер вне
+  текущего объёма.
+- **Хвост для следующей сессии:** `eac.tick` печатает 144-байтный модельный
+  кадр (честно помечен `model`); `playerloop.rs` и worker-trace всё ещё
+  привязаны к `648f61b1…`; `tools/buildgen.py` не знает новых полей
+  (`image_stride/name/filename`, `class_from_name`) — при следующем обновлении
+  игры их надо добавить в генератор, иначе дескриптор соберётся неполным.
