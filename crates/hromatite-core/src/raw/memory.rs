@@ -81,6 +81,47 @@ pub unsafe extern "system" fn WriteProcessMemory(
     0
 }
 
+#[cfg(not(target_os = "windows"))]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Unsupported host stub: the arguments follow the Win32 allocation contract
+/// but no guest page is reserved; a null result makes every caller fail closed.
+pub unsafe extern "system" fn VirtualAlloc(
+    _addr: usize,
+    _size: usize,
+    _ty: u32,
+    _protect: u32,
+) -> *mut u8 {
+    core::ptr::null_mut()
+}
+
+#[cfg(not(target_os = "windows"))]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Unsupported host stub: `old` is the same optional output pointer as in the
+/// Win32 declaration and is left untouched; protection changes are refused.
+pub unsafe extern "system" fn VirtualProtect(
+    _addr: *mut u8,
+    _size: usize,
+    _newp: u32,
+    _old: *mut u32,
+) -> i32 {
+    0
+}
+
+#[cfg(not(target_os = "windows"))]
+#[unsafe(no_mangle)]
+/// # Safety
+/// Unsupported host stub: the handle and range use the Win32 contract but no
+/// cache flush is performed; the host needs no instruction-cache coherence.
+pub unsafe extern "system" fn FlushInstructionCache(
+    _h: crate::ffi::HANDLE,
+    _base: *const u8,
+    _size: usize,
+) -> i32 {
+    0
+}
+
 /// Give the game's GC a window: `SuspendThread` fails ("Fatal error in GC") when
 /// our injected thread is busy inside a long memory scan, and the game freezes.
 /// Every full-memory scan in the console calls this once per region.
