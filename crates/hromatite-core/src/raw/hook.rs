@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use std::sync::Mutex;
 
 const MEM_FREE: u32 = 0x0001_0000;
-const PAGE_SIZE: usize = 0x1000;
+pub(crate) const PAGE_SIZE: usize = 0x1000;
 /// Stay well inside the ±2 GiB reach of a `jmp rel32`.
 const REL32_SPAN: usize = 0x7F00_0000;
 
@@ -275,7 +275,7 @@ pub fn decode_one(b: &[u8]) -> Option<Insn> {
 
 /// Decode until at least `min` bytes are covered; return the covered length and
 /// the decoded instructions (needed to relocate the copy).
-fn decode_span(bytes: &[u8], min: usize) -> Option<(usize, Vec<Insn>)> {
+pub(crate) fn decode_span(bytes: &[u8], min: usize) -> Option<(usize, Vec<Insn>)> {
     let mut off = 0usize;
     let mut out = Vec::with_capacity(8);
     while off < min {
@@ -302,18 +302,18 @@ pub fn prologue_len(bytes: &[u8], min: usize) -> Option<usize> {
 // Trampoline allocation
 // ---------------------------------------------------------------------------
 
-fn rel32_ok(from: usize, to: usize) -> bool {
+pub(crate) fn rel32_ok(from: usize, to: usize) -> bool {
     let d = to as i64 - from as i64;
     d >= i32::MIN as i64 && d <= i32::MAX as i64
 }
 
-fn adjusted_disp32(original: i32, delta: i64) -> Option<i32> {
+pub(crate) fn adjusted_disp32(original: i32, delta: i64) -> Option<i32> {
     // delta = trampoline - old_address. The relocated instruction's next RIP
     // moved by +delta, so its displacement must move by -delta, not +delta.
     (original as i64 - delta).try_into().ok()
 }
 
-fn write_mode(offset_in_16: usize) -> Option<u8> {
+pub(crate) fn write_mode(offset_in_16: usize) -> Option<u8> {
     match offset_in_16 {
         0..=3 => Some(8),
         4..=11 => Some(16),
@@ -321,7 +321,7 @@ fn write_mode(offset_in_16: usize) -> Option<u8> {
     }
 }
 
-fn branch_into_prologue(target: usize, prologue: usize, off: usize, len: usize, disp: i64) -> bool {
+pub(crate) fn branch_into_prologue(target: usize, prologue: usize, off: usize, len: usize, disp: i64) -> bool {
     let absolute = target as i64 + (off + len) as i64 + disp;
     absolute >= target as i64 && absolute < target as i64 + prologue as i64
 }
@@ -480,7 +480,7 @@ pub struct Hook {
 ///   blocks: write the `rel32` tail first, then the opcode. A thread that
 ///   fetches in between sees the original opcode with a patched displacement —
 ///   the only non-atomic case.
-unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8) -> bool {
+pub(crate) unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8) -> bool {
     let o16 = target - base16;
     match wmode {
         8 => {
@@ -555,7 +555,7 @@ unsafe fn write_window(base16: usize, target: usize, new32: &[u8; 32], wmode: u8
     }
 }
 
-fn set_range_protect(addr: usize, len: usize, prot: u32) -> Option<u32> {
+pub(crate) fn set_range_protect(addr: usize, len: usize, prot: u32) -> Option<u32> {
     let page = addr & !(PAGE_SIZE - 1);
     let end = (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut old = 0u32;
@@ -565,7 +565,7 @@ fn set_range_protect(addr: usize, len: usize, prot: u32) -> Option<u32> {
     (ok != 0).then_some(old)
 }
 
-fn flush(addr: usize, len: usize) {
+pub(crate) fn flush(addr: usize, len: usize) {
     // SAFETY: the pseudo-process handle is always valid; addr/len describe the
     // generated code range supplied by the caller.
     unsafe {
@@ -577,7 +577,7 @@ fn flush(addr: usize, len: usize) {
 /// far outside rel32 reach (wine maps ntdll at 0x6fff_xxxx_xxxx while a
 /// manual-mapped payload sits near 0x1xx_xxxx), so the patched `jmp rel32` lands
 /// on this relay, which does an absolute jump to the real detour.
-const RELAY_OFF: usize = 0x100;
+pub(crate) const RELAY_OFF: usize = 0x100;
 
 pub(crate) struct Prep {
     target: usize,
