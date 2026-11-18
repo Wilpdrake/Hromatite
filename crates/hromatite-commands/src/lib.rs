@@ -106,7 +106,7 @@ pub const SPECS: &[Spec] = &[
     Spec {
         name: "draw",
         aliases: &[],
-        usage: "draw [on|off|status]",
+        usage: "draw [on|off|status|probe]",
         summary: "in-game ESP drawn by the game's own renderer",
         note: "оверлей внутри кадра игры: сетка/боксы рисует сама Unity (без хука графики)",
         risk: Risk::ReadOnly,

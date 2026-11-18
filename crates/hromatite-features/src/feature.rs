@@ -259,7 +259,7 @@ impl Feature {
                     self.render.set(false);
                     self.respond(["draw: off".to_string()], STATUS_OK)
                 }
-                other => self.error(format!("usage: draw [on|off|status] (got '{other}')")),
+                other => self.error(format!("usage: draw [on|off|status|probe] (got '{other}')")),
             },
             "q" | "qword" => match parse_addr(a1) {
                 Some(address) => {

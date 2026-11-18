@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(send("draw off"), STATUS_OK);
         assert_eq!(send("draw sideways"), STATUS_BAD_ARGUMENT);
         assert!(
-            fake::message_log().contains("usage: draw [on|off|status]"),
+            fake::message_log().contains("usage: draw [on|off|status|probe]"),
             "{}",
             fake::message_log()
         );
