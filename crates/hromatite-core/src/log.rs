@@ -8,8 +8,18 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn path() -> std::path::PathBuf {
-    let base = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string());
-    std::path::PathBuf::from(base).join("hromatite.log")
+    #[cfg(windows)]
+    {
+        let base = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:".to_string());
+        std::path::PathBuf::from(base).join("hromatite.log")
+    }
+    #[cfg(not(windows))]
+    {
+        // Host builds have no `%USERPROFILE%`. The old default produced a file
+        // literally named `C:\hromatite.log` in the working directory, which
+        // every `cargo test` run left inside the crate that was logging.
+        std::env::temp_dir().join("hromatite.log")
+    }
 }
 
 fn stamps(secs: u64, tag: &str, msg: &str) -> String {
@@ -22,7 +32,11 @@ pub fn log_tag(tag: &str, msg: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = stamps(secs, tag, msg);
-    for p in [path(), std::path::PathBuf::from("C:\\hromatite.log")] {
+    #[cfg(windows)]
+    let candidates = [path(), std::path::PathBuf::from("C:\\hromatite.log")];
+    #[cfg(not(windows))]
+    let candidates = [path()];
+    for p in candidates {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
             let _ = f.write_all(line.as_bytes());
             return;
