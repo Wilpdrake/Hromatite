@@ -20,6 +20,10 @@ pub mod hot;
 pub mod iat;
 pub mod il2cpp;
 pub mod localmap;
+// EAC_M3_DUMP diagnostic (raw byte dumps of the class table for
+// `~/EAC-RE/tools/m3dump_analyze.py`). Kept from `eac-cut`; the env-gated call
+// site is not wired on master, so nothing references it yet.
+#[allow(dead_code)]
 pub mod m3dump;
 pub mod memory;
 pub mod memscan;

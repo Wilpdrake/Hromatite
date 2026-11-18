@@ -4268,3 +4268,18 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   `~/RustroverProjects/Hromatite-replace/target/.../hromatite.dll` (сборка от 06:51, до всех этих
   мержей). Чтобы проверить master (PlayerLoop, репер GC, keyhunt, `eac.module`), надо пересобрать
   этот worktree от обновлённой ветки или переуказать путь на свежую сборку master.
+
+### 2026-11-18 — Пересборка и переключение живого payload на master
+
+- Коммит этого шага: `chore(build): silence m3dump dead_code after the eac-cut merge`.
+- `crates/hromatite-core/src/raw/mod.rs`: модуль `m3dump` (пришёл из `eac-cut`) помечен
+  `#[allow(dead_code)]` с комментарием — его env-gated вход `EAC_M3_DUMP` на master не
+  подключён, и 29 предупреждений ломали «сборка без warning'ов». Сам дампер оставлен:
+  это инструмент разбора раскладки классов (`~/EAC-RE/tools/m3dump_analyze.py`).
+- `~/.hromatite-mode` переведён на сборку master: `HROMATITE_DLL`/`HROMATITE_FEATURE_DLL`
+  → `~/RustroverProjects/Hromatite/target/x86_64-pc-windows-gnu/release/…` (раньше указывали
+  на `Hromatite-replace`, сборка 06:51 — до мержей, без PlayerLoop-якорей и keyhunt).
+  Остальные строки не тронуты, бэкап рядом (`~/.hromatite-mode.bak-<ts>`).
+- Проверено: `cargo build --workspace --release --target x86_64-pc-windows-gnu` — `Finished`,
+  `cargo clippy --workspace --all-targets --release … -- -D warnings` — **0 замечаний**.
+  Живой прогон не делался (игру запускает пользователь); `HROMATITE_PLAYER_LOOP` остаётся `0`.
