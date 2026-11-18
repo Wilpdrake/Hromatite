@@ -3523,3 +3523,10 @@ il2cpp одними чтениями памяти (без единого выз�
   привязаны к `648f61b1…`; `tools/buildgen.py` не знает новых полей
   (`image_stride/name/filename`, `class_from_name`) — при следующем обновлении
   игры их надо добавить в генератор, иначе дескриптор соберётся неполным.
+- **Тот же прогон через 4 минуты** (игра осталась в мире, агент только дописал
+  `eac.status` в командный файл): JSONL 287 записей — **117 heartbeat, все
+  `source=wire`, `frame_len=512`**, `dt` median **2008** (p10 2001, p90 2014),
+  один `sid=0x5eac`, последний `seq=145`; 11 `report`, 158 `ac_in`, ровно один
+  `gap` 6912 мс против ожидаемых 2012. `eac.status`: `interval_ms=2012,
+  observed=117, frame_len=512`, `tap_crc=155/155` (155 кадров, 0 ошибок CRC).
+  Копия лога: `~/.hermes/profiles/ds/cache/scratch/live-heartbeat/eac-final.jsonl`.
