@@ -15,6 +15,7 @@ pub mod context;
 pub mod ffi;
 pub mod gcguard;
 pub mod hook;
+pub mod hookset;
 pub mod hostapi;
 pub mod hot;
 pub mod iat;
