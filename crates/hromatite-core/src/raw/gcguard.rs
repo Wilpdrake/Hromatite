@@ -6,26 +6,42 @@
 //! so it never leaks raw records or handles. The original no-argument suspend
 //! pass runs under Boehm's own thread-list lock, which is recursive by design.
 
-use crate::raw::hook::{Prep, patch, prepare, register};
+use crate::gamebuild;
+use crate::raw::hook::{Prep, masked_signature_matches, patch, prepare, register};
 use crate::{ffi, log, procs};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-const GC_REMOVE_THREAD_RVA: usize = 0xc417b0;
-const GC_SKIP_CLOSE_RVA: usize = 0xc417f0;
-const GC_AFTER_UNLINK_RVA: usize = 0xc41818;
-const GC_UNLINKED_NEXT_RVA: usize = 0xc417f6;
-const GC_SUSPEND_ENTRY_RVA: usize = 0xc41a20;
-const GC_RESUME_ABORT_RVA: usize = 0xc41afb;
-const GC_SUSPEND_ABORT_RVA: usize = 0xc41b65;
-const GC_PROCESS_RECORD_RVA: usize = 0xc41a90;
-const GC_ADVANCE_BUCKET_RVA: usize = 0xc41c6a;
-const GC_THREADS_RVA: usize = 0x0e6b_b180;
-const THREAD_LIST_CS_RVA: usize = 0x0e6b_b100;
+// Boehm's thread-lifetime block on the 2026-11-17 build (`245768f2…`), measured
+// with Ghidra plus one live read of `GC_threads[]`:
+//
+//   FUN_180c43520 = GC_remove_thread   `LEA R14,[0x18e6bd8a0]`, CloseHandle at
+//                                      +0x40, unlink at +0x46, free at +0x68
+//   FUN_180c43790 = GC_suspend_all     `LEA RCX,[0x18e6bd860]` (EnterCriticalSection),
+//                                      `LEA R15,[0x18e6bd8a0]`, `LEA R12,[0x18e6be0a0]`
+//   GetThreadContext call-site +0xb2, retry limit 0xf4240, three INT3 sites.
+//
+// The previous build was `GC_threads` 0xe6bb180 / remove 0xc417b0 / suspend 0xc41a20.
+const GC_REMOVE_THREAD_RVA: usize = 0xc43520;
+const GC_SKIP_CLOSE_RVA: usize = 0xc43560;
+const GC_AFTER_UNLINK_RVA: usize = 0xc43588;
+const GC_UNLINKED_NEXT_RVA: usize = 0xc43566;
+const GC_SUSPEND_ENTRY_RVA: usize = 0xc43790;
+const GC_RESUME_ABORT_RVA: usize = 0xc4386b;
+const GC_SUSPEND_ABORT_RVA: usize = 0xc438d5;
+const GC_PROCESS_RECORD_RVA: usize = 0xc43800;
+const GC_ADVANCE_BUCKET_RVA: usize = 0xc439da;
+const GC_THREADS_RVA: usize = 0x0e6b_d8a0;
+const THREAD_LIST_CS_RVA: usize = 0x0e6b_d860;
 const WIN64_CONTEXT_RBX: usize = 0x90;
 const WIN64_CONTEXT_RIP: usize = 0xf8;
 
-const SKIP_CLOSE_SIGNATURE: [u8; 6] = [0xff, 0x15, 0x92, 0x78, 0xac, 0x0a];
-const AFTER_UNLINK_SIGNATURE: [u8; 7] = [0x48, 0x8d, 0x05, 0x41, 0xaf, 0xa2, 0x0d];
+/// `None` is a wildcard. These blocks are identified by their opcodes; the
+/// IAT `call [rip+disp32]` and the RIP-relative `lea` displacement belong to the
+/// build's import/data layout and change on every patch.
+const SKIP_CLOSE_SIGNATURE: &[Option<u8>] = &[Some(0xff), Some(0x15), None, None, None, None];
+const AFTER_UNLINK_SIGNATURE: &[Option<u8>] =
+    &[Some(0x48), Some(0x8d), Some(0x05), None, None, None, None];
+/// `GC_suspend_all` prologue: pushes RBX/RBP/RSI/RDI. No displacement, exact.
 const SUSPEND_ENTRY_SIGNATURE: [u8; 15] = [
     0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18,
 ];
@@ -637,9 +653,26 @@ pub fn install() -> bool {
         return true;
     }
     reset_install();
-    if crate::symbols::GAMEASSEMBLY_SHA256
-        != "648f61b13e4f6daf6b144d03ff0fcdd0b294ca4b812ade90b7f7f9fcbd25903b"
+    // `HROMATITE_GCT_ENTRY=0` is an experiment switch: keep Boehm completely
+    // stock. The removal-path patches (`skip_close`, `after_unlink`) are only
+    // sound while the entry detour holds the thread-list lock — their safety
+    // argument states so — therefore disabling the entry disables them too.
+    // Measured use: the world-switch freeze on 2026-11-18 left 134 of 138
+    // threads idle with the main thread at 0% CPU, i.e. a stop-the-world that
+    // never resumed, and the last run that loaded worlds (07:14) had the guard
+    // disabled by its build gate.
+    if std::env::var("HROMATITE_GCT_ENTRY")
+        .map(|value| value == "0")
+        .unwrap_or(false)
     {
+        log::log_tag(
+            "gct",
+            "GC guard disabled by HROMATITE_GCT_ENTRY=0: Boehm runs stock and the \
+             removal-path protection is off with it",
+        );
+        return false;
+    }
+    if !gamebuild::is_supported() {
         log::log_tag(
             "gct",
             "entry guard disabled: unsupported GameAssembly build",
@@ -658,11 +691,11 @@ pub fn install() -> bool {
             .map(|head| valid_gc_suspend_entry(&head))
             != Some(true))
         || (SKIP_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(skip, SKIP_CLOSE_SIGNATURE.len()).as_deref()
-                != Some(SKIP_CLOSE_SIGNATURE.as_slice()))
+            && exact_bytes(skip, SKIP_CLOSE_SIGNATURE.len())
+                .is_none_or(|head| !masked_signature_matches(&head, SKIP_CLOSE_SIGNATURE)))
         || (AFTER_PREP.load(Ordering::Acquire) == 0
-            && exact_bytes(after, AFTER_UNLINK_SIGNATURE.len()).as_deref()
-                != Some(AFTER_UNLINK_SIGNATURE.as_slice()))
+            && exact_bytes(after, AFTER_UNLINK_SIGNATURE.len())
+                .is_none_or(|head| !masked_signature_matches(&head, AFTER_UNLINK_SIGNATURE)))
     {
         log::log_tag(
             "gct",

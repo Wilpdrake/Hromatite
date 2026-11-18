@@ -80,10 +80,23 @@ fn validate_modes(frame_hook: &str, live: &str, seal: &str, l2b: &str) -> Result
 
 fn require_gc_guard(installed: bool) -> Result<(), &'static str> {
     if installed {
-        Ok(())
-    } else {
-        Err("refusing to install managed LateUpdate without the inline GC GetThreadContext guard")
+        return Ok(());
     }
+    // `HROMATITE_GCT_ENTRY=0` is the deliberate A/B: Boehm runs stock and the
+    // startup is allowed to continue, loudly. Without it the guard stays
+    // mandatory, because an unguarded inline hook next to a leaked Boehm record
+    // is what turns a normal worker exit into `SuspendThread loop failed`.
+    if std::env::var("HROMATITE_GCT_ENTRY")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+    {
+        log::log_tag(
+            "gct",
+            "startup continues WITHOUT the GC guard: HROMATITE_GCT_ENTRY=0 is an experiment switch",
+        );
+        return Ok(());
+    }
+    Err("refusing to install managed LateUpdate without the inline GC GetThreadContext guard")
 }
 
 fn install_late_update_with_retry(
@@ -312,6 +325,15 @@ pub extern "system" fn DllMain(
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
         log::install_panic_hook();
+        // A launcher that retries the injection maps a fresh copy each time;
+        // only the first one may install hooks, guards and a VEH handler.
+        if !procs::claim_single_instance("Local\\hromatite_payload_v1") {
+            log::log_tag(
+                "dll",
+                "another payload instance is already resident; this copy stays dormant",
+            );
+            return 1;
+        }
         hromatite_core::veh::install();
         if log::guard("dllmain", || attach(hinst)).is_none() {
             log::log_tag(
