@@ -4209,3 +4209,62 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   измерение, и для новой сборки он честно пишет `0` + note (тогда `m3` откажется работать,
   пока значение не впишут).
 
+
+### 2026-11-18 — Сведение веток в master: build-26715337, eac-keyhunt, eac-cut, eac-replace
+
+- Коммиты: **`4fbf795`** (merge `build-26715337`), **`4737fa9`** (merge `eac-keyhunt`), **`a91b99b`**
+  (merge `eac-cut`), **`545d61b`** (`docs(PROMPT-EAC-CUT.md)` из `eac-replace`), плюс этот журнал.
+- **Зачем.** Работа жила в четырёх worktree/ветках, и живой payload брался из `eac-replace`
+  (в `~/.hromatite-mode` путь туда), т.е. часть кода не видела per-build дескриптор и
+  PlayerLoop-якоря. Свели всё в master.
+- **Что вошло:**
+  * `build-26715337` — единственный коммит (регенерация `symbols.rs` для `245768f2`). Мерж без
+    конфликтов, по содержимому **ноль изменений**: `symbols.rs` побайтово равен тому, что уже
+    лежал в master (проверено `git diff --quiet b880c6c HEAD -- crates/hromatite-core/src/symbols.rs`).
+  * `eac-keyhunt` — фича `EAC_KEYHUNT=1` (скан памяти за сессионным ключом AC) + capture-fallback
+    в регионах/RPM. Конфликты `AGENTS.md`, `hromatite-eac/src/lib.rs`, `features/eac.rs` — union:
+    keyhunt-модуль + master'ов `tap` живут вместе, help берётся из `hromatite-commands::SPECS`.
+    Влит fast-forward'ом (`4737fa9`) — в истории остался его собственный merge-коммит.
+  * `eac-cut` — 86 коммитов EAC-исследования (forge/report/photon/m3dump/cut-verdict, `eac.module`,
+    `EAC_BLIND`). 15 конфликтных файлов, правило «union, master wins on per-build anchors»:
+    - `gcthreads` — таблица `GC_threads[]` из `buildinfo::gc_anchors`, `CANDIDATE_RVAS` только как
+      last resort (веткин литерал `0x0e6b_d8a0` убран);
+    - `m3.rs` — целиком дескрипторный master-вариант, веткины `0xc2a0a0/0xc29de0/0xc29dc0/
+      0xe66f0d0` и `find_contains`/`score_table`/`discover_class` удалены;
+    - `gcguard.rs` — master (патч `gc.context_call`, CloseHandle после unlink); веткин
+      `HROMATITE_GCT_ENTRY` остался **только** как выключатель с дефолтом = master;
+    - `hook.rs` — якоря из дескриптора, гейты `gamebuild::is_supported()` убраны;
+    - `game_fixture.rs`/`features/m3.rs` — слоты из `layout()`/`image_stride` вместо литералов;
+    - `procs.rs` — union (`claim_single_instance` + `own_module_path`);
+    - `photon.rs`/`m3dump.rs` переписаны под новый `m3` (иначе не компилировались);
+    - `hromatite-commands` — добавлен `eac.module` в `SPECS`.
+  * `eac-replace` — от неё остались **только 2 коммита**, оба про один файл
+    `docs/PROMPT-EAC-CUT.md` (180 строк + правка 4 строки). Взял файл из её tip
+    (`git checkout eac-replace -- docs/PROMPT-EAC-CUT.md`), а не мержил ветку: тащить её дерево
+    поверх уже слитого `eac-cut` бессмысленно и рискованно.
+- **Единственный конфликт, снятый руками:** `crates/hromatite-eac/src/eos.rs`, блок доп. проб в
+  `install()`. Стороны независимы → union: `EAC_KEYHUNT_EVP` (keyhunt: `install_evp`, `EVP_SLOTS`)
+  + `EAC_IAT` (`install_iat`), `EAC_M3_PROBE` (`crate::m3probe::probe`), `EAC_EVP`
+  (`crate::evp::install`). Проверено, что все символы обеих сторон на месте.
+- **Чем подтверждено (реальный вывод на `545d61b`).** `cargo test --workspace --target
+  x86_64-unknown-linux-gnu --offline` → **355 passed, 0 failed** (сумма по всем целям; ветки
+  добавили свои тесты: core 138→185, eac 43→112 + интеграционные, dll 5→6). `cargo build
+  --workspace --release --target x86_64-pc-windows-gnu --offline` → `Finished`. `tools/test_buildgen.py`
+  → **13/13 OK**. Литералов старых сборок в коде нет — единственное вхождение `0x86cda10`/`0xbf7a60`/
+  `0xc43690` осталось в строке `note` дескриптора (это документация вывода). Конфликтных маркеров
+  в дереве нет, рабочее дерево чистое.
+- **Что осталось невлитым:** `eac-emu` — 0 коммитов сверх master (полностью вошёл через цепочку),
+  ветку/worktree можно удалять; `eac-emu-wip` — 1 коммит, это явный WIP-снимок, в master не тащим.
+  Worktree `Hromatite-build`, `Hromatite-cut`, `Hromatite-keyhunt`, `Hromatite-replace` и сами ветки
+  **не удалял** (по договорённости) — при уборке: `git worktree remove <path>` + `git branch -d`.
+- **Живой приёмки не было** (игру запускает только пользователь). Из отчётов агентов в `needs_human`:
+  (1) в `m3.rs` вместе с эвристиками удалён и `discover_class` — резервный путь в `photon.rs`
+  теперь дескрипторный, гадать больше негде; (2) у `features/m3.rs` пропал bound `methodsCount`
+  (в `Layout` нет такого поля — если нужен, это правка `tools/buildgen.py` + дескриптор + оракул);
+  (3) `raw/m3dump.rs` даёт 29 `dead_code` (в ветке он и не вызывался) — нужен либо вход из консоли,
+  либо удаление; (4) `tools/hromatite-launch.sh` теперь union обеих сторон (459 строк,
+  `sh -n` чист) — **против живой игры не запускался**.
+- **Практическое следствие для живых прогонов:** `~/.hromatite-mode` по-прежнему указывает на
+  `~/RustroverProjects/Hromatite-replace/target/.../hromatite.dll` (сборка от 06:51, до всех этих
+  мержей). Чтобы проверить master (PlayerLoop, репер GC, keyhunt, `eac.module`), надо пересобрать
+  этот worktree от обновлённой ветки или переуказать путь на свежую сборку master.
