@@ -3396,3 +3396,52 @@ il2cpp одними чтениями памяти (без единого выз�
   есть `wine client error:53c/798 … Bad file descriptor` — то есть потоки
   движка умирали аварийно. Причина зависания не изолирована; EAC-часть к этому
   моменту была исправна (8/8 хуков, живая сессия).
+
+### 2026-11-18 — TUI: переключение между логами (игра, EAC, хуки, GC, wrapper, launcher)
+
+- Коммит **`4ae5728`** (`feat(console): switch between the game, EAC, GC and
+  wrapper logs`). Изменён только host-крейт `crates/hromatite-console` (+ новый
+  `src/sources.rs`, `tools/test-console-logs.py`); payload, протокол, тик,
+  GC-guard и игровая часть не тронуты, игра агентом не перезапускалась.
+- **Что теперь есть.** Все логи тейлятся одновременно, у каждого **своя**
+  история, свой `scroll_back`, свой `follow` и счётчик непрочитанного; строка 3
+  кадра стала полосой: `logs 2/7: payload [game] eac+28 …`. Переключение —
+  `F9`/`F10` (CSI `20~`/`21~`, декодер дополнен) либо локальные команды
+  `log <name|next|prev|N>` и `logs` (в payload не уходят; `log` нет в
+  `hromatite-commands`, так что конфликта имён нет).
+- **Источники** (`src/sources.rs`, `plan()`): `payload` (hromatite.log),
+  `game` (`AppData/LocalLow/VRChat/VRChat/output_log_*.txt`, самый новый),
+  `eac` (`EasyAntiCheat/*/*/anticheatlauncher.log`), `hooks`
+  (`hromatite_eac_hooks.log`), `gc` (`VRChat.gc.log`, `$HROMATITE_GCLOG`),
+  `stdout` (`$HROMATITE_DBG_DIR` или `~/.hromatite-logs/game-*.log`),
+  `launch` (`~/.hromatite-launch.log`). Свой мини-glob (`*` внутри компонента и
+  компонент-`*`) без внешних зависимостей; wildcard переразрешается раз в 20
+  опросов (~2 с), смена файла (перезапуск игры) даёт `retargeted` и replay
+  хвоста нового файла.
+- **Важные решения.** (1) `LINKED`/`STALE` и гейт авто-телеметрии по-прежнему
+  считаются по `payload` — это единственный лог, который payload пишет по
+  команде; `rx` в шапке показывает свежесть **активного** вида. (2) Эхо
+  `tx | > cmd` всегда пишется в вид `payload`, потому что ответ придёт туда;
+  если на экране другой лог, у `payload` растёт счётчик. (3) Replay при старте и
+  при смене файла идёт через `ingest_replay` и **не** накручивает unread (иначе
+  полоса сразу показывала `game+1529`). (4) `--view NAME|N` задаёт стартовый вид
+  и работает с `--snapshot`; неизвестное имя печатается в notice, а не игнорируется.
+- **Чем подтверждено (реальные прогоны).**
+  - `cargo test --target x86_64-unknown-linux-gnu` в `crates/hromatite-console`:
+    lib **58/58**, `hot_reload` 6/6, `snapshot` 3/3; clippy `-D warnings` чисто;
+    `rustfmt --edition 2024` только по тронутым файлам; release-сборка OK.
+  - Новый PTY-стенд `tools/test-console-logs.py` (настоящий pty 120×24,
+    фейковый префикс с файлами ровно по реальным путям) — **14/14**: полоса
+    находит все 7 источников, `F9` → player log, второй `F9` → EAC, `log gc` по
+    имени, `F10` назад, `logs` печатает нумерованный список, отправленная
+    команда помечает `payload+N`, возврат показывает эхо и обнуляет счётчик,
+    `--view eac` стартует на EAC, неизвестный `--view` сообщается.
+  - Живая установка (игра запущена, pid 903380): `--snapshot` для
+    `payload`/`game`/`eac` показал реальные строки из
+    `output_log_2026-11-18_07-22-27` (`waiting for UI Manager`) и
+    `anticheatlauncher.log` (`Starting Wine module mapping, Wine version: 11.0`),
+    полоса — `logs 1/7 … 3/7` с нулевыми счётчиками после старта.
+- **Осталось.** В интерактивном окне на живой игре (konsole) не проверялось —
+  запуск делает пользователь; критерий: `F9`/`F10` листают семь видов, `logs`
+  печатает список, в игре ничего не меняется. Дефолты не изменились:
+  `tools/hromatite-tui.sh` без аргументов по-прежнему открывает `payload`.
