@@ -918,12 +918,17 @@ mod imp {
         }
 
         fn update_subresource(&self, resource: usize, data: &[u8], row_pitch: u32) -> bool {
-            // `UpdateSubresource` is at index 48 in the context vtable.
+            // `UpdateSubresource(pResource, DstSubresource, pDstBox, pSrcData,
+            // SrcRowPitch, SrcDepthPitch)` — the box is NULL for a whole-resource
+            // update. Passing the pixels as the box (the old code dropped this
+            // argument) makes the runtime read a `D3D11_BOX` out of the atlas
+            // bytes and write outside the texture.
             let hr = method(
                 self.context,
                 48,
                 &[
                     (resource as u64),
+                    0,
                     0,
                     (data.as_ptr() as u64),
                     (row_pitch as u64),
