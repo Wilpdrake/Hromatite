@@ -1,5 +1,5 @@
 //! The OS half of [`crate::eos`]: the twelve `EOS_AntiCheatClient_*` detours,
-//! their install path, the IAT walk and the BoringSSL EVP probe.
+//! their install path, the IAT walk and the `EAC_EVP` install point.
 //!
 //! Compiled only with the `runtime` feature (the crate's default). The pure
 //! types, the counters and the status lines they publish live in
@@ -9,7 +9,7 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::capture::{CaptureFile, hex_prefix, read_frames};
 use crate::clock::now_ms;
@@ -322,16 +322,6 @@ impl Hooks {
             }
         }
 
-        // `EAC_KEYHUNT_EVP=1`: also probe the statically linked BoringSSL
-        // entry points the RE located. Mode 1 is expected to leave them cold,
-        // so this is a proof-of-absence as much as a key source.
-        if env_flag("EAC_KEYHUNT_EVP") {
-            let before = reports.len();
-            install_evp(module, &mut reports);
-            let ok = reports[before..].iter().filter(|report| report.ok).count();
-            hook_log_blocking(&format!("[evp] installed {ok}/{}", EVP_SLOTS));
-        }
-
         // `EAC_IAT=1`: also rewrite the *callers'* import slots. An inline patch
         // of the export entry is only seen by a game that has not cached the
         // pointer yet; VRChat caches `AddNotifyMessageToServer` about 20 s in,
@@ -341,11 +331,22 @@ impl Hooks {
             hook_log_blocking(&format!("[iat] {patched} slot(s) now hold a detour"));
         }
 
-        // `EAC_EVP=1`: probe the statically linked BoringSSL inside the SDK.
-        // Nothing here is a documented export, so each target is matched by its
-        // recorded prologue and skipped on drift. The point is the `Init`
-        // shape, whose `r9` is the AES-256-GCM key the protector really uses.
-        if env_flag("EAC_EVP") {
+        // Probe the statically linked BoringSSL inside the SDK — nothing here
+        // is a documented export, so each target is matched by its recorded
+        // prologue and skipped on drift. The point is the `Init` shape, whose
+        // `r9` is the AES-256-GCM key the protector really uses.
+        //
+        // `EAC_EVP=1` and the older `EAC_KEYHUNT_EVP=1` are *one* probe:
+        // [`crate::evp`] is the only implementation (it also covers the
+        // protector constructor, which the removed local table lacked), so the
+        // two flags are merged here instead of installing the same entries
+        // twice. `evp::install` is idempotent as well.
+        if env_flag("EAC_EVP") || env_flag("EAC_KEYHUNT_EVP") {
+            if env_flag("EAC_EVP") && env_flag("EAC_KEYHUNT_EVP") {
+                hook_log_blocking(
+                    "[evp] EAC_EVP and EAC_KEYHUNT_EVP name the same probe; installing once",
+                );
+            }
             // SAFETY: `module` is the base of the loaded EOSSDK module, checked
             // non-null above, and stays mapped for the process lifetime.
             let evp_reports = unsafe { crate::evp::install(module as isize) };
@@ -359,216 +360,6 @@ impl Hooks {
     }
 }
 
-// ------------------------------------------------- BoringSSL EVP key probe
-
-/// One EOSSDK entry point worth hooking for key material, addressed by the RE
-/// offset rather than by a symbol: EOSSDK's BoringSSL is statically linked, so
-/// nothing in the export table names it.
-struct EvpTarget {
-    name: &'static str,
-    /// Offset from the image base (`0x180000000` in the RE listing).
-    rva: usize,
-    /// Exact prologue from the RE listing: a drift disables the hook instead of
-    /// patching the middle of a function.
-    signature: &'static [u8],
-    kind: EvpKind,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EvpKind {
-    /// `EVP_CIPHER_CTX_new` — count only, there is no key to read yet.
-    CtxNew,
-    /// `EVP_*Init_ex`-shaped: arg4 is the key pointer, arg5 the IV pointer.
-    Init,
-    /// Unknown arity: dump arg4 when it looks like a readable pointer.
-    Generic,
-}
-
-/// The five addresses the RE identified in the protector's crypto path
-/// (`findings/eossdk.md` §6). VRChat runs AC mode 1, where these are *expected*
-/// to stay silent — the hook exists to prove or disprove that live.
-const EVP_TARGETS: [EvpTarget; 5] = [
-    EvpTarget {
-        name: "evp@cdb040(ctx_new)",
-        rva: 0xcdb040,
-        signature: &[
-            0xb8, 0x28, 0x00, 0x00, 0x00, 0xe8, 0xe6, 0xff, 0x18, 0x00, 0x48, 0x2b, 0xe0,
-        ],
-        kind: EvpKind::CtxNew,
-    },
-    EvpTarget {
-        name: "evp@cdbcb0(cipher_init)",
-        rva: 0xcdbcb0,
-        signature: &[
-            0xb8, 0x38, 0x00, 0x00, 0x00, 0xe8, 0x76, 0xf3, 0x18, 0x00, 0x48, 0x2b, 0xe0,
-        ],
-        kind: EvpKind::Init,
-    },
-    EvpTarget {
-        name: "evp@cdbce0",
-        rva: 0xcdbce0,
-        signature: &[
-            0xb8, 0x38, 0x00, 0x00, 0x00, 0xe8, 0x46, 0xf3, 0x18, 0x00, 0x48, 0x2b, 0xe0, 0x83,
-            0x79, 0x10, 0x00,
-        ],
-        kind: EvpKind::Generic,
-    },
-    EvpTarget {
-        name: "evp@cdbb60",
-        rva: 0xcdbb60,
-        signature: &[
-            0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x6c, 0x24, 0x20, 0x41, 0x56, 0xb8,
-        ],
-        kind: EvpKind::Generic,
-    },
-    EvpTarget {
-        name: "evp@cdaf90",
-        rva: 0xcdaf90,
-        signature: &[
-            0xb8, 0x38, 0x00, 0x00, 0x00, 0xe8, 0x96, 0x00, 0x19, 0x00, 0x48, 0x2b, 0xe0,
-        ],
-        kind: EvpKind::Generic,
-    },
-];
-
-const EVP_SLOTS: usize = EVP_TARGETS.len();
-static EVP_TRAMPS: [AtomicUsize; EVP_SLOTS] = [const { AtomicUsize::new(0) }; EVP_SLOTS];
-static EVP_CALLS: [AtomicU64; EVP_SLOTS] = [const { AtomicU64::new(0) }; EVP_SLOTS];
-
-/// Log `key`/`iv` (init-shaped hooks) or a small buffer dump (generic ones).
-#[cfg(windows)]
-fn log_evp(slot: usize, calls: u64, a1: u64, a2: u64, a4: u64, a5: u64, a6: u64) {
-    use hromatite_win::memory as safe;
-    let target = &EVP_TARGETS[slot];
-    let mut line = format!(
-        "[evp] {} #{calls} arg1={a1:#x} arg2={a2:#x} arg4={a4:#x} arg5={a5:#x} arg6={a6:#x}",
-        target.name
-    );
-    match target.kind {
-        EvpKind::CtxNew => {}
-        EvpKind::Init => {
-            if a4 != 0
-                && let Some(key) = safe::read_bytes(a4 as usize, 32)
-            {
-                line.push_str(&format!(" key32={}", hex_prefix(&key, 32)));
-            }
-            if a5 != 0
-                && let Some(iv) = safe::read_bytes(a5 as usize, 16)
-            {
-                line.push_str(&format!(
-                    " iv12={} iv16={}",
-                    hex_prefix(&iv[..12], 12),
-                    hex_prefix(&iv, 16)
-                ));
-            }
-        }
-        EvpKind::Generic => {
-            if a4 != 0
-                && let Some(bytes) = safe::read_bytes(a4 as usize, 32)
-            {
-                line.push_str(&format!(" data32={}", hex_prefix(&bytes, 32)));
-            }
-            if a5 < 0x1_0000 {
-                line.push_str(&format!(" arg5_u32={a5:#x}"));
-            }
-        }
-    }
-    hook_log(line);
-}
-
-macro_rules! evp_detour {
-    ($name:ident, $slot:expr) => {
-        /// Generic six-slot detour: log, then tail-call the trampoline.
-        ///
-        /// # Safety
-        ///
-        /// Called by the patched entry with the original argument registers.
-        #[cfg(windows)]
-        unsafe extern "system" fn $name(
-            a1: u64,
-            a2: u64,
-            a3: u64,
-            a4: u64,
-            a5: u64,
-            a6: u64,
-        ) -> u64 {
-            let calls = EVP_CALLS[$slot].fetch_add(1, Ordering::Relaxed) + 1;
-            if calls <= 64 || calls.is_multiple_of(100) {
-                let _ = std::panic::catch_unwind(|| {
-                    log_evp($slot, calls, a1, a2, a4, a5, a6);
-                });
-            }
-            let tramp = EVP_TRAMPS[$slot].load(Ordering::Acquire);
-            if tramp == 0 {
-                return 0;
-            }
-            // SAFETY: the trampoline is the relocated prologue of this very
-            // function, ending in an absolute jump back into it.
-            let function: Fn6 = unsafe { core::mem::transmute(tramp) };
-            // SAFETY: same ABI and argument registers as the interrupted call.
-            unsafe { function(a1, a2, a3, a4, a5, a6) }
-        }
-    };
-}
-
-evp_detour!(evp_slot0, 0);
-evp_detour!(evp_slot1, 1);
-evp_detour!(evp_slot2, 2);
-evp_detour!(evp_slot3, 3);
-evp_detour!(evp_slot4, 4);
-
-/// Install the EVP probes. Every target must match its recorded prologue.
-#[cfg(windows)]
-fn install_evp(module: usize, reports: &mut Vec<Report>) {
-    use hromatite_win::memory as safe;
-    let handlers: [usize; EVP_SLOTS] = [
-        evp_slot0 as *const () as usize,
-        evp_slot1 as *const () as usize,
-        evp_slot2 as *const () as usize,
-        evp_slot3 as *const () as usize,
-        evp_slot4 as *const () as usize,
-    ];
-    for (index, target) in EVP_TARGETS.iter().enumerate() {
-        let address = module + target.rva;
-        let matches = safe::read_bytes(address, target.signature.len())
-            .is_some_and(|seen| seen.as_slice() == target.signature);
-        if !matches {
-            reports.push(Report {
-                name: target.name,
-                ok: false,
-                mode: 0,
-                detail: "prologue mismatch".to_string(),
-                tramp: 0,
-            });
-            continue;
-        }
-        // SAFETY: `address` is a function entry whose prologue matches the RE
-        // listing, and the handler has the same six-integer ABI.
-        match unsafe { hook::install(address, handlers[index], target.name) } {
-            Ok(installed) => {
-                if installed.mode == 1 {
-                    hook_log(format!("[hook] {}: {}", target.name, installed.describe()));
-                }
-                EVP_TRAMPS[index].store(installed.tramp, Ordering::Release);
-                reports.push(Report {
-                    name: target.name,
-                    ok: true,
-                    mode: installed.mode,
-                    detail: format!("prologue={} copied", installed.copied),
-                    tramp: installed.tramp,
-                });
-            }
-            Err(reason) => reports.push(Report {
-                name: target.name,
-                ok: false,
-                mode: 0,
-                detail: reason,
-                tramp: 0,
-            }),
-        }
-    }
-}
-
 fn default_dir() -> PathBuf {
     std::env::temp_dir()
 }
@@ -576,22 +367,17 @@ fn default_dir() -> PathBuf {
 /// `EAC_KEYHUNT_EVP=1`: the per-target call counts of the BoringSSL probe.
 ///
 /// `Hooks::status_lines` lives in the pure [`super::state`] half, so the EVP
-/// counters (this module owns them) are handed back as one already-formatted
-/// line instead of being read across the split.
+/// counters (owned by [`crate::evp`], which is also what both install flags
+/// arm) are handed back as one already-formatted line instead of being read
+/// across the split.
 pub(super) fn evp_status_line() -> Option<String> {
     if !env_flag("EAC_KEYHUNT_EVP") {
         return None;
     }
-    let counts = EVP_CALLS
+    let counts = crate::evp::TARGETS
         .iter()
-        .enumerate()
-        .map(|(index, calls)| {
-            format!(
-                "{}={}",
-                EVP_TARGETS[index].name,
-                calls.load(Ordering::Relaxed)
-            )
-        })
+        .zip(crate::evp::calls())
+        .map(|(target, calls)| format!("{}={calls}", target.name))
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!("eac.hooks: evp {counts}"))
@@ -2121,6 +1907,7 @@ unsafe extern "system" fn hook_sysreq(a1: u64, a2: u64, a3: u64, a4: u64, a5: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn events_are_bounded_and_drained() {
