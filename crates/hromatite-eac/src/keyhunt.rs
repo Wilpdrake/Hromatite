@@ -19,6 +19,16 @@
 //! Only the raw reads are `unsafe`; each carries a `// SAFETY:` note. The region
 //! parser, the key-derivation table and the matcher are pure and unit-tested on
 //! the host.
+//!
+//! `Hunter` and every reader it drives (`read_maps`, `read_block`,
+//! `read_window`, `enumerate_regions`, `find_in_region`) are behind the
+//! `runtime` feature: they read the live address space through `hromatite-win`.
+//! The pure half (region parsing, key derivation, the matcher) compiles into the
+//! `default-features = false` core that `hromatite-features` links.
+
+// Without the OS layer the scan driver and its readers are simply absent, which
+// leaves the matcher and a few budgets unused in that build only.
+#![cfg_attr(not(feature = "runtime"), allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -164,6 +174,7 @@ pub fn parse_maps(text: &str) -> Vec<Region> {
 }
 
 /// Read the live region map. Wine exposes the host `/proc` through `Z:`.
+#[cfg(feature = "runtime")]
 fn read_maps() -> Option<String> {
     for path in [
         "Z:\\proc\\self\\maps",
@@ -180,6 +191,7 @@ fn read_maps() -> Option<String> {
 }
 
 /// Block size for fault-tolerant reads: one kernel transition per 64 KiB.
+#[cfg(feature = "runtime")]
 const BLOCK: usize = 64 * 1024;
 
 /// Copy `dst.len()` bytes from `addr` into `dst`, returning how many landed.
@@ -187,6 +199,7 @@ const BLOCK: usize = 64 * 1024;
 /// Never faults: an unmapped or guard page only shortens the copy. A region can
 /// be unmapped between the `/proc/self/maps` snapshot and the read, so this is
 /// the difference between a scan and a crash.
+#[cfg(feature = "runtime")]
 #[cfg(windows)]
 fn read_block(addr: usize, dst: &mut [u8]) -> usize {
     hromatite_win::memory::read_partial(addr, dst)
@@ -194,6 +207,7 @@ fn read_block(addr: usize, dst: &mut [u8]) -> usize {
 
 /// Linux variant of [`read_block`], used on the host target (tests) and by any
 /// build that runs the feature image natively.
+#[cfg(feature = "runtime")]
 #[cfg(not(windows))]
 fn read_block(addr: usize, dst: &mut [u8]) -> usize {
     #[repr(C)]
@@ -231,6 +245,7 @@ fn read_block(addr: usize, dst: &mut [u8]) -> usize {
 }
 
 /// Read a window of the address space, zero-filling whatever could not be read.
+#[cfg(feature = "runtime")]
 fn read_window(addr: usize, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut done = 0usize;
@@ -254,6 +269,7 @@ fn read_window(addr: usize, len: usize) -> Vec<u8> {
 /// mistake cost one whole run: 110 regions, 51 MiB, no EOSSDK image in it).
 /// `VirtualQuery` walks the NT view of the calling process, which is the one
 /// the payload lives in.
+#[cfg(feature = "runtime")]
 #[cfg(windows)]
 fn enumerate_regions() -> Vec<Region> {
     use hromatite_win::ffi::{MEM_IMAGE, MEM_MAPPED};
@@ -282,6 +298,7 @@ fn enumerate_regions() -> Vec<Region> {
 }
 
 /// Host variant: the plain `/proc/self/maps` walk (correct off-Wine).
+#[cfg(feature = "runtime")]
 #[cfg(not(windows))]
 fn enumerate_regions() -> Vec<Region> {
     parse_maps(&read_maps().unwrap_or_default())
@@ -505,6 +522,7 @@ pub fn probe_from_capture() -> Option<FrameProbe> {
 
 // -------------------------------------------------------------------- hunter
 
+#[cfg(feature = "runtime")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Waiting for a big frame and the settle delay.
@@ -516,6 +534,7 @@ enum Phase {
 }
 
 /// Scan driver owned by the feature generation and driven from the managed tick.
+#[cfg(feature = "runtime")]
 pub struct Hunter {
     enabled: bool,
     dir: PathBuf,
@@ -541,12 +560,14 @@ pub struct Hunter {
     log_written: bool,
 }
 
+#[cfg(feature = "runtime")]
 impl Default for Hunter {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "runtime")]
 impl Hunter {
     /// Read the flag and the output directory once.
     pub fn new() -> Self {
@@ -1018,6 +1039,7 @@ pub fn hexdump(bytes: &[u8], base: usize) -> String {
 
 /// Find `needle` inside one already-known-readable region (used by tests and by
 /// the report tooling).
+#[cfg(feature = "runtime")]
 pub fn find_in_region(region: &Region, needle: &[u8]) -> Vec<usize> {
     if !region.readable() || region.len() < 8 {
         return Vec::new();
@@ -1075,6 +1097,7 @@ mod tests {
         assert_eq!(matcher.needles[hits[0].needle].name, *name);
     }
 
+    #[cfg(feature = "runtime")]
     #[test]
     fn matcher_finds_a_needle_in_live_memory() {
         let needle = b"hromatite-keyhunt-needle-0123456";

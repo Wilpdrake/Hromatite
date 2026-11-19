@@ -794,7 +794,7 @@ pub fn image_span(maps: &[MapEntry], base: u64) -> (u64, u64) {
     (lo, hi)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "runtime"))]
 mod live {
     use super::*;
     use hromatite_win::memory as safe;
@@ -1138,9 +1138,11 @@ mod live {
 // Wine simply does not track mappings that native code created.
 
 /// `/proc` of the host namespace, as seen through Wine.
+#[cfg(feature = "runtime")]
 const UNIX_PROC: &str = r"\\?\unix\proc";
 
 /// The Linux pid of `VRChat.exe`, found by reading `cmdline` of `/proc/<pid>`.
+#[cfg(feature = "runtime")]
 pub fn find_process_pid() -> Option<u32> {
     let entries = std::fs::read_dir(UNIX_PROC).ok()?;
     for (index, entry) in entries.flatten().enumerate() {
@@ -1164,6 +1166,7 @@ pub fn find_process_pid() -> Option<u32> {
 }
 
 /// `maps` text of one pid.
+#[cfg(feature = "runtime")]
 pub fn maps_of(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("{UNIX_PROC}/{pid}/maps")).ok()
 }
@@ -1209,12 +1212,14 @@ pub fn segments_of(maps: &[MapEntry], base: u64) -> Vec<Segment> {
 /// The segments come from `/proc/<pid>/maps`, so every read is inside a mapping
 /// the kernel reports; the VEH guard turns a stale mapping into `None` instead
 /// of a dead game.
+#[cfg(feature = "runtime")]
 pub struct NativeMemRead {
     segments: Vec<Segment>,
     budget: usize,
     spent: usize,
 }
 
+#[cfg(feature = "runtime")]
 impl NativeMemRead {
     /// Reader over the image whose segments are `segments`.
     pub fn new(segments: Vec<Segment>, budget: usize) -> Self {
@@ -1242,6 +1247,7 @@ impl NativeMemRead {
     }
 }
 
+#[cfg(feature = "runtime")]
 impl ReadAt for NativeMemRead {
     fn read_at(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
         let at = self.address_of(offset, u64::try_from(len).ok()?)?;
@@ -1266,6 +1272,7 @@ impl ReadAt for NativeMemRead {
 }
 
 /// Locate the memfd image through `maps` + direct reads, and describe it.
+#[cfg(feature = "runtime")]
 pub fn locate_native(probe: &Probe) -> Vec<String> {
     let Some(pid) = find_process_pid() else {
         return vec!["eac.module: VRChat.exe not found in /proc (wine unix view)".to_string()];
@@ -1333,6 +1340,7 @@ pub fn locate_native(probe: &Probe) -> Vec<String> {
 
 /// `eac.module [pages] [read=<bytes>] [imports=<n>]`: locate the in-process
 /// ELF image(s) and describe them. Read-only; never writes a byte.
+#[cfg(feature = "runtime")]
 pub fn command(arg: &str) -> Vec<String> {
     let probe = Probe::parse(arg);
     #[cfg(windows)]
@@ -1539,6 +1547,7 @@ mod tests {
         assert!(parse_size("nope").is_none());
     }
 
+    #[cfg(feature = "runtime")]
     #[test]
     fn the_module_command_always_answers_and_never_touches_memory_on_the_host() {
         let lines = command("pages read=1m typo");
@@ -1604,6 +1613,7 @@ mod tests {
         assert_eq!(image_span(&maps, 0xdead), (0xdead, 0xdead), "unknown base is empty");
     }
 
+    #[cfg(feature = "runtime")]
     #[test]
     fn segment_table_translates_file_offsets_the_way_the_loader_mapped_them() {
         // Live lines (2026-11-18): the last LOAD has p_offset 0x219000 but

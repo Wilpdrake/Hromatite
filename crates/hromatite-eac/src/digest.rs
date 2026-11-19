@@ -192,20 +192,13 @@ pub fn crc32c(data: &[u8]) -> u32 {
 /// heartbeat frames and 18/18 short frames — while the standard variant
 /// (`crc32c`) reproduces none of them.
 /// Check value: `crc32c_eac(b"123456789") == 0x58e3_FA20`.
-pub fn crc32c_eac(data: &[u8]) -> u32 {
-    let mut crc = 0u32;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0x82f6_3b78
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    crc
-}
+///
+/// Re-exported from [`hromatite_abi::crc`] (pure `std`): the Photon transport
+/// seals frames with the same function, and one copy is one contract.
+pub use hromatite_abi::crc::crc32c_eac;
+/// Store [`crc32c_eac`] into `frame[at..at+4]` after zeroing that window —
+/// the exact recipe every live frame follows.
+pub use hromatite_abi::crc::seal_checksum;
 
 /// 32-bit FNV-1a, kept only as a third cheap candidate during capture analysis.
 pub fn fnv1a32(data: &[u8]) -> u32 {

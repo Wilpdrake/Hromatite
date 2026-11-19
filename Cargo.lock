@@ -45,6 +45,7 @@ dependencies = [
 name = "hromatite-eac"
 version = "0.1.0"
 dependencies = [
+ "hromatite-abi",
  "hromatite-core",
  "hromatite-hook",
  "hromatite-win",
