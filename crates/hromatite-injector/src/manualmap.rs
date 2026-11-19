@@ -21,55 +21,6 @@ pub struct Options {
     pub erase_headers: bool,
     /// Map inside this module's tail slack instead of a fresh allocation.
     pub stomp: Option<String>,
-    /// L2: after the payload's entry point returns, XOR every page of the
-    /// mapping and drop it to `RW`. At rest the image is neither executable
-    /// nor PE-parseable — a "find the module" sweep sees ciphertext.
-    pub seal: bool,
-}
-
-/// XOR one page of the remote image in place with `crypto::xor_page` — the very
-/// same function the payload's shim page re-runs in machine code (plan 4). Any
-/// divergence here means the tick decrypts garbage, so the page index and the
-/// page length are the contract, not an implementation detail.
-fn seal_image(
-    r: &Remote,
-    base: usize,
-    size: usize,
-    keep: Option<(usize, usize)>,
-) -> (usize, usize) {
-    const PAGE: usize = crate::crypto::PAGE;
-    let mut done = 0usize;
-    let mut failed = 0usize;
-    let mut off = 0usize;
-    while off < size {
-        let n = (size - off).min(PAGE);
-        let addr = base + off;
-        if let Some((k_lo, k_hi)) = keep
-            && addr >= k_lo
-            && addr < k_hi
-        {
-            off += n;
-            continue;
-        }
-        if !r.protect(addr, n, hromatite_win::ffi::PAGE_READWRITE) {
-            failed += 1;
-            off += n;
-            continue;
-        }
-        match r.read_vec(addr, n) {
-            Some(mut buf) => {
-                crate::crypto::xor_page((off / PAGE) as u64, &mut buf);
-                if r.write(addr, &buf) {
-                    done += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-            None => failed += 1,
-        }
-        off += n;
-    }
-    (done, failed)
 }
 
 fn rd_u16(d: &[u8], o: usize) -> u16 {
@@ -292,19 +243,14 @@ fn resolve_imports(image: &mut [u8], img: &PeImage, r: &Remote) -> Result<(), St
 /// `CreateRemoteThread` hands over a single argument and wine does not
 /// special-case DLL entry points, so TLS callbacks *and* DllMain both need this
 /// shim. Combining them keeps the game at one stray thread instead of two.
-fn dll_stub(base: u64, targets: &[u64], reserved: u64) -> Vec<u8> {
+fn dll_stub(base: u64, targets: &[u64]) -> Vec<u8> {
     let mut code = Vec::new();
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
     for cb in targets {
         code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
         code.extend_from_slice(&base.to_le_bytes());
         code.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx, 1
-        // r8 = reserved argument: the payload's only channel for values the
-        // injector knows and it cannot discover itself (the image range needed by
-        // L2b — VirtualQuery reports the section split, not SizeOfImage, so the
-        // shim used to decrypt the wrong range and ran the cipher on every call).
-        code.extend_from_slice(&[0x49, 0xB8]); // mov r8, imm64
-        code.extend_from_slice(&reserved.to_le_bytes());
+        code.extend_from_slice(&[0x4D, 0x31, 0xC0]); // xor r8, r8 (no reserved payload)
         code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
         code.extend_from_slice(&cb.to_le_bytes());
         code.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -470,65 +416,8 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
     let entry = base + img.entry as usize;
     targets.push(entry as u64);
 
-    // (base, size, text_lo, text_hi) for the payload: it cannot read its own PE
-    // header any more, and L2b-style sealing needs to know which pages must stay
-    // plaintext (its own code) so the tick can run without a shim.
-    // Keep everything the running tick touches: its code *and* the writable
-    // sections (statics, Mutexes, the reader). Sealing `.data` while code still
-    // runs is fatal — measured, the game dies right after `seal: 73 pages`.
-    // What gets sealed then: headers, `.rdata`, `.reloc`.
-    let text = img
-        .sections
-        .iter()
-        .find(|s| s.is_executable())
-        .map(|s| {
-            let lo = base + s.va as usize;
-            let hi = img
-                .sections
-                .iter()
-                .filter(|x| !x.is_executable() && x.characteristics & 0x8000_0000 != 0)
-                .map(|x| base + x.va as usize + x.vsize as usize)
-                .max()
-                .unwrap_or(lo + s.vsize as usize);
-            (lo, hi.max(lo + s.vsize as usize))
-        })
-        .unwrap_or((0, 0));
-    // Only the partial mode keeps pages plaintext; the shim mode seals everything
-    // (it decrypts on entry instead).
-    let partial = std::env::var("HROMATITE_L2B_PARTIAL")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    let keep_range = if partial && text.0 != 0 && text.1 > text.0 {
-        Some((text.0 & !0xFFF, (text.1 + 0xFFF) & !0xFFF))
-    } else {
-        None
-    };
-    // Executable sections only: the shim makes exactly this range `RX` inside the
-    // window. Using the `keep` range instead turned `.data` read-only, and the
-    // Rust detour faulted on its own statics (measured: `stage=7`, lock stuck).
-    let code = img.sections.iter().filter(|s| s.is_executable()).fold(
-        (usize::MAX, 0usize),
-        |(lo, hi), s| {
-            let l = base + s.va as usize;
-            let h = l + s.vsize as usize;
-            (lo.min(l), hi.max(h))
-        },
-    );
-    let (code_lo, code_hi) = if code.0 == usize::MAX { (0, 0) } else { code };
-    let params = r
-        .alloc(48, hromatite_win::ffi::PAGE_READWRITE)
-        .ok_or("param alloc failed")?;
-    let mut pbuf = [0u8; 48];
-    pbuf[..8].copy_from_slice(&(base as u64).to_le_bytes());
-    pbuf[8..16].copy_from_slice(&(size as u64).to_le_bytes());
-    pbuf[16..24].copy_from_slice(&(text.0 as u64).to_le_bytes());
-    pbuf[24..32].copy_from_slice(&(text.1 as u64).to_le_bytes());
-    pbuf[32..40].copy_from_slice(&(code_lo as u64).to_le_bytes());
-    pbuf[40..48].copy_from_slice(&(code_hi as u64).to_le_bytes());
-    if !r.write(params, &pbuf) {
-        return Err("param write failed".into());
-    }
-    let stub = dll_stub(base as u64, &targets, params as u64);
+    // The payload discovers its own module; the stub passes nothing else.
+    let stub = dll_stub(base as u64, &targets);
     let stub_mem = r
         .alloc(stub.len(), hromatite_win::ffi::PAGE_READWRITE)
         .ok_or("stub alloc failed")?;
@@ -536,20 +425,12 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         return Err("stub write failed".into());
     }
     r.protect(stub_mem, stub.len(), hromatite_win::ffi::PAGE_EXECUTE_READ);
-    // Sealing rewrites every page of the image, so the payload must be *done*:
-    // wait far longer than the default when a seal is going to follow.
-    // 30 min: interactive mode (HROMATITE_LIVE) keeps the entry point alive while
-    // the host explores through the command file, and the seal has to happen
-    // after the last answer, not on a timeout.
-    let wait_ms = if opts.seal { 1_800_000 } else { 60_000 };
-    let code = r
-        .call(stub_mem, 0, wait_ms)
+    // The runtime has no separate "finished" state to wait for: the stub returns
+    // as soon as DllMain's startup phase is done (a live console mode returns
+    // early and keeps running on the game's own thread).
+    let _code = r
+        .call(stub_mem, 0, 60_000)
         .ok_or("CreateRemoteThread(stub) failed")?;
-    if opts.seal && code == 0x103 {
-        log::log(
-            "seal: stub thread still active (0x103), skipping seal to avoid rewriting live code",
-        );
-    }
 
     log::log(&format!(
         "manualmap: {dll_path} mapped at {base:#x} (delta {delta:#x}, relocs {relocs}, rx sections {rx}, \
@@ -558,19 +439,5 @@ pub fn inject(pid: u32, dll_path: &str, opts: &Options) -> Result<usize, String>
         opts.stomp.as_deref().unwrap_or("-")
     ));
 
-    // L2: the payload has returned into the stub thread, so no instruction
-    // fetch can land in the image any more — encrypt it and leave it RW.
-    if opts.seal && code != 0x103 {
-        let before = r.read_vec(base, 16).unwrap_or_default();
-        let keep = keep_range.filter(|(lo, hi)| *lo > base && *hi <= base + size);
-        let (pages, failed) = seal_image(&r, base, size, keep);
-        let after = r.read_vec(base, 16).unwrap_or_default();
-        log::log(&format!(
-            "seal: {pages} pages XORed, {failed} failed, size {size:#x}, crypto=block8; \
-             before {:02x?}; after {:02x?}",
-            &before[..before.len().min(16)],
-            &after[..after.len().min(16)]
-        ));
-    }
     Ok(base)
 }

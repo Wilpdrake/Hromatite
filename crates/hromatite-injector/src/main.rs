@@ -10,7 +10,6 @@
 
 use hromatite_win::{GAME_ASSEMBLY, GAME_EXE, UNITY_PLAYER, log, procs, remote::Remote};
 
-mod crypto;
 mod manualmap;
 
 fn usage() {
@@ -117,8 +116,8 @@ fn inject(
         },
     };
     log::log_echo(&format!(
-        "target pid {pid}, dll {dll}, erase_headers={}, seal={}, stomp={:?}",
-        opts.erase_headers, opts.seal, opts.stomp
+        "target pid {pid}, dll {dll}, erase_headers={}, stomp={:?}",
+        opts.erase_headers, opts.stomp
     ));
     let result = if mode == "loadlib" {
         manualmap::inject_loadlib(pid, dll)
@@ -156,7 +155,6 @@ fn main() {
     let mut opts = manualmap::Options {
         erase_headers: true,
         stomp: None,
-        seal: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -177,10 +175,6 @@ fn main() {
             i += 2;
         } else if args[i] == "--keep-headers" {
             opts.erase_headers = false;
-            i += 1;
-        } else if args[i] == "--seal" {
-            // L2: encrypt the image once the payload has finished.
-            opts.seal = true;
             i += 1;
         } else {
             i += 1;
