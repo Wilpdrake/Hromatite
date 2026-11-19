@@ -490,6 +490,7 @@ fn rebuild(
 
 /// Reinterpret an `f32` slice as bytes without copying: the staging buffer is
 /// the same memory the write service reads for the duration of the call.
+#[allow(unsafe_code)]
 fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: `f32` has no padding and no invalid bit patterns, so re-borrowing
     // the same allocation with a byte view is total and has the same lifetime.
