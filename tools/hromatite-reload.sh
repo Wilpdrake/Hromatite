@@ -96,7 +96,7 @@ done
 
 if [ -z "$EXPECTED_GAME_SHA" ]; then
     EXPECTED_GAME_SHA=$(sed -n 's/^pub const GAMEASSEMBLY_SHA256: &str = "\([0-9a-f]\{64\}\)";$/\1/p' \
-        "$PROJECT/crates/hromatite-core/src/symbols.rs")
+        "$PROJECT/crates/hromatite-il2cpp/src/symbols.rs")
 fi
 valid_sha "$EXPECTED_GAME_SHA" ||
     fail 'expected GameAssembly SHA-256 must be 64 lowercase hex characters'

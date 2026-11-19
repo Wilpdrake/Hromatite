@@ -94,7 +94,7 @@ class GcDetourAbiTest(unittest.TestCase):
         main thread at 0% CPU, no dump, no abort. The same binary with the guard
         off loaded worlds for 40+ minutes.
         """
-        source = (ROOT / "crates/hromatite-core/src/raw/gcguard.rs").read_text()
+        source = (ROOT / "crates/hromatite-il2cpp/src/raw/gcguard.rs").read_text()
         marker = 'unsafe extern "system" fn suspend_entry_detour'
         body = source[source.index(marker) :]
         body = body[: body.index("\n}")]

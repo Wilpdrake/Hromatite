@@ -222,7 +222,7 @@ test_wrong_game_hash_is_rejected_before_build() {
     fi
     grep 'GameAssembly hash mismatch' "$FIXTURE/err" >/dev/null || fail 'missing hash mismatch diagnostic'
     expected=$(sed -n 's/^pub const GAMEASSEMBLY_SHA256: &str = "\([0-9a-f]\{64\}\)";$/\1/p' \
-        "$PROJECT/crates/hromatite-core/src/symbols.rs")
+        "$PROJECT/crates/hromatite-il2cpp/src/symbols.rs")
     grep "$expected" "$FIXTURE/err" >/dev/null || fail 'did not use generated symbols.rs hash'
     [ ! -e "$FIXTURE/cargo-called" ] || fail 'cargo ran before game validation'
     [ ! -e "$MODULES/current.manifest" ] || fail 'wrong hash published a manifest'

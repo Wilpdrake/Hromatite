@@ -2,7 +2,7 @@
 """Generate the per-build symbol map for Hromatite.
 
 Reads the installed game's GameAssembly.dll and UnityPlayer.dll and emits
-`crates/hromatite-core/src/symbols.rs` (export name -> RVA) keyed by the
+`crates/hromatite-il2cpp/src/symbols.rs` (export name -> RVA) keyed by the
 GameAssembly hash. Read-only with respect to the game.
 
 Usage:
@@ -92,7 +92,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--game-dir", default=DEFAULT_GAME)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..",
-                                                  "crates/hromatite-core/src/symbols.rs"))
+                                                  "crates/hromatite-il2cpp/src/symbols.rs"))
     args = ap.parse_args()
     game = args.game_dir.rstrip("/")
 

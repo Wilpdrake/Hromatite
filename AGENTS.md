@@ -130,45 +130,81 @@ x86_64-w64-mingw32-objdump -p $G/GameAssembly.dll | sed -n '/^\[Ordinal\/Name Po
 
 ## 3. Структура репозитория
 
+Корень — **виртуальный workspace**: каждая единица сборки — крейт в `crates/`.
+Границы зависимостей жёсткие (проверяются `cargo tree`, см. §7.5):
+
 ```
 Hromatite/
-├─ Cargo.toml                 # пакет Hromatite (CLI) + workspace (core, dll, test-target)
-├─ .cargo/config.toml         # target = x86_64-pc-windows-gnu, linker=mingw,
-│                             # rustflags=-L/run/current-system/sw/lib (иначе нет -l:libpthread.a)
-├─ src/main.rs                # CLI: bridge | inject | procs | mods
-├─ crates/hromatite-core/     # вся Win32/PE/il2cpp-механика (библиотека)
-│  ├─ ffi.rs                  # ручные extern-декларации Win32 (без внешних крейтов)
-│  ├─ log.rs                  # лог в %USERPROFILE%\hromatite.log (+ fallback C:\)
-│  ├─ procs.rs                # Toolhelp32 + PEB unlink (unlink_from_peb)
-│  ├─ remote.rs               # OpenProcess + RPM/WPM/VirtualAllocEx/CreateRemoteThread,
-│  │                          # парсинг экспортов чужого модуля (с forwarder'ами)
-│  ├─ pe.rs                   # парсер PE из файла: секции (+characteristics), reloc, imports, TLS
-│  ├─ manualmap.rs            # маппер: manual-map и loadlib, stealth-опции, один стаб
-│  ├─ il2cpp.rs               # рантайм-резолв таблицы экспортов (один проход) + геттеры
-│  └─ symbols.rs              # СГЕНЕРИРОВАННЫЙ symmap.py (не править руками)
-├─ crates/hromatite-dll/      # cdylib "hromatite.dll": DllMain + inline recon + PEB unlink
-├─ crates/test-target/        # подставной VRChat.exe (tick-цикл) для тестов маппера
-├─ tools/symmap.py            # генератор символов (uv run --no-project python)
-├─ hromatite-mode             # режим запуска (KEY=VALUE), читает launch-wrapper
-├─ tools/hromatite-launch.sh  # Steam launch-options wrapper + инжект (attach/proton)
-├─ tools/test-loadlib.sh      # стенд для loadlib-пути в отдельном префиксе
-├─ symbols-<sha12>.json       # побочный выход symmap
-└─ AGENTS.md                  # этот файл
+├─ Cargo.toml                  # virtual workspace: members, workspace-lints, profile.release
+├─ .cargo/config.toml          # target = x86_64-pc-windows-gnu, linker = mingw
+├─ crates/
+│  ├─ hromatite-abi/           # ЧИСТЫЙ контракт: HostApiV1/FeatureApiV1 (ABI=2),
+│  │                           # per-build дескрипторы (build), crc32c_eac/seal_checksum,
+│  │                           # hot-контракт (HotReload/HotConfig/HotState/HotStatus,
+│  │                           # parse_config/format_hot_status/parse_feature_manifest)
+│  ├─ hromatite-commands/      # каталог команд SPECS + Scope (Resident/Both/Feature),
+│  │                           # is_resident_only/is_feature_only — единственный список команд
+│  ├─ hromatite-win/           # граница ОС: Win32 FFI, safe memory/VirtualQuery, memscan,
+│  │                           # VEH (call0..call10), PE-парсер, procs/PEB, remote
+│  │                           # (feature "remote"), sha256, файловый лог
+│  ├─ hromatite-hook/          # x64 inline-движок (декодер, релокатор, трамплин, alloc_near),
+│  │                           # общая таблица хуков, midhook, vmt, iat, hookset
+│  ├─ hromatite-render/        # nuklear (C-shim + Nk/Ui/Input/Frame), kiero (Present VMT),
+│  │                           # D3D11-бэкенд, прекомпилированные шейдеры, ui install/status
+│  ├─ hromatite-il2cpp/        # домен Unity: symbols, buildinfo, gamebuild, m3 (классы/поля/
+│  │                           # методы), gcthreads, gcguard (entry-guard), lateupdate,
+│  │                           # playerloop, photon, discover; tests/{frames,report_stream}
+│  ├─ hromatite-eac/           # модель EAC: codec/payload/session/epoch/digest/capture/tap/
+│  │                           # eventlog/tailer/report/forge — ЧИСТОЕ ядро (feature
+│  │                           # "runtime" добавляет eos/, evp, keyhunt, eacimage/live)
+│  ├─ hromatite-runtime/       # резидент: startup (весь DllMain), tick (TickTarget), hot
+│  │                           # (контракт из abi + router), localmap, hostapi, console,
+│  │                           # bin "hot-smoke"
+│  ├─ hromatite-dll/           # cdylib "hromatite.dll": три строки над runtime::dll_main
+│  ├─ hromatite-injector/      # bin "Hromatite": CLI (bridge/inject/procs/mods) + manualmap
+│  ├─ hromatite-features/      # cdylib "hromatite_features": фичи поверх HostApi, БЕЗ Win32
+│  ├─ hromatite-console/       # отдельный Linux-workspace: TUI (model/, hot на abi::hot)
+│  └─ test-target/             # подставной VRChat.exe (tick-цикл) для тестов маппера
+├─ docs/                       # REFACTOR_AUDIT.md, HOT-RELOAD.md, EAC-*, archive/
+├─ tools/                      # генераторы (buildgen/symmap/api_map), launch-wrapper, TUI
+├─ hromatite-mode              # режим запуска (KEY=VALUE), читает launch-wrapper
+└─ AGENTS.md                   # этот файл
 ```
+
+Граф (кто от кого зависит, только внутренние рёбра):
+
+```
+abi ◀── commands ◀── runtime ──▶ win ◀── hook ◀── render
+                       │            ▲        ▲
+                       ├──▶ il2cpp ─┘────────┘
+                       └──▶ eac (runtime) ──▶ win, hook
+injector ──▶ win
+dll ──▶ runtime
+features ──▶ abi, commands, eac (default-features = false → только abi)
+```
+
+Инварианты (нарушение = баг, проверять `cargo tree`):
+
+1. `hromatite-injector` — **только** `hromatite-win`; никаких render/il2cpp/eac/runtime.
+2. `hromatite-dll` — **только** `hromatite-runtime`; `manualmap`/`remote` ему не видны.
+3. `hromatite-hook` — **только** `hromatite-win`; ноль ссылок на LateUpdate/EOS/il2cpp.
+4. `hromatite-eac` **не** зависит от `hromatite-il2cpp`: отправка Photon-кадров
+   инвертирована (`forge::set_photon_sender`), регистрируется в runtime.
+5. `hromatite-features` не тянет транзитивно win/hook/render/il2cpp/runtime:
+   `hromatite-eac` подключается с `default-features = false`.
+6. `crates/hromatite-core` больше нет и заводить его снова не нужно.
 
 Сборка:
 
 ```bash
 cd ~/RustroverProjects/Hromatite
-cargo build --workspace            # → target/x86_64-pc-windows-gnu/debug/{Hromatite.exe,hromatite.dll,test-target.exe}
-cargo build --workspace --release  # для stomp/скорости скана (см. §7.3)
+cargo build --workspace            # debug: Hromatite.exe, hromatite.dll,
+                                   # hromatite_features.dll, hot-smoke.exe, test-target.exe
+cargo build --workspace --release  # рабочие артефакты (target/x86_64-pc-windows-gnu/release)
 uv run --no-project python tools/symmap.py     # обновить symbols.rs после патча игры
 ```
 
-Замечание: `cargo build` в корне workspace'а с корневым пакетом собирает только
-корневой пакет; для DLL нужен `--workspace`.
-
-CLI (`Hromatite.exe`):
+CLI (`Hromatite.exe`, `crates/hromatite-injector`):
 
 ```
 bridge                     найти VRChat.exe, показать базы GameAssembly/UnityPlayer, прочитать PE-заголовок
@@ -182,6 +218,10 @@ inject --dll <Z:\path>     инжект; флаги:
 procs                      список процессов в текущей wine-сессии
 mods                       список модулей целевого процесса (что видит модульный скан)
 ```
+
+`--seal` удалён: рантайм отклоняет `HROMATITE_SEAL/HROMATITE_L2B`, и запечатанный
+образ больше некому расшифровать. Тестовая петля hot-reload — отдельный бинарь
+`hot-smoke.exe` (`crates/hromatite-runtime/src/bin/hot_smoke.rs`).
 
 ---
 

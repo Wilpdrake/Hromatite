@@ -49,7 +49,7 @@ DEFAULT_GAME = os.path.expanduser("~/.local/share/Steam/steamapps/common/VRChat"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(REPO, "tools", "data")
 BUILD_RS = os.path.join(REPO, "crates", "hromatite-abi", "src", "build.rs")
-SYMBOLS_RS = os.path.join(REPO, "crates", "hromatite-core", "src", "symbols.rs")
+SYMBOLS_RS = os.path.join(REPO, "crates", "hromatite-il2cpp", "src", "symbols.rs")
 
 # Distances inside `GC_suspend_all` / `GC_remove_thread` that stayed constant
 # across both measured builds.  They are *hints*: every one of them is verified

@@ -12,7 +12,7 @@ GA="$GAME/GameAssembly.dll"
 
 new_hash=$(sha256sum "$GA")
 new_hash=${new_hash%% *}
-old_hash=$(uv run --no-project python -c 'import re;print(re.search(r"GAMEASSEMBLY_SHA256: &str = \"([0-9a-f]+)\"",open("crates/hromatite-core/src/symbols.rs").read()).group(1))')
+old_hash=$(uv run --no-project python -c 'import re;print(re.search(r"GAMEASSEMBLY_SHA256: &str = \"([0-9a-f]+)\"",open("crates/hromatite-il2cpp/src/symbols.rs").read()).group(1))')
 
 if [ "$new_hash" = "$old_hash" ]; then
     uv run --no-project python tools/api_map.py --check
@@ -23,7 +23,7 @@ fi
 printf 'new build: %s -> %s\n' "$old_hash" "$new_hash"
 uv run --no-project python tools/symmap.py --game-dir "$GAME"
 uv run --no-project python tools/api_map.py --game-dir "$GAME"
-version=$(uv run --no-project python -c 'import re;print(re.search(r"UNITY_VERSION: &str = \"([^\"]+)\"",open("crates/hromatite-core/src/symbols.rs").read()).group(1))')
+version=$(uv run --no-project python -c 'import re;print(re.search(r"UNITY_VERSION: &str = \"([^\"]+)\"",open("crates/hromatite-il2cpp/src/symbols.rs").read()).group(1))')
 timestamp=$(date -Iseconds)
 cat >>AGENTS.md <<EOF
 

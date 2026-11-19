@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_GAME = Path.home() / ".local/share/Steam/steamapps/common/VRChat"
 DEFAULT_NAMES = ROOT / "tools/data/il2cpp-api-names.txt"
 DEFAULT_ANCHORS = ROOT / "tools/data/il2cpp-api-anchors.json"
-DEFAULT_OUT = ROOT / "crates/hromatite-core/src/api_symbols.rs"
+DEFAULT_OUT = ROOT / "crates/hromatite-il2cpp/src/api_symbols.rs"
 DEFAULT_REPORT = ROOT / "api_map.json"
 
 

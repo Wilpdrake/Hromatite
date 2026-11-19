@@ -323,7 +323,7 @@ class RustShapes(unittest.TestCase):
     }
 
     def _rust_bytes(self, name: str) -> bytes:
-        source = open(os.path.join(REPO, "crates", "hromatite-core", "src", "raw", "discover.rs")).read()
+        source = open(os.path.join(REPO, "crates", "hromatite-il2cpp", "src", "raw", "discover.rs")).read()
         start = source.index(f"const {name}: &[u8] = &[")
         body = source[start : source.index("];", start)]
         return bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})", body))
@@ -345,7 +345,7 @@ class RustShapes(unittest.TestCase):
                 self.assertEqual(hits, [expected[sha]], f"{name} in {sha[:12]}")
 
     def test_the_icall_name_the_getter_caches_is_the_same_string(self):
-        source = open(os.path.join(REPO, "crates", "hromatite-core", "src", "raw", "discover.rs")).read()
+        source = open(os.path.join(REPO, "crates", "hromatite-il2cpp", "src", "raw", "discover.rs")).read()
         self.assertIn(bg.PLAYER_LOOP_ICALL.decode(), source)
         for path in (OLD_BINARY, os.path.join(GAME_DIR, "GameAssembly.dll")):
             if not os.path.exists(path):
