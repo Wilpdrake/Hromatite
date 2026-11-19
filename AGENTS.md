@@ -5004,3 +5004,40 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   (нужен `cargo build -p hromatite-runtime --bin hot-smoke --release` и Steam);
   `tools/test_gc_detour_abi.py` намеренно не тронут — рефакторится на следующей
   стадии.
+
+### 2026-11-19 — `hromatite-eac`: `report.rs` (1644 строки) разбит на `report/{mod,parser,generator,stream}.rs`
+
+- Коммиты ветки `refactor/eac-report`: `refactor(eac): make report a module
+  directory, move only` (чистый `git mv`, R100) + этот
+  (`refactor(eac): split report into parser/generator/stream`; хеш не вписан —
+  запись дописана в тот же коммит). Реализация §5 `docs/REFACTOR_AUDIT.md`,
+  стадия 4.
+- **Раскладка:** `parser.rs` — `Report` + `split_messages` + `record`
+  (capture-формат, «что записано»); `generator.rs` — `GenConfig`, `Generator`,
+  `boundary_flags`, `spawn_photon_sender` (что пересобирается и как);
+  `stream.rs` — `Slot`, `Stream`, `retarget` (что отдаётся в игру и как
+  перецеливается); `mod.rs` — доки модуля, `DEFAULT_AFTER_MS`/
+  `DEFAULT_MIN_FRAMES`, `Config` (`EAC_REPLAY_*`) и `pub use` всех частей.
+- **API не менялся:** `hromatite_eac::report::{Report, GenConfig, Generator,
+  Slot, Stream, retarget, record, Config, DEFAULT_AFTER_MS, DEFAULT_MIN_FRAMES}`
+  — те же пути, новых публичных имён нет. Внутри `report` пришлось расширить
+  видимость: поля `Report::{frames, messages, generator}` и
+  `split_messages`/`spawn_photon_sender` стали `pub(super)`, иначе соседние
+  подмодули не читают запись без второй копии кадров.
+- **Тесты:** все 16 остались при своём коде (parser 4, generator 4, stream 6,
+  `Config` 2 в `mod`) — тексты не менялись ни на строку; общие фикстуры
+  (`frame_at`, `sample_report`, `REAL_CAPTURE`, `REPORT_FULL`, `crc_holds`,
+  `flags_of/seq_of/sid_of`) вынесены в `#[cfg(test)] pub(crate) mod fixtures`
+  в `parser.rs`. `validate_recorded` остался в тестах `parser`.
+- **Чем подтверждено:** `cargo test -p hromatite-eac --target
+  x86_64-unknown-linux-gnu --offline` — **102 passed** в lib-тестах (столько же,
+  сколько до правки) + 1 `epochs` + 3 `keyhunt_scan`; `cargo test
+  --no-default-features --lib` — **83 passed** (чистое ядро, `report` компилируется
+  без `runtime`); `cargo clippy -p hromatite-eac --all-targets --target
+  x86_64-pc-windows-gnu -- -D warnings` — чисто; `cargo build -p
+  hromatite-features --target x86_64-pc-windows-gnu` — собирается; `cargo tree -p
+  hromatite-eac --no-default-features --edges normal` — только `hromatite-abi`;
+  `cargo doc -p hromatite-eac --no-deps` — ни одного нового предупреждения
+  (ссылки `Stream::*` в чужих модулях переписаны на `crate::report::Stream::*`).
+- **Осталось:** живой прогон не нужен (поведение не менялось); `docs/
+  REFACTOR_AUDIT.md` §5-строка про `report.rs` осталась описанием плана.
