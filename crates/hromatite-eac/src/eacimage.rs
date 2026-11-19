@@ -18,7 +18,7 @@
 //!
 //! * `MAX_REGIONS` regions per call (a Unity game has a few thousand);
 //! * an optional page walk (`pages`) capped by `MAX_PAGES` and yielding to the
-//!   GC every `YIELD_EVERY` probes with [`hromatite_core::safe::scan_yield`];
+//!   GC every `YIELD_EVERY` probes with [`hromatite_win::memory::scan_yield`];
 //! * a byte budget for the snapshot of one candidate (`read=<bytes>`), so a
 //!   random 1 GB region cannot be copied.
 //!

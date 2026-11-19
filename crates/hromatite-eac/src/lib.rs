@@ -68,10 +68,7 @@ pub mod evp;
 pub mod forge;
 #[allow(unsafe_code)]
 pub mod keyhunt;
-// The il2cpp type-table probe reads the live GameAssembly: runtime only.
-#[cfg(feature = "runtime")]
 #[allow(unsafe_code)]
-pub mod m3probe;
 pub mod payload;
 pub mod report;
 pub mod session;

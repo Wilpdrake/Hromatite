@@ -6,13 +6,12 @@
 #
 #   hromatite-injector   Hromatite.exe       -> hromatite-win only
 #   hromatite-dll        hromatite.dll       -> hromatite-runtime only
-#   hromatite-runtime    resident library    -> win, hook, render, core, eac
+#   hromatite-runtime    resident library    -> win, hook, render, il2cpp, eac
 #   hromatite-features   hromatite_features  -> abi, commands, protocol-only eac
 [workspace]
 members = [
     "crates/hromatite-abi",
     "crates/hromatite-commands",
-    "crates/hromatite-core",
     "crates/hromatite-dll",
     "crates/hromatite-eac",
     "crates/hromatite-features",

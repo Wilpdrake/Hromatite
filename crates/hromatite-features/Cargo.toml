@@ -11,7 +11,10 @@ path = "src/lib.rs"
 [dependencies]
 hromatite-abi = { path = "../hromatite-abi" }
 hromatite-commands = { path = "../hromatite-commands" }
-hromatite-eac = { path = "../hromatite-eac" }
+# Protocol-only EAC model: the feature image must not link the Win32/hook layer,
+# so the crate's OS-facing modules stay behind the `runtime` feature (which is
+# off here and on by default for the resident).
+hromatite-eac = { path = "../hromatite-eac", default-features = false }
 
 [lints]
 workspace = true

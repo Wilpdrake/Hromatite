@@ -341,13 +341,6 @@ impl Hooks {
             hook_log_blocking(&format!("[iat] {patched} slot(s) now hold a detour"));
         }
 
-        // `EAC_M3_PROBE=1`: locate the il2cpp class table of *this* build.
-        if env_flag("EAC_M3_PROBE") {
-            for line in crate::m3probe::probe() {
-                hook_log_blocking(&line);
-            }
-        }
-
         // `EAC_EVP=1`: probe the statically linked BoringSSL inside the SDK.
         // Nothing here is a documented export, so each target is matched by its
         // recorded prologue and skipped on drift. The point is the `Init`

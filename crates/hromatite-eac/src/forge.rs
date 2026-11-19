@@ -456,7 +456,7 @@ pub enum Via {
     #[default]
     Wrapper,
     /// The managed `PhotonPeer.SendOperation` RaiseEvent emitter
-    /// ([`hromatite_core::photon::emulate_send`]) — no EOS module involved.
+    /// (through [`set_photon_sender`]) — no EOS module involved.
     Photon,
     /// Both: the wrapper path *and* the Photon ring.
     Both,
@@ -814,30 +814,54 @@ pub struct Delivery {
     pub unarmed: bool,
 }
 
+/// One managed Photon send: `(bytes) -> bytes written`.
+///
+/// The resident registers this at startup. `hromatite-eac` must not depend on
+/// the IL2CPP crate: the payload's transport is inverted into a callback, so the
+/// pure protocol build links neither `hromatite-il2cpp` nor Win32.
+pub type PhotonSender = fn(&[u8]) -> Result<usize, String>;
+
+// A `fn` pointer inside a `Mutex`: the crate denies `unsafe_code`, and the slot
+// is written once at startup and read once per tick, so a lock is free here.
+static PHOTON_SENDER: Mutex<Option<PhotonSender>> = Mutex::new(None);
+
+/// Publish the managed emitter. Called once by the resident runtime.
+pub fn set_photon_sender(sender: PhotonSender) {
+    let mut slot = PHOTON_SENDER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *slot = Some(sender);
+}
+
+fn photon_sender() -> Option<PhotonSender> {
+    let slot = PHOTON_SENDER
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *slot
+}
+
 /// Hand every queued frame to the managed Photon emitter.
 ///
 /// This is the transport that does not touch EOSSDK at all: the bytes are
 /// written into the live `byte[]` captured from the game's own
 /// `RaiseEvent(253, {244: 66, 245: payload})` and the original `SendOperation`
-/// is called through its trampoline ([`hromatite_core::photon::emulate_send`]).
+/// is called through its trampoline.
 ///
-/// Only the `runtime` feature has an il2cpp layer to call, so the pure build
-/// keeps the ring and the counters and reports the emitter as unarmed: a
-/// feature image can queue frames for the resident to send, it just cannot send
-/// them itself.
-#[cfg(feature = "runtime")]
+/// Until the resident registers [`set_photon_sender`] the ring and the counters
+/// keep working and the pass reports the emitter as unarmed: a feature image can
+/// queue frames for the resident to send, it just cannot send them itself.
 pub fn pump_photon() -> Delivery {
-    if hromatite_core::photon::template().is_none() {
+    let Some(send) = photon_sender() else {
         return Delivery {
             unarmed: true,
             ..Delivery::default()
         };
-    }
+    };
     let frames = drain_frames();
     let mut delivery = Delivery::default();
     let mut failed = VecDeque::new();
     for frame in frames {
-        match hromatite_core::photon::emulate_send(&frame) {
+        match send(&frame) {
             Ok(_) => {
                 delivery.sent += 1;
                 PHOTON_SENT.fetch_add(1, Ordering::Relaxed);
@@ -865,16 +889,6 @@ pub fn pump_photon() -> Delivery {
         }
     }
     delivery
-}
-
-/// No il2cpp layer in this build: the ring stays queued and the pass reports
-/// "not armed", exactly as it does before a live template is captured.
-#[cfg(not(feature = "runtime"))]
-pub fn pump_photon() -> Delivery {
-    Delivery {
-        unarmed: true,
-        ..Delivery::default()
-    }
 }
 
 /// Append one frame to `path` in the capture format (`u32 len | u32 dt | bytes`).

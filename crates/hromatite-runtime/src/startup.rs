@@ -214,6 +214,11 @@ fn attach(hinst: *mut core::ffi::c_void) {
         return;
     }
 
+    // The EAC model owns the forged-frame ring but not the transport: the
+    // managed Photon emitter lives in the IL2CPP crate, so it is handed over
+    // here instead of `hromatite-eac` depending on it.
+    hromatite_eac::forge::set_photon_sender(hromatite_il2cpp::photon::emulate_send);
+
     // Anti-cheat hooks before any managed tick exists: VRChat registers its
     // message-to-server callback early and only once.
     log::guard("install_ac_hooks", install_ac_hooks);

@@ -1210,9 +1210,14 @@ mod command_tests {
         ] {
             assert!(listed.contains(&name), "resident help lost {name}");
         }
-        // A feature image owns these; the resident runtime must not claim them.
+        // A feature image owns the eac.* family; the one exception is
+        // `eac.module`, which reads EAC's own modules through Win32 and is
+        // therefore dispatched by the resident (checked before the eac.* branch).
+        assert!(listed.contains(&"eac.module"), "{listed:?}");
         assert!(
-            !listed.iter().any(|name| name.starts_with("eac.")),
+            !listed
+                .iter()
+                .any(|name| name.starts_with("eac.") && *name != "eac.module"),
             "{listed:?}"
         );
         assert!(!listed.contains(&"feature"), "{listed:?}");

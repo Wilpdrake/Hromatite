@@ -13,16 +13,15 @@ path = "src/lib.rs"
 # and the Photon emitter. Off for `hromatite-features`, which links the pure
 # protocol core (`default-features = false`) and must not pull Win32 transitively.
 default = ["runtime"]
-runtime = ["dep:hromatite-core", "dep:hromatite-win", "dep:hromatite-hook"]
+runtime = ["dep:hromatite-win", "dep:hromatite-hook"]
 
 [dependencies]
 # Pure `std` (no FFI, no Win32): the EAC frame checksum is shared with the
 # Photon transport, so it lives in the ABI crate.
 hromatite-abi = { path = "../hromatite-abi" }
-# In-repo only (no external crates): the m3 probe reads il2cpp structures
-# through the same safe readers the rest of the payload uses. All three belong
-# to the `runtime` feature.
-hromatite-core = { path = "../hromatite-core", optional = true }
+# In-repo only (no external crates): the OS boundary (safe readers, PE/procs)
+# and the hook engine. Both belong to the `runtime` feature; the pure core needs
+# neither.
 hromatite-hook = { path = "../hromatite-hook", optional = true }
 hromatite-win = { path = "../hromatite-win", optional = true }
 
