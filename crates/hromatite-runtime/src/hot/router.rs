@@ -1223,27 +1223,12 @@ pub fn smoke(paths: &[String], rounds: usize) -> Result<Vec<String>, String> {
 /// there is no replaceable feature available and the established built-in
 /// console should execute the command as before.
 pub fn resident_command(command: &str) -> bool {
-    matches!(
-        command
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "gct"
-            | "threads"
-            | "gctfix"
-            | "gctresume"
-            | "loopc"
-            | "loop"
-            | "latec"
-            | "latehook"
-            | "late"
-            | "panic"
-            | "av"
-            | "seal"
-            | "quit"
-    )
+    let name = command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    hromatite_commands::is_resident_only(&name)
 }
 
 pub fn dispatch(line: &str) -> bool {
@@ -1295,31 +1280,25 @@ mod tests {
 
     #[test]
     fn resident_commands_never_fallback_to_a_feature_image() {
-        for command in [
-            "gct",
-            "threads",
-            "gctfix",
-            "gctresume",
-            "loopc",
-            "loop",
-            "latec",
-            "latehook",
-            "late",
-            "panic",
-            "av",
-            "seal",
-            "quit",
-        ] {
-            assert!(
-                super::resident_command(command),
-                "feature can steal {command}"
-            );
+        for spec in hromatite_commands::SPECS {
+            if spec.scope == hromatite_commands::Scope::Resident {
+                assert!(
+                    super::resident_command(spec.name),
+                    "feature can steal {}",
+                    spec.name
+                );
+            } else {
+                assert!(
+                    !super::resident_command(spec.name),
+                    "feature loses {}",
+                    spec.name
+                );
+            }
         }
-        for command in [
-            "feature", "pos", "who", "esp", "m3c", "q", "guard", "unknown",
-        ] {
-            assert!(!super::resident_command(command), "feature loses {command}");
-        }
+        // The regression that motivated the shared predicate: `ui` is resident
+        // (it drives the Present hook from the resident thread).
+        assert!(super::resident_command("ui status"));
+        assert!(!super::resident_command("unknown"));
     }
 
     #[test]

@@ -485,6 +485,20 @@ pub const SPECS: &[Spec] = &[
 
 /// `help` lines for one image: the resident runtime lists everything it can
 /// route; a feature image lists everything it implements itself.
+/// True when the resident runtime must execute `name` itself.
+///
+/// The command router and the feature image both call this instead of keeping a
+/// private list: the previous hand-maintained copies had already drifted (`ui`
+/// was missing from the router, so the feature image could intercept it).
+pub fn is_resident_only(name: &str) -> bool {
+    matches!(find(name), Some(spec) if spec.scope == Scope::Resident)
+}
+
+/// True when only a hot-reloaded feature image implements `name`.
+pub fn is_feature_only(name: &str) -> bool {
+    matches!(find(name), Some(spec) if spec.scope == Scope::Feature)
+}
+
 pub fn help_lines(scope: Scope) -> Vec<String> {
     SPECS
         .iter()
