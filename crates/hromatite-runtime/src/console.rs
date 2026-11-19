@@ -1130,6 +1130,18 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         "latec" | "latehook" | "late" => {
             (hromatite_il2cpp::hook::command(line).unwrap_or_default(), Action::None)
         }
+        // `eac.module` is the one eac.* command the resident owns: it reads the
+        // anti-cheat's own image through Win32 and `/proc`, which a feature
+        // image cannot do. Everything else in the eac.* family stays with the
+        // feature image.
+        "eac.module" => (
+            hromatite_eac::eacimage::command(
+                line.split_once(char::is_whitespace)
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or(""),
+            ),
+            Action::None,
+        ),
         "seal" => (
             vec!["seal requested, returning from DllMain".into()],
             Action::Seal,
@@ -1154,6 +1166,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         .to_ascii_lowercase();
     match cmd.as_str() {
         "help" | "?" => (help_lines(), Action::None),
+        "eac.module" => (
+            vec!["eac.module: needs the Windows payload".into()],
+            Action::None,
+        ),
         "" => (Vec::new(), Action::None),
         other => (
             vec![format!("unknown command: {other} (try help)")],
@@ -1165,6 +1181,16 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
 #[cfg(test)]
 mod command_tests {
     use super::dispatch;
+
+    #[test]
+    fn the_one_resident_eac_command_is_not_reported_unknown() {
+        let (lines, _) = dispatch("eac.module 64");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            !lines[0].starts_with("unknown command"),
+            "eac.module is resident-scoped but the console does not route it: {lines:?}"
+        );
+    }
 
     #[test]
     fn help_is_generated_and_lists_only_routable_resident_commands() {
