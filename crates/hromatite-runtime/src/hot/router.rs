@@ -89,7 +89,7 @@ fn parse_versioned_name(name: &str) -> Option<VersionedName> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn config_text(config: crate::hot::HotConfig) -> String {
+fn config_text(config: hromatite_abi::hot::HotConfig) -> String {
     format!(
         "TICK_MS={}\nGRACE_MS={}\nTELEMETRY={}\nMEMORY={}\nM3={}\n",
         config.tick_ms,
@@ -102,10 +102,10 @@ fn config_text(config: crate::hot::HotConfig) -> String {
 
 #[cfg(any(target_os = "windows", test))]
 fn replace_config(
-    original: crate::hot::HotConfig,
+    original: hromatite_abi::hot::HotConfig,
     key: &str,
     value: &str,
-) -> Result<crate::hot::HotConfig, crate::hot::ConfigError> {
+) -> Result<hromatite_abi::hot::HotConfig, hromatite_abi::hot::ConfigError> {
     let mut lines: Vec<String> = config_text(original).lines().map(str::to_string).collect();
     let prefix = format!("{key}=");
     if let Some(line) = lines.iter_mut().find(|line| line.starts_with(&prefix)) {
@@ -113,7 +113,7 @@ fn replace_config(
     } else {
         lines.push(format!("{prefix}{value}"));
     }
-    crate::hot::parse_config(&lines.join("\n"))
+    hromatite_abi::hot::parse_config(&lines.join("\n"))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -228,7 +228,7 @@ mod imp {
         FeatureArtifact, ReloadSelection, bootstrap_feature_requested, config_text,
         parse_feature_manifest, parse_reload_request, parse_versioned_name, replace_config,
     };
-    use crate::hot::{Fault, HotConfig, HotReload, Phase, Tick};
+    use hromatite_abi::hot::{Fault, HotConfig, HotReload, Phase, Tick};
     use crate::localmap::FeatureImage;
     use hromatite_il2cpp::symbols;
     use hromatite_abi::{HostApiV1, STATUS_OK};
@@ -294,7 +294,7 @@ mod imp {
             let mut error = None;
             match read_config_file() {
                 Ok(text) if text.trim().is_empty() => {}
-                Ok(text) => match crate::hot::parse_config(&text) {
+                Ok(text) => match hromatite_abi::hot::parse_config(&text) {
                     Ok(value) => config = value,
                     Err(problem) => error = Some(format!("initial config: {problem:?}")),
                 },
@@ -570,7 +570,7 @@ mod imp {
                     }
                     self.dirty = true;
                 }
-                Err(crate::hot::HotError::CallsInFlight) => {}
+                Err(hromatite_abi::hot::HotError::CallsInFlight) => {}
                 Err(problem) => self.last_error = Some(format!("retire check: {problem:?}")),
             }
         }
@@ -607,7 +607,7 @@ mod imp {
                 if self.model.phase() == Phase::Draining {
                     match self.model.begin_loading(now_ms()) {
                         Ok(()) => {}
-                        Err(crate::hot::HotError::CallsInFlight) => return,
+                        Err(hromatite_abi::hot::HotError::CallsInFlight) => return,
                         Err(problem) => return self.fail_pending(format!("drain: {problem:?}")),
                     }
                 }
@@ -1064,7 +1064,7 @@ mod imp {
                 let response = match action.as_str() {
                     "show" if parts.next().is_none() => config_text(runtime.config),
                     "reload" if parts.next().is_none() => match read_config_file() {
-                        Ok(text) => match crate::hot::parse_config(&text) {
+                        Ok(text) => match hromatite_abi::hot::parse_config(&text) {
                             Ok(config) => {
                                 apply_config_file(runtime, config).unwrap_or_else(|error| {
                                     runtime.last_error = Some(error.clone());
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn config_set_preserves_unrelated_values_and_rejects_the_whole_bad_update() {
-        let original = crate::hot::HotConfig {
+        let original = hromatite_abi::hot::HotConfig {
             tick_ms: 123,
             telemetry: false,
             ..Default::default()
