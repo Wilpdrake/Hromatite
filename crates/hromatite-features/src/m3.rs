@@ -2,8 +2,7 @@
 //! All foreign reads/calls go through `Host`; the class-table cache is owned by
 //! one feature generation and dropped on reload or shutdown.
 
-use crate::host::Host;
-use crate::memory::parse_addr;
+use crate::host::{Host, parse_addr};
 use hromatite_abi::build::{Il2cppAnchors, Layout};
 use hromatite_abi::{STATUS_ERROR, STATUS_NOT_READY, STATUS_OK};
 

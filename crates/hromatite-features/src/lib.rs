@@ -2,13 +2,14 @@
 //!
 //! Every game-memory access and native call is delegated to the resident host.
 //! No core runtime, VEH handler, panic hook or leaked cache lives in this image.
-#![allow(unsafe_code)]
+// `unsafe` is allowed per item, not for the crate: the ABI boundary is the only
+// place that touches raw pointers, and each such site carries its own SAFETY note.
+#![deny(unsafe_code)]
 
 mod eac;
 mod feature;
 mod host;
 mod m3;
-mod memory;
 mod render;
 mod telemetry;
 
@@ -27,6 +28,7 @@ struct Lifecycle(UnsafeCell<Option<Feature>>);
 
 // SAFETY: all access is externally serialized by the resident as described
 // above. No reference or pointer escapes a synchronous ABI invocation.
+#[allow(unsafe_code)]
 unsafe impl Sync for Lifecycle {}
 
 static STATE: Lifecycle = Lifecycle(UnsafeCell::new(None));
@@ -35,6 +37,7 @@ fn state() -> *mut Option<Feature> {
     STATE.0.get()
 }
 
+#[allow(unsafe_code)]
 fn init_impl(host: *const HostApiV1, generation: u64) -> i32 {
     if host.is_null() || !(host as usize).is_multiple_of(core::mem::align_of::<HostApiV1>()) {
         return STATUS_BAD_ARGUMENT;
@@ -69,6 +72,7 @@ extern "system" fn init(host: *const HostApiV1, generation: u64) -> i32 {
     init_impl(host, generation)
 }
 
+#[allow(unsafe_code)]
 fn dispatch_impl(command: *const i8, command_len: usize) -> i32 {
     // SAFETY: the resident exclusively serializes this synchronous invocation;
     // BUSY admission prevents a host callback from creating a second borrow.
@@ -104,6 +108,7 @@ extern "system" fn dispatch(command: *const i8, command_len: usize) -> i32 {
     dispatch_impl(command, command_len)
 }
 
+#[allow(unsafe_code)]
 fn configure_impl(key: *const i8, key_len: usize, value: *const i8, value_len: usize) -> i32 {
     // SAFETY: the resident exclusively serializes this synchronous invocation;
     // BUSY admission prevents a host callback from creating a second borrow.
@@ -158,6 +163,7 @@ extern "system" fn configure(
 /// Managed tick (LateUpdate / native PlayerLoop). Telemetry stays request-driven;
 /// only anti-cheat housekeeping runs here: heartbeat cadence and the game-log
 /// mirror. Bounded file I/O, no game-memory access, no native calls.
+#[allow(unsafe_code)]
 extern "system" fn tick() {
     // SAFETY: the resident exclusively serializes this synchronous invocation on
     // the established game thread; BUSY admission prevents re-entry from a host
@@ -168,6 +174,7 @@ extern "system" fn tick() {
     }
 }
 
+#[allow(unsafe_code)]
 extern "system" fn shutdown() {
     // Dropping the owned state invalidates our copied service table and every
     // resolved-pointer cache. A fresh generation is built only by `init`.
@@ -178,6 +185,7 @@ extern "system" fn shutdown() {
 
 /// Per-frame entry: the resident calls this once per game frame, outside the
 /// throttled tick. It must stay bounded and free of file or console I/O.
+#[allow(unsafe_code)]
 extern "system" fn frame() {
     // SAFETY: the resident exclusively serializes this synchronous invocation on
     // the established game thread; BUSY admission prevents re-entry from a host
@@ -201,12 +209,14 @@ static FEATURE_API: FeatureApiV1 = FeatureApiV1 {
 
 /// Exported ABI entry. The resident loader keeps the returned table for the
 /// complete module generation and never caches addresses in another image.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn hromatite_feature_v1() -> *const FeatureApiV1 {
     &FEATURE_API
 }
 
 /// Manual mapping can call this entry, but reload setup belongs to `init`.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
     _module: *mut core::ffi::c_void,
@@ -219,6 +229,7 @@ pub extern "system" fn DllMain(
 #[cfg(test)]
 mod game_fixture;
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod test_support;
 
 #[cfg(test)]
@@ -252,6 +263,7 @@ mod tests {
         );
     }
 
+    #[allow(unsafe_code)]
     fn api() -> &'static FeatureApiV1 {
         // SAFETY: the exported table has static lifetime and a fixed C layout.
         unsafe { &*hromatite_feature_v1() }
@@ -434,6 +446,29 @@ mod tests {
         assert!(log.contains("unknown command: not-a-command (try help)"));
         assert!(log.contains("usage: q <addr> [n]"));
         assert!(log.contains("usage: call <addr> [a1] [a2] [a3]"));
+    }
+
+    /// Resident-only commands are refused from the shared table *before* the
+    /// `eac` family branch, so a forwarded `eac.module` (resident-scoped since
+    /// it reads EAC's own modules) is rejected here instead of falling through
+    /// to `eac.*` dispatch.
+    #[test]
+    fn resident_only_commands_are_refused_before_the_eac_family_branch() {
+        let _serial = fake::serial();
+        start(50);
+        assert_eq!(send("eac.module"), STATUS_NOT_READY);
+        assert_eq!(send("gct"), STATUS_NOT_READY);
+        assert_eq!(send("quit"), STATUS_NOT_READY);
+        let log = fake::message_log();
+        assert!(
+            log.contains("eac.module: resident-only command (feature image did not execute it)"),
+            "{log}"
+        );
+        assert!(log.contains("quit: resident-only command"), "{log}");
+        assert!(
+            !log.contains("unknown eac command"),
+            "eac.module must not reach eac dispatch: {log}"
+        );
     }
 
     /// `draw` is the in-game overlay switch: it must answer from the feature

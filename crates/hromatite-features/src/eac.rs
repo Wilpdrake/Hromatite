@@ -26,7 +26,6 @@ use hromatite_eac::codec::{ChecksumKind, FRAME_LEN, HEADER_LEN, WIRE_HEARTBEAT_L
 use hromatite_eac::digest::sha256;
 use hromatite_eac::encode_beat;
 use hromatite_eac::eventlog::{Event, JsonlLog};
-use hromatite_eac::keyhunt::Hunter;
 use hromatite_eac::payload::{integrity_digest, module_list_hash};
 use hromatite_eac::session::{EacSession, MAX_INTERVAL_MS, MIN_INTERVAL_MS};
 use hromatite_eac::tailer::{Tailer, announces_begin, announces_end};
@@ -89,7 +88,6 @@ pub struct EacFeature {
     last_error: Option<String>,
     hooks: Hooks,
     hooks_enabled: bool,
-    hunter: Hunter,
     /// Incremental reader over the resident's outbound capture file.
     tap: Option<CaptureTap>,
     /// Captured frames whose header checksum reproduced.
@@ -122,7 +120,6 @@ impl EacFeature {
             last_error: None,
             hooks: Hooks::new(),
             hooks_enabled: true,
-            hunter: Hunter::new(),
             tap: None,
             tap_crc_ok: 0,
             tap_crc_bad: 0,
@@ -509,9 +506,6 @@ impl EacFeature {
                 self.apply_hook_events(events, &mut lines);
             }
         }
-        if self.hunter.enabled() {
-            lines.extend(self.hunter.tick());
-        }
         self.poll_tail(&mut lines);
         self.poll_tap(&mut lines);
         // A tap reports what really went out; synthesizing beats next to it
@@ -542,9 +536,6 @@ impl EacFeature {
             "eac.end" => self.end_command(arg),
             "eac.hooks" => self.hooks_command(arg),
             "eac.tap" => self.tap_command(arg),
-            // Read-only: locate the in-process ELF image of the anti-cheat
-            // client module (it is not a PE, so no module list can show it).
-            "eac.module" => (hromatite_eac::eos::module_report(arg), STATUS_OK),
             "eac.log" => self.log_command(arg),
             "eac.tail" => self.tail_command(arg),
             other => (
@@ -555,11 +546,14 @@ impl EacFeature {
     }
 
     fn help(&self) -> Vec<String> {
-        // Generated from the shared command table: every `eac.*` entry is listed
-        // once, with the same wording the host palette shows.
+        // Generated from the shared command table: every `eac.*` entry this
+        // image executes is listed once, with the same wording the host palette
+        // shows. Resident-scoped entries (`eac.module`) are not ours to offer.
         hromatite_commands::SPECS
             .iter()
-            .filter(|spec| spec.name.starts_with("eac."))
+            .filter(|spec| {
+                spec.name.starts_with("eac.") && spec.scope != hromatite_commands::Scope::Resident
+            })
             .map(|spec| spec.help_line())
             .collect()
     }
@@ -610,12 +604,6 @@ impl EacFeature {
         lines.push(self.tap_status());
         if let Some(line) = self.hooks.status_lines().into_iter().nth(1) {
             lines.push(line);
-        }
-        if self.hunter.enabled() {
-            lines.push(format!(
-                "eac.keyhunt: enabled=1 dir={}",
-                self.hunter.dir().display()
-            ));
         }
         lines
     }

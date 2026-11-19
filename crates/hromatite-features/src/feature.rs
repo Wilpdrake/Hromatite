@@ -1,9 +1,8 @@
 //! Command routing and feature-owned generation state.
 
 use crate::eac::{EacFeature, INTERVAL_RANGE};
-use crate::host::Host;
+use crate::host::{Host, bytes, decode_hex, parse_addr, qwords};
 use crate::m3::{Cache as MetadataCache, Metadata};
-use crate::memory::{bytes, decode_hex, parse_addr, qwords};
 use crate::render::Renderer;
 use crate::telemetry::Cache as TelemetryCache;
 use hromatite_abi::{
@@ -167,6 +166,21 @@ impl Feature {
         let a1 = parts.next().unwrap_or("");
         let a2 = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
+
+        // Resident-only facilities are refused before any family branch: a
+        // forwarded `eac.module` must not fall into `eac.*` dispatch (the
+        // resident executes it), and the check comes from the shared table so
+        // no second list of resident names has to be maintained here.
+        if hromatite_commands::find(&command)
+            .is_some_and(|spec| spec.scope == hromatite_commands::Scope::Resident)
+        {
+            return self.respond(
+                [format!(
+                    "{command}: resident-only command (feature image did not execute it)"
+                )],
+                STATUS_NOT_READY,
+            );
+        }
 
         // One token (`eac.status`), never a bare prefix match on `eac`.
         if command == "eac" || command.starts_with("eac.") {
@@ -369,15 +383,6 @@ impl Feature {
                     None => self.error("usage: call <addr> [a1] [a2] [a3]".into()),
                 }
             }
-            // Resident-only facilities are explicit rather than falling through
-            // to an alarming unknown-command response in a routed console.
-            "gct" | "threads" | "gctfix" | "gctresume" | "loopc" | "loop" | "latec"
-            | "latehook" | "late" | "panic" | "av" | "seal" | "quit" => self.respond(
-                [format!(
-                    "{command}: resident-only command (feature image did not execute it)"
-                )],
-                STATUS_NOT_READY,
-            ),
             other => self.error(format!("unknown command: {other} (try help)")),
         }
     }

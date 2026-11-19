@@ -389,7 +389,7 @@ pub const SPECS: &[Spec] = &[
         summary: "locate the in-process ELF image of the anti-cheat client",
         note: "найти ELF-образ античита в процессе",
         risk: Risk::ReadOnly,
-        scope: Scope::Feature,
+        scope: Scope::Resident,
     },
     Spec {
         name: "eac.log",
@@ -542,6 +542,28 @@ mod tests {
             assert!(line.contains(spec.usage), "{} lost its usage", spec.name);
             assert!(line.contains("— "), "{} lost its separator", spec.name);
         }
+    }
+
+    /// `eac.module` reads EAC's own modules through live Win32 memory, so only
+    /// the resident runtime may execute it; the feature image must not.
+    #[test]
+    fn module_report_is_a_resident_command() {
+        let spec = find("eac.module").expect("eac.module must stay declared");
+        assert_eq!(spec.scope, Scope::Resident);
+        assert_eq!(spec.risk, Risk::ReadOnly);
+        assert_eq!(spec.usage, "eac.module [pages] [read=<bytes>]");
+        assert!(
+            !help_lines(Scope::Feature)
+                .iter()
+                .any(|line| line.starts_with("eac.module ")),
+            "the feature image must not advertise a resident-only command"
+        );
+        assert!(
+            help_lines(Scope::Resident)
+                .iter()
+                .any(|line| line.starts_with("eac.module ")),
+            "the resident runtime lost eac.module from its help"
+        );
     }
 
     #[test]
