@@ -35,6 +35,19 @@
 //! Only `hook`/`eos`/`keyhunt` contain `unsafe`; every block carries a
 //! `// SAFETY:` justification and stays inside those `#[allow(unsafe_code)]`
 //! modules.
+//!
+//! # Features
+//!
+//! * `runtime` (**default**) — the OS half: the inline `hook` re-export, the
+//!   `EOSSDK` detours (`eos::hooks`), the BoringSSL `evp` probe, `m3probe`, the
+//!   live ELF locator of [`eacimage`], the memory scan of [`keyhunt`] and the
+//!   Photon emitter behind `forge::pump_photon`. It links `hromatite-core`,
+//!   `hromatite-win` and `hromatite-hook`.
+//! * `default-features = false` — the pure protocol core only (`codec`,
+//!   `payload`, `session`, `epoch`, `capture`, `tap`, `eventlog`, `tailer`,
+//!   `digest`, `report`, the pure halves of `eacimage`/`keyhunt`, and the whole
+//!   observation contract in `eos::state`). This is what `hromatite-features`
+//!   links, so it must stay free of Win32.
 
 #![deny(unsafe_code)]
 
@@ -48,13 +61,17 @@ pub mod eacimage;
 pub mod eos;
 pub mod epoch;
 pub mod eventlog;
+// The BoringSSL probe patches EOSSDK code: runtime only.
+#[cfg(feature = "runtime")]
 #[allow(unsafe_code)]
 pub mod evp;
 pub mod forge;
 #[allow(unsafe_code)]
-pub mod m3probe;
-#[allow(unsafe_code)]
 pub mod keyhunt;
+// The il2cpp type-table probe reads the live GameAssembly: runtime only.
+#[cfg(feature = "runtime")]
+#[allow(unsafe_code)]
+pub mod m3probe;
 pub mod payload;
 pub mod report;
 pub mod session;
@@ -65,7 +82,10 @@ pub use capture::{CaptureFile, Frame as CapturedFrame};
 pub use codec::{ChecksumKind, CodecError, Frame, Header, WIRE_BODY_LEN, WIRE_HEARTBEAT_LEN};
 pub use eos::{Counters as HookCounters, HookEvent, Hooks};
 pub use eventlog::{Event, JsonlLog};
+// The inline-hook engine is an OS dependency: only the runtime build re-exports it.
+#[cfg(feature = "runtime")]
 pub use hromatite_hook::abs as hook;
+#[cfg(feature = "runtime")]
 pub use hromatite_hook::abs::Hook;
 pub use payload::{HeartbeatPayload, PAYLOAD_LEN};
 pub use session::{Beat, EacSession};

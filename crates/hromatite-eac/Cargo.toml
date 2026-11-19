@@ -8,12 +8,31 @@ description = "EAC/EOS anti-cheat session, heartbeat codec and JSONL event log (
 name = "hromatite_eac"
 path = "src/lib.rs"
 
+[features]
+# The OS half: the EOSSDK export hooks, the live ELF locator, the memory scan
+# and the Photon emitter. Off for `hromatite-features`, which links the pure
+# protocol core (`default-features = false`) and must not pull Win32 transitively.
+default = ["runtime"]
+runtime = ["dep:hromatite-core", "dep:hromatite-win", "dep:hromatite-hook"]
+
 [dependencies]
+# Pure `std` (no FFI, no Win32): the EAC frame checksum is shared with the
+# Photon transport, so it lives in the ABI crate.
+hromatite-abi = { path = "../hromatite-abi" }
 # In-repo only (no external crates): the m3 probe reads il2cpp structures
-# through the same safe readers the rest of the payload uses.
-hromatite-core = { path = "../hromatite-core" }
-hromatite-hook = { path = "../hromatite-hook" }
-hromatite-win = { path = "../hromatite-win" }
+# through the same safe readers the rest of the payload uses. All three belong
+# to the `runtime` feature.
+hromatite-core = { path = "../hromatite-core", optional = true }
+hromatite-hook = { path = "../hromatite-hook", optional = true }
+hromatite-win = { path = "../hromatite-win", optional = true }
+
+[[test]]
+name = "eos_install"
+required-features = ["runtime"]
+
+[[test]]
+name = "keyhunt_scan"
+required-features = ["runtime"]
 
 [lints]
 workspace = true

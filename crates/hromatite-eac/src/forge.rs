@@ -820,6 +820,12 @@ pub struct Delivery {
 /// written into the live `byte[]` captured from the game's own
 /// `RaiseEvent(253, {244: 66, 245: payload})` and the original `SendOperation`
 /// is called through its trampoline ([`hromatite_core::photon::emulate_send`]).
+///
+/// Only the `runtime` feature has an il2cpp layer to call, so the pure build
+/// keeps the ring and the counters and reports the emitter as unarmed: a
+/// feature image can queue frames for the resident to send, it just cannot send
+/// them itself.
+#[cfg(feature = "runtime")]
 pub fn pump_photon() -> Delivery {
     if hromatite_core::photon::template().is_none() {
         return Delivery {
@@ -859,6 +865,16 @@ pub fn pump_photon() -> Delivery {
         }
     }
     delivery
+}
+
+/// No il2cpp layer in this build: the ring stays queued and the pass reports
+/// "not armed", exactly as it does before a live template is captured.
+#[cfg(not(feature = "runtime"))]
+pub fn pump_photon() -> Delivery {
+    Delivery {
+        unarmed: true,
+        ..Delivery::default()
+    }
 }
 
 /// Append one frame to `path` in the capture format (`u32 len | u32 dt | bytes`).
