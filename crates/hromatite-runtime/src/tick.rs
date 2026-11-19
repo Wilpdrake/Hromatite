@@ -51,14 +51,8 @@ fn interval_ms() -> u64 {
 
 /// Throttled work on the game's managed thread.
 fn work() {
-    // Inline repairs publish lock-free counters in GetThreadContext; formatting
-    // and file IO happen only after the collector's stop-the-world detour.
-    if let Some((count, last_tid)) = hook::take_inline_repairs() {
-        log::log_tag(
-            "gct",
-            &format!("inline guard: {count} stale record(s) reaped; last id={last_tid:#x}"),
-        );
-    }
+    // The GC guard publishes its repairs as counters; formatting and file IO
+    // happen only here, after the collector's stop-the-world detour.
     for line in hromatite_il2cpp::gcguard::report_lines() {
         log::log_tag("gct", &line);
     }
