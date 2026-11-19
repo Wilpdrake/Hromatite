@@ -2,21 +2,15 @@
 name = "hromatite-core"
 version = "0.1.0"
 edition = "2024"
+description = "Transitional facade over hromatite-il2cpp (scheduled for deletion)"
 
 [lib]
 name = "hromatite_core"
 path = "src/lib.rs"
 
 [dependencies]
-hromatite-abi = { path = "../hromatite-abi" }
-# The payload's own `help` is generated from this shared table, so the in-game
-# text and the host palette can never disagree.
-hromatite-commands = { path = "../hromatite-commands" }
-hromatite-hook = { path = "../hromatite-hook" }
-# The in-game renderer (nuklear + kiero + D3D11). Core only re-exports its
-# install/status surface until the runtime owns that wiring.
+hromatite-il2cpp = { path = "../hromatite-il2cpp" }
 hromatite-render = { path = "../hromatite-render" }
-hromatite-win = { path = "../hromatite-win", features = ["remote"] }
 
 [lints]
 workspace = true

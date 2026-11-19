@@ -6,8 +6,8 @@
 //! (LateUpdate by default, native PlayerLoop on request). A failed prerequisite
 //! never falls back to another tick source.
 
-use hromatite_core::lateupdate::{Candidate, Selector};
-use hromatite_core::{GAME_ASSEMBLY, UNITY_PLAYER, hook, log, playerloop, procs};
+use hromatite_il2cpp::lateupdate::{Candidate, Selector};
+use hromatite_il2cpp::{GAME_ASSEMBLY, UNITY_PLAYER, hook, log, playerloop, procs};
 use hromatite_win::log as win_log;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
@@ -43,7 +43,7 @@ fn select_late_update(value: Option<&str>) -> Result<Selector, String> {
         return Ok(Selector::Auto);
     };
     let value = value.trim();
-    hromatite_core::lateupdate::parse_selector(value).ok_or_else(|| {
+    hromatite_il2cpp::lateupdate::parse_selector(value).ok_or_else(|| {
         format!("HROMATITE_LATE_UPDATE={value:?} is invalid; managed LateUpdate is required")
     })
 }
@@ -101,7 +101,7 @@ fn install_late_update_with_retry(selector: Selector) -> Result<Candidate, Strin
         .min(120_000);
     let wait = std::time::Duration::from_millis(wait_ms);
     let started = std::time::Instant::now();
-    hromatite_core::lateupdate::retry_for(wait, std::time::Duration::from_millis(250), |attempt| {
+    hromatite_il2cpp::lateupdate::retry_for(wait, std::time::Duration::from_millis(250), |attempt| {
         if !hook::materialise_late_class(selector) {
             if attempt % 20 == 0 {
                 log::log_tag(
@@ -171,7 +171,7 @@ fn install_ac_hooks() {
 /// Photon hook. Photon types are materialised later, so failure here is normal -
 /// the tick retries through `photon::poll` once the managed runtime is up.
 fn install_photon_hook() {
-    use hromatite_core::photon;
+    use hromatite_il2cpp::photon;
     if !photon::enabled_outgoing() && !photon::enabled_incoming() {
         return;
     }
@@ -328,7 +328,7 @@ pub fn dll_main(hinst: *mut core::ffi::c_void, reason: u32) -> i32 {
         );
         return 1;
     }
-    hromatite_core::veh::install();
+    hromatite_il2cpp::veh::install();
     if log::guard("dllmain", || attach(hinst)).is_none() {
         log::log_tag(
             "dll",
@@ -341,7 +341,7 @@ pub fn dll_main(hinst: *mut core::ffi::c_void, reason: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{env_flag_on, require_gc_guard, select_late_update, validate_modes};
-    use hromatite_core::lateupdate::Selector;
+    use hromatite_il2cpp::lateupdate::Selector;
 
     #[test]
     fn player_loop_and_iat_are_explicit_opt_in() {

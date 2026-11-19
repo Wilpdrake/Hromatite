@@ -1,8 +1,8 @@
 //! The managed tick: what runs inside Unity's own frame callback.
 //!
 //! `hromatite-core`'s LateUpdate / PlayerLoop detours call
-//! [`hromatite_core::hook::tick`], which dispatches through the
-//! [`TickTarget`](hromatite_core::hook::TickTarget) published here. Splitting it
+//! [`hromatite_il2cpp::hook::tick`], which dispatches through the
+//! [`TickTarget`](hromatite_il2cpp::hook::TickTarget) published here. Splitting it
 //! this way keeps the detours free of the command channel and the feature
 //! router, and lets the two crates stay acyclic.
 //!
@@ -18,7 +18,7 @@
 
 use crate::console;
 use crate::hot::router;
-use hromatite_core::{gcthreads, hook, log};
+use hromatite_il2cpp::{gcthreads, hook, log};
 use std::sync::Mutex;
 
 static READER: Mutex<Option<console::Reader>> = Mutex::new(None);
@@ -59,7 +59,7 @@ fn work() {
             &format!("inline guard: {count} stale record(s) reaped; last id={last_tid:#x}"),
         );
     }
-    for line in hromatite_core::gcguard::report_lines() {
+    for line in hromatite_il2cpp::gcguard::report_lines() {
         log::log_tag("gct", &line);
     }
     for line in gcthreads::drain_worker_events() {
@@ -128,7 +128,7 @@ fn original_first() -> bool {
     router::original_first_required()
 }
 
-/// The implementation published into `hromatite_core::hook`.
+/// The implementation published into `hromatite_il2cpp::hook`.
 pub static TARGET: hook::TickTarget = hook::TickTarget {
     prepare,
     frame,

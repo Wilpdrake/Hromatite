@@ -17,6 +17,7 @@ members = [
     "crates/hromatite-eac",
     "crates/hromatite-features",
     "crates/hromatite-hook",
+    "crates/hromatite-il2cpp",
     "crates/hromatite-injector",
     "crates/hromatite-render",
     "crates/hromatite-runtime",

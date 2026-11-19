@@ -11,8 +11,8 @@
 //! * when neither exists (CI) every test prints `skip:` and returns — a missing
 //!   artifact must not turn the suite red.
 //!
-//! Only the public API is used: `hromatite_core::crc::{crc32c_eac,
-//! seal_checksum}` and `hromatite_core::photon::{parse_payload_records,
+//! Only the public API is used: `hromatite_abi::crc::{crc32c_eac,
+//! seal_checksum}` and `hromatite_il2cpp::photon::{parse_payload_records,
 //! retarget_frame, EAC_CHECKSUM_OFF, EAC_FRAME_LEN}`. Nothing in `src/` is
 //! touched, so the offsets `SessionId = 4` and `Sequence = 12` (private consts
 //! in `raw::photon`) are restated here from the verified wire layout
@@ -22,8 +22,8 @@
 
 use std::path::PathBuf;
 
-use hromatite_core::crc::{crc32c_eac, seal_checksum};
-use hromatite_core::photon::{EAC_CHECKSUM_OFF, EAC_FRAME_LEN, parse_payload_records, retarget_frame};
+use hromatite_abi::crc::{crc32c_eac, seal_checksum};
+use hromatite_il2cpp::photon::{EAC_CHECKSUM_OFF, EAC_FRAME_LEN, parse_payload_records, retarget_frame};
 
 /// Wire header: `u16 Version, u16 Flags, u64 SessionId, u64 Sequence, u32 CRC`.
 const HEADER_LEN: usize = 24;

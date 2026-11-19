@@ -10,7 +10,7 @@ description = "Resident Hromatite runtime: startup orchestration, tick, hot-relo
 [dependencies]
 hromatite-abi = { path = "../hromatite-abi" }
 hromatite-commands = { path = "../hromatite-commands" }
-hromatite-core = { path = "../hromatite-core" }
+hromatite-il2cpp = { path = "../hromatite-il2cpp" }
 hromatite-eac = { path = "../hromatite-eac" }
 hromatite-hook = { path = "../hromatite-hook" }
 hromatite-render = { path = "../hromatite-render" }

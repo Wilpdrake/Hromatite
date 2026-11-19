@@ -1,0 +1,24 @@
+[package]
+name = "hromatite-il2cpp"
+version = "0.1.0"
+edition = "2024"
+description = "Unity IL2CPP domain: per-build descriptors, class/method access, GC interop, PlayerLoop/LateUpdate, Photon"
+
+# The domain layer over the OS layer. No renderer, no EAC model, no console and
+# no runtime state: everything here is either a pure descriptor/parser or a
+# detour that the resident runtime wires up.
+[dependencies]
+hromatite-abi = { path = "../hromatite-abi" }
+hromatite-hook = { path = "../hromatite-hook" }
+hromatite-win = { path = "../hromatite-win" }
+
+[dev-dependencies]
+# The frame tests exercise the shared CRC, not a private copy.
+hromatite-abi = { path = "../hromatite-abi" }
+
+[lib]
+name = "hromatite_il2cpp"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

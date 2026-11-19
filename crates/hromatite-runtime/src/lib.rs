@@ -11,7 +11,7 @@
 //!   waiting for Unity, EAC hooks, the tick target, GC guard, LateUpdate /
 //!   PlayerLoop installation. `hromatite-dll` is a three-line shim over it.
 //! * [`tick`] - the managed-tick implementation published into
-//!   `hromatite_core::hook`: per-frame feature entry, throttled work (GC
+//!   `hromatite_il2cpp::hook`: per-frame feature entry, throttled work (GC
 //!   reports, hot reload, command dispatch).
 //! * [`hot`] - the generation state machine ([`hot`]) and its runtime router
 //!   ([`hot::router`]: mapping, canary, retirement, reload commands).
@@ -23,7 +23,7 @@
 //!
 //! `hromatite-core` owns the detours and must not depend on this crate (this
 //! crate depends on it). The detour therefore calls through
-//! [`hromatite_core::hook::TickTarget`], which [`tick::install`] publishes once
+//! [`hromatite_il2cpp::hook::TickTarget`], which [`tick::install`] publishes once
 //! at startup. Before that call the tick only counts frames.
 
 #![deny(unsafe_code)]

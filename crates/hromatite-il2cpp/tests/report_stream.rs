@@ -12,7 +12,7 @@
 //! `$HOME/EAC-RE/evidence` is used; when no artifact exists the test prints
 //! `skip:` and returns, so CI stays green without the lab box.
 //!
-//! Only `hromatite_core::photon::parse_payload_records` is reused — the
+//! Only `hromatite_il2cpp::photon::parse_payload_records` is reused — the
 //! reassembly itself lives here because no `src/` file may change for this
 //! step. The layout restated below is the verified one
 //! (`findings/report_stream.md`, `tools/frame_analyze.py`):
@@ -28,7 +28,7 @@
 
 use std::path::PathBuf;
 
-use hromatite_core::photon::parse_payload_records;
+use hromatite_il2cpp::photon::parse_payload_records;
 
 /// Frame header (Version/Flags/SessionId/Sequence/CRC).
 const FRAME_HDR: usize = 24;

@@ -4,7 +4,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use hromatite_core::procs;
+use hromatite_il2cpp::procs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -86,25 +86,25 @@ fn parse_addr(s: &str) -> Option<usize> {
 // thread, i.e. a dead game instead of a bad answer line.
 
 fn qword(addr: usize) -> Option<u64> {
-    hromatite_core::safe::read_u64(addr)
+    hromatite_il2cpp::safe::read_u64(addr)
 }
 
 fn bytes(addr: usize, len: usize) -> Vec<u8> {
     // partial read on purpose: `b <addr> n` should show what is there
-    hromatite_core::safe::read_upto(addr, len)
+    hromatite_il2cpp::safe::read_upto(addr, len)
 }
 
 fn ascii(addr: usize, max: usize) -> String {
-    hromatite_core::safe::ascii_lossy(addr, max)
+    hromatite_il2cpp::safe::ascii_lossy(addr, max)
 }
 
 fn utf16(addr: usize, max: usize) -> String {
-    hromatite_core::safe::utf16_lossy(addr, max)
+    hromatite_il2cpp::safe::utf16_lossy(addr, max)
 }
 
 fn tag_of(v: usize) -> &'static str {
-    let ga = procs::own_module(hromatite_core::GAME_ASSEMBLY);
-    let up = procs::own_module(hromatite_core::UNITY_PLAYER);
+    let ga = procs::own_module(hromatite_il2cpp::GAME_ASSEMBLY);
+    let up = procs::own_module(hromatite_il2cpp::UNITY_PLAYER);
     if let Some((b, s)) = ga
         && v >= b
         && v < b + s
@@ -163,11 +163,11 @@ fn pos_probe() -> Vec<String> {
     let mut out = Vec::new();
     // Everything below uses the verified Unity 6 layout (crate::m3):
     // name@+0x98, methods@+0x50, parent@+0x10.
-    let cam = match hromatite_core::m3::find("UnityEngine", "Camera", 120_000).first() {
+    let cam = match hromatite_il2cpp::m3::find("UnityEngine", "Camera", 120_000).first() {
         Some((i, c)) => {
             out.push(format!(
                 "pos: Camera class {c:#x} ({}), #{i}",
-                hromatite_core::m3::class_full_name(*c)
+                hromatite_il2cpp::m3::class_full_name(*c)
             ));
             *c
         }
@@ -175,7 +175,7 @@ fn pos_probe() -> Vec<String> {
     };
 
     // 1. static Camera.main
-    let main = match hromatite_core::m3::methods(cam)
+    let main = match hromatite_il2cpp::m3::methods(cam)
         .into_iter()
         .find(|m| m.name == "get_main")
     {
@@ -187,7 +187,7 @@ fn pos_probe() -> Vec<String> {
     };
     // SAFETY: get_main is Camera's static accessor (no arguments) taken from
     // the live MethodInfo table; VEH contains a bad target.
-    let cam_inst = match unsafe { hromatite_core::veh::call0(main) } {
+    let cam_inst = match unsafe { hromatite_il2cpp::veh::call0(main) } {
         Ok(v) => v,
         Err(e) => {
             out.push(format!("pos: Camera.main faulted: {e}"));
@@ -202,7 +202,7 @@ fn pos_probe() -> Vec<String> {
 
     // 2. `Component.transform` — found through the parent chain
     //    (Camera → Behaviour → Component), never in Camera's own method list.
-    let (owner, get_transform) = match hromatite_core::m3::method_in_chain(cam, "get_transform") {
+    let (owner, get_transform) = match hromatite_il2cpp::m3::method_in_chain(cam, "get_transform") {
         Some(v) => v,
         None => {
             out.push("pos: no get_transform in the class chain".into());
@@ -211,10 +211,10 @@ fn pos_probe() -> Vec<String> {
     };
     out.push(format!(
         "pos: get_transform from {}",
-        hromatite_core::m3::class_full_name(owner)
+        hromatite_il2cpp::m3::class_full_name(owner)
     ));
     // SAFETY: instance getter, exactly one `this` pointer, from a live MethodInfo.
-    let tr = match unsafe { hromatite_core::veh::call1(get_transform, cam_inst) } {
+    let tr = match unsafe { hromatite_il2cpp::veh::call1(get_transform, cam_inst) } {
         Ok(v) => v,
         Err(e) => {
             out.push(format!("pos: get_transform faulted: {e}"));
@@ -223,7 +223,7 @@ fn pos_probe() -> Vec<String> {
     };
     out.push(format!(
         "pos: transform = {tr:#x} ({})",
-        hromatite_core::m3::class_full_name(hromatite_core::safe::read_usize(tr).unwrap_or(0))
+        hromatite_il2cpp::m3::class_full_name(hromatite_il2cpp::safe::read_usize(tr).unwrap_or(0))
     ));
     if tr < 0x10000 {
         return out;
@@ -231,7 +231,7 @@ fn pos_probe() -> Vec<String> {
 
     // 3. `Transform.position` and `localPosition` (struct return: hidden buffer
     //    in rcx, `this` in rdx — measured, not assumed).
-    let trc = match hromatite_core::m3::find("UnityEngine", "Transform", 120_000).first() {
+    let trc = match hromatite_il2cpp::m3::find("UnityEngine", "Transform", 120_000).first() {
         Some((_, c)) => *c,
         None => {
             out.push("pos: Transform class not found".into());
@@ -239,7 +239,7 @@ fn pos_probe() -> Vec<String> {
         }
     };
     for name in ["get_position", "get_localPosition"] {
-        let f = match hromatite_core::m3::methods(trc).into_iter().find(|m| m.name == name) {
+        let f = match hromatite_il2cpp::m3::methods(trc).into_iter().find(|m| m.name == name) {
             Some(m) => m.entry,
             None => {
                 out.push(format!("pos: no Transform.{name}"));
@@ -250,7 +250,7 @@ fn pos_probe() -> Vec<String> {
         // SAFETY: get_*Position returns a 12-byte Vector3 through a hidden
         // output pointer (first argument) and takes `this` second; `buf` is a
         // live two-qword writable buffer on our own stack.
-        match unsafe { hromatite_core::veh::call2(f, buf.as_mut_ptr() as usize, tr) } {
+        match unsafe { hromatite_il2cpp::veh::call2(f, buf.as_mut_ptr() as usize, tr) } {
             Ok(_) => {
                 let (x, y, z) = vec3(buf);
                 out.push(format!(
@@ -269,11 +269,11 @@ fn il2cpp_string(p: usize) -> Option<String> {
     if p < 0x10000 {
         return None;
     }
-    let len = hromatite_core::safe::read_u32(p + 0x10)? as usize;
+    let len = hromatite_il2cpp::safe::read_u32(p + 0x10)? as usize;
     if len > 4096 {
         return None;
     }
-    let bytes = hromatite_core::safe::read_bytes(p + 0x14, len.checked_mul(2)?)?;
+    let bytes = hromatite_il2cpp::safe::read_bytes(p + 0x14, len.checked_mul(2)?)?;
     let (units, _) = bytes.as_chunks::<2>();
     let units: Vec<u16> = units.iter().map(|c| u16::from_le_bytes(*c)).collect();
     Some(String::from_utf16_lossy(&units))
@@ -289,20 +289,20 @@ fn il2cpp_string(p: usize) -> Option<String> {
 /// Class by namespace/name; if the class table has not materialised it yet,
 /// walk the assembly's `image_get_class(image, i)` (which builds it on demand).
 fn class_or_materialise(ns: &str, name: &str, assembly: &str) -> Option<usize> {
-    if let Some((_, c)) = hromatite_core::m3::find(ns, name, 120_000).first() {
+    if let Some((_, c)) = hromatite_il2cpp::m3::find(ns, name, 120_000).first() {
         return Some(*c);
     }
-    let f = hromatite_core::m3::image_get_class_addr()?;
-    let first = hromatite_core::il2cpp::find_domain()?;
-    let image = hromatite_core::m3::image_of(first, assembly)?;
+    let f = hromatite_il2cpp::m3::image_get_class_addr()?;
+    let first = hromatite_il2cpp::il2cpp::find_domain()?;
+    let image = hromatite_il2cpp::m3::image_of(first, assembly)?;
     for i in 0..40_000usize {
         // SAFETY: image_get_class(image, i) with the measured ABI; VEH guards it.
-        let cls = unsafe { hromatite_core::veh::call2(f, image, i) }.ok()?;
-        if cls < 0x10000 || !hromatite_core::safe::readable_at(cls) {
+        let cls = unsafe { hromatite_il2cpp::veh::call2(f, image, i) }.ok()?;
+        if cls < 0x10000 || !hromatite_il2cpp::safe::readable_at(cls) {
             continue;
         }
-        if hromatite_core::m3::class_name(cls).as_deref() == Some(name)
-            && hromatite_core::m3::class_namespace(cls).as_deref() == Some(ns)
+        if hromatite_il2cpp::m3::class_name(cls).as_deref() == Some(name)
+            && hromatite_il2cpp::m3::class_namespace(cls).as_deref() == Some(ns)
         {
             return Some(cls);
         }
@@ -339,7 +339,7 @@ struct CamApi {
 static SDK: AtomicUsize = AtomicUsize::new(0);
 static CAM: AtomicUsize = AtomicUsize::new(0);
 
-fn method_entry(ms: &[hromatite_core::m3::Method], name: &str) -> usize {
+fn method_entry(ms: &[hromatite_il2cpp::m3::Method], name: &str) -> usize {
     ms.iter().find(|m| m.name == name).map_or(0, |m| m.entry)
 }
 
@@ -350,16 +350,16 @@ fn sdk() -> Option<&'static Sdk> {
         return Some(unsafe { &*(cached as *const Sdk) });
     }
     let api_class = class_or_materialise("VRC.SDKBase", "VRCPlayerApi", "VRCSDKBase")?;
-    let ms = hromatite_core::m3::methods(api_class);
+    let ms = hromatite_il2cpp::m3::methods(api_class);
     let get_all = method_entry(&ms, "get_AllPlayers");
     let get_id = method_entry(&ms, "GetPlayerId");
     if get_all == 0 || get_id == 0 {
         return None;
     }
-    let obj_name = hromatite_core::m3::find("UnityEngine", "Object", 120_000)
+    let obj_name = hromatite_il2cpp::m3::find("UnityEngine", "Object", 120_000)
         .first()
         .and_then(|(_, c)| {
-            hromatite_core::m3::methods(*c)
+            hromatite_il2cpp::m3::methods(*c)
                 .into_iter()
                 .find(|m| m.name == "get_name")
                 .map(|m| m.entry)
@@ -385,10 +385,10 @@ fn cam_api() -> Option<&'static CamApi> {
         // SAFETY: `cached` is a `Box::into_raw` pointer that is never freed.
         return Some(unsafe { &*(cached as *const CamApi) });
     }
-    let cam_class = hromatite_core::m3::find("UnityEngine", "Camera", 120_000).first()?.1;
-    let (trc, get_transform) = hromatite_core::m3::method_in_chain(cam_class, "get_transform")?;
-    let trms = hromatite_core::m3::methods(trc);
-    let ms = hromatite_core::m3::methods(cam_class);
+    let cam_class = hromatite_il2cpp::m3::find("UnityEngine", "Camera", 120_000).first()?.1;
+    let (trc, get_transform) = hromatite_il2cpp::m3::method_in_chain(cam_class, "get_transform")?;
+    let trms = hromatite_il2cpp::m3::methods(trc);
+    let ms = hromatite_il2cpp::m3::methods(cam_class);
     let get_proj = method_entry(&ms, "get_projectionMatrix");
     let get_view = method_entry(&ms, "get_worldToCameraMatrix");
     let get_main = method_entry(&ms, "get_main");
@@ -430,7 +430,7 @@ struct Players {
 /// `GetPosition(player)` (Vector3 through a hidden output pointer).
 fn enumerate_players(sdk: &Sdk, with_name: bool) -> Result<Players, String> {
     // SAFETY: get_AllPlayers is the SDK's static accessor (no arguments).
-    let list = match unsafe { hromatite_core::veh::call0(sdk.get_all) } {
+    let list = match unsafe { hromatite_il2cpp::veh::call0(sdk.get_all) } {
         Ok(v) if v >= 0x10000 => v,
         Ok(_) => {
             return Ok(Players {
@@ -443,23 +443,23 @@ fn enumerate_players(sdk: &Sdk, with_name: bool) -> Result<Players, String> {
         Err(e) => return Err(format!("get_AllPlayers faulted: {e}")),
     };
     // List<T>: _items @+0x10, _size @+0x18; Il2CppArray: length @+0x18, data @+0x20.
-    let items = hromatite_core::safe::read_usize(list + 0x10).unwrap_or(0);
-    let size = hromatite_core::safe::read_u32(list + 0x18).unwrap_or(0) as usize;
-    let maxlen = hromatite_core::safe::read_usize(items + 0x18).unwrap_or(0);
+    let items = hromatite_il2cpp::safe::read_usize(list + 0x10).unwrap_or(0);
+    let size = hromatite_il2cpp::safe::read_u32(list + 0x18).unwrap_or(0) as usize;
+    let maxlen = hromatite_il2cpp::safe::read_usize(items + 0x18).unwrap_or(0);
     let mut rows = Vec::new();
     for i in 0..size.min(maxlen).min(256) {
-        let p = hromatite_core::safe::read_usize(items + 0x20 + i * 8).unwrap_or(0);
+        let p = hromatite_il2cpp::safe::read_usize(items + 0x20 + i * 8).unwrap_or(0);
         if p < 0x10000 {
             continue;
         }
         // SAFETY: GetPlayerId(VRCPlayerApi*) is a pure accessor on a live instance.
-        let id = unsafe { hromatite_core::veh::call1(sdk.get_id, p) }.unwrap_or(usize::MAX);
+        let id = unsafe { hromatite_il2cpp::veh::call1(sdk.get_id, p) }.unwrap_or(usize::MAX);
         let mut pos = None;
         if sdk.get_pos != 0 {
             let mut buf = [0u64; 2];
             // SAFETY: GetPosition returns Vector3 through a hidden output
             // pointer (rcx) with `this` in rdx; buf is a live stack buffer.
-            if unsafe { hromatite_core::veh::call2(sdk.get_pos, buf.as_mut_ptr() as usize, p) }.is_ok() {
+            if unsafe { hromatite_il2cpp::veh::call2(sdk.get_pos, buf.as_mut_ptr() as usize, p) }.is_ok() {
                 pos = Some(vec3(buf));
             }
         }
@@ -470,14 +470,14 @@ fn enumerate_players(sdk: &Sdk, with_name: bool) -> Result<Players, String> {
             && sdk.get_objects != 0
             && sdk.obj_name != 0
             // SAFETY: GetPlayerObjects is a pure accessor on this live SDK player.
-            && let Ok(arr) = unsafe { hromatite_core::veh::call1(sdk.get_objects, p) }
+            && let Ok(arr) = unsafe { hromatite_il2cpp::veh::call1(sdk.get_objects, p) }
             && arr >= 0x10000
         {
-            let len = hromatite_core::safe::read_usize(arr + 0x18).unwrap_or(0);
-            let first = hromatite_core::safe::read_usize(arr + 0x20).unwrap_or(0);
+            let len = hromatite_il2cpp::safe::read_usize(arr + 0x18).unwrap_or(0);
+            let first = hromatite_il2cpp::safe::read_usize(arr + 0x20).unwrap_or(0);
             if len > 0 && first >= 0x10000 {
                 // SAFETY: Object.get_name on a live UnityEngine.Object.
-                if let Ok(s) = unsafe { hromatite_core::veh::call1(sdk.obj_name, first) } {
+                if let Ok(s) = unsafe { hromatite_il2cpp::veh::call1(sdk.obj_name, first) } {
                     name = il2cpp_string(s).filter(|s| !s.is_empty());
                 }
             }
@@ -547,7 +547,7 @@ fn call_matrix(f: usize, this: usize) -> Option<[f32; 16]> {
     let mut buf = [0u64; 8];
     // SAFETY: get_projectionMatrix/get_worldToCameraMatrix are pure getters; the
     // buffer is a live 64-byte stack array and the VEH guards the call.
-    unsafe { hromatite_core::veh::call2(f, buf.as_mut_ptr() as usize, this) }.ok()?;
+    unsafe { hromatite_il2cpp::veh::call2(f, buf.as_mut_ptr() as usize, this) }.ok()?;
     let mut out = [0f32; 16];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = f32::from_bits((buf[i / 2] >> ((i % 2) * 32)) as u32);
@@ -563,7 +563,7 @@ fn transform_vec3(entry: usize, this: usize) -> Option<(f32, f32, f32)> {
     let mut buf = [0u64; 2];
     // SAFETY: instance getter, hidden Vector3 return pointer in rcx and `this`
     // in rdx; buf is a live stack buffer, VEH guards the call.
-    unsafe { hromatite_core::veh::call2(entry, buf.as_mut_ptr() as usize, this) }.ok()?;
+    unsafe { hromatite_il2cpp::veh::call2(entry, buf.as_mut_ptr() as usize, this) }.ok()?;
     Some(vec3(buf))
 }
 
@@ -621,7 +621,7 @@ fn esp_probe() -> Vec<String> {
         )];
     };
     // SAFETY: Camera.get_main is the static accessor.
-    let inst = match unsafe { hromatite_core::veh::call0(cam.get_main) } {
+    let inst = match unsafe { hromatite_il2cpp::veh::call0(cam.get_main) } {
         Ok(v) if v >= 0x10000 => v,
         Ok(v) => {
             out.push(format!("esp: no main camera ({v:#x})"));
@@ -634,13 +634,13 @@ fn esp_probe() -> Vec<String> {
     };
     let mut pw = if cam.get_pixw != 0 {
         // SAFETY: Camera.pixelWidth is a constant instance getter.
-        unsafe { hromatite_core::veh::call1(cam.get_pixw, inst) }.unwrap_or(0) as u32
+        unsafe { hromatite_il2cpp::veh::call1(cam.get_pixw, inst) }.unwrap_or(0) as u32
     } else {
         0
     };
     let mut ph = if cam.get_pixh != 0 {
         // SAFETY: Camera.pixelHeight is a constant instance getter.
-        unsafe { hromatite_core::veh::call1(cam.get_pixh, inst) }.unwrap_or(0) as u32
+        unsafe { hromatite_il2cpp::veh::call1(cam.get_pixh, inst) }.unwrap_or(0) as u32
     } else {
         0
     };
@@ -649,7 +649,7 @@ fn esp_probe() -> Vec<String> {
         ph = 1080;
     }
     // SAFETY: Component.get_transform on a live Camera instance.
-    let tr = unsafe { hromatite_core::veh::call1(cam.get_transform, inst) }.unwrap_or(0);
+    let tr = unsafe { hromatite_il2cpp::veh::call1(cam.get_transform, inst) }.unwrap_or(0);
     let cam_pos = transform_vec3(cam.tr_position, tr);
     let fwd = transform_vec3(cam.tr_forward, tr);
     let (Some(proj), Some(view)) = (
@@ -768,8 +768,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // `gct` alone = detection report + full dump; `gct <rva>` forces a base.
         "gct" => {
             let forced = parse_addr(a1).map(|v| v as u32);
-            let mut out = hromatite_core::gcthreads::probe(forced);
-            match hromatite_core::gcthreads::snapshot(forced) {
+            let mut out = hromatite_il2cpp::gcthreads::probe(forced);
+            match hromatite_il2cpp::gcthreads::snapshot(forced) {
                 Some(t) => out.extend(t.lines()),
                 None => out.push("gct: table not found (see candidate scores above)".into()),
             }
@@ -780,11 +780,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // when the automatic repair is off.
         "wq" => match (parse_addr(a1), parse_addr(a2)) {
             (Some(addr), Some(v)) => {
-                let ok = hromatite_core::safe::write_usize(addr, v);
+                let ok = hromatite_il2cpp::safe::write_usize(addr, v);
                 (
                     vec![format!(
                         "wq {addr:#x} <- {v:#x}: {ok} (now {:#x})",
-                        hromatite_core::safe::read_usize(addr).unwrap_or(0)
+                        hromatite_il2cpp::safe::read_usize(addr).unwrap_or(0)
                     )],
                     Action::None,
                 )
@@ -809,7 +809,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     .flatten();
                 match bytes {
                     Some(b) => {
-                        let ok = hromatite_core::safe::write_bytes(addr, &b);
+                        let ok = hromatite_il2cpp::safe::write_bytes(addr, &b);
                         (
                             vec![format!("wb {addr:#x} <- {} byte(s): {ok}", b.len())],
                             Action::None,
@@ -827,8 +827,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // the world is left suspended and the game looks frozen while we still
         // run. Harmless when nothing is suspended (a resume of a running thread
         // only decrements a count that is already 0... and returns 0/-1).
-        "gctresume" => match hromatite_core::gcthreads::snapshot(None) {
-            Some(t) => (hromatite_core::gcthreads::resume_all(&t), Action::None),
+        "gctresume" => match hromatite_il2cpp::gcthreads::snapshot(None) {
+            Some(t) => (hromatite_il2cpp::gcthreads::resume_all(&t), Action::None),
             None => (vec!["gctresume: table not found".into()], Action::None),
         },
         // Raw guarded call: `call <addr> [a1] [a2] [a3]`.
@@ -854,7 +854,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             )];
             // SAFETY: this is the explicit low-level `call` command: the user
             // supplied the Win64 address and all opaque pointer arguments knowingly.
-            match unsafe { hromatite_core::veh::call3(f, g(0), g(1), g(2)) } {
+            match unsafe { hromatite_il2cpp::veh::call3(f, g(0), g(1), g(2)) } {
                 Ok(v) => out.push(format!("  -> {v:#x}")),
                 Err(e) => out.push(format!("  fault: {e}")),
             }
@@ -863,14 +863,14 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // Unlink every dead record from Boehm's table right now.
         "gctfix" => {
             let mut out = Vec::new();
-            match hromatite_core::gcthreads::snapshot(None) {
+            match hromatite_il2cpp::gcthreads::snapshot(None) {
                 Some(t) => {
                     out.push(t.summary());
                     if t.dead == 0 {
                         out.push("nothing to repair".into());
                     } else {
-                        out.extend(hromatite_core::gcthreads::repair(&t));
-                        if let Some(t2) = hromatite_core::gcthreads::snapshot(None) {
+                        out.extend(hromatite_il2cpp::gcthreads::repair(&t));
+                        if let Some(t2) = hromatite_il2cpp::gcthreads::snapshot(None) {
                             out.push(format!("after repair: {}", t2.summary()));
                         }
                     }
@@ -883,15 +883,15 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // whether Boehm has a record for them: a thread without a record, or a
         // record whose thread is gone, is what aborts the collector.
         "threads" => {
-            let table = hromatite_core::gcthreads::snapshot(None);
-            (hromatite_core::gcthreads::thread_rows(table.as_ref()), Action::None)
+            let table = hromatite_il2cpp::gcthreads::snapshot(None);
+            (hromatite_il2cpp::gcthreads::thread_rows(table.as_ref()), Action::None)
         }
         // In-game nuklear UI: report the hook, the frame count and the panel
         // state. The overlay itself is drawn from the render thread's Present
         // hook, so there is nothing to toggle here — `HROMATITE_UI=1` is the
         // switch and it is read at startup.
         "ui" => match a1 {
-            "" | "status" => (hromatite_core::ui::status(), Action::None),
+            "" | "status" => (hromatite_render::ui::status(), Action::None),
             _ => (vec!["usage: ui [status]".into()], Action::None),
         },
         // Raw diagnostic calls stay behind the same VEH boundary as M3 getters.
@@ -900,10 +900,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // line, never a dead game (that is the whole point of `veh`).
         "guard" => match parse_addr(a1) {
             Some(addr) => {
-                hromatite_core::log::log_tag("con", &format!("guard {addr:#x}: calling under VEH"));
+                hromatite_il2cpp::log::log_tag("con", &format!("guard {addr:#x}: calling under VEH"));
                 // SAFETY: the explicit guard command is a delegated raw Win64
                 // probe; VEH captures the calling thread before dereferencing code.
-                match unsafe { hromatite_core::veh::call0(addr) } {
+                match unsafe { hromatite_il2cpp::veh::call0(addr) } {
                     Ok(v) => (
                         vec![format!("guard {addr:#x}: returned {v:#x}")],
                         Action::None,
@@ -918,14 +918,14 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         "m3f" => {
             let ns = a1;
             let name = a2;
-            let hits = hromatite_core::m3::find(ns, name, 120_000);
+            let hits = hromatite_il2cpp::m3::find(ns, name, 120_000);
             let mut out = vec![format!(
                 "m3f {ns:?} {name:?}: {} class(es), table {:#x}",
                 hits.len(),
-                hromatite_core::m3::class_table().unwrap_or(0)
+                hromatite_il2cpp::m3::class_table().unwrap_or(0)
             )];
             for (i, p) in hits.iter().take(32) {
-                out.push(format!("  #{i} {p:#x}  {}", hromatite_core::m3::class_full_name(*p)));
+                out.push(format!("  #{i} {p:#x}  {}", hromatite_il2cpp::m3::class_full_name(*p)));
             }
             (out, Action::None)
         }
@@ -934,12 +934,12 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let want = a1.to_ascii_lowercase();
             let mut out = vec![format!("m3s {want:?}")];
             let mut n = 0usize;
-            for (i, p) in hromatite_core::m3::classes(120_000) {
-                let nm = hromatite_core::m3::class_name(p).unwrap_or_default();
+            for (i, p) in hromatite_il2cpp::m3::classes(120_000) {
+                let nm = hromatite_il2cpp::m3::class_name(p).unwrap_or_default();
                 if want.is_empty() || nm.to_ascii_lowercase().contains(&want) {
                     n += 1;
                     if n <= 40 {
-                        out.push(format!("  #{i} {p:#x}  {}", hromatite_core::m3::class_full_name(p)));
+                        out.push(format!("  #{i} {p:#x}  {}", hromatite_il2cpp::m3::class_full_name(p)));
                     }
                 }
             }
@@ -953,19 +953,19 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             let asm = if a1.is_empty() { "Assembly-CSharp" } else { a1 };
             let filt = a2.to_ascii_lowercase();
             let max = parse_addr(rest.trim()).unwrap_or(30_000).min(60_000);
-            if hromatite_core::procs::own_module(hromatite_core::GAME_ASSEMBLY).is_none() {
+            if hromatite_il2cpp::procs::own_module(hromatite_il2cpp::GAME_ASSEMBLY).is_none() {
                 return (
                     vec!["m3l: GameAssembly.dll not loaded".into()],
                     Action::None,
                 );
             }
-            let Some(f) = hromatite_core::m3::image_get_class_addr() else {
+            let Some(f) = hromatite_il2cpp::m3::image_get_class_addr() else {
                 return (
                     vec!["m3l: image_get_class outside the module".into()],
                     Action::None,
                 );
             };
-            let first = match hromatite_core::il2cpp::find_domain() {
+            let first = match hromatite_il2cpp::il2cpp::find_domain() {
                 Some(v) => v,
                 None => {
                     return (
@@ -974,7 +974,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     );
                 }
             };
-            let image = match hromatite_core::m3::image_of(first, asm) {
+            let image = match hromatite_il2cpp::m3::image_of(first, asm) {
                 Some(i) => i,
                 None => return (vec![format!("m3l: no image for '{asm}'")], Action::None),
             };
@@ -987,7 +987,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             for i in 0..max {
                 // SAFETY: image_get_class(image, i) is the measured (image,index)
                 // ABI; i stays inside the caller's bound and VEH contains faults.
-                let cls = match unsafe { hromatite_core::veh::call2(f, image, i) } {
+                let cls = match unsafe { hromatite_il2cpp::veh::call2(f, image, i) } {
                     Ok(v) => v,
                     Err(_) => {
                         faults += 1;
@@ -998,11 +998,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                         continue;
                     }
                 };
-                if cls < 0x10000 || !hromatite_core::safe::readable_at(cls) {
+                if cls < 0x10000 || !hromatite_il2cpp::safe::readable_at(cls) {
                     continue;
                 }
                 seen += 1;
-                let nm = hromatite_core::m3::class_name(cls).unwrap_or_default();
+                let nm = hromatite_il2cpp::m3::class_name(cls).unwrap_or_default();
                 if nm.is_empty() {
                     continue;
                 }
@@ -1011,7 +1011,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                     if shown <= 60 {
                         out.push(format!(
                             "  #{i} {cls:#x}  {}.{nm}",
-                            hromatite_core::m3::class_namespace(cls).unwrap_or_default()
+                            hromatite_il2cpp::m3::class_namespace(cls).unwrap_or_default()
                         ));
                     }
                 }
@@ -1026,10 +1026,10 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             Some(c) if c >= 0x10000 => {
                 let mut out = vec![format!(
                     "m3c {c:#x}  {}  (image {:#x})",
-                    hromatite_core::m3::class_full_name(c),
-                    hromatite_core::safe::read_usize(c).unwrap_or(0)
+                    hromatite_il2cpp::m3::class_full_name(c),
+                    hromatite_il2cpp::safe::read_usize(c).unwrap_or(0)
                 )];
-                let fld = hromatite_core::m3::fields(c);
+                let fld = hromatite_il2cpp::m3::fields(c);
                 out.push(format!("  fields: {}", fld.len()));
                 for f in fld.iter().take(40) {
                     out.push(format!(
@@ -1037,7 +1037,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                         f.offset_or_index, f.name, f.ty, f.parent
                     ));
                 }
-                let ms = hromatite_core::m3::methods(c);
+                let ms = hromatite_il2cpp::m3::methods(c);
                 out.push(format!("  methods: {}", ms.len()));
                 for m in ms.iter().take(60) {
                     out.push(format!("    {:<36} entry {:#x}", m.name, m.entry));
@@ -1047,7 +1047,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             _ => (vec!["usage: m3c <classaddr>".into()], Action::None),
         },
         // `m3i <assembly>` — Il2CppImage* (images are getter+i*0x48).
-        "m3i" => match hromatite_core::il2cpp::find_domain() {
+        "m3i" => match hromatite_il2cpp::il2cpp::find_domain() {
             Some(first) => {
                 let mut out = vec![format!("m3i: corlib image {first:#x}")];
                 let want = if a1.is_empty() {
@@ -1055,11 +1055,11 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
                 } else {
                     a1
                 };
-                match hromatite_core::m3::image_of(first, want) {
+                match hromatite_il2cpp::m3::image_of(first, want) {
                     Some(img) => {
                         out.push(format!(
                             "  {want}: image {img:#x}, il2cpp_image_get_class {:#x}",
-                            hromatite_core::m3::image_get_class_addr().unwrap_or(0)
+                            hromatite_il2cpp::m3::image_get_class_addr().unwrap_or(0)
                         ));
                     }
                     None => out.push(format!("  {want}: not found")),
@@ -1072,8 +1072,8 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             ),
         },
         // Native PlayerLoop discovery/status; still no SetPlayerLoop call.
-        "loopc" => (hromatite_core::playerloop::snapshot_lines(), Action::None),
-        "loop" => (hromatite_core::playerloop::status(), Action::None),
+        "loopc" => (hromatite_il2cpp::playerloop::snapshot_lines(), Action::None),
+        "loop" => (hromatite_il2cpp::playerloop::status(), Action::None),
         // `pos` — the M3 proof: Camera.main -> transform -> position, i.e. a
         // real Vector3 read out of the running game with plain memory reads
         // plus three guarded method calls.
@@ -1100,7 +1100,7 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
             } else {
                 msg
             };
-            hromatite_core::log::log_tag("con", &format!("panic test: about to panic with '{msg}'"));
+            hromatite_il2cpp::log::log_tag("con", &format!("panic test: about to panic with '{msg}'"));
             panic!("console panic test: {msg}");
         }
         // `av <addr>` shows the difference between the two failure classes:
@@ -1108,27 +1108,27 @@ pub fn dispatch(line: &str) -> (Vec<String>, Action) {
         // the VEH from plan 2 has to catch. Default 0x1 — never mapped.
         "av" => {
             let addr = parse_addr(a1).unwrap_or(1);
-            let guarded = match hromatite_core::safe::read_u64(addr) {
+            let guarded = match hromatite_il2cpp::safe::read_u64(addr) {
                 Some(v) => format!("{v:#016x}"),
                 None => "(unreadable, survived)".to_string(),
             };
             let head = format!(
                 "av @{addr:#x}: readable_at={}, safe::read_u64={guarded}",
-                hromatite_core::safe::readable_at(addr)
+                hromatite_il2cpp::safe::readable_at(addr)
             );
             // log before the raw deref: if the process dies here, this line is
             // the only witness we get.
-            hromatite_core::log::log_tag("con", &head);
+            hromatite_il2cpp::log::log_tag("con", &head);
             // SAFETY: this command deliberately performs an unaligned probe of
             // an arbitrary address under VEH, as documented by diagnostic_raw_read.
-            let raw = match unsafe { hromatite_core::safe::diagnostic_raw_read(addr) } {
+            let raw = match unsafe { hromatite_il2cpp::safe::diagnostic_raw_read(addr) } {
                 Ok(v) => format!("raw deref @{addr:#x} = {v:#016x} (address was mapped)"),
                 Err(e) => format!("raw deref @{addr:#x}: {e} (VEH caught it)"),
             };
             (vec![head, raw], Action::None)
         }
         "latec" | "latehook" | "late" => {
-            (hromatite_core::hook::command(line).unwrap_or_default(), Action::None)
+            (hromatite_il2cpp::hook::command(line).unwrap_or_default(), Action::None)
         }
         "seal" => (
             vec!["seal requested, returning from DllMain".into()],

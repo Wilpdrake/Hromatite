@@ -1060,7 +1060,7 @@ pub fn retarget_frame(frame: &[u8], session: Option<u64>, seq: u64) -> Vec<u8> {
         out[EAC_SESSION_OFF..EAC_SESSION_OFF + 8].copy_from_slice(&session.to_le_bytes());
     }
     out[EAC_SEQUENCE_OFF..EAC_SEQUENCE_OFF + 8].copy_from_slice(&seq.to_le_bytes());
-    crate::crc::seal_checksum(&mut out, EAC_CHECKSUM_OFF);
+    hromatite_abi::crc::seal_checksum(&mut out, EAC_CHECKSUM_OFF);
     out
 }
 
@@ -2640,7 +2640,7 @@ mod tests {
         let mut zeroed = out.clone();
         zeroed[super::EAC_CHECKSUM_OFF..super::EAC_CHECKSUM_OFF + 4].fill(0);
         assert_eq!(
-            crate::crc::crc32c_eac(&zeroed),
+            hromatite_abi::crc::crc32c_eac(&zeroed),
             u32::from_le_bytes(
                 out[super::EAC_CHECKSUM_OFF..super::EAC_CHECKSUM_OFF + 4]
                     .try_into()

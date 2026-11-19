@@ -30,11 +30,8 @@ version = "0.1.0"
 name = "hromatite-core"
 version = "0.1.0"
 dependencies = [
- "hromatite-abi",
- "hromatite-commands",
- "hromatite-hook",
+ "hromatite-il2cpp",
  "hromatite-render",
- "hromatite-win",
 ]
 
 [[package]]
@@ -70,6 +67,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hromatite-il2cpp"
+version = "0.1.0"
+dependencies = [
+ "hromatite-abi",
+ "hromatite-hook",
+ "hromatite-win",
+]
+
+[[package]]
 name = "hromatite-injector"
 version = "0.1.0"
 dependencies = [
@@ -91,9 +97,9 @@ version = "0.1.0"
 dependencies = [
  "hromatite-abi",
  "hromatite-commands",
- "hromatite-core",
  "hromatite-eac",
  "hromatite-hook",
+ "hromatite-il2cpp",
  "hromatite-render",
  "hromatite-win",
 ]

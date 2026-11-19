@@ -18,13 +18,13 @@
 // The public M1 surface is consumed by the separate hot-reload integration.
 #![allow(dead_code)]
 
-use hromatite_core::pe::PeImage;
+use hromatite_il2cpp::pe::PeImage;
 
 fn verify_artifact_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("verified feature digest must contain 64 hexadecimal characters".into());
     }
-    let actual = hromatite_core::sha256::hex_digest(bytes);
+    let actual = hromatite_il2cpp::sha256::hex_digest(bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(format!(
             "feature bytes SHA-256 mismatch: got {actual}, expected {expected}"
@@ -387,7 +387,7 @@ fn push_cleanup_error(errors: &mut Vec<String>, stage: &str, result: Result<(), 
 /// Keep zeroed headers accessible as the proven remote mapper does; NOACCESS
 /// here turns an otherwise valid attach into an AV before feature init runs.
 fn erased_headers_protection() -> u32 {
-    hromatite_core::ffi::PAGE_READWRITE
+    hromatite_il2cpp::ffi::PAGE_READWRITE
 }
 
 fn protection_plan(pe: &PeImage) -> Result<Vec<(u32, u32, u32)>, String> {
@@ -416,11 +416,11 @@ fn protection_plan(pe: &PeImage) -> Result<Vec<(u32, u32, u32)>, String> {
             return Err("section and erased headers share a protection page".into());
         }
         let protection = if section.is_executable() {
-            hromatite_core::ffi::PAGE_EXECUTE_READ
+            hromatite_il2cpp::ffi::PAGE_EXECUTE_READ
         } else if section.characteristics & 0x8000_0000 != 0 {
-            hromatite_core::ffi::PAGE_READWRITE
+            hromatite_il2cpp::ffi::PAGE_READWRITE
         } else {
-            hromatite_core::ffi::PAGE_READONLY
+            hromatite_il2cpp::ffi::PAGE_READONLY
         };
         pages.push((start, end, protection));
     }
@@ -628,8 +628,8 @@ mod imp {
         feature_api_bytes_valid, feature_api_range_valid, finish_import_resolution,
         protection_plan, push_cleanup_error, resolve_imports_with,
     };
-    use hromatite_core::pe::PeImage;
-    use hromatite_core::{ffi, safe as memory};
+    use hromatite_il2cpp::pe::PeImage;
+    use hromatite_il2cpp::{ffi, safe as memory};
     use hromatite_abi::{FeatureApiV1, FeatureEntryFn};
 
     #[derive(Clone)]
@@ -855,7 +855,7 @@ mod imp {
         fn find_export_anywhere(&mut self, name: &str) -> Result<Option<usize>, String> {
             // SAFETY: parameterless process-id query.
             let pid = unsafe { ffi::GetCurrentProcessId() };
-            for (_, base, _) in hromatite_core::procs::modules(pid).into_iter().take(512) {
+            for (_, base, _) in hromatite_il2cpp::procs::modules(pid).into_iter().take(512) {
                 let Some(module) = LiveModule::from_base(base) else {
                     continue;
                 };
@@ -898,7 +898,7 @@ mod imp {
     }
 
     fn guarded_tls(base: usize, callback_rva: u32, reason: u32) -> Result<(), String> {
-        hromatite_core::veh::call_guarded(|| {
+        hromatite_il2cpp::veh::call_guarded(|| {
             // SAFETY: the callback was validated in an executable image section;
             // the inner VEH boundary returns here before mapper cleanup must run.
             unsafe { tls_callback(base, callback_rva, reason) };
@@ -907,7 +907,7 @@ mod imp {
     }
 
     fn guarded_dll_main(base: usize, entry_rva: u32, reason: u32) -> Result<i32, String> {
-        hromatite_core::veh::call_guarded(|| {
+        hromatite_il2cpp::veh::call_guarded(|| {
             // SAFETY: the entry was validated in an executable image section;
             // returning through this inner guard keeps failed-load cleanup reachable.
             unsafe { dll_main(base, entry_rva, reason) }
@@ -1089,7 +1089,7 @@ mod imp {
             // validated as executable. hromatite_feature_v1 has no arguments.
             let feature: FeatureEntryFn =
                 unsafe { core::mem::transmute(base + feature_entry as usize) };
-            let api = hromatite_core::veh::call_guarded(|| feature())
+            let api = hromatite_il2cpp::veh::call_guarded(|| feature())
                 .map_err(|fault| format!("hromatite_feature_v1: {fault}"))?;
             if api.is_null() {
                 return Err("hromatite_feature_v1 returned null".into());
@@ -1224,7 +1224,7 @@ mod tests {
             0x7fff_1234_5000
         );
     }
-    use hromatite_core::pe::PeImage;
+    use hromatite_il2cpp::pe::PeImage;
 
     fn fixture() -> Vec<u8> {
         let mut data = vec![0u8; 0x800];
@@ -1409,13 +1409,13 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                (0x1000, 0x1000, hromatite_core::ffi::PAGE_EXECUTE_READ),
-                (0x2000, 0x1000, hromatite_core::ffi::PAGE_READWRITE)
+                (0x1000, 0x1000, hromatite_il2cpp::ffi::PAGE_EXECUTE_READ),
+                (0x2000, 0x1000, hromatite_il2cpp::ffi::PAGE_READWRITE)
             ]
         );
         assert!(
             plan.iter()
-                .all(|entry| entry.2 != hromatite_core::ffi::PAGE_EXECUTE_READWRITE)
+                .all(|entry| entry.2 != hromatite_il2cpp::ffi::PAGE_EXECUTE_READWRITE)
         );
     }
 
@@ -1500,7 +1500,7 @@ mod tests {
 
     #[test]
     fn load_verified_rejects_a_different_generation_before_mapping() {
-        let expected = hromatite_core::sha256::hex_digest(b"generation-one");
+        let expected = hromatite_il2cpp::sha256::hex_digest(b"generation-one");
         assert!(super::verify_artifact_digest(b"generation-one", &expected).is_ok());
         assert!(super::verify_artifact_digest(b"generation-two", &expected).is_err());
         assert!(super::verify_artifact_digest(b"generation-one", "not-a-full-digest").is_err());
@@ -1621,8 +1621,8 @@ mod tests {
     #[test]
     fn erased_headers_remain_readable_for_crt_startup() {
         let protection = super::erased_headers_protection();
-        assert_eq!(protection, hromatite_core::ffi::PAGE_READWRITE);
-        assert_ne!(protection & 0xf0, hromatite_core::ffi::PAGE_EXECUTE_READWRITE);
+        assert_eq!(protection, hromatite_il2cpp::ffi::PAGE_READWRITE);
+        assert_ne!(protection & 0xf0, hromatite_il2cpp::ffi::PAGE_EXECUTE_READWRITE);
     }
 
     #[test]
