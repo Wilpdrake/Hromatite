@@ -5081,3 +5081,64 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   (ссылки `Stream::*` в чужих модулях переписаны на `crate::report::Stream::*`).
 - **Осталось:** живой прогон не нужен (поведение не менялось); `docs/
   REFACTOR_AUDIT.md` §5-строка про `report.rs` осталась описанием плана.
+
+### 2026-11-19 — Полный архитектурный рефакторинг: этапы 2–5 (все границы проверены)
+
+- **Коммиты** (ветка `master`, база `5dfb77e`): `5c2e145`, `813a8de`, `5a6db0b`,
+  `70ce686`, `46b46ca`, `b0f6bbd`, `0718fce`, `75cd9b2`, `38de6dc`, `07d4920`,
+  `f4b1746` + ветки `refactor/{eac-runtime-feature,features-cleanup,tools-cleanup,
+  eac-report,eac-image}` и merge-коммиты `b1ea799`, `2515c28`, `ecbc365`,
+  `57c68b8`, `6d1d977`. План и карта — `docs/REFACTOR_AUDIT.md`, состав — `PROJECT.md`.
+- **Этап 2 (`813a8de`).** `hromatite-win` (FFI, safe memory/VirtualQuery,
+  memscan, VEH, PE, procs/PEB, remote под feature, sha256, лог) и
+  `hromatite-hook` (единый x64-движок, общая таблица, midhook/vmt/iat/hookset).
+  Из `core` и `eac` удалены дубли FFI, обходов VirtualQuery и второго движка.
+- **Этап 3 (`5a6db0b`).** Корневой `Cargo.toml` — virtual workspace.
+  `hromatite-render` (nuklear + kiero + d3d11 + shaders + ui) зависит только от
+  win+hook; `hromatite-injector` (`bin Hromatite`) — только от `hromatite-win`;
+  `hromatite-runtime` — весь резидент (startup из `DllMain`, tick, hot-роутер,
+  localmap, hostapi, console, `bin hot-smoke`); `hromatite-dll` — три строки над
+  `runtime::dll_main`. Цикл core↔runtime разорван слотом
+  `hook::TickTarget`/`set_tick_target`. `localmap::feature_api_bytes_valid`
+  проверяет `frame` и использует общий `feature_header_fields_valid`.
+  Дополнительно: `hromatite-eac` получил feature `runtime`
+  (`default = ["runtime"]`, чистое ядро — только `hromatite-abi`), а
+  `hromatite-features` подключает его с `default-features = false`; из features
+  убраны `memory.rs` и `Hunter`, `eac.module` стал `Scope::Resident`.
+- **Этап 4 (`70ce686`, `f4b1746`, `57c68b8`, `6d1d977`).** Создан
+  `hromatite-il2cpp` (symbols, buildinfo, gamebuild, m3, gcthreads, gcguard,
+  lateupdate, playerloop, photon, discover + тесты frames/report_stream);
+  `crates/hromatite-core` **удалён** (вместе с `raw/m3dump.rs` и дублем `crc.rs`).
+  `hromatite-eac` больше не зависит от il2cpp: отправка Photon-кадров
+  инвертирована через `forge::set_photon_sender`, регистрируется в runtime.
+  Удалён `m3probe.rs`. `eos.rs` разложен на `eos/{mod,state,hooks}` (чистое
+  ядро отдельно от детуров), `report.rs` — на `report/{mod,parser,generator,
+  stream}`, `eacimage.rs` — на `eacimage/{mod,elf,locator,live,report}`,
+  дублирующий `install_evp` убран (`EAC_KEYHUNT_EVP` идёт в `evp::install`).
+- **Этап 5 (`46b46ca`, `b0f6bbd`, `0718fce`, `75cd9b2`, `07d4920`, `38de6dc`).**
+  Единый hot-контракт: `hromatite-runtime` переэкспортирует `hromatite_abi::hot`
+  (дрейф `stable/requested/canary` устранён). Маршрутизация команд — только через
+  `hromatite_commands::{is_resident_only,is_feature_only}` (починен `ui`).
+  Удалён мёртвый код: legacy mid-function GC guard с семью тестами,
+  недостижимые `hookat`/`unhook`/`hooks`/`tick` и их машинерия, `--seal`/
+  `seal_image`/`crypto.rs` из инжектора (вместе с 30-минутным ожиданием entry).
+  `tools/` вычищен по §6, `test-hot-smoke.sh` переведён на `hot-smoke.exe` и
+  `abi=2`, генераторы указывают на `crates/hromatite-il2cpp/src/symbols.rs`.
+- **Чем подтверждено (всё — реальные прогоны на этой машине).**
+  `cargo build --workspace` и `--release` — OK; `cargo clippy --workspace
+  --all-targets -- -D warnings` на `x86_64-pc-windows-gnu` и на
+  `x86_64-unknown-linux-gnu` — чисто; `cargo test --workspace --target
+  x86_64-unknown-linux-gnu` — **402 passed**, 0 failed; `cargo test -p
+  hromatite-eac --no-default-features` — **84 passed**; `hromatite-console` —
+  68 passed + clippy чисто; `tools/test_buildgen.py` 13/13; `bash -n` и
+  `python3 -m py_compile` по всем скриптам `tools/`. Изоляция (`cargo tree
+  --edges normal`): injector → только `hromatite-win`; dll → только
+  `hromatite-runtime`; hook → только `hromatite-win`; features → abi + commands +
+  eac(protocol); eac(no-default) → только abi; `crates/hromatite-core` отсутствует.
+- **Осталось (нужен живой прогон, игру запускает пользователь).** В игре после
+  этого рефакторинга ничего не проверялось: критерий приёмки — обычный запуск с
+  wrapper'ом, в логе `modules ready`, `peb unlink: true`, `inline GetThreadContext
+  guard installed`, `LateUpdate runtime ready` (или `PlayerLoop runtime ready`),
+  команды через консоль (`pos`, `who`, `late`, `ui status`) и отсутствие
+  `SuspendThread loop failed` за ≥15 минут. Также не прогонялись
+  `tools/test-hot-smoke.sh` (нужен Proton) и живой hot-reload фич.
