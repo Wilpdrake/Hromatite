@@ -4,13 +4,13 @@
 # Both `proton run` invocations must happen in ONE shell: separate invocations
 # end up on different wine servers and the injector sees an empty process list.
 #
-#   sh tools/test-loadlib.sh [prefix-name]
+#   sh tools/archive/test-loadlib.sh [prefix-name]
 #
 set -u
 
 NAME="${1:-pmtestX}"
 PREFIX="/home/wilpdrake/.hermes/cache/scratch/$NAME"
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 PROTON="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental/proton"
 DLL_WIN='Z:\home\wilpdrake\RustroverProjects\Hromatite\target\x86_64-pc-windows-gnu\release\hromatite.dll'
 EXE="$ROOT/target/x86_64-pc-windows-gnu/release/Hromatite.exe"

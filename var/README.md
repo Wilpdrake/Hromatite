@@ -45,7 +45,8 @@ var/
 Перемещение делалось через `mv` (тот же inode), поэтому даже открытые на запись
 хэндлы живого процесса продолжают писать в новый путь; симлинки — на случай
 пути, зашитого в коде (`%USERPROFILE%\hromatite.log`, `~/.hromatite-logs` в TUI,
-`~/.cache/hromatite` в `tools/il2cppdump.sh`).
+`~/.cache/hromatite` в `tools/il2cppdump.sh` — скрипт удалён 2026-11-19, см.
+`tools/archive/README.md`).
 
 `~/.hromatite-mode` **остаётся обычным файлом** в `$HOME`: wrapper делает
 `cp -a` рядом (`~/.hromatite-mode.launch-bak.<pid>`) и возвращает файл на место,

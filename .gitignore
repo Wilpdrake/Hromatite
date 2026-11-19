@@ -3,6 +3,11 @@
 crates/*/target/
 target-*/
 
+# Launch-wrapper backups of the tracked `hromatite-mode` file: the wrapper drops
+# `hromatite-mode.launch-bak.<pid>` next to it and removes it again on exit, so a
+# killed run leaves debris in the repo root. Never commit those.
+/hromatite-mode.launch-bak.*
+
 # Python
 __pycache__/
 *.py[cod]

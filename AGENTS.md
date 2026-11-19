@@ -4953,3 +4953,54 @@ takeover-режиму дефект надо закрыть: эмиттер об�
   * `cargo clippy --workspace --all-targets --release --target x86_64-pc-windows-gnu --offline -- -D warnings` — 0 ошибок и 0 предупреждений.
   * `cargo build --workspace --release --target x86_64-pc-windows-gnu --offline` — релизные `hromatite.dll` и `hromatite_features.dll` пересобраны.
 - **Осталось:** живой прогон в VRChat (запускает пользователь) с `HROMATITE_UI=1`.
+
+### 2026-11-19 — `tools/`: удаление мёртвых скриптов, архив `test-loadlib.sh`, починка `test-hot-smoke.sh`
+
+- Коммит — **этот** (`chore(tools): delete superseded host scripts, archive
+  test-loadlib, fix hot-smoke`, ветка `refactor/tools-cleanup`); хеш не
+  вписан, потому что запись дописана в тот же коммит через `--amend`.
+  Реализация §6
+  `docs/REFACTOR_AUDIT.md` (решения по каждому файлу) — стадия 5, хост-часть.
+- **Удалено (12, мёртвые/перекрытые):**
+  `tools/gct_table.py` (заменён `buildgen.py`, `GcAnchors::threads`),
+  `tools/resolve_api.py` (`api_map.py` + `buildgen.py` + `export_transfer.py`),
+  `tools/hromatite-console.sh` (Rust `hromatite-console`, `--seal` снят),
+  `tools/test-seal.sh` (`--seal` отклоняется на старте),
+  `tools/meta_parse.py`, `tools/dump.py`, `tools/il2cpp_methods.py`,
+  `tools/il2cppdump.sh`, `tools/test_dumps.py`, `tools/test_il2cpp_methods.py`,
+  `tools/test_meta_parse.py` (архивный пайплайн `docs/archive/IL2CPP-DUMP.md`,
+  `dumpmeta` в payload больше нет), `tools/gamediff.py` (сравнивал только выходы
+  `dump.py`).
+- **Архивировано:** `tools/test-loadlib.sh` → `tools/archive/test-loadlib.sh`
+  (ручной стенд `--mode loadlib` + PEB-unlink). Добавлен `tools/archive/README.md`:
+  что это было, что заменило, и таблица удалённых в этом коммите скриптов.
+- **Починен `tools/test-hot-smoke.sh`:** (1) греб теперь ищет `abi=2`
+  (`hromatite-abi::ABI_VERSION`, `features/src/feature.rs:226` печатает `abi=2`);
+  (2) точка входа переехала — `Hromatite.exe hot-smoke` больше нет, smoke-бинарник
+  `hot-smoke.exe` собирает `hromatite-runtime`
+  (`cargo build -p hromatite-runtime --bin hot-smoke --release --target x86_64-pc-windows-gnu`),
+  поэтому путь `target/<triple>/release/hot-smoke.exe`, а аргументы — без
+  подкоманды (`<rounds> <dll-a> <dll-b>`); в шапке скрипта — команда сборки и
+  явная проверка наличия exe.
+- **Ссылки:** `docs/baselines/README.md` (про удалённый `gamediff.py`) и
+  `var/README.md` (`~/.cache/hromatite` в удалённом `il2cppdump.sh`) помечены как
+  исторические. **Все упоминания перечисленных скриптов в §17 до этой записи —
+  исторические**; актуальная замена описана в `tools/archive/README.md`.
+  `docs/archive/IL2CPP-DUMP.md` и `PROMPT-il2cpp-base.md` не правятся: это
+  архив разбора, пути в них относятся к снятому пайплайну. §3 (`Структура
+  репозитория`, строка про `tools/test-loadlib.sh`) оставлен родителю.
+- **Корень репозитория:** удалён мусорный бэкап `hromatite-mode.launch-bak.1833113`
+  (untracked, байт-в-байт равен `hromatite-mode`); в `.gitignore` добавлено
+  `/hromatite-mode.launch-bak.*`, чтобы обрыв запуска wrapper'а больше не мусорил
+  в `git status`. Отслеживаемый `hromatite-mode` не тронут.
+- **Чем подтверждено:** `ls tools/ tools/archive/` — 20 скриптов + `archive/`
+  (`README.md`, `test-loadlib.sh`); `for f in tools/*.sh; do bash -n` — ни одного
+  `SYNTAX FAIL`; `for f in tools/*.py; do python3 -m py_compile` — ни одного
+  `COMPILE FAIL` (скрипты не исполнялись); `grep -rn` по удалённым именам — только
+  §17-история, `docs/archive/`, `tools/archive/README.md` и помеченные строки
+  `docs/baselines/README.md` / `var/README.md`; `git status` — только
+  запланированные изменения.
+- **Осталось:** живой прогон `tools/test-hot-smoke.sh` под Proton не делался
+  (нужен `cargo build -p hromatite-runtime --bin hot-smoke --release` и Steam);
+  `tools/test_gc_detour_abi.py` намеренно не тронут — рефакторится на следующей
+  стадии.
